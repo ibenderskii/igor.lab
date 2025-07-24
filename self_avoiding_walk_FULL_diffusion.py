@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+#test
+print ("ur mom")
+
 """
 Lattice Monte-Carlo simulation of homopolymer collapse
 ------------------------------------------------------
