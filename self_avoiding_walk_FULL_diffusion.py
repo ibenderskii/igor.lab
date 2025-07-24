@@ -1,36 +1,28 @@
 #!/usr/bin/env python3
 """
-Lattice Monte-Carlo simulation of homopolymer collapse
-------------------------------------------------------
-Simple-cubic lattice, attractive nearest-neighbour contacts,
-Metropolis sampling with pivot / crank-shaft / end-flip moves.
+MC polymer collapse
+3d lattice, attractive nearest-neighbour contacts,
+Metropolis with pivot / crank-shaft / end-flip moves.
 """
-
 from __future__ import annotations
 import argparse, random, math
 import numpy as np
 import matplotlib.pyplot as plt
-
 from typing import Tuple, List
-
 from scipy.optimize import curve_fit
 Vec = Tuple[int, int, int]
 
-# ----------------------------------------------------------------------
-# helper tables for 3-D cubic lattice
-# ----------------------------------------------------------------------
+#helper functions for Vec
 NN_VECS: List[Vec] = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
 
 def add(a:Vec, b:Vec) -> Vec: return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
 def sub(a:Vec, b:Vec) -> Vec: return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 
-# 90° rotations about x, y, z axes
+# 90° rotations
 ROT_X = lambda v: ( v[0],  -v[2],  v[1])
 ROT_Y = lambda v: ( v[2],   v[1], -v[0])
 ROT_Z = lambda v: (-v[1],   v[0],  v[2])
 ROTATIONS = [ ROT_X, ROT_Y, ROT_Z ]
-
-# ----------------------------------------------------------------------
 
 def energy(chain:List[Vec], occ:set[Vec], eps:float) -> float:
     """Return −ε × (# non-bonded contacts)."""
@@ -43,15 +35,14 @@ def energy(chain:List[Vec], occ:set[Vec], eps:float) -> float:
             nbr = add(r, v)
             if nbr in occ and nbr not in (prev, next):
                 E -= eps
-    return 0.5*E          # each contact counted twice
+    return 0.5*E        # each contact counted twice
 
-# ----------------------------------------------------------------------
+
 def radius_of_gyration(chain:List[Vec]) -> float:
     r = np.array(chain, dtype=float)
     com = r.mean(axis=0)
     return math.sqrt(((r - com)**2).sum(axis=1).mean())
 
-# ----------------------------------------------------------------------
 def attempt_pivot(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     n = len(chain)
     i = random.randrange(1, n-1)         # pivot monomer (not ends)
@@ -72,7 +63,6 @@ def attempt_pivot(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     new_chain = head + new_tail
     return True, new_chain, new_occ
 
-# ----------------------------------------------------------------------
 def attempt_crankshaft(chain, occ):
     """
     Local 'kink flip' crankshaft move:
@@ -114,8 +104,6 @@ def attempt_crankshaft(chain, occ):
     new_occ = (occ - {b}) | {b_new}
     return True, new_chain, new_occ
 
-
-# ----------------------------------------------------------------------
 def attempt_end_move(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     n = len(chain)
     end = 0 if random.random() < 0.5 else n-1
@@ -129,7 +117,7 @@ def attempt_end_move(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     new_chain = chain.copy()
     new_chain[end] = r_new
     new_occ = (occ - { chain[end] }) | { r_new }
-    # keep bond length 1 for the new end bond (already ensured)
+    # keep bond length 1 for the new end bond 
     return True, new_chain, new_occ
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
@@ -147,12 +135,12 @@ def diffusion_vs_radius(trajectory: np.ndarray,
     if tau_frames >= trajectory.shape[0]:
         raise ValueError("tau_frames larger than trajectory length")
 
-    # displacement over lag τ
-    disp = trajectory[tau_frames:] - trajectory[:-tau_frames]        # (F-τ, N, 3)
-    msd  = np.sum(disp*disp, axis=2)                                 # (F-τ, N)
+    # displacement over lag tau
+    disp = trajectory[tau_frames:] - trajectory[:-tau_frames]        # (F-tau, N, 3)
+    msd  = np.sum(disp*disp, axis=2)                                 # (F-tau, N)
 
-    # radius at *start* of each pair
-    r0   = np.linalg.norm(trajectory[:-tau_frames], axis=2)          # (F-τ, N)
+    # r at start of each pair
+    r0   = np.linalg.norm(trajectory[:-tau_frames], axis=2)          # (F-tau, N)
 
     # flatten to 1-D
     r_flat  = r0.ravel()
@@ -187,7 +175,7 @@ def main() -> None:
     if args.seed is not None:
         random.seed(args.seed); np.random.seed(args.seed)
 
-    # --- build initial chain: along +x -----------------------
+    #  initial chain-
     chain: List[Vec] = [(i,0,0) for i in range(args.N)]
     occ = set(chain)
     E = energy(chain, occ, args.eps)
@@ -196,7 +184,7 @@ def main() -> None:
     acc = 0
     snapshots = []
     sample_every = 1000          # MC steps between saved frames
-    dt_frame     = sample_every  # one attempted move per monomer ≈ 1 unit
+    dt_frame     = sample_every  # one attempted move per monomer 
 
     record_interval = max(1, args.steps // 2000)
     saved_steps, E_traj2, Rg_traj2 = [], [], []
@@ -232,7 +220,7 @@ def main() -> None:
 
 
 
-    # --- plots -------------------------------------------------------
+    # plotting
     plt.plot(saved_steps, Rg_traj2, label = 'Rg raw' )
     plt.title('Rg vs steps')
     plt.show()
@@ -243,12 +231,12 @@ def main() -> None:
     plt.tight_layout(); plt.show()
    
     #curve fitting:
-    burn = int(0.30 * trajectory.shape[0])   # 30% of frames
+    burn = int(0.30 * trajectory.shape[0])  
     traj_eq = trajectory[burn:]
     traj_eq = traj_eq - traj_eq.mean(axis=1, keepdims=True)
-    dt_frame = sample_every       # whatever you used before
+    dt_frame = sample_every   
     
-    Rmax   = np.linalg.norm(traj_eq[-1], axis=1).max()   # outermost bead
+    Rmax   = np.linalg.norm(traj_eq[-1], axis=1).max()   
     r_bins = np.linspace(0, Rmax, 21)     # 20 radial bins
     tau    = 5                            # evaluate MSD after 5 saved frames
 
@@ -265,20 +253,18 @@ def main() -> None:
     print(traj_eq.shape[0] , "traj frames")
 
     p0 = (D_fit.min(), D_fit.max(), r_fit[np.argmin(np.abs(D_fit-np.median(D_fit)))], 0.1*Rmax)
-    # weighted fit (optional): sigma = 1/√hits
     sigma = 1/np.sqrt(np.maximum(w_fit, 2))
     popt, pcov = curve_fit(tanh_step, r_fit, D_fit, p0=p0, sigma=sigma, absolute_sigma=True, bounds=([0, 0, 0, 1e-6], [np.inf, np.inf, r_bins[-1], r_bins[-1]]))
     D_core, D_shell, r_c, w = popt
     print(f"Fitted parameters: D_core={D_core:.3f}, D_shell={D_shell:.3f}, r_c={r_c:.3f}, w={w:.3f}")
     r_plot = np.linspace(0, Rmax, 400)
-
-    # quick plot
+    #plot fit and data
     plt.figure(figsize=(6,4))
     plt.plot(r_mid, D_r, 'o', alpha=0.4, label='raw (post-burn)')
     plt.plot(r_fit, D_fit, 'o', label='fit bins')
     plt.plot(r_plot, tanh_step(r_plot, *popt), '-', label='tanh fit')
     plt.xlabel('r'); plt.ylabel('D(r)'); plt.legend(); plt.tight_layout(); plt.show()
 
-# ----------------------------------------------------------------------
+# RUn
 if __name__ == "__main__":
     main()
