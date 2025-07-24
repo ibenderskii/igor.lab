@@ -174,12 +174,11 @@ def diffusion_vs_radius(trajectory: np.ndarray,
 
 def tanh_step(r, D_core, D_shell, r_c, w):
         return D_shell - 0.5*(D_shell - D_core)*(1 - np.tanh((r - r_c)/w))
-   
 # ----------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument('--N',        type=int,   default=1000,    help='chain length')
-    ap.add_argument('--steps',    type=int,   default=100000000, help='Monte-Carlo steps')
+    ap.add_argument('--N',        type=int,   default=100,    help='chain length')
+    ap.add_argument('--steps',    type=int,   default=1000000, help='Monte-Carlo steps')
     ap.add_argument('--eps',      type=float, default=1.0,   help='contact energy ε')
     ap.add_argument('--T',        type=float, default=3.0,   help='temperature (k_B=1)')
     ap.add_argument('--seed',     type=int,   default=None,  help='RNG seed')
@@ -234,10 +233,6 @@ def main() -> None:
 
 
     # --- plots -------------------------------------------------------
-    plt.plot(saved_steps, E_traj2, alpha=0.3, label='E raw')
-    plt.title('E vs steps')
-    plt.show()
-
     plt.plot(saved_steps, Rg_traj2, label = 'Rg raw' )
     plt.title('Rg vs steps')
     plt.show()
@@ -246,17 +241,6 @@ def main() -> None:
     ax[0].plot(E_traj2); ax[0].set_xlabel('MC block'); ax[0].set_ylabel('E')
     ax[1].plot(Rg_traj2); ax[1].set_xlabel('MC block'); ax[1].set_ylabel(r'$R_g$')
     plt.tight_layout(); plt.show()
-
-    # quick 3-D scatter of last conformation
-    try:
-        from mpl_toolkits.mplot3d import Axes3D        # noqa: F401
-        fig = plt.figure(figsize=(4,4)); ax3 = fig.add_subplot(111, projection='3d')
-        r = np.array(chain)
-        ax3.plot(r[:,0], r[:,1], r[:,2], '-o', ms=4)
-        ax3.set_title('final conformation'); plt.show()
-    except Exception:
-        pass
-    
    
     #curve fitting:
     burn = int(0.30 * trajectory.shape[0])   # 30% of frames
@@ -285,6 +269,7 @@ def main() -> None:
     sigma = 1/np.sqrt(np.maximum(w_fit, 2))
     popt, pcov = curve_fit(tanh_step, r_fit, D_fit, p0=p0, sigma=sigma, absolute_sigma=True, bounds=([0, 0, 0, 1e-6], [np.inf, np.inf, r_bins[-1], r_bins[-1]]))
     D_core, D_shell, r_c, w = popt
+    print(f"Fitted parameters: D_core={D_core:.3f}, D_shell={D_shell:.3f}, r_c={r_c:.3f}, w={w:.3f}")
     r_plot = np.linspace(0, Rmax, 400)
 
     # quick plot
