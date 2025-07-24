@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+#test
+print ("ur mom")
+
 """
 MC polymer collapse
 3d lattice, attractive nearest-neighbour contacts,
