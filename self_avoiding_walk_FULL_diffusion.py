@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-#test
-print ("ur mom")
 
 """
 MC polymer collapse
@@ -220,19 +218,6 @@ def main() -> None:
    
 
 
-
-
-
-    # plotting
-    plt.plot(saved_steps, Rg_traj2, label = 'Rg raw' )
-    plt.title('Rg vs steps')
-    plt.show()
-    
-    fig, ax = plt.subplots(1,2, figsize=(10,4))
-    ax[0].plot(E_traj2); ax[0].set_xlabel('MC block'); ax[0].set_ylabel('E')
-    ax[1].plot(Rg_traj2); ax[1].set_xlabel('MC block'); ax[1].set_ylabel(r'$R_g$')
-    plt.tight_layout(); plt.show()
-   
     #curve fitting:
     burn = int(0.30 * trajectory.shape[0])  
     traj_eq = trajectory[burn:]
@@ -271,3 +256,7 @@ def main() -> None:
 # RUn
 if __name__ == "__main__":
     main()
+
+
+#next steps: Visualize the trajectory in 3D
+# multiple polymers
