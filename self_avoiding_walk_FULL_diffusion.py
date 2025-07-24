@@ -7,12 +7,12 @@ Metropolis sampling with pivot / crank-shaft / end-flip moves.
 """
 
 from __future__ import annotations
-import argparse, random, math, sys
+import argparse, random, math
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import defaultdict
+
 from typing import Tuple, List
-from numba import njit
+
 from scipy.optimize import curve_fit
 Vec = Tuple[int, int, int]
 
@@ -34,7 +34,7 @@ ROTATIONS = [ ROT_X, ROT_Y, ROT_Z ]
 
 def energy(chain:List[Vec], occ:set[Vec], eps:float) -> float:
     """Return −ε × (# non-bonded contacts)."""
-    E = 0
+    E = 0.0
     N=len(chain)
     for i, r in enumerate(chain):
         prev = chain[i-1] if i > 0       else None
@@ -73,27 +73,47 @@ def attempt_pivot(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     return True, new_chain, new_occ
 
 # ----------------------------------------------------------------------
-def attempt_crankshaft(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
+def attempt_crankshaft(chain, occ):
+    """
+    Local 'kink flip' crankshaft move:
+    Works only when the local triplet (a,b,c) forms a 90° kink.
+    """
     n = len(chain)
-    i = random.randrange(1, n-2)         # pick two consecutive bonds
-    a, b, c = chain[i-1:i+2]
-    axis = sub(c, a)
-    if axis not in NN_VECS:              # straight segment → no rotation
+    i = random.randrange(1, n-1)        # b = chain[i], needs neighbors on both sides
+    a, b, c = chain[i-1], chain[i], chain[i+1]
+
+    u1 = sub(b, a)   # bond a->b
+    u2 = sub(c, b)   # bond b->c
+
+    # both bonds must be unit lattice vectors
+    if u1 not in NN_VECS or u2 not in NN_VECS:
         return False, chain, occ
-    # rotate b around axis by ±90°
-    rot = ROTATIONS[NN_VECS.index(axis)//2]   # pick rotation matching axis
-    if random.random() < 0.5:            # clockwise / anticlockwise
-        rot = ROTATIONS[(ROTATIONS.index(rot)+2)%3]
-    b_new = add(a, rot(sub(b, a)))
+
+    # reject straight segments (parallel or antiparallel)
+    if u1 == u2 or u1 == (-u2[0], -u2[1], -u2[2]):
+        return False, chain, occ
+
+    # we only accept perfect 90° kinks
+    if (u1[0]*u2[0] + u1[1]*u2[1] + u1[2]*u2[2]) != 0:
+        return False, chain, occ
+
+    # proposed new middle monomer (180° flip of the kink)
+    b_new = add(a, u2)
+
+    # must be empty
     if b_new in occ:
         return False, chain, occ
+
+    # bonds must remain unit length
+    if sub(b_new, a) not in NN_VECS or sub(c, b_new) not in NN_VECS:
+        return False, chain, occ
+
+    # commit
     new_chain = chain.copy()
     new_chain[i] = b_new
     new_occ = (occ - {b}) | {b_new}
-    # check neighbouring bonds remain unit length
-    if sub(new_chain[i+1], b_new) not in NN_VECS:
-        return False, chain, occ
     return True, new_chain, new_occ
+
 
 # ----------------------------------------------------------------------
 def attempt_end_move(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
@@ -152,11 +172,14 @@ def diffusion_vs_radius(trajectory: np.ndarray,
     r_centers = 0.5*(r_bins[:-1] + r_bins[1:])
     return r_centers, D, counts  
 
+def tanh_step(r, D_core, D_shell, r_c, w):
+        return D_shell - 0.5*(D_shell - D_core)*(1 - np.tanh((r - r_c)/w))
+   
 # ----------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument('--N',        type=int,   default=100,    help='chain length')
-    ap.add_argument('--steps',    type=int,   default=10000000, help='Monte-Carlo steps')
+    ap.add_argument('--N',        type=int,   default=1000,    help='chain length')
+    ap.add_argument('--steps',    type=int,   default=100000000, help='Monte-Carlo steps')
     ap.add_argument('--eps',      type=float, default=1.0,   help='contact energy ε')
     ap.add_argument('--T',        type=float, default=3.0,   help='temperature (k_B=1)')
     ap.add_argument('--seed',     type=int,   default=None,  help='RNG seed')
@@ -236,14 +259,12 @@ def main() -> None:
     
    
     #curve fitting:
-    def tanh_step(r, D_core, D_shell, r_c, w):
-        return D_shell - 0.5*(D_shell - D_core)*(1 - np.tanh((r - r_c)/w))
     burn = int(0.30 * trajectory.shape[0])   # 30% of frames
     traj_eq = trajectory[burn:]
     traj_eq = traj_eq - traj_eq.mean(axis=1, keepdims=True)
     dt_frame = sample_every       # whatever you used before
     
-    Rmax   = max(np.linalg.norm(traj_eq[-1], axis=1))   # outermost bead
+    Rmax   = np.linalg.norm(traj_eq[-1], axis=1).max()   # outermost bead
     r_bins = np.linspace(0, Rmax, 21)     # 20 radial bins
     tau    = 5                            # evaluate MSD after 5 saved frames
 
@@ -251,6 +272,8 @@ def main() -> None:
     r_mid, D_r, hits = diffusion_vs_radius(traj_eq, r_bins, tau, dt_frame)
     # keep only well-populated bins
     mask = (hits > 50) & np.isfinite(D_r)
+    if mask.sum() < 4:
+        raise ValueError("Not enough bins with counts>50 to fit 4 parameters. Run longer or merge bins.")
     r_fit = r_mid[mask]
     D_fit = D_r[mask]
     w_fit = hits[mask]    
@@ -260,20 +283,16 @@ def main() -> None:
     p0 = (D_fit.min(), D_fit.max(), r_fit[np.argmin(np.abs(D_fit-np.median(D_fit)))], 0.1*Rmax)
     # weighted fit (optional): sigma = 1/√hits
     sigma = 1/np.sqrt(np.maximum(w_fit, 2))
-    popt, pcov = curve_fit(tanh_step, r_fit, D_fit, p0=p0, sigma=sigma, absolute_sigma=True)
+    popt, pcov = curve_fit(tanh_step, r_fit, D_fit, p0=p0, sigma=sigma, absolute_sigma=True, bounds=([0, 0, 0, 1e-6], [np.inf, np.inf, r_bins[-1], r_bins[-1]]))
     D_core, D_shell, r_c, w = popt
     r_plot = np.linspace(0, Rmax, 400)
 
-     # quick plot
-    plt.plot(r_mid, D_r, 'o-')
-    plt.xlabel('radius r'); plt.ylabel('D(r)')
-    plt.title('Radial diffusion coefficient after collapse')
-    plt.show()
-
+    # quick plot
     plt.figure(figsize=(6,4))
-    plt.plot(r_plot, tanh_step(r_plot, *popt), '-', label='fit')
-    plt.xlabel('r'); plt.ylabel('D(r)')
-    plt.legend(); plt.tight_layout(); plt.show()
+    plt.plot(r_mid, D_r, 'o', alpha=0.4, label='raw (post-burn)')
+    plt.plot(r_fit, D_fit, 'o', label='fit bins')
+    plt.plot(r_plot, tanh_step(r_plot, *popt), '-', label='tanh fit')
+    plt.xlabel('r'); plt.ylabel('D(r)'); plt.legend(); plt.tight_layout(); plt.show()
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
