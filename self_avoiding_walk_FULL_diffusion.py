@@ -11,6 +11,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, List
 from scipy.optimize import curve_fit
+from matplotlib import animation
+from mpl_toolkits.mplot3d import Axes3D 
 Vec = Tuple[int, int, int]
 
 #helper functions for Vec
@@ -26,7 +28,7 @@ ROT_Z = lambda v: (-v[1],   v[0],  v[2])
 ROTATIONS = [ ROT_X, ROT_Y, ROT_Z ]
 
 def energy(chain:List[Vec], occ:set[Vec], eps:float) -> float:
-    """Return −ε × (# non-bonded contacts)."""
+    """Return − × (# non-bonded contacts)."""
     E = 0.0
     N=len(chain)
     for i, r in enumerate(chain):
@@ -163,13 +165,55 @@ def diffusion_vs_radius(trajectory: np.ndarray,
 
 def tanh_step(r, D_core, D_shell, r_c, w):
         return D_shell - 0.5*(D_shell - D_core)*(1 - np.tanh((r - r_c)/w))
+
+
+
+def render_movie(snaps, out="polymer.mp4", fps=30, stride=1):
+    """snaps: list of (N,3) arrays collected during the run."""
+    traj = np.asarray(snaps, dtype=float)[::stride]          # (F, N, 3)
+    F = traj.shape[0]
+    mins = traj.reshape(-1,3).min(0) - 2
+    maxs = traj.reshape(-1,3).max(0) + 2
+
+    fig = plt.figure(figsize=(5,5))
+    ax  = fig.add_subplot(111, projection='3d')
+    (line,) = ax.plot([], [], [], '-o', ms=3)
+    ax.set_xlim(mins[0], maxs[0]); ax.set_ylim(mins[1], maxs[1]); ax.set_zlim(mins[2], maxs[2])
+    ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+
+    def init():
+        line.set_data([], [])
+        line.set_3d_properties([])
+        return (line,)
+
+    def update(f):
+        r = traj[f]
+        line.set_data(r[:,0], r[:,1])
+        line.set_3d_properties(r[:,2])
+        ax.set_title(f"frame {f+1}/{F}")
+        return (line,)
+
+    ani = animation.FuncAnimation(fig, update, init_func=init, frames=F,
+                                  interval=1000/fps, blit=False)
+    try:
+        ani.save(out, writer=animation.FFMpegWriter(fps=fps, bitrate=1800))
+    except Exception:
+        ani.save(out.replace(".mp4", ".gif"), writer="pillow", fps=fps)
+    plt.close(fig)
+
+def log_schedule(total_steps, n_frames):
+    # indices in [1..total_steps] roughly logarithmically spaced
+    xs = np.geomspace(1, total_steps, n_frames).astype(int)
+    return np.unique(xs)
+
+
 # ----------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--N',        type=int,   default=100,    help='chain length')
     ap.add_argument('--steps',    type=int,   default=1000000, help='Monte-Carlo steps')
-    ap.add_argument('--eps',      type=float, default=1.0,   help='contact energy ε')
-    ap.add_argument('--T',        type=float, default=3.0,   help='temperature (k_B=1)')
+    ap.add_argument('--eps',      type=float, default=1,   help='contact energy ')
+    ap.add_argument('--T',        type=float, default=1.5,   help='temperature (k_B=1)')
     ap.add_argument('--seed',     type=int,   default=None,  help='RNG seed')
     args = ap.parse_args()
 
@@ -189,7 +233,8 @@ def main() -> None:
 
     record_interval = max(1, args.steps // 2000)
     saved_steps, E_traj2, Rg_traj2 = [], [], []
-
+    frames_to_save = set(log_schedule(args.steps, 2000))
+    frames = []  
 
 
     for step in range(1, args.steps+1):
@@ -211,12 +256,15 @@ def main() -> None:
         if step % sample_every == 0:
             sample_trajectory(chain, snapshots)
 
+        if step in frames_to_save:
+            sample_trajectory(chain, frames)
+
+
     trajectory = np.stack(snapshots)
 
     print(f"Acceptance ratio: {acc/args.steps:.3f}")
     print(f"⟨E⟩ = {np.mean(E_traj2):.2f}   ⟨R_g⟩ = {np.mean(Rg_traj2):.2f}")
-   
-
+    render_movie(frames, out="polymer.mp4", fps=24, stride=1)
 
     #curve fitting:
     burn = int(0.30 * trajectory.shape[0])  
@@ -258,5 +306,3 @@ if __name__ == "__main__":
     main()
 
 
-#next steps: Visualize the trajectory in 3D
-# multiple polymers
