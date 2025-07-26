@@ -9,7 +9,7 @@ from numba import njit
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--R', type=float, default=1.0, help='outer radius')
 parser.add_argument('--Nr', type=int,   default=1000, help='# radial nodes (incl. r=0)')
-parser.add_argument('--tmax', type=float, default=100, help='total simulation time')
+parser.add_argument('--tmax', type=float, default=10, help='total simulation time')
 parser.add_argument('--cfl',  type=float, default=0.4, help='Courant safety factor (<1)')
 parser.add_argument('--profile', choices=['gaussian','shell'], default='gaussian',
                     help='initial condition')
@@ -30,9 +30,9 @@ if args.D_profile == 'const':
     D_node = np.full(Nr, 1.0)
 elif args.D_profile == 'tanh':   # tanh: slow core, faster shell
     D_shell = 0.005
-    D_core  = 0.0
-    r_c     = 7.336
-    w       = 4.454
+    D_core  = 0.001
+    r_c     = 0.336
+    w       = 0.1
     D_node = D_shell - 0.5*(D_shell - D_core)*(1 - np.tanh((r - r_c)/w))
 elif args.D_profile == 'inv': 
      D_node = 1/np.maximum(r,1e-6)
