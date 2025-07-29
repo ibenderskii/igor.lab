@@ -33,7 +33,7 @@ end
 
 
 %% Normalize every file and store each 2d array in a cell array
-path="D:\Igor\6.25.25_T_Ramp_40kda_1wt_20_1_60";
+path="C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps\0.1 or 7.5";
 cd(path);
 files = dir(fullfile(path, '*'));
 multiArray = {}; %cell(length(files), 1);
@@ -48,7 +48,7 @@ for k=1 : length(files)
     wn = data(:,1);
     abs = data(:,2);
     [wn2, abs2] = norm(wn, abs);
-    arr = [wn, abs];
+    arr = [wn2, abs2];
     multiArray{end+1}= arr;
        
 end
@@ -113,7 +113,7 @@ title('first temperature component-unweighted');
 %plot ~ first 4 spectral components & first 4 temp components
 subplot(2,2,3);
 for i=1:4 
-plot(wn(WN_i:WN_f),dS(i,1)*U(:,i) );
+plot(wn(WN_i:WN_f),dS(i)*U(:,i) );
 hold on;
 end
 hold off;
@@ -121,7 +121,7 @@ title('weighted spectral cols 1-4');
 
 subplot(2,2,4);
 for i=1:4 
-plot(temps,dS(i,1)*V(:,i) );
+plot(temps,dS(i)*V(:,i) );
 hold on;
 end
 hold off;
