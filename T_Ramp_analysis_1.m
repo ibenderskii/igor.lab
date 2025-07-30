@@ -1,39 +1,11 @@
 %% given wn, abs output the normalized wn, abs
 clear
 close all
-function [xf,yf] = norm(x, y)
-wn = x;
-abs = y;
 
-wn_i=find(wn>=4000, 1, 'first');
-wn_f=find(wn>=7000, 1, 'first');
-
-abs_range=abs(wn_i : wn_f);
-wn_range = wn(wn_i : wn_f);
-
-%polynomial fit
-p = polyfit(wn_range, abs_range, 1);
-line = p(1).*wn+p(2);
-abs2=abs-line;
-abs = abs2;
-
-%normalize
-wn2_i=find(wn>=1600, 1, 'first');
-wn2_f=find(wn>=1700, 1, 'first');
-
-abs2_range=abs2(wn2_i : wn2_f);
-wn2_range = wn(wn2_i : wn2_f);
-
-N=sum(abs2_range);
-abs = abs2./N;
-
-xf = wn;
-yf = abs;
-end
 
 
 %% Normalize every file and store each 2d array in a cell array
-path="C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps\1wt";
+path="C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps\7.5";
 cd(path);
 files = dir(fullfile(path, '*'));
 multiArray = {}; %cell(length(files), 1);
@@ -47,8 +19,8 @@ for k=1 : length(files)
 
     wn = data(:,1);
     abs = data(:,2);
-    [wn2, abs2] = norm(wn, abs);
-    arr = [wn, abs];
+    [wn2, abs2] = MYnorm(wn, abs);
+    arr = [wn2, abs2];
     multiArray{end+1}= arr;
        
 end
@@ -93,6 +65,12 @@ hold off;
 
 [U, S, V] = svd(subS);
 % only do this for the am1 peak 1600-1700 wn
+
+
+
+
+
+
 
 dS=diag(S);
 index = 1:1:length(dS); 
@@ -198,7 +176,38 @@ hold on;
 plot(T, Vfit);
 hold off;
 
+function [xf,yf] = MYnorm(x, y)
+wn = x;
+abs = y;
 
+wn_i=find(wn>=4000, 1, 'first');
+wn_f=find(wn>=7000, 1, 'first');
+
+abs_range=y(wn_i : wn_f);
+wn_range = wn(wn_i : wn_f);
+
+%polynomial fit
+p = polyfit(wn_range, abs_range, 1);
+line = p(1).*wn+p(2);
+abs2=abs-line;
+
+%normalize
+wn2_i=find(wn>=1600, 1, 'first');
+wn2_f=find(wn>=1700, 1, 'first');
+
+abs2_range=abs2(wn2_i : wn2_f);
+wn2_range = wn(wn2_i : wn2_f);
+
+N=sum(abs2_range);
+
+if N <0
+    N=-N;
+end
+abs = abs2./N;
+
+xf = wn;
+yf = abs;
+end
 
 
 

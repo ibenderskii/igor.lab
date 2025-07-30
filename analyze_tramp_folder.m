@@ -27,7 +27,7 @@ for k = 1:length(files)
 
     [wn2, abs2] = norm_local(wn, abs);
 
-    arr = [wn, abs];
+    arr = [wn2, abs2];
 
     multiArray{end+1} = arr;
 end
@@ -60,7 +60,7 @@ end
 
 % find row index for 1600, 1700 wn
 WN_i = find(wn >= 1585, 1, 'first');
-WN_f = find(wn >= 1700, 1, 'first');
+WN_f = find(wn <= 1700, 1, 'last');
 
 subS = s(WN_i:WN_f, :);
 
@@ -168,6 +168,84 @@ hold on;
 plot(T, Vfit);
 hold off;
 
+
+
+
+%% ===== Transition temperature extraction =====
+
+% 1) Choose an observable Y(T)
+%    (a) PC1 score (weighted): Y = sigma1 * V(:,1)
+Y_pc1 = S(1,1) * V(:,1);
+
+%    (b) Or band area in the same window for each spectrum (columns of subS)
+%       This is optional; uncomment if you prefer band area route:
+% Y_area = sum(subS, 1).';   % column sum -> (nTemps x 1)
+
+% Select which observable to use
+Y = Y_pc1;           % or Y = Y_area;
+Y = Y(:);
+temps = temps(:);
+if numel(Y) ~= numel(temps)
+    error('Mismatch: %d spectra vs %d temps', numel(Y), numel(temps));
+end
+% 2) Normalize to [0,1] for stable fitting/interpretation
+Y = (Y - min(Y)) / max(1e-12, (max(Y) - min(Y)));
+
+% 3) Optional smoothing to reduce noise (keeps shape; tune window)
+Y_s = smoothdata(Y, 'sgolay', 7);
+
+% 4) Sigmoid (two-state/Boltzmann) fit to get midpoint and width
+%    model: y = A2 + (A1 - A2)/(1 + exp((T - Tm)/dT))
+boltz = @(b, T) b(2) + (b(1) - b(2)) ./ (1 + exp((T - b(3)) / b(4)));
+% Initial guesses:
+[~, iMaxSlope] = max(abs(gradient(Y_s, temps)));
+Tm0   = temps(iMaxSlope);
+dT0   = (max(temps)-min(temps))/20;  % initial width guess
+A10   = 1; A20 = 0;
+b0    = [A10, A20, Tm0, dT0];
+
+% Bounds (A1,A2 within [0,1]; width positive but not huge)
+lb = [0, 0, min(temps)-5, 0.1];
+ub = [1, 1, max(temps)+5, (max(temps)-min(temps))];
+
+opts = optimoptions('lsqcurvefit', 'Display','off');
+try
+    bfit = lsqcurvefit(boltz, b0, temps(:), Y_s(:), lb, ub, opts);
+catch
+    % Fallback if Optimization Toolbox unavailable: use nlinfit if you have Statistics Toolbox
+    % bfit = nlinfit(temps(:), Y_s(:), @(b,T) boltz(b,T), b0);
+    % Otherwise, just use derivative/half-height methods below.
+    bfit = b0;
+end
+Y_fit = boltz(bfit, temps(:));
+Tm_fit = bfit(3);      % sigmoid midpoint
+dT_fit = abs(bfit(4)); % transition width (cooperativity proxy)
+
+% 5) Derivative-based estimate: max slope temperature
+dYdT  = gradient(Y_s, temps);
+[~, iDerivMax] = max(abs(dYdT));
+Tm_deriv = temps(iDerivMax);
+
+% 6) Half-height estimate: where Y crosses 0.5
+Tm_half = interp1(Y_s, temps, 0.5, 'linear', 'extrap');
+
+% 7) Plot quick diagnostic (optional)
+figure; 
+subplot(1,2,1);
+plot(temps, Y, 'o', 'DisplayName','Y raw'); hold on;
+plot(temps, Y_s, '-', 'DisplayName','Y smooth');
+plot(temps, Y_fit, '--', 'DisplayName','Boltzmann fit');
+xlabel('T (°C)'); ylabel('Observable (norm.)'); grid on;
+legend('Location','best');
+title(sprintf('Tm_{fit}=%.2f, Tm_{dY/dT}=%.2f, Tm_{1/2}=%.2f', Tm_fit, Tm_deriv, Tm_half));
+
+subplot(1,2,2);
+plot(temps, dYdT, '-o'); grid on;
+xlabel('T (°C)'); ylabel('dY/dT');
+title('Derivative (steepest point ~ T_m)');
+
+% 8) Save results to a struct you return (or to disk)
+
 % --------- Package outputs (optional)
 res = struct();
 res.path       = path;
@@ -180,36 +258,43 @@ res.temps = temps;
 res.fit.params = p;
 res.fit.Vfit   = Vfit;
 res.fit.normData = normData;
+res.Tm_fit   = Tm_fit;
+res.dT_fit   = dT_fit;
+res.Tm_deriv = Tm_deriv;
+res.Tm_half  = Tm_half;
+res.method   = 'PC1';
 end
 
 % ==================== Local function (your original 'norm') ====================
 function [xf,yf] = norm_local(x, y)
 % Your code unchanged except the function name.
 wn  = x;
-abs = y;
+absorb = y;
 
 wn_i = find(wn >= 4000, 1, 'first');
-wn_f = find(wn >= 7000, 1, 'first');
+wn_f = find(wn <= 7000, 1, 'last');
 
-abs_range = abs(wn_i : wn_f);
+absorb_range = absorb(wn_i : wn_f);
 wn_range  = wn(wn_i : wn_f);
 
 % polynomial fit
-p    = polyfit(wn_range, abs_range, 1);
+p    = polyfit(wn_range, absorb_range, 1);
 line = p(1).*wn + p(2);
-abs2 = abs - line;
-abs  = abs2;
+absorb2 = absorb - line;
 
 % normalize
 wn2_i = find(wn >= 1600, 1, 'first');
-wn2_f = find(wn >= 1700, 1, 'first');
+wn2_f = find(wn <= 1700, 1, 'last');
 
-abs2_range = abs2(wn2_i : wn2_f);
-wn2_range  = wn(wn2_i : wn2_f);
+absorb2_range = absorb2(wn2_i : wn2_f) ;
+if sum (absorb2_range) < 0
+        %absorb2 = -absorb2;
+        absorb2_range = -absorb2_range;
+end
 
-N   = sum(abs2_range);
-abs = abs2 ./ N;
+N   = sum(absorb2_range);
+absorb = absorb2 ./ N;
 
 xf = wn;
-yf = abs;
+yf = absorb;
 end
