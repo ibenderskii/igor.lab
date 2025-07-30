@@ -1,9 +1,16 @@
+name
+
+clc;  % optional
+disp('Starting…');
 base = "C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps";
 folders = dir(base);
 folders = folders([folders.isdir]);
 folders = folders(~ismember({folders.name},{'.','..'}));
 
 allres = cell(numel(folders),1);
+
+
+
 for k = 1:numel(folders)
     fpath = fullfile(base, folders(k).name);
     fprintf('Processing: %s\n', fpath);

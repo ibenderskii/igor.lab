@@ -33,7 +33,7 @@ end
 
 
 %% Normalize every file and store each 2d array in a cell array
-path="C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps\0.1 or 7.5";
+path="C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps\1wt";
 cd(path);
 files = dir(fullfile(path, '*'));
 multiArray = {}; %cell(length(files), 1);
@@ -48,7 +48,7 @@ for k=1 : length(files)
     wn = data(:,1);
     abs = data(:,2);
     [wn2, abs2] = norm(wn, abs);
-    arr = [wn2, abs2];
+    arr = [wn, abs];
     multiArray{end+1}= arr;
        
 end
@@ -116,16 +116,18 @@ for i=1:4
 plot(wn(WN_i:WN_f),dS(i)*U(:,i) );
 hold on;
 end
-hold off;
 title('weighted spectral cols 1-4');
+hold off;
+
 
 subplot(2,2,4);
 for i=1:4 
 plot(temps,dS(i)*V(:,i) );
+title('weighted temp cols 1-4');
 hold on;
 end
 hold off;
-title('weighted temp cols 1-4');
+
 %%
 
 

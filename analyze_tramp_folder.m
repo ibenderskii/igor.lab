@@ -27,7 +27,7 @@ for k = 1:length(files)
 
     [wn2, abs2] = norm_local(wn, abs);
 
-    arr = [wn2, abs2];
+    arr = [wn, abs];
 
     multiArray{end+1} = arr;
 end
