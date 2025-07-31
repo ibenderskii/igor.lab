@@ -27,7 +27,7 @@ function res = simple_tm_from_folder(path, temps, varargin)
 p = inputParser;
 p.addParameter('Win', [1585 1700], @(v)isnumeric(v)&&numel(v)==2);
 p.addParameter('Baseline', [6000 7000], @(v)isnumeric(v)&&numel(v)==2);
-p.addParameter('SmoothN', 5, @(v)isnumeric(v)&&isscalar(v)&&v>=1);
+p.addParameter('SmoothN', 7, @(v)isnumeric(v)&&isscalar(v)&&v>=1);
 p.parse(varargin{:});
 win       = sort(p.Results.Win);
 baseRange = sort(p.Results.Baseline);
