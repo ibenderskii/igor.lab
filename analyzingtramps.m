@@ -1,5 +1,6 @@
 clear
-clc;  % optional
+close all
+clc;  
 
 
 disp('Starting…');
@@ -13,35 +14,19 @@ allres = cell(numel(folders),1);
 Tms  = nan(numel(folders),1);
 dTs  = nan(numel(folders),1);
 concs = nan(numel(folders),1);
-
+addpath("C:\Users\ibend\igor.lab");
 
 for k = 1:numel(folders)
     fpath = fullfile(base, folders(k).name);
     fprintf('Processing: %s\n', fpath);
-
+    temps = 20:60;
     concs(k) = parseConcFromName(folders(k).name);
     try
-        allres{k} = analyze_tramp_folder(fpath, 20:60);
-        Tms(k) = allres{k}.Tm_fit;
-        dTs(k) = allres{k}.dT_fit;
+        analyze_tramp_folder(fpath, temps, concs(k));
     catch ME 
         warning('you dumbass this folder"%s" failed: %s', folders(k).name, ME.message);
     end
 end
-
-ok = isfinite(concs) & isfinite(Tms) & isfinite(dTs);
-concs = concs(ok);  Tms = Tms(ok);  dTs = dTs(ok);
-
-[concs, idx] = sort(concs);
-Tms = Tms(idx);
-dTs = dTs(idx);
-
-figure; 
-subplot(1,2,1); plot(concs, Tms, 'o-'); xlabel('wt%'); ylabel('T_{tr} (°C)'); grid on;
-subplot(1,2,2); plot(concs, dTs, 'o-'); xlabel('wt%'); ylabel('width dT (°C)'); grid on;
-
-summaryT = table(concs(:), Tms(:), dTs(:), 'VariableNames', {'wtpct','Ttr_C','width_C'});
-writetable(summaryT, fullfile(base, 'summary_transition_vs_conc.csv'));
 
 function c = parseConcFromName(nameStr)
     % Try to extract the first decimal/float-looking number
