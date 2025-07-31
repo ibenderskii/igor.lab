@@ -8,7 +8,7 @@ if nargin < 2
 end
 
 
-% --------- Normalize every file and store each 2d array in a cell array
+% --------- Normalize every file and store each 2d array in a cell array------------------------------
 oldpwd = pwd;
 cleanupObj = onCleanup(@() cd(oldpwd));
 cd(path);
@@ -32,14 +32,14 @@ for k = 1:length(files)
     multiArray{end+1} = arr;
 end
 
-% --------- Plots all spectra in multiArray together
+% --------- Plots all spectra in multiArray together-------------------
 sample       = multiArray(1,1);
 sample_data  = sample{1,1};
 x            = sample_data(:,1);
 y            = sample_data(:,2);
 figure;
 plot(x,y);
-title("Normalized & baseline corrected Spectra", NAME); % (title text kept)
+title("Normalized & baseline corrected Spectra", NAME); 
 
 hold on;
 for i = 2:length(multiArray)
@@ -51,7 +51,7 @@ for i = 2:length(multiArray)
 end
 hold off;
 
-% --------- SVD
+% --------- SVD------------------------------
 % stack columns
 s = [];
 for i = 1:length(multiArray)
@@ -90,7 +90,7 @@ subplot(2,2,2);
 plot(temps, V(:,1));
 title('first temperature component-unweighted', NAME);
 
-% plot ~ first 4 spectral components & first 4 temp components
+% plot  first 4 spectral components & first 4 temp components----------------------------------------
 subplot(2,2,3);
 for i = 1:4
     plot(wn(WN_i:WN_f), dS(i,1)*U(:,i) );
@@ -107,9 +107,9 @@ end
 hold off;
 title('weighted temp cols 1-4');
 
-% --------- Two-state fit section (kept as-is)
+% --------- fitting-----------------------------
 addpath('C:\Users\ibenderskii\Documents\MATLAB\'); 
-addpath("C:\Users\ibend\igor.lab");  % your line
+addpath("C:\Users\ibend\igor.lab");  
 % guess parameters
 H  = 4e5;
 R  = 8.3144;
@@ -126,10 +126,11 @@ K  = exp(-G./(R.*T));
 f  = 1./(K+1);
 Sd = dm.*T + db;
 Sm = mm.*T + mb;
-Vtest = f.*(Sd-Sm) + Sm;
 
-figure;
-plot(T, Vtest);
+%Vtest = f.*(Sd-Sm) + Sm;
+
+%figure;
+%plot(T, Vtest);
 
 p0(1)= H;
 p0(2)= Tm;
@@ -168,40 +169,40 @@ plot(T, normData);
 hold on;
 plot(T, Vfit);
 hold off;
-title("V matrix fit vs fucking nromalized data. ", NAME);
+title("V matrix fit vs  nromalized data. ", NAME);
 
-end
 
-% ==================== Local function (your original 'norm') ====================
+
+% -------------------Normalize func----------------
 function [xf,yf] = norm_local(x, y)
-% Your code unchanged except the function name.
-wn  = x(:);
-absorb = y(:);
+wn  = x;
+absorb = y;
 
 wn_i = find(wn >= 4000, 1, 'first');
-wn_f = find(wn <= 7000, 1, 'last');
+wn_f = find(wn >= 7000, 1, 'first');
 
-absorb_range = absorb(wn_i : wn_f);
+absorb_range = y(wn_i : wn_f);
 wn_range  = wn(wn_i : wn_f);
 
-% polynomial fit
+
 p    = polyfit(wn_range, absorb_range, 1);
 line = p(1).*wn + p(2);
 absorb2 = absorb - line;
 
-% normalize
+
 wn2_i = find(wn >= 1600, 1, 'first');
-wn2_f = find(wn <= 1700, 1, 'last');
+wn2_f = find(wn >= 1700, 1, 'first');
 
 absorb2_range = absorb2(wn2_i : wn2_f) ;
-if sum (absorb2_range) < 0
-        %absorb2 = -absorb2;
-        absorb2_range = -absorb2_range;
-end
 
 N   = sum(absorb2_range);
+if N<0
+    N=-N;
+end
 absorb = absorb2 ./ N;
 
 xf = wn;
 yf = absorb;
+end
+
 end

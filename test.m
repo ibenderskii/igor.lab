@@ -1,5 +1,4 @@
-clear
-close all
+
 
 base = "C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps";
 folders = dir(base);
@@ -13,16 +12,16 @@ concs     = nan(numel(folders),1);
 
 for k = 1:numel(folders)
     fpath = fullfile(base, folders(k).name);
-    % Build temps from file count or pass your known temperatures:
+    
     d = dir(fpath); d = d(~[d.isdir]);
-    temps = linspace(20,60,numel(d));      % or parse from filenames
+    temps = linspace(20,60,numel(d));      
     
     try
         res = simple_tm_from_folder(fpath, temps);
         Tms_half(k)  = res.Tm_half;
         Tms_deriv(k) = res.Tm_deriv;
         widths(k)    = res.width;
-        concs(k)     = parseConcFromName(folders(k).name); % your helper
+        concs(k)     = parseConcFromName(folders(k).name);
     catch ME
         warning('Folder "%s" failed: %s', folders(k).name, ME.message);
     end

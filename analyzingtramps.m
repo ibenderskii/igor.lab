@@ -1,6 +1,5 @@
 clear
 close all
-clc;  
 
 
 disp('Starting…');
