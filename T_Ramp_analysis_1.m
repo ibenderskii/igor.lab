@@ -1,20 +1,6 @@
 %% given wn, abs output the normalized wn, abs
 clear
 close all
-data1 = load("C:\Users\ibend\data\mylar\control.dpt");
-data2 = load("C:\Users\ibend\data\mylar\mylar.dpt");
-wnc = data1(:,1);
-absc = data1(:,2);
-wnt = data2(:,1);
-abst = data2(:,2);
-
-figure;
-plot(wnc,absc);
-hold on;
-plot(wnt, abst);
-hold off;
-title("control and test");
-
 
 
 %% Normalize every file and store each 2d array in a cell array
@@ -22,6 +8,7 @@ path="C:\Users\ibend\data\PNIPAM_300kda_20_1_60_T_Ramps\1";
 cd(path);
 files = dir(fullfile(path, '*'));
 multiArray = {}; %cell(length(files), 1);
+multiArray1 = {};
 for k=1 : length(files)
     
     if files(k).isdir
@@ -32,11 +19,26 @@ for k=1 : length(files)
 
     wn = data(:,1);
     abs = data(:,2);
+    arr1=[wn, abs];
+    multiArray1{end+1} =arr1;
     [wn2, abs2] = MYnorm(wn, abs);
     arr = [wn2, abs2];
     multiArray{end+1}= arr;
        
 end
+
+figure;
+for i=1: length(multiArray1)
+  lsample1 = multiArray1(1,i);
+  lsample_data1=lsample1{1,1};
+    x1=lsample_data1(:,1);
+    y1 = lsample_data1(:,2);
+    plot(x1,y1);
+    hold on;
+end
+hold off;
+title('raw data');
+
 %% Plots all spectra in multiArray together
 sample = multiArray(1,1);
 sample_data=sample{1,1};
