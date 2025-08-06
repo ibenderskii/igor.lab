@@ -39,7 +39,7 @@ x            = sample_data(:,1);
 y            = sample_data(:,2);
 figure;
 plot(x,y);
-title("Normalized & baseline corrected Spectra", NAME); 
+title("Normalized & baseline corrected Spectra" +string(NAME)); 
 
 hold on;
 for i = 2:length(multiArray)
@@ -69,43 +69,54 @@ for i = 1:size(s,2)
     plot(wn(WN_i:WN_f), subS(:, i));
     hold on;
 end
-title('AM1 Peak', NAME);
+title('AM1 Peak' +string(NAME));
 hold off;
 
 [U, S, V] = svd(subS);
 % only do this for the am1 peak 1600-1700 wn
+% ---------- ENFORCE CONSISTENT ORIENTATION (increasing with T) ----------
+% Choose which V components you care about. You plot V(:,1), and you fit using V(:,2).
+comps_to_orient = [1 2 3];  % adjust if you use other components
 
+for c = comps_to_orient
+    % If the average slope of V(:,c) vs temps is negative, flip signs
+    if mean(gradient(V(:,c), temps)) < 0
+        V(:,c)   = -V(:,c);
+        U(:,c)   = -U(:,c);   % keep reconstruction USV' unchanged
+        % (S stays positive; do NOT change S)
+    end
+end
 dS    = diag(S);
 index = 1:1:length(dS);
 figure;
 plot(index, dS);
-title("basis weights", NAME);
+title("Singular Values " +string(NAME));
 
 figure;
 subplot(2, 2, 1);
 plot (wn(WN_i:WN_f), U(:,1));
-title('first spectral component-unweighted', NAME);
+title('first spectral component-unweighted' +string(NAME));
 
 subplot(2,2,2);
 plot(temps, V(:,1));
-title('first temperature component-unweighted', NAME);
+title('first temperature component-unweighted' +string(NAME));
 
 % plot  first 4 spectral components & first 4 temp components----------------------------------------
 subplot(2,2,3);
-for i = 1:4
+for i = 1:3
     plot(wn(WN_i:WN_f), dS(i,1)*U(:,i) );
     hold on;
 end
 hold off;
-title('weighted spectral cols 1-4');
+title('weighted spectral cols 1-3 (PCA)');
 
 subplot(2,2,4);
-for i = 1:4
+for i = 1:3
     plot(temps, dS(i,1)*V(:,i) );
     hold on;
 end
 hold off;
-title('weighted temp cols 1-4');
+title('weighted temp cols 1-3(PCA) transition curves ');
 
 % --------- fitting-----------------------------
 addpath('C:\Users\ibenderskii\Documents\MATLAB\'); 
@@ -169,8 +180,11 @@ plot(T, normData);
 hold on;
 plot(T, Vfit);
 hold off;
-title("V matrix fit vs  nromalized data. ", NAME);
+title("V matrix fit vs  nromalized data. xnd component" +string(NAME));
 
+res.ndata = normData;
+res.Vmatfit = Vfit;
+res.Tem = Tm;
 
 
 % -------------------Normalize func----------------

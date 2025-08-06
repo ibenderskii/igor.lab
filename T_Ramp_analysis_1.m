@@ -1,6 +1,19 @@
 %% given wn, abs output the normalized wn, abs
 clear
 close all
+data1 = load("C:\Users\ibend\data\mylar\control.dpt");
+data2 = load("C:\Users\ibend\data\mylar\mylar.dpt");
+wnc = data1(:,1);
+absc = data1(:,2);
+wnt = data2(:,1);
+abst = data2(:,2);
+
+figure;
+plot(wnc,absc);
+hold on;
+plot(wnt, abst);
+hold off;
+title("control and test");
 
 
 
