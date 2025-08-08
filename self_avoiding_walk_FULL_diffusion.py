@@ -210,7 +210,7 @@ def log_schedule(total_steps, n_frames):
 # ----------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument('--N',        type=int,   default=100,    help='chain length')
+    ap.add_argument('--N',        type=int,   default=44,    help='chain length')
     ap.add_argument('--steps',    type=int,   default=1000000, help='Monte-Carlo steps')
     ap.add_argument('--eps',      type=float, default=1,   help='contact energy ')
     ap.add_argument('--T',        type=float, default=1.5,   help='temperature (k_B=1)')

@@ -56,7 +56,8 @@ def load_kde_as_u0(pkl_path, T, r, R_domain=None, shift_min_to_zero=True):
     p0 = np.interp(r, rg, pdf, left=0.0, right=0.0)
 
     # 4) convert to shell mass u(r) = 4π r² p(r), renormalize for safety
-    u0 = 4.0 * np.pi * (r**2) * p0
+    #u0 = 4.0 * np.pi * (r**2) * p0
+    u0=p0
     Zu = np.trapz(u0, r)
     if not np.isfinite(Zu) or Zu <= 0:
         raise ValueError("u0 normalization failed on r-grid.")

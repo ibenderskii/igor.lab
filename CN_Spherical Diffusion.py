@@ -10,7 +10,7 @@ from kde_utils import load_kde_as_u0
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--R', type=float, default=1.0, help='outer radius')
 parser.add_argument('--Nr', type=int,   default=1000, help='# radial nodes (incl. r=0)')
-parser.add_argument('--tmax', type=float, default=10, help='total simulation time')
+parser.add_argument('--tmax', type=float, default=80, help='total simulation time')
 parser.add_argument('--cfl',  type=float, default=0.4, help='Courant safety factor (<1)')
 parser.add_argument('--profile', choices=['gaussian','shell', 'given'], default='given',
                     help='initial condition')
@@ -30,9 +30,9 @@ D_cap = 1e8
 if args.D_profile == 'const':
     D_node = np.full(Nr, 1.0)
 elif args.D_profile == 'tanh':   # tanh: slow core, faster shell
-    D_shell = 0.005
-    D_core  = 0.001
-    r_c     = 0.336
+    D_shell = 0.002
+    D_core  = 0.0001
+    r_c     = 0.2
     w       = 0.1
     D_node = D_shell - 0.5*(D_shell - D_core)*(1 - np.tanh((r - r_c)/w))
 elif args.D_profile == 'inv': 
@@ -63,7 +63,7 @@ elif args.profile == 'shell':  # thin shell near 0.6 R
     p0 = np.exp(-((r-0.6*R)/0.02)**2)
 elif args.profile == 'given':
     pkl_path = r"C:\Users\ibend\data\rg_kde_data_44mer.pkl"
-    T_sel = 293
+    T_sel = 297
     p0 = load_kde_as_u0(pkl_path, T_sel, r, R)
 
 # normalise probability 
@@ -162,7 +162,7 @@ for n in range(Nt):
         print("u[1]/r[1]**2       :", u[1]/(r[1]**2))
         print("u[2]/r[2]**2       :", u[2]/(r[2]**2))
 
-    if (n+1) % max(1, Nt//5) == 0:
+    if (n+1) % max(1, Nt//10) == 0:
         profiles.append(u.copy())
         ts.append((n+1)*dt)
 
