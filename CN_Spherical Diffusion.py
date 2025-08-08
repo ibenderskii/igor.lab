@@ -2,6 +2,7 @@
 from __future__ import annotations
 import numpy as np, argparse, matplotlib.pyplot as plt
 from numba import njit
+from kde_utils import load_kde_as_u0 
 
 # ------------------------------------------------------------------
 # 1. parameters
@@ -11,7 +12,7 @@ parser.add_argument('--R', type=float, default=1.0, help='outer radius')
 parser.add_argument('--Nr', type=int,   default=1000, help='# radial nodes (incl. r=0)')
 parser.add_argument('--tmax', type=float, default=10, help='total simulation time')
 parser.add_argument('--cfl',  type=float, default=0.4, help='Courant safety factor (<1)')
-parser.add_argument('--profile', choices=['gaussian','shell'], default='gaussian',
+parser.add_argument('--profile', choices=['gaussian','shell', 'given'], default='given',
                     help='initial condition')
 parser.add_argument('--D_profile', choices=['const','tanh', 'inv', 'inv2'], default='tanh',
                     help='radial dependence of D(r)')
@@ -58,8 +59,12 @@ if args.profile == 'gaussian':
     p0 = np.exp(-((r-0.2)/0.1)**2)
     
 
-else:  # thin shell near 0.6 R
+elif args.profile == 'shell':  # thin shell near 0.6 R
     p0 = np.exp(-((r-0.6*R)/0.02)**2)
+elif args.profile == 'given':
+    pkl_path = r"C:\Users\ibend\data\rg_kde_data_44mer.pkl"
+    T_sel = 293
+    p0 = load_kde_as_u0(pkl_path, T_sel, r, R)
 
 # normalise probability 
 u =  4* np.pi*(r**2) *p0
@@ -146,7 +151,8 @@ for n in range(Nt):
 
     
     
-    # If i want i can normalise prob with u /= np.trapezoid(u, r)
+    # If i want i can normalise prob with 
+    u /= np.trapezoid(u, r)
 
     if n == 0:   # after *first* step is enough
         print("u[1]/r[1]**2 =", u[1]/r[1]**2, "  u[2]/r[2]**2 =", u[2]/r[2]**2)
