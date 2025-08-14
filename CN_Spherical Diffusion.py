@@ -59,10 +59,28 @@ print(f"Using dt={dt:.3e}, Nt={Nt}, dr={dr:.3e}")
 #-----------------------------
 T = 297
 beta = 1.0 / (kB*T)
-U0   = 5.0e-21        # depth scale, ~ a few kBT
-r0   = 0.2*R          # collapse length scale
-# Example: soft attractive well with short-range core (tunable)
-U = -U0*np.exp(-(r/r0)**2)     # <-- customize here (see notes below)
+# kBT scale in Joules
+kBT   = kB*T
+
+# Well depths in Joules
+U_collapse = -4.0 * kBT   # inner well depth
+U_extended = -1.0 * kBT   # outer well depth
+U_barrier  =  1.0 * kBT   # barrier height
+
+# Positions and widths
+r_collapse = 0.2 * R
+w_collapse = 0.05 * R
+
+r_extended = 0.7 * R
+w_extended = 0.08 * R
+
+r_barrier  = 0.45 * R
+w_barrier  = 0.05 * R
+
+# Construct U(r)
+U = -(U_collapse * np.exp(-0.5*((r - r_collapse)/w_collapse)**2) +
+     U_extended * np.exp(-0.5*((r - r_extended)/w_extended)**2) +
+     U_barrier  * np.exp(-0.5*((r - r_barrier )/w_barrier )**2))
 
 # Interface derivative of U: U'(r) at interfaces
 # use central diff on nodes, then average to interfaces for smoothness
@@ -195,6 +213,12 @@ for n in range(Nt):
 
 # ------------------------------------------------------------------
 # 7. plot --------------------------------------------------------
+plt.figure(figsize=(6,4))
+plt.plot(r,U)
+plt.xlabel('radius r'); plt.ylabel('U(r)')
+plt.tight_layout()
+plt.show()
+
 plt.figure(figsize=(6,4))
 for prof, tcur in zip(profiles, ts):
     plt.plot(r, prof, label=f"t={tcur:.3f}")
