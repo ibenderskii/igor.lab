@@ -24,6 +24,7 @@ args = parser.parse_args()
 # ------------------------------------------------------------------
 R, Nr = args.R, args.Nr
 r     = np.linspace(0.0, R, Nr)
+f = 4*np.pi*r**2
 dr    = r[1] - r[0]
 D_cap = 1e8
 
@@ -138,6 +139,7 @@ def solve_tridiagonal(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray
 # 6.  integration loop
 # ------------------------------------------------------------------
 profiles, ts = [u.copy()], [0.0]
+probs = [u.copy()]
 rhs = np.empty_like(u)
 for n in range(Nt):
     rhs[1:-1] = (bE[1:-1]*u[1:-1] +
@@ -154,41 +156,28 @@ for n in range(Nt):
     # If i want i can normalise prob with 
     u /= np.trapezoid(u, r)
 
-    if n == 0:   # after *first* step is enough
-        print("u[1]/r[1]**2 =", u[1]/r[1]**2, "  u[2]/r[2]**2 =", u[2]/r[2]**2)
-
-    if n == Nt-1:                       # only at final step
-        print("first 5 nodes of u :", u[:5])
-        print("u[1]/r[1]**2       :", u[1]/(r[1]**2))
-        print("u[2]/r[2]**2       :", u[2]/(r[2]**2))
-
     if (n+1) % max(1, Nt//10) == 0:
         profiles.append(u.copy())
         ts.append((n+1)*dt)
-
-
-
-# --- reconstruct p(r) in a way that is well behaved at r=0 -----------
-p = np.empty_like(u)
-
-# 1) all interior nodes: straightforward divide
-p[1:] = u[1:] / (4*np.pi * r[1:]**2)
-
-# 2) value at the origin:   p(0) = lim_{r→0} u/(4πr²)
-#    use L'Hôpital or a quadratic Taylor expansion:
-p[0] = u[1] / (4*np.pi*r[1]**2)
-
-
+        pr=f*u.copy()
+        probs.append(pr)
 
 # ------------------------------------------------------------------
 # 7. plot --------------------------------------------------------
 plt.figure(figsize=(6,4))
 for prof, tcur in zip(profiles, ts):
     plt.plot(r, prof, label=f"t={tcur:.3f}")
-plt.xlabel('radius r'); plt.ylabel('u shell mass(r,t)')
+plt.xlabel('radius r'); plt.ylabel('spherical prob density p(r,t)')
 plt.title('Spherical diffusion with D(r)')
 plt.legend(); plt.tight_layout(); plt.show()
 
+
+plt.figure(figsize=(6,4))
+for prob, tcur in zip(probs, ts):
+    plt.plot(r, prob, label=f"t={tcur:.3f}")
+plt.xlabel('radius r'); plt.ylabel('Radial Prob P(r,t)')
+plt.title('Spherical diffusion with D(r)')
+plt.legend(); plt.tight_layout(); plt.show()
 
 
 
