@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np, argparse, matplotlib.pyplot as plt
 from numba import njit
 from kde_utils import load_kde_as_u0 
+from scipy.constants import Boltzmann as kB
 
 # ------------------------------------------------------------------
 # 1. parameters
@@ -53,6 +54,21 @@ Nt     = int(np.ceil(args.tmax / Dt_max))
 dt     = args.tmax / Nt
 print(f"Using dt={dt:.3e}, Nt={Nt}, dr={dr:.3e}")
 
+#-----------------------------------------------
+# 2.5: U(r)
+#-----------------------------
+T = 297
+beta = 1.0 / (kB*T)
+U0   = 5.0e-21        # depth scale, ~ a few kBT
+r0   = 0.2*R          # collapse length scale
+# Example: soft attractive well with short-range core (tunable)
+U = -U0*np.exp(-(r/r0)**2)     # <-- customize here (see notes below)
+
+# Interface derivative of U: U'(r) at interfaces
+# use central diff on nodes, then average to interfaces for smoothness
+Up_node = np.gradient(U, dr)           # dU/dr on nodes
+Up_if = (U[1:] - U[:-1]) / dr
+
 # ------------------------------------------------------------------
 # 3. initial condition u(r,0)
 # ------------------------------------------------------------------
@@ -64,7 +80,7 @@ elif args.profile == 'shell':  # thin shell near 0.6 R
     p0 = np.exp(-((r-0.6*R)/0.02)**2)
 elif args.profile == 'given':
     pkl_path = r"C:\Users\ibend\data\rg_kde_data_44mer.pkl"
-    T_sel = 297
+    T_sel = T
     p0 = load_kde_as_u0(pkl_path, T_sel, r, R)
 
 # normalise probability 
@@ -94,6 +110,19 @@ for j in range(1, Nr-1):
     cE[j]  =  Ajp
     bE[j]  = 1 - (Ajm + Ajp)
 
+    Gjm = 0.5*dt * (r_if[j-1]**2 * D_if[j-1]) * (beta * Up_if[j-1]) / (dr * (r[j]**2))
+    Gjp = 0.5*dt * (r_if[j]  **2 * D_if[j]  ) * (beta * Up_if[j]  ) / (dr * (r[j]**2))
+
+    # Implicit (add +½ * drift stencil)
+    a[j]  += -0.5*Gjm
+    b[j]  +=  0.5*(Gjp - Gjm)
+    c[j]  +=  0.5*Gjp
+
+    # Explicit (RHS gets minus those)
+    aE[j] +=  +0.5*Gjm
+    bE[j] +=  -0.5*(Gjp - Gjm)
+    cE[j] +=  -0.5*Gjp
+
 # --- symmetry BC at r=0 (j=0): u_{-1}=u_1 --------------------------
 
 Ajp   = 1.5*dt * (D_if[0]) / ((dr**2) )  # avoid 0/0
@@ -110,7 +139,7 @@ cE[0] =  Ajp
 
 # --- absorbing BC at outer wall r=R (j=Nr-1): u=0 ------------------
 a[-1] = 0.0; b[-1] = 1.0; c[-1] = 0.0
-bE[-1]= 1.0
+aE[-1]=0.0; bE[-1]=1.0; cE[-1]=0.0
 
 # ------------------------------------------------------------------
 # 5. Thomas solver
@@ -139,19 +168,20 @@ def solve_tridiagonal(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray
 # 6.  integration loop
 # ------------------------------------------------------------------
 profiles, ts = [u.copy()], [0.0]
-probs = [u.copy()]
+prob1 = f*u.copy()
+prob1 /= np.trapezoid(prob1,r)
+probs = [prob1]
 rhs = np.empty_like(u)
 for n in range(Nt):
     rhs[1:-1] = (bE[1:-1]*u[1:-1] +
                  aE[1:-1]*u[:-2]   +
                  cE[1:-1]*u[2:])      # no wrap-around
     rhs[0]  = bE[0]*u[0] + cE[0]*u[1]
-    rhs[-1] = 0.0                        # absorbing outer BC    This causes problems because renormalizing divides by a smaller and smaller thing, because some probaility leaks out each time. 
+    rhs[-1] = u[-1]                        # absorbing outer BC    This causes problems because renormalizing divides by a smaller and smaller thing, because some probaility leaks out each time. 
     u = solve_tridiagonal(a, b, c, rhs)
                         
-    u[-1] = 0.0                          # absorbing at R
-
-    
+    u[-1] = 0.0                       
+  
     
     # If i want i can normalise prob with 
     u /= np.trapezoid(u, r)
@@ -160,6 +190,7 @@ for n in range(Nt):
         profiles.append(u.copy())
         ts.append((n+1)*dt)
         pr=f*u.copy()
+        pr /= np.trapezoid(pr,r)
         probs.append(pr)
 
 # ------------------------------------------------------------------
