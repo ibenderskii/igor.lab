@@ -23,8 +23,8 @@ for k = 1:numel(folders)
     concs(k) = parseConcFromName(folders(k).name);
     try
         res =analyze_tramp_folder(fpath, temps, concs(k));
-        vfits{k} = res.ndata;
-        vdatas{k} = res.Vmatfit; 
+        vdatas{k} = res.ndata;
+        vfits{k} = res.Vmatfit; 
         Tms(k,1) = res.Tem;
        
     catch ME 
