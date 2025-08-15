@@ -6,14 +6,34 @@ function res = analyze_tramp_folder(path, temps, NAME)
 if nargin < 2
     temps = 20:1:60;    
 end
+%% D2O baseline subtraction
+pathb="C:\Users\ibend\data\d2o base";
+cd(pathb)
+filesb = dir(fullfile(pathb, '*.dpt'));
+if isempty(filesb)
+    error('No baseline files found in %s', pathb);
+end
+base_arr = {};
+for k = 1:length(filesb)
+    fileName = fullfile(pathb, filesb(k).name);
+    base=load(fileName);
+    wn = base(:,1);
+    abs = base(:,2);
+    %[wn2, abs2] = norm_local(wn, abs);     %normalzing??
 
+    arr = [wn, abs];
+
+    base_arr{end+1} = arr;
+end
+
+%% rest of code
 
 % --------- Normalize every file and store each 2d array in a cell array------------------------------
 oldpwd = pwd;
 cleanupObj = onCleanup(@() cd(oldpwd));
 cd(path);
 
-files = dir(fullfile(path, '*'));
+files = dir(fullfile(path, '*.dpt'));
 multiArray = {}; %cell(length(files), 1);
 for k = 1:length(files)
     if files(k).isdir
@@ -24,6 +44,14 @@ for k = 1:length(files)
 
     wn  = data(:,1);
     abs = data(:,2);
+%%
+    lsample      = base_arr(1,k);
+    lsample_data = lsample{1,1};
+    
+    abs_base = lsample_data(:,2);
+%%  
+   
+    abs = abs- abs_base;
 
     [wn2, abs2] = norm_local(wn, abs);
 
