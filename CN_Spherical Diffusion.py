@@ -54,9 +54,34 @@ Nt     = int(np.ceil(args.tmax / Dt_max))
 dt     = args.tmax / Nt
 print(f"Using dt={dt:.3e}, Nt={Nt}, dr={dr:.3e}")
 
+
+# ------------------------------------------------------------------
+# 3. initial condition u(r,0)
+# ------------------------------------------------------------------
+if args.profile == 'gaussian':
+    p0 = np.exp(-((r-0.2)/0.1)**2)
+    
+
+elif args.profile == 'shell':  # thin shell near 0.6 R
+    p0 = np.exp(-((r-0.6*R)/0.02)**2)
+elif args.profile == 'given':
+    pkl_path = r"C:\Users\ibend\data\rg_kde_data_44mer.pkl"
+    T_sel = T
+    p0 = load_kde_as_u0(pkl_path, T_sel, r, R)
+
+# normalise probability 
+u =  4* np.pi*(r**2) *p0
+u_norm = np.trapezoid(u, r)
+u /= u_norm
+
 #-----------------------------------------------
 # 2.5: U(r)
 #-----------------------------
+#T_jump = T_sel +5
+#C =0 ????
+#pf = load_kde_as_u0(pkl_path, T_jump, r, R)
+# U = k*T_jump*np.ln(pf) + C  #potential from dist at temp might need to include a 1/4pir^2
+
 T = 297
 beta = 1.0 / (kB*T)
 # kBT scale in Joules
@@ -86,26 +111,6 @@ U = -(U_collapse * np.exp(-0.5*((r - r_collapse)/w_collapse)**2) +
 # use central diff on nodes, then average to interfaces for smoothness
 Up_node = np.gradient(U, dr)           # dU/dr on nodes
 Up_if = (U[1:] - U[:-1]) / dr
-
-# ------------------------------------------------------------------
-# 3. initial condition u(r,0)
-# ------------------------------------------------------------------
-if args.profile == 'gaussian':
-    p0 = np.exp(-((r-0.2)/0.1)**2)
-    
-
-elif args.profile == 'shell':  # thin shell near 0.6 R
-    p0 = np.exp(-((r-0.6*R)/0.02)**2)
-elif args.profile == 'given':
-    pkl_path = r"C:\Users\ibend\data\rg_kde_data_44mer.pkl"
-    T_sel = T
-    p0 = load_kde_as_u0(pkl_path, T_sel, r, R)
-
-# normalise probability 
-u =  4* np.pi*(r**2) *p0
-u_norm = np.trapezoid(u, r)
-u /= u_norm
-
 
 # ------------------------------------------------------------------
 # 4.  matrices 

@@ -45,6 +45,14 @@ title('SVD fits component 2');
 
 figure;
 scatter(concs, Tms, 100, "filled");
+hold on;
+scatter(0.05, 310.15, 100, "red", "filled");
+scatter(0.25, 310.15, 100, "red", "filled");
+scatter(0.5, 310.15, 100, "red", "filled");
+scatter(1, 310.15, 100, "red", "filled");
+scatter(0.75, 310.15, 100, "red", "filled");
+scatter(1, 310.15, 100, "red", "filled");
+scatter(2, 310.15, 100, "red", "filled");
 title('TMs');
 
 function c = parseConcFromName(nameStr)
