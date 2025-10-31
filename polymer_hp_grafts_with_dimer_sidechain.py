@@ -1,4 +1,4 @@
-# polymer_hp_grafts_with_dimer_sidechains.py
+# polymer_hp_grafts_with_dimer_sidechains_instrumented.py
 from __future__ import annotations
 import argparse, random, math
 from matplotlib import animation
@@ -96,7 +96,7 @@ def count_contacts_from_chain(chain:List[Vec], occ: Set[Vec] = None):
             contacts += 1
     return contacts
 
-# ---------- epsilon function factory (type- and T-dependent) ----------
+# ---------- epsilon function factory (sigmoid) ----------
 def make_eps_sigmoid(eps_params):
     """
     eps_params[(ti,tj)] = (eps_low, eps_high, Tmid, width)
@@ -104,7 +104,11 @@ def make_eps_sigmoid(eps_params):
     """
     def eps_fn(ti, tj, T):
         eps_low, eps_high, Tmid, width = eps_params[(ti,tj)]
-        s = 0.5 * (1.0 + math.tanh((T - Tmid)/width))
+        # protect against width=0
+        if width == 0:
+            s = 1.0 if T > Tmid else 0.0
+        else:
+            s = 0.5 * (1.0 + math.tanh((T - Tmid)/width))
         return eps_low*(1-s) + eps_high*s
     return eps_fn
 
@@ -168,11 +172,52 @@ def energy(chain:List[Vec],
             E -= eps_fn(t_i, t_j, T)
     return 0.5 * E  # pairs counted twice
 
-# ---------- radius of gyration (backbone) ----------
+# ---------- radius of gyration (backbone and full system) ----------
 def radius_of_gyration(chain:List[Vec]) -> float:
     r = np.array(chain, dtype=float)
     com = r.mean(axis=0)
     return math.sqrt(((r - com)**2).sum(axis=1).mean())
+
+def radius_of_gyration_full(chain:List[Vec], side_grafts:Dict[int,List[Vec]]) -> float:
+    arrs = [np.asarray(chain, dtype=float)]
+    for p in sorted(side_grafts.keys()):
+        for pos in side_grafts[p]:
+            arrs.append(np.asarray(pos, dtype=float))
+    r = np.vstack(arrs)
+    com = r.mean(axis=0)
+    return math.sqrt(((r - com)**2).sum(axis=1).mean())
+
+# ---------- H-H contact counter including grafts ----------
+def count_HH_contacts(chain, side_grafts, types, graft_types):
+    pos_to_type = {}
+    for i, p in enumerate(chain):
+        pos_to_type[p] = types[i]
+    for parent, glist in side_grafts.items():
+        for k, p in enumerate(glist):
+            pos_to_type[p] = graft_types[parent][k]
+
+    seen = set()
+    hh_contacts = 0
+    for pos, t in pos_to_type.items():
+        if t != 'H':
+            continue
+        for v in NN_VECS:
+            nbr = add(pos, v)
+            t2 = pos_to_type.get(nbr, None)
+            if t2 != 'H':
+                continue
+            a = (pos, nbr) if pos < nbr else (nbr, pos)
+            if a in seen:
+                continue
+            # exclude bonded neighbours when both are backbone adjacent indices is ignored here
+            seen.add(a)
+            hh_contacts += 1
+    return hh_contacts
+
+def eps_summary(eps_fn, Ts=[0.5, 1.0, 2.0, 3.0, 4.0]):
+    print("eps summary:")
+    for T in Ts:
+        print(f"  eps_HH(T={T}) = {eps_fn('H','H',T):.4f}")
 
 # ---------- Moves (carry multi-unit grafts) ----------
 def attempt_pivot(chain:List[Vec], occ:set, side_grafts:Dict[int,List[Vec]]):
@@ -386,31 +431,27 @@ def verify_no_overlap(chain: List[Vec], side_grafts: Dict[int, List[Vec]]) -> No
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--N',        type=int,   default=44,    help='backbone chain length')
-    ap.add_argument('--steps',    type=int,   default=2500000, help='MC steps')
-    ap.add_argument('--T',        type=float, default=4.0,   help='temperature (k_B=1)')
-    ap.add_argument('--seed',     type=int,   default=None,  help='RNG seed')
+    ap.add_argument('--steps',    type=int,   default=50000, help='MC steps')
+    ap.add_argument('--T',        type=float, default=3,   help='temperature (k_B=1)')
+    ap.add_argument('--seed',     type=int,   default=42,  help='RNG seed')
     ap.add_argument('--fH',       type=float, default=0.6,   help='fraction hydrophobic backbone')
-    ap.add_argument('--f_graft',  type=float, default=0.6,   help='fraction of backbone sites with one graft (excluding ends)')
+    ap.add_argument('--f_graft',  type=float, default=0.5,   help='fraction of backbone sites with one graft (excluding ends)')
     ap.add_argument('--graft_len',type=int,   default=2,     help='length of side graft chains (>=1)')
-    # eps params: positive => attraction magnitude
-    ap.add_argument('--eps_HH_base', type=float, default=1.0)
-    ap.add_argument('--alpha_HH',    type=float, default=0.8)
-    ap.add_argument('--eps_HP_base', type=float, default=0.0)
-    ap.add_argument('--alpha_HP',    type=float, default=0.0)
-    ap.add_argument('--eps_PP_base', type=float, default=0.0)
-    ap.add_argument('--alpha_PP',    type=float, default=0.0)
+    # NOTE: eps params are now handled below (sigmoid)
     args = ap.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed); np.random.seed(args.seed)
 
+    # ---- stronger defaults for quick testing ----
     eps_params = {
-    ('H','H'): (0.05, 3.0,  2.0, 0.15),   # low->high, mid collapse ~ T=2.0
-    ('H','P'): (0.0,  0.0,  2.0, 0.1),    # nearly neutral
-    ('P','H'): (0.0,  0.0,  2.0, 0.1),
-    ('P','P'): (0.0,  0.0,  2.0, 0.1),
-                    }
+        ('H','H'): (0.05, 3.5,  2.0, 0.2),   # eps_low, eps_high, Tmid, width
+        ('H','P'): (0.0,  0.0,  2.0, 0.1),
+        ('P','H'): (0.0,  0.0,  2.0, 0.1),
+        ('P','P'): (0.0,  0.0,  2.0, 0.1),
+    }
     eps_fn = make_eps_sigmoid(eps_params)
+
     # backbone initial straight line
     chain: List[Vec] = [(i,0,0) for i in range(args.N)]
     occ = set(chain)
@@ -464,7 +505,6 @@ def main() -> None:
             # success: assign graft positions and types (example: inner hydrophilic 'P', outer hydrophobic 'H')
             side_grafts[p] = glist
             # choose graft monomer types: inner = P, outer = H for PNIPAM-like pattern
-            # if GRAFT_LEN > 2, middle ones choose as desired (we set inner-most 'P', outer-most 'H', rest 'P')
             gt = []
             for k in range(GRAFT_LEN):
                 if k == 0:
@@ -484,6 +524,13 @@ def main() -> None:
     # optional check
     # verify_no_overlap(chain, side_grafts)
 
+    # initial diagnostics
+    print(f"Initial T = {args.T}")
+    eps_summary(eps_fn, Ts=[0.5,1.0,2.0,3.0,4.0])
+    hh_init = count_HH_contacts(chain, side_grafts, types, graft_types)
+    print(f"Initial HH nonbonded contacts = {hh_init}")
+    print(f"Backbone H fraction = {types.count('H')}/{len(types)}; grafts placed = {len(side_grafts)}")
+
     E = energy(chain, side_grafts, types, graft_types, args.T, eps_fn)
     beta = 1.0 / args.T
 
@@ -494,6 +541,7 @@ def main() -> None:
 
     record_interval = max(1, args.steps // 2000)
     saved_steps, E_traj2, Rg_traj2 = [], [], []
+    Rg_full_traj, HH_traj = [], []
     frames_to_save = set(log_schedule(args.steps, 2000))
     frames = []
     frame_steps = []
@@ -502,7 +550,11 @@ def main() -> None:
         if step % record_interval == 0:
             saved_steps.append(step)
             E_traj2.append(E)
-            Rg_traj2.append(radius_of_gyration(chain))
+            Rg_back = radius_of_gyration(chain)
+            Rg_full = radius_of_gyration_full(chain, side_grafts)
+            Rg_traj2.append(Rg_back)
+            Rg_full_traj.append(Rg_full)
+            HH_traj.append(count_HH_contacts(chain, side_grafts, types, graft_types))
 
         move = random.choice(MOVE_FUNCS)
         ok, chain_new, occ_new, side_new = move(chain, occ, side_grafts)
@@ -520,12 +572,70 @@ def main() -> None:
             frames.append(sample_trajectory(chain, side_grafts, include_grafts=False))
             frame_steps.append(step)
 
-    print(f"Acceptance ratio: {acc/args.steps:.3f}")
-    print(f"Final E = {E:.3f}, Rg = {radius_of_gyration(chain):.3f}")
+    hh_final = count_HH_contacts(chain, side_grafts, types, graft_types)
 
-    # render movie from frames if any
+    # Compute averages over last 30% of recorded samples (if available)
+    avg_msg = ""
+    if len(saved_steps) > 0:
+        n = len(saved_steps)
+        start_idx = int(math.floor(n * 0.7))
+        if start_idx < 0:
+            start_idx = 0
+        # slice arrays
+        E_slice = np.array(E_traj2[start_idx:]) if len(E_traj2) > start_idx else np.array([E])
+        Rg_back_slice = np.array(Rg_traj2[start_idx:]) if len(Rg_traj2) > start_idx else np.array([radius_of_gyration(chain)])
+        Rg_full_slice = np.array(Rg_full_traj[start_idx:]) if len(Rg_full_traj) > start_idx else np.array([radius_of_gyration_full(chain, side_grafts)])
+        HH_slice = np.array(HH_traj[start_idx:]) if len(HH_traj) > start_idx else np.array([hh_final])
+
+        E_mean, E_std = float(np.nanmean(E_slice)), float(np.nanstd(E_slice, ddof=0))
+        Rg_back_mean, Rg_back_std = float(np.nanmean(Rg_back_slice)), float(np.nanstd(Rg_back_slice, ddof=0))
+        Rg_full_mean, Rg_full_std = float(np.nanmean(Rg_full_slice)), float(np.nanstd(Rg_full_slice, ddof=0))
+        HH_mean, HH_std = float(np.nanmean(HH_slice)), float(np.nanstd(HH_slice, ddof=0))
+
+        avg_msg += f"\nAverages over last 30% of recorded samples (indices {start_idx}..{n-1}):\n"
+        avg_msg += f"  E_mean = {E_mean:.3f} ± {E_std:.3f}\n"
+        avg_msg += f"  Rg_back_mean = {Rg_back_mean:.3f} ± {Rg_back_std:.3f}\n"
+        avg_msg += f"  Rg_full_mean = {Rg_full_mean:.3f} ± {Rg_full_std:.3f}\n"
+        avg_msg += f"  HH_mean = {HH_mean:.3f} ± {HH_std:.3f}\n"
+    else:
+        avg_msg += "\nNo recorded samples to average over; using instantaneous final values.\n"
+
+    print(f"\nRun summary:")
+    eps_summary(eps_fn, Ts=[args.T])
+    print(f"Initial HH contacts = {hh_init}; Final HH contacts = {hh_final}")
+    print(f"Acceptance ratio: {acc/args.steps:.3f}")
+    # Print averaged values (replace single final Rg/E prints with averaged values as requested)
+    if avg_msg:
+        print(avg_msg)
+    else:
+        print(f"Final E = {E:.3f}, Rg_backbone = {radius_of_gyration(chain):.3f}, Rg_full = {radius_of_gyration_full(chain, side_grafts):.3f}")
+
+    # save diagnostic time series plots
+    if len(saved_steps):
+        steps_arr = np.array(saved_steps)
+        Rg_back_arr = np.array(Rg_traj2)
+        Rg_full_arr = np.array(Rg_full_traj)
+        HH_arr = np.array(HH_traj)
+
+        plt.figure(figsize=(6,3))
+        plt.plot(steps_arr, Rg_back_arr, '.', alpha=0.5, label='R_g (backbone)')
+        plt.plot(steps_arr, Rg_full_arr, '.', alpha=0.5, label='R_g (full)')
+        plt.xlabel('MC step'); plt.ylabel('R_g')
+        plt.legend(); plt.tight_layout()
+        plt.savefig("Rg_vs_steps_full.png", dpi=160)
+        plt.close()
+        print("Saved Rg_vs_steps_full.png")
+
+        plt.figure(figsize=(6,3))
+        plt.plot(steps_arr, HH_arr, '-', alpha=0.7)
+        plt.xlabel('MC step'); plt.ylabel('HH nonbonded contacts')
+        plt.tight_layout()
+        plt.savefig("HH_contacts_vs_steps.png", dpi=160)
+        plt.close()
+        print("Saved HH_contacts_vs_steps.png")
+
+    # 1) movie from log-sampled frames
     if len(frames) > 0:
-        print(f"Rendering movie from {len(frames)} log-sampled frames -> polymer_logmovie.mp4")
         try:
             render_movie(frames, out="polymer_logmovie.mp4", fps=24, stride=1)
         except Exception as e:
@@ -537,30 +647,7 @@ def main() -> None:
     else:
         print("No log-sampled frames found in `frames`. Increase the log_schedule frames or check frames_to_save.")
 
-    # Rg vs steps
-    if len(saved_steps) and len(Rg_traj2):
-        steps_arr = np.array(saved_steps)
-        Rg_arr    = np.array(Rg_traj2)
-        Rg_smooth = moving_average(Rg_arr, w=21)
-
-        plt.figure(figsize=(7,3.5))
-        plt.plot(steps_arr, Rg_arr, '.', alpha=0.35, label='sampled Rg')
-        plt.plot(steps_arr, Rg_smooth, '-', color='k', lw=1.5, label='moving avg')
-
-        if len(frames) > 0 and len(frame_steps) == len(frames):
-            for s in frame_steps:
-                plt.axvline(s, color='tab:gray', alpha=0.2, lw=1)
-
-        plt.xlabel('MC step')
-        plt.ylabel(r'$R_g$')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("Rg_vs_steps.png", dpi=160)
-        plt.close()
-    else:
-        print("No saved_steps / Rg_traj2 found — ensure you recorded values in the run (record_interval etc.).")
-
-    # Energy time series
+    # Energy time series (existing plot)
     if len(saved_steps) and len(E_traj2):
         plt.figure(figsize=(7,3))
         plt.plot(saved_steps, E_traj2, '-', alpha=0.7)
@@ -568,6 +655,7 @@ def main() -> None:
         plt.tight_layout()
         plt.savefig("Energy_vs_steps.png", dpi=160)
         plt.close()
+        print("Saved Energy_vs_steps.png")
 
 if __name__ == "__main__":
     main()

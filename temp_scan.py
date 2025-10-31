@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-temp_scan.py
-
-Driver to run the lattice polymer script at many temperatures, collect final Rg and E,
-and produce Rg(T) and E(T) plots + CSV output.
+temp_scan.py (updated to parse instrumented sim averages)
 
 Usage:
-    python temp_scan.py
-or to change scan parameters:
-    python temp_scan.py --Tmin 0.5 --Tmax 4.0 --nT 20 --reps 3 --steps 200000
+    python temp_scan.py --sim-script polymer_hp_grafts_with_dimer_sidechains_instrumented.py
 """
 import argparse
 import subprocess
@@ -20,14 +15,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statistics import mean, stdev
 
-# default simulation script name (change if your file is named differently)
-DEFAULT_SIM_SCRIPT = "polymer_hp_grafts_with_dimer_sidechain.py"
+DEFAULT_SIM_SCRIPT = "polymer_hp_grafts_with_dimer_sidechains.py"
 
-# regex to parse the "Final E = ..., Rg = ..." line from the sim stdout
+# fallback regex (old single-line format)
 FINAL_RE = re.compile(r"Final E\s*=\s*([-\d\.]+),\s*Rg\s*=\s*([-\d\.]+)")
 
+# regexes for the instrumented averaged output:
+E_MEAN_RE      = re.compile(r"E_mean\s*=\s*([-\d\.]+)\s*±\s*([-\d\.]+)")
+RG_BACK_MEAN_RE= re.compile(r"Rg_back_mean\s*=\s*([-\d\.]+)\s*±\s*([-\d\.]+)")
+RG_FULL_MEAN_RE= re.compile(r"Rg_full_mean\s*=\s*([-\d\.]+)\s*±\s*([-\d\.]+)")
+HH_MEAN_RE     = re.compile(r"HH_mean\s*=\s*([-\d\.]+)\s*±\s*([-\d\.]+)")
+
 def run_simulation_once(sim_script, T, steps, seed, extra_args=None, timeout=3600):
-    """Run the simulation script once and parse Final E and Rg from stdout."""
+    """Run sim script and extract averaged observables (if present). Returns dict or (None,err)."""
     cmd = [sys.executable, sim_script,
            "--T", str(T),
            "--steps", str(steps),
@@ -35,83 +35,152 @@ def run_simulation_once(sim_script, T, steps, seed, extra_args=None, timeout=360
     if extra_args:
         cmd += extra_args
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=timeout)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, None, f"timeout after {timeout}s"
-    out = p.stdout + "\n" + p.stderr
+        return None, f"timeout after {timeout}s"
+
+    out = (p.stdout or "") + "\n" + (p.stderr or "")
+    # Try instrumented averages first
+    result = {}
+    m = E_MEAN_RE.search(out)
+    if m:
+        try:
+            result["E_mean"] = float(m.group(1))
+            result["E_std"]  = float(m.group(2))
+        except Exception:
+            pass
+    m = RG_BACK_MEAN_RE.search(out)
+    if m:
+        result["Rg_back_mean"] = float(m.group(1)); result["Rg_back_std"] = float(m.group(2))
+    m = RG_FULL_MEAN_RE.search(out)
+    if m:
+        result["Rg_full_mean"] = float(m.group(1)); result["Rg_full_std"] = float(m.group(2))
+    m = HH_MEAN_RE.search(out)
+    if m:
+        result["HH_mean"] = float(m.group(1)); result["HH_std"] = float(m.group(2))
+
+    # If we found at least E_mean and Rg_back_mean use those
+    if "E_mean" in result and ("Rg_back_mean" in result or "Rg_full_mean" in result):
+        return result, None
+
+    # else try old single-line format as fallback
     m = FINAL_RE.search(out)
-    if not m:
-        # return full stdout for debugging if parse fails
-        return None, None, out
-    E = float(m.group(1))
-    Rg = float(m.group(2))
-    return E, Rg, None
+    if m:
+        try:
+            result = {
+                "E_mean": float(m.group(1)),
+                "E_std": 0.0,
+                "Rg_back_mean": float(m.group(2)),
+                "Rg_back_std": 0.0,
+            }
+            return result, None
+        except Exception:
+            pass
+
+    # nothing parsed -> return stdout as error for debugging
+    return None, out
 
 def scan_temperatures(sim_script, Ts, steps, reps, seed0, extra_args=None, verbose=True):
     results = []
     for i, T in enumerate(Ts):
-        Es, Rgs = [], []
+        Es, E_stds = [], []
+        Rb_means, Rb_stds = [], []
+        Rf_means, Rf_stds = [], []
+        HH_means, HH_stds = [], []
+
         for r in range(reps):
             seed = None if seed0 is None else (seed0 + i*reps + r)
-            E, Rg, err = run_simulation_once(sim_script, T, steps, seed, extra_args=extra_args)
+            res, err = run_simulation_once(sim_script, T, steps, seed, extra_args=extra_args)
             if err:
                 if verbose:
-                    print(f"[T={T:.3g} rep={r}] run failed / parse error; returning stdout for debugging:")
+                    print(f"[T={T:.3g} rep={r}] run failed / parse error; stdout/stderr:")
                     print(err)
-                Es.append(math.nan); Rgs.append(math.nan)
-            else:
-                Es.append(E); Rgs.append(Rg)
-                if verbose:
-                    print(f"[T={T:.3g} rep={r}] E={E:.4f}, Rg={Rg:.4f}")
-        Es_clean = [x for x in Es if not math.isnan(x)]
-        Rgs_clean = [x for x in Rgs if not math.isnan(x)]
-        if len(Es_clean) > 1:
-            e_mean, e_std = mean(Es_clean), stdev(Es_clean)
-        elif len(Es_clean) == 1:
-            e_mean, e_std = Es_clean[0], 0.0
-        else:
-            e_mean, e_std = math.nan, math.nan
-        if len(Rgs_clean) > 1:
-            r_mean, r_std = mean(Rgs_clean), stdev(Rgs_clean)
-        elif len(Rgs_clean) == 1:
-            r_mean, r_std = Rgs_clean[0], 0.0
-        else:
-            r_mean, r_std = math.nan, math.nan
+                # record NaNs so later stats don't break
+                Es.append(math.nan); E_stds.append(math.nan)
+                Rb_means.append(math.nan); Rb_stds.append(math.nan)
+                Rf_means.append(math.nan); Rf_stds.append(math.nan)
+                HH_means.append(math.nan); HH_stds.append(math.nan)
+                continue
+
+            # res is a dict with some or all fields
+            e = res.get("E_mean", math.nan); e_std = res.get("E_std", 0.0)
+            rb = res.get("Rg_back_mean", math.nan); rb_std = res.get("Rg_back_std", 0.0)
+            rf = res.get("Rg_full_mean", math.nan); rf_std = res.get("Rg_full_std", 0.0)
+            hh = res.get("HH_mean", math.nan); hh_std = res.get("HH_std", 0.0)
+
+            Es.append(e); E_stds.append(e_std)
+            Rb_means.append(rb); Rb_stds.append(rb_std)
+            Rf_means.append(rf); Rf_stds.append(rf_std)
+            HH_means.append(hh); HH_stds.append(hh_std)
+
+            if verbose:
+                print(f"[T={T:.3g} rep={r}] E={e:.4f} (±{e_std:.3f}), Rg_back={rb:.4f} (±{rb_std:.3f}), Rg_full={rf:.4f} (±{rf_std:.3f}), HH={hh:.3f}")
+
+        # clean NaNs for summary stats
+        def stats(values, stds=None):
+            clean = [v for v in values if not math.isnan(v)]
+            if len(clean) == 0:
+                return math.nan, math.nan
+            if len(clean) == 1:
+                return clean[0], 0.0
+            return mean(clean), stdev(clean)
+
+        E_mean, E_std = stats(Es)
+        Rb_mean, Rb_std = stats(Rb_means)
+        Rf_mean, Rf_std = stats(Rf_means)
+        HH_mean, HH_std = stats(HH_means)
+
         results.append({
             "T": T,
-            "E_mean": e_mean, "E_std": e_std,
-            "Rg_mean": r_mean, "Rg_std": r_std,
-            "Es": Es, "Rgs": Rgs
+            "E_mean": E_mean, "E_std": E_std,
+            "Rg_back_mean": Rb_mean, "Rg_back_std": Rb_std,
+            "Rg_full_mean": Rf_mean, "Rg_full_std": Rf_std,
+            "HH_mean": HH_mean, "HH_std": HH_std,
+            "Es": Es, "Rg_backs": Rb_means, "Rg_fulls": Rf_means, "HHs": HH_means
         })
     return results
 
 def save_results_csv(results, out_csv="temp_scan_results.csv"):
-    keys = ["T", "E_mean", "E_std", "Rg_mean", "Rg_std"]
+    keys = ["T", "E_mean", "E_std", "Rg_back_mean", "Rg_back_std", "Rg_full_mean", "Rg_full_std", "HH_mean", "HH_std"]
     with open(out_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(keys)
         for r in results:
-            w.writerow([r["T"], r["E_mean"], r["E_std"], r["Rg_mean"], r["Rg_std"]])
+            w.writerow([
+                r["T"], r["E_mean"], r["E_std"],
+                r["Rg_back_mean"], r["Rg_back_std"],
+                r["Rg_full_mean"], r["Rg_full_std"],
+                r["HH_mean"], r["HH_std"]
+            ])
     print(f"Saved CSV to {out_csv}")
 
 def plot_results(results, out_prefix="temp_scan"):
     Ts = np.array([r["T"] for r in results])
-    Rg_means = np.array([r["Rg_mean"] for r in results])
-    Rg_errs  = np.array([r["Rg_std"] for r in results])
+    Rg_back_means = np.array([r["Rg_back_mean"] for r in results])
+    Rg_back_errs  = np.array([r["Rg_back_std"] for r in results])
+    Rg_full_means = np.array([r["Rg_full_mean"] for r in results])
+    Rg_full_errs  = np.array([r["Rg_full_std"] for r in results])
     E_means  = np.array([r["E_mean"] for r in results])
     E_errs   = np.array([r["E_std"] for r in results])
+    HH_means = np.array([r["HH_mean"] for r in results])
 
+    # Rg backbone
     plt.figure(figsize=(6,4))
-    plt.errorbar(Ts, Rg_means, yerr=Rg_errs, marker='o', linestyle='-', capsize=3)
+    plt.errorbar(Ts, Rg_back_means, yerr=Rg_back_errs, marker='o', linestyle='-', capsize=3, label='Rg_backbone')
+    if not np.all(np.isnan(Rg_full_means)):
+        plt.errorbar(Ts, Rg_full_means, yerr=Rg_full_errs, marker='s', linestyle='--', capsize=3, label='Rg_full')
     plt.xlabel("Temperature T")
     plt.ylabel("Rg (mean ± std)")
     plt.title("Rg vs T")
+    plt.legend()
     plt.tight_layout()
     png1 = f"{out_prefix}_Rg_vs_T.png"
     plt.savefig(png1, dpi=150)
     plt.close()
     print(f"Saved {png1}")
 
+    # Energy
     plt.figure(figsize=(6,4))
     plt.errorbar(Ts, E_means, yerr=E_errs, marker='o', linestyle='-', capsize=3)
     plt.xlabel("Temperature T")
@@ -123,14 +192,27 @@ def plot_results(results, out_prefix="temp_scan"):
     plt.close()
     print(f"Saved {png2}")
 
+    # HH contacts (if present)
+    if not np.all(np.isnan(HH_means)):
+        plt.figure(figsize=(6,4))
+        plt.plot(Ts, HH_means, 'o-')
+        plt.xlabel("Temperature T")
+        plt.ylabel("HH nonbonded contacts (mean)")
+        plt.title("HH contacts vs T")
+        plt.tight_layout()
+        png3 = f"{out_prefix}_HH_vs_T.png"
+        plt.savefig(png3, dpi=150)
+        plt.close()
+        print(f"Saved {png3}")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--Tmin", type=float, default=0.5)
     ap.add_argument("--Tmax", type=float, default=4.0)
     ap.add_argument("--nT", type=int, default=20)
     ap.add_argument("--reps", type=int, default=3, help="replicates per T")
-    ap.add_argument("--steps", type=int, default=200000)
-    ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--steps", type=int, default=50000)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sim-script", type=str, default=DEFAULT_SIM_SCRIPT)
     ap.add_argument("--extra-args", type=str, default="", help="extra args to pass to sim script (quoted)")
     ap.add_argument("--out-csv", type=str, default="temp_scan_results.csv")
