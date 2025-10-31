@@ -97,15 +97,15 @@ def count_contacts_from_chain(chain:List[Vec], occ: Set[Vec] = None):
     return contacts
 
 # ---------- epsilon function factory (type- and T-dependent) ----------
-def make_eps_func(eps_params):
+def make_eps_sigmoid(eps_params):
     """
-    eps_params: dict mapping (type_i,type_j) -> (base, alpha)
-    returns eps_fn(type_i, type_j, T) -> float (positive means attraction magnitude)
+    eps_params[(ti,tj)] = (eps_low, eps_high, Tmid, width)
+    returns eps_fn(ti,tj,T)
     """
     def eps_fn(ti, tj, T):
-        a, b = eps_params[(ti, tj)]
-        val = a + b * T
-        return val
+        eps_low, eps_high, Tmid, width = eps_params[(ti,tj)]
+        s = 0.5 * (1.0 + math.tanh((T - Tmid)/width))
+        return eps_low*(1-s) + eps_high*s
     return eps_fn
 
 # ---------- energy counting (backbone + multi-unit grafts) ----------
@@ -386,14 +386,14 @@ def verify_no_overlap(chain: List[Vec], side_grafts: Dict[int, List[Vec]]) -> No
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--N',        type=int,   default=44,    help='backbone chain length')
-    ap.add_argument('--steps',    type=int,   default=250000, help='MC steps')
-    ap.add_argument('--T',        type=float, default=2.0,   help='temperature (k_B=1)')
+    ap.add_argument('--steps',    type=int,   default=2500000, help='MC steps')
+    ap.add_argument('--T',        type=float, default=4.0,   help='temperature (k_B=1)')
     ap.add_argument('--seed',     type=int,   default=None,  help='RNG seed')
-    ap.add_argument('--fH',       type=float, default=0.4,   help='fraction hydrophobic backbone')
-    ap.add_argument('--f_graft',  type=float, default=0.2,   help='fraction of backbone sites with one graft (excluding ends)')
+    ap.add_argument('--fH',       type=float, default=0.6,   help='fraction hydrophobic backbone')
+    ap.add_argument('--f_graft',  type=float, default=0.6,   help='fraction of backbone sites with one graft (excluding ends)')
     ap.add_argument('--graft_len',type=int,   default=2,     help='length of side graft chains (>=1)')
     # eps params: positive => attraction magnitude
-    ap.add_argument('--eps_HH_base', type=float, default=0.1)
+    ap.add_argument('--eps_HH_base', type=float, default=1.0)
     ap.add_argument('--alpha_HH',    type=float, default=0.8)
     ap.add_argument('--eps_HP_base', type=float, default=0.0)
     ap.add_argument('--alpha_HP',    type=float, default=0.0)
@@ -405,13 +405,12 @@ def main() -> None:
         random.seed(args.seed); np.random.seed(args.seed)
 
     eps_params = {
-        ('H','H'): (args.eps_HH_base, args.alpha_HH),
-        ('H','P'): (args.eps_HP_base, args.alpha_HP),
-        ('P','H'): (args.eps_HP_base, args.alpha_HP),
-        ('P','P'): (args.eps_PP_base, args.alpha_PP),
-    }
-    eps_fn = make_eps_func(eps_params)
-
+    ('H','H'): (0.05, 3.0,  2.0, 0.15),   # low->high, mid collapse ~ T=2.0
+    ('H','P'): (0.0,  0.0,  2.0, 0.1),    # nearly neutral
+    ('P','H'): (0.0,  0.0,  2.0, 0.1),
+    ('P','P'): (0.0,  0.0,  2.0, 0.1),
+                    }
+    eps_fn = make_eps_sigmoid(eps_params)
     # backbone initial straight line
     chain: List[Vec] = [(i,0,0) for i in range(args.N)]
     occ = set(chain)
