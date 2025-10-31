@@ -171,6 +171,8 @@ def tanh_step(r, D_core, D_shell, r_c, w):
 def render_movie(snaps, out="polymer.mp4", fps=30, stride=1):
     """snaps: list of (N,3) arrays collected during the run."""
     traj = np.asarray(snaps, dtype=float)[::stride]          # (F, N, 3)
+    if traj.size == 0:
+        return
     F = traj.shape[0]
     mins = traj.reshape(-1,3).min(0) - 2
     maxs = traj.reshape(-1,3).max(0) + 2
@@ -211,10 +213,10 @@ def log_schedule(total_steps, n_frames):
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--N',        type=int,   default=44,    help='chain length')
-    ap.add_argument('--steps',    type=int,   default=1000000, help='Monte-Carlo steps')
+    ap.add_argument('--steps',    type=int,   default=50000, help='Monte-Carlo steps')
     ap.add_argument('--eps',      type=float, default=1,   help='contact energy ')
-    ap.add_argument('--T',        type=float, default=1.5,   help='temperature (k_B=1)')
-    ap.add_argument('--seed',     type=int,   default=None,  help='RNG seed')
+    ap.add_argument('--T',        type=float, default=0.01,   help='temperature (k_B=1)')
+    ap.add_argument('--seed',     type=int,   default=42,  help='RNG seed')
     args = ap.parse_args()
 
     if args.seed is not None:
@@ -260,17 +262,48 @@ def main() -> None:
             sample_trajectory(chain, frames)
 
 
-    trajectory = np.stack(snapshots)
+    trajectory = np.stack(snapshots) if snapshots else np.empty((0, args.N, 3))
 
     print(f"Acceptance ratio: {acc/args.steps:.3f}")
-    print(f"⟨E⟩ = {np.mean(E_traj2):.2f}   ⟨R_g⟩ = {np.mean(Rg_traj2):.2f}")
-    render_movie(frames, out="polymer.mp4", fps=24, stride=1)
+
+    # Compute averages over last 30% of recorded samples (if available)
+    if len(saved_steps) > 0:
+        n = len(saved_steps)
+        start_idx = int(math.floor(n * 0.7))
+        if start_idx < 0:
+            start_idx = 0
+        # slices
+        E_slice = np.array(E_traj2[start_idx:]) if len(E_traj2) > start_idx else np.array([E])
+        Rg_slice = np.array(Rg_traj2[start_idx:]) if len(Rg_traj2) > start_idx else np.array([radius_of_gyration(chain)])
+
+        E_mean = float(np.nanmean(E_slice))
+        E_std  = float(np.nanstd(E_slice, ddof=0))
+        Rg_mean = float(np.nanmean(Rg_slice))
+        Rg_std  = float(np.nanstd(Rg_slice, ddof=0))
+
+        # placeholders for models that do not provide these quantities
+        Rg_full_mean = 0.0
+        Rg_full_std  = 0.0
+        HH_mean = 0.0
+        HH_std  = 0.0
+
+        # Print in instrumented format expected by temp_scan.py
+        print(f"E_mean = {E_mean:.3f} ± {E_std:.3f}")
+        print(f"Rg_back_mean = {Rg_mean:.3f} ± {Rg_std:.3f}")
+        print(f"Rg_full_mean = {Rg_full_mean:.3f} ± {Rg_full_std:.3f}")
+        print(f"HH_mean = {HH_mean:.3f} ± {HH_std:.3f}")
+    else:
+        # fallback to instantaneous prints if no recorded samples
+        print(f"⟨E⟩ = {np.mean(E_traj2) if E_traj2 else E:.2f}   ⟨R_g⟩ = {np.mean(Rg_traj2) if Rg_traj2 else radius_of_gyration(chain):.2f}")
+        print(f"E_mean = {E:.3f} ± {0.000:.3f}")
+        print(f"Rg_back_mean = {radius_of_gyration(chain):.3f} ± {0.000:.3f}")
+        # placeholders
+        print(f"Rg_full_mean = {0.000:.3f} ± {0.000:.3f}")
+        print(f"HH_mean = {0.000:.3f} ± {0.000:.3f}")
 
 
-   
-    
+
+
 # RUn
 if __name__ == "__main__":
     main()
-
-
