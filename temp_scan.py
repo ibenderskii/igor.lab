@@ -15,7 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statistics import mean, stdev
 
-DEFAULT_SIM_SCRIPT = "polymer_hp_grafts_with_dimer_sidechains.py"
+DEFAULT_SIM_SCRIPT = "HP_coop.py"
 
 # fallback regex (old single-line format)
 FINAL_RE = re.compile(r"Final E\s*=\s*([-\d\.]+),\s*Rg\s*=\s*([-\d\.]+)")
@@ -207,10 +207,10 @@ def plot_results(results, out_prefix="temp_scan"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--Tmin", type=float, default=0.5)
-    ap.add_argument("--Tmax", type=float, default=4.0)
-    ap.add_argument("--nT", type=int, default=20)
-    ap.add_argument("--reps", type=int, default=3, help="replicates per T")
+    ap.add_argument("--Tmin", type=float, default=0.1)
+    ap.add_argument("--Tmax", type=float, default=3.0)
+    ap.add_argument("--nT", type=int, default=10)
+    ap.add_argument("--reps", type=int, default=2, help="replicates per T")
     ap.add_argument("--steps", type=int, default=50000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sim-script", type=str, default=DEFAULT_SIM_SCRIPT)
