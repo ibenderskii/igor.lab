@@ -1,0 +1,1 @@
+A collection of scripts and helpers I use in my lab work.  Some of the smaller helpers and variations of programs are written by LLMs and are just used for visualization and what not.  Organization and descriptions of programs are very much lacking right now because I am only just making this public.  
