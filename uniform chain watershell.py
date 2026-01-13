@@ -250,8 +250,8 @@ def main() -> None:
     ap.add_argument('--steps',    type=int,   default=50000, help='Monte-Carlo steps')
 
     ap.add_argument('--T',        type=float, default=0.5,   help='temperature (k_B=1)')
-    ap.add_argument('--Tc',       type=float, default=1.5,   help='LCST crossover temperature')
-    ap.add_argument('--width',    type=float, default=0.2,   help='width of LCST crossover in T')
+    ap.add_argument('--Tc',       type=float, default=2.0,   help='LCST crossover temperature')
+    ap.add_argument('--width',    type=float, default=0.1,   help='width of LCST crossover in T')
 
     ap.add_argument('--eps',      type=float, default=1.0,
                     help='high-T contact strength eps_high (low-T approx 0)')

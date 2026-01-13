@@ -15,7 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from statistics import mean, stdev
 
-DEFAULT_SIM_SCRIPT = "HP_coop.py"
+DEFAULT_SIM_SCRIPT = "HP watershell.py"
 
 # fallback regex (old single-line format)
 FINAL_RE = re.compile(r"Final E\s*=\s*([-\d\.]+),\s*Rg\s*=\s*([-\d\.]+)")
