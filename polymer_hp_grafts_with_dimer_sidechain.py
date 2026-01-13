@@ -16,7 +16,7 @@ def sub(a:Vec, b:Vec) -> Vec: return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 
 # 90° rotations about origin (right-handed)
 ROT_X = lambda v: ( v[0],  -v[2],  v[1])
-ROT_Y = lambda v: ( v[2],   v[1], -v[0])
+ROT_Y = lambda v: ( v[2],   v[1], -v[0]) 
 ROT_Z = lambda v: (-v[1],   v[0],  v[2])
 ROTATIONS = [ROT_X, ROT_Y, ROT_Z]
 
