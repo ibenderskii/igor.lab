@@ -13,12 +13,12 @@ sigma0 = 2.0     # std(m) at J=0
 sigma02 = sigma0**2
 
 # Cooperative model parameters
-eps0 = 1.0       # scale of temperature-dependent contact strength
+eps0 = 3.0       # scale of temperature-dependent contact strength
 Tc   = 2.0       # LCST (in same units as your T)
 J    = 0.05      # cooperativity parameter (keep modest so Gaussian stays stable)
 
 # Temperatures to sample (should straddle Tc)
-T_list = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+T_list = [ 1.0, 1.2, 1.3, 1.5, 1.8, 1.9, 2.0, 2.1,2.2, 2.5, 3.0]
 
 # Max contacts we'll consider
 m_max  = 40
@@ -59,6 +59,7 @@ for T in T_list:
 
     # Plot
     plt.plot(m_vals, P, marker='o', linestyle='-', label=f"T = {T:g}")
+    
 
 plt.xlabel("Number of favorable contacts m")
 plt.ylabel("Probability P(m | T)")

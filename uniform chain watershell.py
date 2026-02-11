@@ -56,7 +56,7 @@ ROT_Z = lambda v: (-v[1],   v[0],  v[2])
 ROTATIONS = [ ROT_X, ROT_Y, ROT_Z ]
 
 # ----------------------------------------------------------------------
-# Smooth LCST switch and couplings
+#  tanh function for linear approximation switch and couplings
 # ----------------------------------------------------------------------
 
 def lcst_switch(T: float, Tc: float, width: float) -> float:

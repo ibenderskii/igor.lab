@@ -40,6 +40,25 @@ def energy(chain:List[Vec], occ:set[Vec], eps:float) -> float:
     return 0.5*E        # each contact counted twice
 
 
+def contact_count(chain: List[Vec], occ: set[Vec]) -> float:
+    """Number of *unique* non-bonded nearest-neighbour contacts.
+
+    We scan each monomer and count occupied nearest neighbours that are
+    not its bonded neighbours; divide by 2 because each contact is seen
+    from both endpoints.
+    """
+    m = 0
+    N = len(chain)
+    for i, r in enumerate(chain):
+        prev = chain[i-1] if i > 0   else None
+        nxt  = chain[i+1] if i < N-1 else None
+        for v in NN_VECS:
+            nbr = add(r, v)
+            if nbr in occ and nbr not in (prev, nxt):
+                m += 1
+    return 0.5 * m
+
+
 def radius_of_gyration(chain:List[Vec]) -> float:
     r = np.array(chain, dtype=float)
     com = r.mean(axis=0)
@@ -233,7 +252,7 @@ def main() -> None:
     dt_frame     = sample_every  # one attempted move per monomer 
 
     record_interval = max(1, args.steps // 2000)
-    saved_steps, E_traj2, Rg_traj2 = [], [], []
+    saved_steps, E_traj2, Rg_traj2, C_traj2 = [], [], [], []
     frames_to_save = set(log_schedule(args.steps, 2000))
     frames = []  
 
@@ -243,6 +262,7 @@ def main() -> None:
             saved_steps.append(step)
             E_traj2.append(E)
             Rg_traj2.append(radius_of_gyration(chain))
+            C_traj2.append(contact_count(chain, occ))
 
         move = random.choice(MOVE_FUNCS)
         ok, chain_new, occ_new = move(chain, occ)
@@ -274,31 +294,26 @@ def main() -> None:
         # slices
         E_slice = np.array(E_traj2[start_idx:]) if len(E_traj2) > start_idx else np.array([E])
         Rg_slice = np.array(Rg_traj2[start_idx:]) if len(Rg_traj2) > start_idx else np.array([radius_of_gyration(chain)])
+        C_slice = np.array(C_traj2[start_idx:]) if len(C_traj2) > start_idx else np.array([contact_count(chain, occ)])
 
         E_mean = float(np.nanmean(E_slice))
         E_std  = float(np.nanstd(E_slice, ddof=0))
         Rg_mean = float(np.nanmean(Rg_slice))
         Rg_std  = float(np.nanstd(Rg_slice, ddof=0))
 
-        # placeholders for models that do not provide these quantities
-        Rg_full_mean = 0.0
-        Rg_full_std  = 0.0
-        HH_mean = 0.0
-        HH_std  = 0.0
+        C_mean = float(np.nanmean(C_slice))
+        C_std  = float(np.nanstd(C_slice, ddof=0))
 
         # Print in instrumented format expected by temp_scan.py
         print(f"E_mean = {E_mean:.3f} ± {E_std:.3f}")
         print(f"Rg_back_mean = {Rg_mean:.3f} ± {Rg_std:.3f}")
-        print(f"Rg_full_mean = {Rg_full_mean:.3f} ± {Rg_full_std:.3f}")
-        print(f"HH_mean = {HH_mean:.3f} ± {HH_std:.3f}")
+        print(f"C_mean = {C_mean:.3f} ± {C_std:.3f}")
     else:
         # fallback to instantaneous prints if no recorded samples
         print(f"⟨E⟩ = {np.mean(E_traj2) if E_traj2 else E:.2f}   ⟨R_g⟩ = {np.mean(Rg_traj2) if Rg_traj2 else radius_of_gyration(chain):.2f}")
         print(f"E_mean = {E:.3f} ± {0.000:.3f}")
         print(f"Rg_back_mean = {radius_of_gyration(chain):.3f} ± {0.000:.3f}")
-        # placeholders
-        print(f"Rg_full_mean = {0.000:.3f} ± {0.000:.3f}")
-        print(f"HH_mean = {0.000:.3f} ± {0.000:.3f}")
+        print(f"C_mean = {contact_count(chain, occ):.3f} ± {0.000:.3f}")
 
 
 
