@@ -20,26 +20,84 @@ NN_VECS: List[Vec] = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
 def add(a:Vec, b:Vec) -> Vec: return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
 def sub(a:Vec, b:Vec) -> Vec: return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 
-# 90° rotations
-ROT_X = lambda v: ( v[0],  -v[2],  v[1])
-ROT_Y = lambda v: ( v[2],   v[1], -v[0])
-ROT_Z = lambda v: (-v[1],   v[0],  v[2])
-ROTATIONS = [ ROT_X, ROT_Y, ROT_Z ]
+# 24 proper cubic rotations (orientation-preserving signed permutations)
+from itertools import permutations, product
 
+def _det3(M):
+    (a,b,c), (d,e,f), (g,h,i) = M
+    return a*(e*i - f*h) - b*(d*i - f*g) + c*(d*h - e*g)
+
+def _generate_cubic_rotations():
+    rots = []
+    for perm in permutations([0, 1, 2]):
+        for signs in product([-1, 1], repeat=3):
+            M = [[0,0,0],[0,0,0],[0,0,0]]
+            for r, c in enumerate(perm):
+                M[r][c] = signs[r]
+            Mt = (tuple(M[0]), tuple(M[1]), tuple(M[2]))
+            if _det3(Mt) == 1:
+                rots.append(Mt)
+    # drop identity to avoid wasting proposals
+    I = ((1,0,0),(0,1,0),(0,0,1))
+    rots = [M for M in rots if M != I]
+    return rots  # 23 matrices
+
+ROT_MATS = _generate_cubic_rotations()
+
+def apply_rot(M, v: Vec) -> Vec:
+    x, y, z = v
+    return (
+        M[0][0]*x + M[0][1]*y + M[0][2]*z,
+        M[1][0]*x + M[1][1]*y + M[1][2]*z,
+        M[2][0]*x + M[2][1]*y + M[2][2]*z,
+    )
 def energy(chain:List[Vec], occ:set[Vec], eps:float) -> float:
-    """Return − × (# non-bonded contacts)."""
-    E = 0.0
-    N=len(chain)
+    """
+    Local cooperative contact energy.
+
+    Base attraction: each *unique* non-bonded nearest-neighbour contact contributes -eps.
+    Local cooperativity: extra reward for concentrating contacts on the same monomer:
+      E = -eps * m  -  gamma * sum_i [ C(k_i, 2) ]
+
+    where k_i is the number of contacts incident on monomer i (degree in the contact graph).
+    This makes "contact-rich cores" disproportionately favorable.
+
+    Tune gamma below. Increasing gamma sharpens collapse, but can make low-T equilibration harder.
+    """
+    gamma = 0.8 * eps  # local cooperativity strength. Try 0.0–0.8*eps.
+
+    N = len(chain)
+    pos_to_idx = {pos: i for i, pos in enumerate(chain)}
+
+    edges = set()
     for i, r in enumerate(chain):
-        prev = chain[i-1] if i > 0       else None
-        next = chain[i+1] if i < N-1     else None
+        prev = chain[i-1] if i > 0   else None
+        nxt  = chain[i+1] if i < N-1 else None
         for v in NN_VECS:
             nbr = add(r, v)
-            if nbr in occ and nbr not in (prev, next):
-                E -= eps
-    return 0.5*E        # each contact counted twice
+            if nbr in occ and nbr not in (prev, nxt):
+                j = pos_to_idx[nbr]
+                if i == j:
+                    continue
+                a, b = (i, j) if i < j else (j, i)
+                edges.add((a, b))
 
+    m = len(edges)
+    if m == 0:
+        return 0.0
 
+    deg = [0] * N
+    for a, b in edges:
+        deg[a] += 1
+        deg[b] += 1
+
+    # sum_i C(k_i, 2) = k_i*(k_i-1)/2
+    local_bonus = 0.0
+    for k in deg:
+        if k >= 2:
+            local_bonus += 0.5 * k * (k - 1)
+
+    return (-eps * m) - (gamma * local_bonus)
 def contact_count(chain: List[Vec], occ: set[Vec]) -> float:
     """Number of *unique* non-bonded nearest-neighbour contacts.
 
@@ -70,13 +128,13 @@ def attempt_pivot(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     tail = chain[i+1:]
     head = chain[:i+1]
 
-    rot = random.choice(ROTATIONS)
+    M = random.choice(ROT_MATS)
     new_tail = []
     new_occ  = set(head)
     pivot = chain[i]
     for r in tail:
         dr = sub(r, pivot)
-        r2 = add(pivot, rot(dr))
+        r2 = add(pivot, apply_rot(M, dr))
         if r2 in new_occ:                # self-intersection
             return False, chain, occ
         new_tail.append(r2)
@@ -126,19 +184,28 @@ def attempt_crankshaft(chain, occ):
     return True, new_chain, new_occ
 
 def attempt_end_move(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
+    """
+    Symmetric end move (good for detailed balance without a Hastings correction):
+    - choose an end with prob 1/2
+    - choose a lattice direction with prob 1/6
+    - accept if the target site is empty AND the end bond remains length 1
+    """
     n = len(chain)
     end = 0 if random.random() < 0.5 else n-1
     anchor = 1 if end == 0 else n-2
-    new_site_candidates = [add(chain[end], v) for v in NN_VECS
-                           if add(chain[end], v) not in occ
-                           and sub(add(chain[end], v), chain[anchor]) in NN_VECS]
-    if not new_site_candidates:
+
+    v = random.choice(NN_VECS)
+    r_new = add(chain[end], v)
+
+    if r_new in occ:
         return False, chain, occ
-    r_new = random.choice(new_site_candidates)
+    if sub(r_new, chain[anchor]) not in NN_VECS:
+        return False, chain, occ
+
     new_chain = chain.copy()
+    old = chain[end]
     new_chain[end] = r_new
-    new_occ = (occ - { chain[end] }) | { r_new }
-    # keep bond length 1 for the new end bond 
+    new_occ = (occ - {old}) | {r_new}
     return True, new_chain, new_occ
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
@@ -232,8 +299,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--N',        type=int,   default=44,    help='chain length')
     ap.add_argument('--steps',    type=int,   default=50000, help='Monte-Carlo steps')
-    ap.add_argument('--eps',      type=float, default=1,   help='contact energy ')
-    ap.add_argument('--T',        type=float, default=0.01,   help='temperature (k_B=1)')
+    ap.add_argument('--eps',      type=float, default=3,   help='contact energy ')
+    ap.add_argument('--T',        type=float, default=4.5,   help='temperature (k_B=1)')
     ap.add_argument('--seed',     type=int,   default=42,  help='RNG seed')
     args = ap.parse_args()
 
@@ -304,6 +371,9 @@ def main() -> None:
         C_mean = float(np.nanmean(C_slice))
         C_std  = float(np.nanstd(C_slice, ddof=0))
 
+        
+        C_var_pop = float(np.nanvar(C_slice, ddof=0))
+        C_var_samp = float(np.nanvar(C_slice, ddof=1)) if C_slice.size > 1 else float("nan")
         # Print in instrumented format expected by temp_scan.py
         print(f"E_mean = {E_mean:.3f} ± {E_std:.3f}")
         print(f"Rg_back_mean = {Rg_mean:.3f} ± {Rg_std:.3f}")
