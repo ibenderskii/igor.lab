@@ -29,6 +29,7 @@ import sys
 import re
 import math
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -178,20 +179,75 @@ def scan_temperatures(sim_script: str,
                       seed0: int | None,
                       extra_args: list[str] | None = None,
                       verbose: bool = True,
-                      timeout: int = 3600) -> list[dict]:
+                      timeout: int = 3600,
+                      n_workers: int = 1) -> list[dict]:
+
+    def stats(values):
+        clean = [v for v in values if not math.isnan(v)]
+        if len(clean) == 0:
+            return math.nan, math.nan
+        if len(clean) == 1:
+            return clean[0], 0.0
+        return mean(clean), stdev(clean)
+
+    # Phase A: pre-compute all (T_index, rep, T, seed) jobs so seeds are
+    # assigned deterministically before any execution begins.
+    jobs: list[tuple[int, int, float, int | None]] = []
+    for i, T in enumerate(Ts):
+        for r in range(reps):
+            seed = None if seed0 is None else (seed0 + i * reps + r)
+            jobs.append((i, r, float(T), seed))
+
+    # Phase B: execute jobs, collect raw per-run results keyed by (i, r).
+    raw: dict[tuple[int, int], tuple[dict | None, str | None]] = {}
+
+    def _report(r, T, res, err):
+        if err:
+            print(f"[T={T:.3g} rep={r}] run failed / parse error; stdout/stderr:")
+            print(err[:4000])
+        else:
+            msg = (f"[T={T:.3g} rep={r}] "
+                   f"E={res.get('E_mean', math.nan):.4f}, "
+                   f"Rg_back={res.get('Rg_back_mean', math.nan):.4f}, "
+                   f"Rg_full={res.get('Rg_full_mean', math.nan):.4f}, "
+                   f"C={res.get('C_mean', math.nan):.3f}")
+            df = res.get("dist_file")
+            if df:
+                msg += f"  (dist: {df})"
+            print(msg)
+
+    if n_workers > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            future_to_meta = {
+                executor.submit(run_simulation_once, sim_script, T, steps, seed,
+                                extra_args, timeout): (i, r, T)
+                for (i, r, T, seed) in jobs
+            }
+            for fut in as_completed(future_to_meta):
+                i, r, T = future_to_meta[fut]
+                res, err = fut.result()
+                raw[(i, r)] = (res, err)
+                if verbose:
+                    _report(r, T, res, err)
+    else:
+        for (i, r, T, seed) in jobs:
+            res, err = run_simulation_once(sim_script, T, steps, seed,
+                                           extra_args=extra_args, timeout=timeout)
+            raw[(i, r)] = (res, err)
+            if verbose:
+                _report(r, T, res, err)
+
+    # Phase C: group by T index and compute per-T statistics.
     results = []
     for i, T in enumerate(Ts):
         Es, Rb_means, Rf_means, C_means = [], [], [], []
         dist_files: list[str] = []
 
         for r in range(reps):
-            seed = None if seed0 is None else (seed0 + i*reps + r)
-            res, err = run_simulation_once(sim_script, float(T), steps, seed, extra_args=extra_args, timeout=timeout)
+            res, err = raw.get((i, r), (None, "missing"))
             if err:
-                if verbose:
-                    print(f"[T={T:.3g} rep={r}] run failed / parse error; stdout/stderr:")
-                    print(err[:4000])
-                Es.append(math.nan); Rb_means.append(math.nan); Rf_means.append(math.nan); C_means.append(math.nan)
+                Es.append(math.nan); Rb_means.append(math.nan)
+                Rf_means.append(math.nan); C_means.append(math.nan)
                 continue
 
             Es.append(float(res.get("E_mean", math.nan)))
@@ -199,23 +255,9 @@ def scan_temperatures(sim_script: str,
             Rf_means.append(float(res.get("Rg_full_mean", math.nan)))
             C_means.append(float(res.get("C_mean", math.nan)))
 
-            df = res.get("dist_file", None)
+            df = res.get("dist_file")
             if isinstance(df, str) and df.strip():
                 dist_files.append(df.strip())
-
-            if verbose:
-                msg = f"[T={T:.3g} rep={r}] E={Es[-1]:.4f}, Rg_back={Rb_means[-1]:.4f}, Rg_full={Rf_means[-1]:.4f}, C={C_means[-1]:.3f}"
-                if df:
-                    msg += f"  (dist: {df})"
-                print(msg)
-
-        def stats(values):
-            clean = [v for v in values if not math.isnan(v)]
-            if len(clean) == 0:
-                return math.nan, math.nan
-            if len(clean) == 1:
-                return clean[0], 0.0
-            return mean(clean), stdev(clean)
 
         E_mean, E_std = stats(Es)
         Rb_mean, Rb_std = stats(Rb_means)
@@ -507,13 +549,15 @@ def main():
     ap.add_argument("--out-prefix", type=str, default="temp_scan")
     ap.add_argument("--rg-bins-common", type=int, default=80,
                     help="common bin count for the merged P(Rg|T) heatmap (rebinning)")
+    ap.add_argument("--n-workers", type=int, default=1,
+                    help="number of parallel workers (ProcessPoolExecutor); default 1 = serial")
 
     args = ap.parse_args()
 
     Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
     extra_args = args.extra_args.split() if args.extra_args.strip() else None
 
-    print(f"Running scan: T in [{args.Tmin}, {args.Tmax}] ({args.nT} points), {args.reps} reps each, steps={args.steps}")
+    print(f"Running scan: T in [{args.Tmin}, {args.Tmax}] ({args.nT} points), {args.reps} reps each, steps={args.steps}, workers={args.n_workers}")
     results = scan_temperatures(
         args.sim_script,
         Ts,
@@ -522,7 +566,8 @@ def main():
         args.seed,
         extra_args=extra_args,
         verbose=True,
-        timeout=args.timeout
+        timeout=args.timeout,
+        n_workers=args.n_workers,
     )
 
     save_results_csv(results, out_csv=args.out_csv)
