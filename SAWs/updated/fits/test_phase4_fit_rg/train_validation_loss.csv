@@ -1,0 +1,7 @@
+split,n_temperatures,loss_name,contact_loss
+train,42,js,2.1358481
+validation,22,js,1.1185101
+all,64,js,3.2543582
+train_rg,42,rg_js,29.063786
+validation_rg,22,rg_js,15.219481
+all_rg,64,rg_js,44.283267

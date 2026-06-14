@@ -5,14 +5,14 @@ SAW on 3d cubic lattice, attractive nearest-neighbour contacts,
 Metropolis MC  with canonical pivot / crank-shaft / end-flip moves.
 """
 from __future__ import annotations
-import argparse, random, math
+import argparse, dataclasses, random, math
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Tuple, List
 from scipy.optimize import curve_fit
 from matplotlib import animation
-from mpl_toolkits.mplot3d import Axes3D 
+from mpl_toolkits.mplot3d import Axes3D
 Vec = Tuple[int, int, int]
 
 #helper functions for Vec
@@ -184,6 +184,22 @@ def attempt_end_move(chain, occ) -> Tuple[bool, List[Vec], set[Vec]]:
     return True, new_chain, new_occ
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
+
+
+@dataclasses.dataclass
+class ChainState:
+    """Mutable MC state: chain positions, occupied-site set, and current energy."""
+    chain: List[Vec]
+    occ:   set
+    E:     float
+
+    @classmethod
+    def initial_straight(cls, N: int, dh: float, ds: float, T: float) -> "ChainState":
+        chain = [(i, 0, 0) for i in range(N)]
+        occ   = set(chain)
+        return cls(chain=chain, occ=occ, E=energy(chain, occ, dh, ds, T))
+
+
 # ------------------------------------------------------------------
 def sample_trajectory(chain, snap_list):
     """Append a snapshot (N,3) float64 array to snap_list."""
@@ -270,6 +286,135 @@ def log_schedule(total_steps, n_frames):
 
 
 # ----------------------------------------------------------------------
+def run_single_temperature(
+    N: int,
+    steps: int,
+    T: float,
+    dh: float,
+    ds: float,
+    seed: int | None = None,
+    dist_dir: str = "dists",
+    rg_bins: int = 80,
+) -> dict:
+    """
+    Run the MC simulation at one temperature and return structured results.
+
+    Returns a dict with keys:
+        E_mean, E_std, Rg_back_mean, Rg_back_std,
+        C_mean, C_std, C_var_pop, C_var_samp,
+        dist_file (str path or None), acceptance_ratio.
+    """
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    state = ChainState.initial_straight(N, dh, ds, T)
+    beta  = 1.0 / T
+
+    acc           = 0
+    snapshots: list = []
+    sample_every  = 1500
+    record_interval = max(1, steps // 2000)
+    saved_steps: list = []
+    E_traj: list = []
+    Rg_traj: list = []
+    C_traj: list  = []
+    frames_to_save = set(log_schedule(steps, 2000))
+    frames: list  = []
+
+    for step in range(1, steps + 1):
+        if step % record_interval == 0:
+            saved_steps.append(step)
+            E_traj.append(state.E)
+            Rg_traj.append(radius_of_gyration(state.chain))
+            C_traj.append(contact_count(state.chain, state.occ))
+
+        move = random.choice(MOVE_FUNCS)
+        ok, chain_new, occ_new = move(state.chain, state.occ)
+        if not ok:
+            continue
+        dE = energy(chain_new, occ_new, dh, ds, T) - state.E
+        if dE <= 0 or random.random() < math.exp(-beta * dE):
+            state.chain, state.occ, state.E = chain_new, occ_new, state.E + dE
+            acc += 1
+
+        if step % sample_every == 0:
+            sample_trajectory(state.chain, snapshots)
+        if step in frames_to_save:
+            sample_trajectory(state.chain, frames)
+
+    dist_file: str | None = None
+
+    if saved_steps:
+        n = len(saved_steps)
+        start_idx = int(math.floor(n * 0.7))
+
+        E_slice  = np.array(E_traj[start_idx:])  if len(E_traj)  > start_idx else np.array([state.E])
+        Rg_slice = np.array(Rg_traj[start_idx:]) if len(Rg_traj) > start_idx else np.array([radius_of_gyration(state.chain)])
+        C_slice  = np.array(C_traj[start_idx:])  if len(C_traj)  > start_idx else np.array([contact_count(state.chain, state.occ)])
+
+        E_mean   = float(np.nanmean(E_slice))
+        E_std    = float(np.nanstd(E_slice,  ddof=0))
+        Rg_mean  = float(np.nanmean(Rg_slice))
+        Rg_std   = float(np.nanstd(Rg_slice, ddof=0))
+        C_mean   = float(np.nanmean(C_slice))
+        C_std    = float(np.nanstd(C_slice,  ddof=0))
+        C_var_pop  = float(np.nanvar(C_slice, ddof=0))
+        C_var_samp = float(np.nanvar(C_slice, ddof=1)) if C_slice.size > 1 else float("nan")
+
+        try:
+            dist_dir_path = Path(dist_dir)
+            dist_dir_path.mkdir(parents=True, exist_ok=True)
+
+            c_int = np.rint(C_slice.astype(float)).astype(int)
+            c_vals, c_counts = np.unique(c_int, return_counts=True)
+            c_prob = c_counts.astype(float) / max(1, c_counts.sum())
+
+            rg = Rg_slice.astype(float)
+            rg = rg[np.isfinite(rg)]
+            if rg.size == 0:
+                rg_edges = np.linspace(0.0, 1.0, int(rg_bins) + 1)
+                rg_prob  = np.zeros(int(rg_bins), dtype=float)
+            else:
+                rg_min, rg_max = float(rg.min()), float(rg.max())
+                pad = 1e-9 if rg_max <= rg_min else 0.02 * (rg_max - rg_min)
+                rg_edges = np.linspace(rg_min - pad, rg_max + pad, int(rg_bins) + 1)
+                rg_counts, _ = np.histogram(rg, bins=rg_edges)
+                rg_prob = rg_counts.astype(float)
+                if rg_prob.sum() > 0:
+                    rg_prob /= rg_prob.sum()
+
+            seed_tag = seed if seed is not None else "na"
+            out_path = dist_dir_path / f"{Path(__file__).stem}_N{N}_T{T:.6g}_seed{seed_tag}.npz"
+            np.savez_compressed(
+                out_path,
+                c_vals=c_vals, c_prob=c_prob,
+                rg_edges=rg_edges, rg_prob=rg_prob,
+                T=float(T), N=int(N), steps=int(steps), seed=seed_tag,
+                dh=float(dh), ds=float(ds), n_samples=int(rg.size),
+            )
+            dist_file = str(out_path)
+        except Exception:
+            pass
+    else:
+        C0  = float(contact_count(state.chain, state.occ))
+        Rg0 = float(radius_of_gyration(state.chain))
+        E_mean   = state.E;  E_std    = 0.0
+        Rg_mean  = Rg0;      Rg_std   = 0.0
+        C_mean   = C0;       C_std    = 0.0
+        C_var_pop  = 0.0;    C_var_samp = float("nan")
+
+    return {
+        "E_mean": E_mean,         "E_std": E_std,
+        "Rg_back_mean": Rg_mean,  "Rg_back_std": Rg_std,
+        "C_mean": C_mean,         "C_std": C_std,
+        "C_var_pop": C_var_pop,   "C_var_samp": C_var_samp,
+        "dist_file": dist_file,
+        "acceptance_ratio": acc / steps,
+    }
+
+
+# ----------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--N',        type=int,   default=300,    help='chain length')
@@ -282,142 +427,19 @@ def main() -> None:
     ap.add_argument('--rg_bins', type=int, default=80, help='number of histogram bins for P(Rg)')
     args = ap.parse_args()
 
-    if args.seed is not None:
-        random.seed(args.seed); np.random.seed(args.seed)
-
-    #  initial chain-
-    chain: List[Vec] = [(i,0,0) for i in range(args.N)]
-    occ = set(chain)
-    E = energy(chain, occ, args.dh, args.ds, args.T)
-    beta = 1.0/args.T
-
-    acc = 0
-    snapshots = []
-    sample_every = 1500          # MC steps between saved frames
-    dt_frame     = sample_every  # one attempted move per monomer 
-
-    record_interval = max(1, args.steps // 2000)
-    saved_steps, E_traj2, Rg_traj2, C_traj2 = [], [], [], []
-    frames_to_save = set(log_schedule(args.steps, 2000))
-    frames = []  
-
-
-    for step in range(1, args.steps+1):
-        if step % record_interval == 0:
-            saved_steps.append(step)
-            E_traj2.append(E)
-            Rg_traj2.append(radius_of_gyration(chain))
-            C_traj2.append(contact_count(chain, occ))
-
-        move = random.choice(MOVE_FUNCS)
-        ok, chain_new, occ_new = move(chain, occ)
-        if not ok:
-            continue
-        dE = energy(chain_new, occ_new, args.dh, args.ds, args.T) - E
-        if dE <= 0 or random.random() < math.exp(-beta*dE):
-            chain, occ, E = chain_new, occ_new, E+dE
-            acc += 1
-
-    
-        if step % sample_every == 0:
-            sample_trajectory(chain, snapshots)
-
-        if step in frames_to_save:
-            sample_trajectory(chain, frames)
-
-
-    trajectory = np.stack(snapshots) if snapshots else np.empty((0, args.N, 3))
-
-    print(f"Acceptance ratio: {acc/args.steps:.3f}")
-
-    # Compute averages over last 30% of recorded samples (if available)
-    if len(saved_steps) > 0:
-        n = len(saved_steps)
-        start_idx = int(math.floor(n * 0.7))
-        if start_idx < 0:
-            start_idx = 0
-        # slices
-        E_slice = np.array(E_traj2[start_idx:]) if len(E_traj2) > start_idx else np.array([E])
-        Rg_slice = np.array(Rg_traj2[start_idx:]) if len(Rg_traj2) > start_idx else np.array([radius_of_gyration(chain)])
-        C_slice = np.array(C_traj2[start_idx:]) if len(C_traj2) > start_idx else np.array([contact_count(chain, occ)])
-
-        E_mean = float(np.nanmean(E_slice))
-        E_std  = float(np.nanstd(E_slice, ddof=0))
-        Rg_mean = float(np.nanmean(Rg_slice))
-        Rg_std  = float(np.nanstd(Rg_slice, ddof=0))
-
-        C_mean = float(np.nanmean(C_slice))
-        C_std  = float(np.nanstd(C_slice, ddof=0))
-        C_var_pop = float(np.nanvar(C_slice, ddof=0))
-        C_var_samp = float(np.nanvar(C_slice, ddof=1)) if C_slice.size > 1 else float("nan")
-
-        
-        C_var_pop = float(np.nanvar(C_slice, ddof=0))
-        C_var_samp = float(np.nanvar(C_slice, ddof=1)) if C_slice.size > 1 else float("nan")
-# Print in instrumented format expected by temp_scan.py
-        # --- equilibrium distributions for temp_scan ---
-        try:
-            dist_dir = Path(args.dist_dir)
-            dist_dir.mkdir(parents=True, exist_ok=True)
-
-            # Contacts distribution P(C)
-            c_int = np.rint(C_slice.astype(float)).astype(int)
-            c_vals, c_counts = np.unique(c_int, return_counts=True)
-            c_prob = c_counts.astype(float) / max(1, c_counts.sum())
-
-            # Rg distribution P(Rg)
-            rg = Rg_slice.astype(float)
-            rg = rg[np.isfinite(rg)]
-            if rg.size == 0:
-                rg_edges = np.linspace(0.0, 1.0, int(args.rg_bins) + 1)
-                rg_prob = np.zeros(int(args.rg_bins), dtype=float)
-            else:
-                rg_min = float(rg.min())
-                rg_max = float(rg.max())
-                pad = 1e-9 if rg_max <= rg_min else 0.02 * (rg_max - rg_min)
-                rg_edges = np.linspace(rg_min - pad, rg_max + pad, int(args.rg_bins) + 1)
-                rg_counts, _ = np.histogram(rg, bins=rg_edges)
-                rg_prob = rg_counts.astype(float)
-                sprob = rg_prob.sum()
-                if sprob > 0:
-                    rg_prob /= sprob
-
-            seed_tag = args.seed if args.seed is not None else "na"
-            dist_file = dist_dir / f"{Path(__file__).stem}_N{args.N}_T{args.T:.6g}_seed{seed_tag}.npz"
-            np.savez_compressed(
-                dist_file,
-                c_vals=c_vals,
-                c_prob=c_prob,
-                rg_edges=rg_edges,
-                rg_prob=rg_prob,
-                T=float(args.T),
-                N=int(args.N),
-                steps=int(args.steps),
-                seed=seed_tag,
-                dh=float(args.dh),
-                ds=float(args.ds),
-                n_samples=int(rg.size),
-            )
-            print(f"DIST_FILE = {dist_file}")
-        except Exception:
-            pass
-
-        print(f"E_mean = {E_mean:.3f} ± {E_std:.3f}")
-        print(f"Rg_back_mean = {Rg_mean:.3f} ± {Rg_std:.3f}")
-        print(f"C_mean = {C_mean:.3f} ± {C_std:.3f}")
-        print(f"C_var(pop) = {C_var_pop:.3f}")
-        print(f"C_var(sample) = {C_var_samp:.3f}")
-    else:
-        # fallback to instantaneous prints if no recorded samples
-        # single-point estimates
-        C0 = float(contact_count(chain, occ))
-        Rg0 = float(radius_of_gyration(chain))
-        print(f"⟨E⟩ = {E:.2f}   ⟨R_g⟩ = {Rg0:.2f}")
-        print(f"E_mean = {E:.3f} ± {0.000:.3f}")
-        print(f"Rg_back_mean = {Rg0:.3f} ± {0.000:.3f}")
-        print(f"C_mean = {C0:.3f} ± {0.000:.3f}")
-        print(f"C_var(pop) = {0.000:.3f}")
-        print(f"C_var(sample) = nan")
+    r = run_single_temperature(
+        N=args.N, steps=args.steps, T=args.T,
+        dh=args.dh, ds=args.ds, seed=args.seed,
+        dist_dir=args.dist_dir, rg_bins=args.rg_bins,
+    )
+    print(f"Acceptance ratio: {r['acceptance_ratio']:.3f}")
+    if r["dist_file"]:
+        print(f"DIST_FILE = {r['dist_file']}")
+    print(f"E_mean = {r['E_mean']:.3f} ± {r['E_std']:.3f}")
+    print(f"Rg_back_mean = {r['Rg_back_mean']:.3f} ± {r['Rg_back_std']:.3f}")
+    print(f"C_mean = {r['C_mean']:.3f} ± {r['C_std']:.3f}")
+    print(f"C_var(pop) = {r['C_var_pop']:.3f}")
+    print(f"C_var(sample) = {r['C_var_samp']:.3f}")
 
 # RUn
 if __name__ == "__main__":
