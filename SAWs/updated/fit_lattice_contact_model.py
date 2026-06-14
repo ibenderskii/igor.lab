@@ -216,7 +216,7 @@ def build_baseline_mass_on_integer(
     m1 = int(round(m_centers_int.max()))
     m_vals = np.arange(m0, m1 + 1, dtype=int)
 
-    # Case A: discrete contact values (c_vals, c_prob)
+    # Case A: discrete contact values with per-value probabilities (c_vals, c_prob)
     if "c_vals" in b.files and "c_prob" in b.files:
         c_vals = np.asarray(b["c_vals"], dtype=int)
         c_prob = np.asarray(b["c_prob"], dtype=float)
@@ -232,7 +232,45 @@ def build_baseline_mass_on_integer(
             raise ValueError("Baseline has no mass on the requested integer m range.")
         return p0 / p0.sum()
 
-    # Case B: baseline provided as contact pdf on arbitrary bins
+    # Case B: REMD-style multi-temperature histogram (c_vals, Pc)
+    # Pc may be 2D (nT, maxC+1); average over rows to get the athermal baseline.
+    if "c_vals" in b.files and "Pc" in b.files:
+        c_vals = np.asarray(b["c_vals"], dtype=int)
+        Pc = np.asarray(b["Pc"], dtype=float)
+        if Pc.ndim == 2:
+            c_prob = np.nanmean(Pc, axis=0)
+        else:
+            c_prob = Pc.copy()
+        c_prob = np.nan_to_num(c_prob, nan=0.0)
+        c_prob = np.clip(c_prob, 0.0, None)
+        if c_prob.sum() <= 0:
+            raise ValueError("baseline Pc sums to 0 after averaging")
+        c_prob /= c_prob.sum()
+        p0 = np.zeros(m_vals.size, dtype=float)
+        for cv, pk in zip(c_vals, c_prob):
+            if m0 <= cv <= m1:
+                p0[cv - m0] += pk
+        if p0.sum() <= 0:
+            raise ValueError("Baseline Pc has no mass on the requested integer m range.")
+        return p0 / p0.sum()
+
+    # Case C: joint baseline P0(m, Rg) — marginalize over Rg to get p0(m)
+    if "c_edges" in b.files and "crg_prob" in b.files:
+        c_edges = np.asarray(b["c_edges"], dtype=float)
+        crg_prob = np.asarray(b["crg_prob"], dtype=float)
+        p_c = crg_prob.sum(axis=1)          # marginalize over Rg
+        p_c = np.clip(p_c, 0.0, None)
+        if p_c.sum() <= 0:
+            raise ValueError("baseline crg_prob marginal over Rg sums to 0")
+        p_c /= p_c.sum()
+        c_centers_joint = 0.5 * (c_edges[:-1] + c_edges[1:])
+        # p_c sums to 1 and bin_width ≈ 1 → can be treated as a PDF
+        _, p0 = rebin_pdf_mass_to_integer_bins(c_centers_joint, p_c, m_min=m0, m_max=m1)
+        if p0.sum() <= 0:
+            raise ValueError("Joint baseline has no mass on the requested integer m range.")
+        return p0
+
+    # Case D: baseline provided as contact pdf on arbitrary bins
     if "ct_centers" in b.files and "ct_hists" in b.files:
         ccent = np.asarray(b["ct_centers"], dtype=float)
         ch = np.asarray(b["ct_hists"], dtype=float)
@@ -242,7 +280,8 @@ def build_baseline_mass_on_integer(
         return p0
 
     raise ValueError(
-        "Unrecognized baseline format. Expected (c_vals,c_prob) or (ct_centers,ct_hists)."
+        "Unrecognized baseline format. Supported: "
+        "(c_vals,c_prob), (c_vals,Pc), (c_edges,crg_prob), (ct_centers,ct_hists)."
     )
 
 
@@ -252,6 +291,10 @@ def _get_baseline_integer_range(baseline_npz: str) -> Tuple[int, int]:
     if "c_vals" in b.files:
         c_vals = np.asarray(b["c_vals"], dtype=int)
         return int(c_vals.min()), int(c_vals.max())
+    if "c_edges" in b.files:
+        c_edges = np.asarray(b["c_edges"], dtype=float)
+        c_centers = 0.5 * (c_edges[:-1] + c_edges[1:])
+        return int(round(c_centers.min())), int(round(c_centers.max()))
     if "ct_centers" in b.files:
         ccent = np.asarray(b["ct_centers"], dtype=float)
         edges = centers_to_edges(ccent)
@@ -563,26 +606,51 @@ def _resolve_split_indices(
       2. --holdout-indices → validation set; training = everything else
       3. --holdout-every N → validation = [0, N, 2N, ...]; training = rest
       4. None             → train on all, no validation
+
+    Raises ValueError for:
+      - --holdout-every <= 0
+      - indices outside [0, n_temps-1]
+      - duplicate indices in any set
+      - empty training set after split
     """
+    if holdout_every is not None and holdout_every <= 0:
+        raise ValueError(f"--holdout-every must be >= 1, got {holdout_every}")
+
     all_idx = np.arange(n_temps, dtype=int)
 
+    def _parse_and_validate(s: str, flag: str) -> np.ndarray:
+        raw = [int(x.strip()) for x in s.split(",") if x.strip()]
+        if len(set(raw)) != len(raw):
+            raise ValueError(f"{flag} contains duplicate indices: {raw}")
+        arr = np.array(raw, dtype=int)
+        if arr.size > 0 and (arr.min() < 0 or arr.max() >= n_temps):
+            raise ValueError(
+                f"{flag} has index out of range [0, {n_temps - 1}]: {raw}"
+            )
+        return arr
+
     if train_indices_str is not None:
-        train_idx = np.array(
-            [int(x.strip()) for x in train_indices_str.split(",")], dtype=int
-        )
+        train_idx = _parse_and_validate(train_indices_str, "--train-indices")
+        if train_idx.size == 0:
+            raise ValueError("--train-indices is empty")
         val_idx = np.setdiff1d(all_idx, train_idx)
         return train_idx, val_idx
 
     if holdout_indices_str is not None:
-        val_idx = np.array(
-            [int(x.strip()) for x in holdout_indices_str.split(",")], dtype=int
-        )
+        val_idx = _parse_and_validate(holdout_indices_str, "--holdout-indices")
         train_idx = np.setdiff1d(all_idx, val_idx)
+        if train_idx.size == 0:
+            raise ValueError("--holdout-indices left no training temperatures")
         return train_idx, val_idx
 
     if holdout_every is not None:
         val_idx = all_idx[::holdout_every]
         train_idx = np.setdiff1d(all_idx, val_idx)
+        if train_idx.size == 0:
+            raise ValueError(
+                f"--holdout-every {holdout_every} left no training temperatures "
+                f"(only {n_temps} temps total)"
+            )
         return train_idx, val_idx
 
     return all_idx.copy(), np.array([], dtype=int)
@@ -1465,7 +1533,29 @@ def main() -> None:
     print(f"Saved: {p3}")
     open_figs.append(fig3)
 
-    # --- 4. Rg distribution overlay (if joint baseline) ---
+    # --- 4. Contact residual heatmap ---
+    residuals_ct = p_obs_mass - p_mod_mass   # shape (n_temps, n_m)
+    fig_crhm, ax_crhm = plt.subplots(figsize=(9, 5))
+    vmax_ct = float(np.abs(residuals_ct).max())
+    vmax_ct = vmax_ct if vmax_ct > 0 else 1.0
+    im_crhm = ax_crhm.pcolormesh(
+        m_centers, temps, residuals_ct,
+        cmap="RdBu_r", vmin=-vmax_ct, vmax=vmax_ct, shading="auto",
+    )
+    plt.colorbar(im_crhm, ax=ax_crhm, label="obs − model")
+    ax_crhm.set_xlabel("m (integer contacts)")
+    ax_crhm.set_ylabel("T")
+    ax_crhm.set_title("Contact residual heatmap (obs − model)")
+    if has_val:
+        for vi in val_idx:
+            ax_crhm.axhline(temps[vi], color="red", lw=0.5, alpha=0.4)
+    fig_crhm.tight_layout()
+    p_crhm = plot_dir / "contact_residual_heatmap.png"
+    fig_crhm.savefig(p_crhm, dpi=150, bbox_inches="tight")
+    print(f"Saved: {p_crhm}")
+    open_figs.append(fig_crhm)
+
+    # --- 6. Rg distribution overlay (if joint baseline) ---
     if rg_mod_mass is not None and rg_centers_model is not None:
         fig4, ax4 = plt.subplots(figsize=(8, 5))
         for k, i in enumerate(show_idxs):
@@ -1499,7 +1589,7 @@ def main() -> None:
         print(f"Saved: {p4}")
         open_figs.append(fig4)
 
-    # --- 5. Rg residual heatmap (if obs Rg available and joint baseline) ---
+    # --- 7. Rg residual heatmap (if obs Rg available and joint baseline) ---
     if has_rg_scoring and rg_mod_mass is not None and rg_centers_obs is not None and p_obs_rg_native is not None:
         # Rebin model Rg mass onto obs Rg grid for residual computation
         rg_edges_obs = centers_to_edges(rg_centers_obs)

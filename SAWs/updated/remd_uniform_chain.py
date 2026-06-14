@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Serial replica exchange Monte Carlo for the lattice polymer model.
+Self-contained replica exchange Monte Carlo for the lattice polymer model.
 
 Hamiltonian:  H(C; T) = m(C) * (dh - T*ds)
 Reduced potential:  u(C, T) = H(C, T) / T = m(C) * (dh/T - ds)
@@ -15,6 +15,22 @@ Accept if random() < exp(min(0, log_accept)).
 Usage:
     python remd_uniform_chain.py --N 50 --nT 8 --Tmin 280 --Tmax 380 \\
         --steps-per-swap 500 --n-cycles 4000 --seed 42
+
+Output NPZ keys (distributions file)
+-------------------------------------
+Canonical (existing):
+    Ts          temperatures, shape (nT,)
+    c_vals      integer contact counts [0, maxC], shape (maxC+1,)
+    Pc          P(m|T) probability mass, shape (nT, maxC+1), rows sum to 1
+    rg_edges    Rg histogram edges, shape (rg_bins+1,)
+    rg_centers  Rg bin centers, shape (rg_bins,)
+    Prg         P(Rg|T) probability mass, shape (nT, rg_bins), rows sum to 1
+
+Compatibility aliases for fit_lattice_contact_model.py:
+    temps       = Ts
+    ct_centers  = c_vals.astype(float)   (use --contact_offset 0 when fitting)
+    ct_hists    = Pc                      (sum per row = 1; bin_width = 1)
+    rg_hists    = Prg                     (sum per row = 1)
 """
 from __future__ import annotations
 
@@ -25,20 +41,179 @@ import math
 import random
 import time
 from concurrent.futures import ProcessPoolExecutor
+from itertools import permutations, product
 from pathlib import Path
+from typing import List, Tuple
 
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
-from thermo_uniform_chain2_DBfix_dists_corrected import (
-    ChainState,
-    MOVE_FUNCS,
-    contact_count,
-    energy,
-    radius_of_gyration,
-)
+
+# ---------------------------------------------------------------------------
+# Lattice polymer physics (self-contained, no external import required)
+# ---------------------------------------------------------------------------
+
+Vec = Tuple[int, int, int]
+NN_VECS: List[Vec] = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+
+
+def _add(a: Vec, b: Vec) -> Vec:
+    return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
+
+
+def _sub(a: Vec, b: Vec) -> Vec:
+    return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
+
+
+def _generate_cubic_rotations() -> list:
+    """Return the 23 proper cubic rotations excluding the identity."""
+    def _det3(M):
+        (a,b,c),(d,e,f),(g,h,i) = M
+        return a*(e*i-f*h) - b*(d*i-f*g) + c*(d*h-e*g)
+
+    rots = []
+    for perm in permutations([0, 1, 2]):
+        for signs in product([-1, 1], repeat=3):
+            M = [[0,0,0],[0,0,0],[0,0,0]]
+            for r, c in enumerate(perm):
+                M[r][c] = signs[r]
+            Mt = (tuple(M[0]), tuple(M[1]), tuple(M[2]))
+            if _det3(Mt) == 1:
+                rots.append(Mt)
+    I = ((1,0,0),(0,1,0),(0,0,1))
+    return [M for M in rots if M != I]   # 23 matrices
+
+
+ROT_MATS = _generate_cubic_rotations()
+
+
+def _apply_rot(M, v: Vec) -> Vec:
+    x, y, z = v
+    return (
+        M[0][0]*x + M[0][1]*y + M[0][2]*z,
+        M[1][0]*x + M[1][1]*y + M[1][2]*z,
+        M[2][0]*x + M[2][1]*y + M[2][2]*z,
+    )
+
+
+def energy(chain: List[Vec], occ: set, dh: float, ds: float, T: float) -> float:
+    """H(C;T) = m(C)*(dh - T*ds).
+
+    m(C) = number of unique non-bonded nearest-neighbour contacts.
+    This energy depends explicitly on T; with Metropolis beta=1/T the sampled
+    weight is exp(-H/T) = exp(-(dh/T - ds)*m).
+    """
+    cnt = 0
+    N = len(chain)
+    for idx, r in enumerate(chain):
+        prev = chain[idx-1] if idx > 0   else None
+        nxt  = chain[idx+1] if idx < N-1 else None
+        for v in NN_VECS:
+            nbr = _add(r, v)
+            if nbr in occ and nbr not in (prev, nxt):
+                cnt += 1
+    return (0.5 * cnt) * (dh - T * ds)
+
+
+def contact_count(chain: List[Vec], occ: set) -> float:
+    """Number of unique non-bonded nearest-neighbour contacts."""
+    m = 0
+    N = len(chain)
+    for i, r in enumerate(chain):
+        prev = chain[i-1] if i > 0   else None
+        nxt  = chain[i+1] if i < N-1 else None
+        for v in NN_VECS:
+            nbr = _add(r, v)
+            if nbr in occ and nbr not in (prev, nxt):
+                m += 1
+    return 0.5 * m
+
+
+def radius_of_gyration(chain: List[Vec]) -> float:
+    r = np.array(chain, dtype=float)
+    com = r.mean(axis=0)
+    return math.sqrt(((r - com)**2).sum(axis=1).mean())
+
+
+# --- MC move functions (must be top-level for pickling on Windows spawn) ---
+
+def attempt_pivot(chain, occ) -> Tuple[bool, list, set]:
+    """Global pivot move: rotate tail around a randomly chosen pivot monomer."""
+    n = len(chain)
+    i = random.randrange(1, n-1)
+    head = chain[:i+1]
+    tail = chain[i+1:]
+    M = random.choice(ROT_MATS)
+    new_occ = set(head)
+    new_tail = []
+    pivot = chain[i]
+    for r in tail:
+        r2 = _add(pivot, _apply_rot(M, _sub(r, pivot)))
+        if r2 in new_occ:
+            return False, chain, occ
+        new_tail.append(r2)
+        new_occ.add(r2)
+    return True, head + new_tail, new_occ
+
+
+def attempt_crankshaft(chain, occ) -> Tuple[bool, list, set]:
+    """Local 90° kink flip (crankshaft move)."""
+    n = len(chain)
+    i = random.randrange(1, n-1)
+    a, b, c = chain[i-1], chain[i], chain[i+1]
+    u1 = _sub(b, a)
+    u2 = _sub(c, b)
+    if u1 not in NN_VECS or u2 not in NN_VECS:
+        return False, chain, occ
+    if u1 == u2 or u1 == (-u2[0], -u2[1], -u2[2]):
+        return False, chain, occ
+    if u1[0]*u2[0] + u1[1]*u2[1] + u1[2]*u2[2] != 0:
+        return False, chain, occ
+    b_new = _add(a, u2)
+    if b_new in occ:
+        return False, chain, occ
+    if _sub(b_new, a) not in NN_VECS or _sub(c, b_new) not in NN_VECS:
+        return False, chain, occ
+    new_chain = chain.copy()
+    new_chain[i] = b_new
+    return True, new_chain, (occ - {b}) | {b_new}
+
+
+def attempt_end_move(chain, occ) -> Tuple[bool, list, set]:
+    """Symmetric end move; no Hastings correction needed."""
+    n = len(chain)
+    end = 0 if random.random() < 0.5 else n-1
+    anchor = 1 if end == 0 else n-2
+    v = random.choice(NN_VECS)
+    r_new = _add(chain[end], v)
+    if r_new in occ:
+        return False, chain, occ
+    if _sub(r_new, chain[anchor]) not in NN_VECS:
+        return False, chain, occ
+    new_chain = chain.copy()
+    old = chain[end]
+    new_chain[end] = r_new
+    return True, new_chain, (occ - {old}) | {r_new}
+
+
+MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
+
+
+@dataclasses.dataclass
+class ChainState:
+    """Mutable MC state: chain positions, occupied-site set, and current energy."""
+    chain: List[Vec]
+    occ:   set
+    E:     float
+
+    @classmethod
+    def initial_straight(cls, N: int, dh: float, ds: float, T: float) -> "ChainState":
+        chain = [(i, 0, 0) for i in range(N)]
+        occ   = set(chain)
+        return cls(chain=chain, occ=occ, E=energy(chain, occ, dh, ds, T))
+
 
 # ---------------------------------------------------------------------------
 # Reduced potential and swap criterion
@@ -58,9 +233,6 @@ def swap_log_accept(
     Log Metropolis ratio for swapping configs C_i (at T_i) and C_j (at T_j).
 
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)
-
-    Equivalent to (m_i - m_j) * dh * (1/T_i - 1/T_j), but written in the
-    general form so the derivation remains transparent.
     """
     return (
         reduced_potential(m_i, T_i, dh, ds)
@@ -138,7 +310,7 @@ def attempt_swap(
 
 
 # ---------------------------------------------------------------------------
-# Parallel worker (must be top-level for pickling on Windows spawn)
+# Parallel worker (top-level for pickling on Windows spawn)
 # ---------------------------------------------------------------------------
 
 def evolve_replica_worker(
@@ -148,7 +320,7 @@ def evolve_replica_worker(
     ds: float,
     seed: int,
 ) -> "Replica":
-    """Deterministically seeded sweep of one replica. Top-level for pickling."""
+    """Deterministically seeded sweep of one replica."""
     random.seed(seed)
     np.random.seed(seed)
     mc_sweep(replica, steps, dh, ds)
@@ -172,7 +344,7 @@ def run_remd(
     timing: bool = False,
 ) -> tuple[list[Replica], np.ndarray, np.ndarray]:
     """
-    Run serial REMD.
+    Run REMD.
 
     Each cycle:
       1. Every replica runs `steps_per_swap` local Metropolis steps.
@@ -209,7 +381,6 @@ def run_remd(
         for cycle in range(n_cycles):
             t0 = time.perf_counter()
 
-            # Local sweeps — parallel or serial
             if executor is not None:
                 worker_seeds = [base_seed + 100_000 * cycle + k for k in range(nT)]
                 futures = [
@@ -228,7 +399,6 @@ def run_remd(
             t1 = time.perf_counter()
             t_sweep_total += t1 - t0
 
-            # Swap attempts: alternate even (0-1, 2-3, …) and odd (1-2, 3-4, …) pairs
             start = cycle % 2
             for k in range(start, nT - 1, 2):
                 swap_props[k] += 1
@@ -238,7 +408,6 @@ def run_remd(
             t2 = time.perf_counter()
             t_swap_total += t2 - t1
 
-            # Record observables
             for rep in replicas:
                 rep.E_traj.append(rep.state.E)
                 rep.C_traj.append(contact_count(rep.state.chain, rep.state.occ))
@@ -305,8 +474,9 @@ def build_distributions(
     """
     Build P(m|T) and P(Rg|T) from post-burnin replica trajectories.
 
-    Output dict matches the format written by temp_scan2_overlay.py so the
-    same replotting code can be used on both outputs.
+    Returns a dict with both the canonical keys (Ts, c_vals, Pc, rg_edges,
+    rg_centers, Prg) and compatibility aliases for fit_lattice_contact_model.py
+    (temps, ct_centers, ct_hists, rg_hists).
     """
     nT = len(replicas)
     Ts = np.array([rep.T for rep in replicas], dtype=float)
@@ -319,13 +489,11 @@ def build_distributions(
         C_arrs.append(np.array(rep.C_traj[s:],  dtype=float))
         Rg_arrs.append(np.array(rep.Rg_traj[s:], dtype=float))
 
-    # Global contacts range
     maxC = max(
         (int(np.nanmax(a)) for a in C_arrs if a.size > 0),
         default=0,
     )
 
-    # Global Rg range for common bin edges
     rg_all = np.concatenate([a[np.isfinite(a)] for a in Rg_arrs if a.size > 0])
     if rg_all.size > 0:
         rg_lo, rg_hi = float(rg_all.min()), float(rg_all.max())
@@ -355,13 +523,21 @@ def build_distributions(
             if s > 0:
                 Prg[i] = counts.astype(float) / s
 
+    c_vals = np.arange(maxC + 1, dtype=int)
+
     return {
+        # Canonical keys (backward-compatible)
         "Ts":         Ts,
-        "c_vals":     np.arange(maxC + 1, dtype=int),
+        "c_vals":     c_vals,
         "Pc":         Pc,
         "rg_edges":   rg_edges,
         "rg_centers": rg_centers,
         "Prg":        Prg,
+        # Aliases for fit_lattice_contact_model.py
+        "temps":      Ts,
+        "ct_centers": c_vals.astype(float),
+        "ct_hists":   Pc,
+        "rg_hists":   Prg,
     }
 
 
@@ -401,6 +577,7 @@ def save_swap_csv(
 
 
 def save_distributions(dist: dict, out_prefix: str) -> str:
+    """Save distributions NPZ with canonical keys and fitting-script aliases."""
     path = f"{out_prefix}_distributions.npz"
     np.savez_compressed(path, **dist)
     print(f"Saved {path}")
@@ -429,9 +606,9 @@ def plot_observables(results: list[dict], out_prefix: str) -> None:
     Rg_errs  = np.array([r["Rg_std"]  for r in results])
 
     for (y, ye, ylabel, title, tag) in [
-        (E_means,  E_errs,  "Energy E (mean ± std)",              "E vs T",        "E_vs_T"),
-        (C_means,  C_errs,  "Contacts m (mean ± std)",            "Contacts vs T", "contacts_vs_T"),
-        (Rg_means, Rg_errs, "Radius of gyration (mean ± std)",    "Rg vs T",       "Rg_vs_T"),
+        (E_means,  E_errs,  "Energy E (mean ± std)",           "E vs T",        "E_vs_T"),
+        (C_means,  C_errs,  "Contacts m (mean ± std)",          "Contacts vs T", "contacts_vs_T"),
+        (Rg_means, Rg_errs, "Radius of gyration (mean ± std)", "Rg vs T",       "Rg_vs_T"),
     ]:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.errorbar(Ts, y, yerr=ye, marker="o", linestyle="-", capsize=3)
@@ -454,7 +631,6 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
 
     cmap, norm, sm = _make_colormap(Ts)
 
-    # Side-by-side overlay
     fig, (ax_rg, ax_c) = plt.subplots(1, 2, figsize=(14, 5))
     for i, T in enumerate(Ts):
         col = cmap(norm(T))
@@ -462,8 +638,8 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
             ax_rg.plot(rg_centers, Prg[i], color=col, alpha=0.7, linewidth=1.0)
         if np.any(np.isfinite(Pc[i])):
             ax_c.plot(c_vals, Pc[i], color=col, alpha=0.7, linewidth=1.0)
-    ax_rg.set_xlabel("Rg");      ax_rg.set_ylabel("P(Rg)");      ax_rg.set_title("P(Rg) by temperature")
-    ax_c.set_xlabel("Contacts"); ax_c.set_ylabel("P(m)");         ax_c.set_title("P(m) by temperature")
+    ax_rg.set_xlabel("Rg");      ax_rg.set_ylabel("P(Rg)");  ax_rg.set_title("P(Rg) by temperature")
+    ax_c.set_xlabel("Contacts"); ax_c.set_ylabel("P(m)");    ax_c.set_title("P(m) by temperature")
     fig.colorbar(sm, ax=ax_rg, label="T")
     fig.colorbar(sm, ax=ax_c,  label="T")
     fig.tight_layout()
@@ -472,7 +648,6 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
     plt.close(fig)
     print(f"Saved {out}")
 
-    # P(Rg) alone
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     for i, T in enumerate(Ts):
         if np.any(np.isfinite(Prg[i])):
@@ -485,7 +660,6 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
     plt.close(fig)
     print(f"Saved {out}")
 
-    # P(m) alone
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     for i, T in enumerate(Ts):
         if np.any(np.isfinite(Pc[i])):
@@ -504,8 +678,7 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
 # ---------------------------------------------------------------------------
 
 def run_quick_test() -> None:
-    """Smoke-test: serial and 2-worker runs, check outputs and normalisation."""
-    import math as _math
+    """Smoke-test: serial and 2-worker runs; checks normalisation and outputs."""
     import os
     import tempfile
 
@@ -528,6 +701,18 @@ def run_quick_test() -> None:
             assert os.path.exists(f"{prefix}_swap_rates.csv"), "swap rates CSV missing"
 
             dist = build_distributions(reps, rg_bins=40, burnin_frac=0.5)
+
+            # Verify canonical keys present
+            for key in ("Ts", "c_vals", "Pc", "rg_edges", "rg_centers", "Prg"):
+                assert key in dist, f"Missing canonical key: {key}"
+
+            # Verify compatibility alias keys present
+            for key in ("temps", "ct_centers", "ct_hists", "rg_hists"):
+                assert key in dist, f"Missing alias key: {key}"
+
+            # Verify ct_centers == c_vals.astype(float)
+            np.testing.assert_array_equal(dist["ct_centers"], dist["c_vals"].astype(float))
+
             for i, row in enumerate(dist["Pc"]):
                 finite = row[np.isfinite(row)]
                 if finite.size > 0:
@@ -541,9 +726,9 @@ def run_quick_test() -> None:
 
             stats = compute_statistics(reps, burnin_frac=0.5)
             for r in stats:
-                assert not _math.isnan(r["E_mean"]),  f"NaN E_mean at T={r['T']}"
-                assert not _math.isnan(r["C_mean"]),  f"NaN C_mean at T={r['T']}"
-                assert not _math.isnan(r["Rg_mean"]), f"NaN Rg_mean at T={r['T']}"
+                assert not math.isnan(r["E_mean"]),  f"NaN E_mean at T={r['T']}"
+                assert not math.isnan(r["C_mean"]),  f"NaN C_mean at T={r['T']}"
+                assert not math.isnan(r["Rg_mean"]), f"NaN Rg_mean at T={r['T']}"
 
         print(f"  quick-test n_workers={n_workers}: PASSED")
     print("quick-test complete.")
@@ -556,23 +741,23 @@ def run_quick_test() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Serial REMD for lattice polymer with T-dependent Hamiltonian.",
+        description="Self-contained REMD for lattice polymer with T-dependent Hamiltonian.",
     )
-    ap.add_argument("--N",              type=int,   default=300,    help="chain length")
-    ap.add_argument("--Tmin",           type=float, default=280.0,  help="lowest temperature")
-    ap.add_argument("--Tmax",           type=float, default=380.0,  help="highest temperature")
-    ap.add_argument("--nT",             type=int,   default=8,      help="number of replicas")
-    ap.add_argument("--steps-per-swap", type=int,   default=500,    help="local MC steps per replica per swap cycle")
-    ap.add_argument("--n-cycles",       type=int,   default=4000,   help="number of swap cycles")
-    ap.add_argument("--dh",             type=float, default=378.96, help="contact enthalpy (dh)")
-    ap.add_argument("--ds",             type=float, default=1.39686,help="contact entropy (ds)")
-    ap.add_argument("--seed",           type=int,   default=42,     help="RNG seed")
+    ap.add_argument("--N",              type=int,   default=300,     help="chain length")
+    ap.add_argument("--Tmin",           type=float, default=280.0,   help="lowest temperature")
+    ap.add_argument("--Tmax",           type=float, default=380.0,   help="highest temperature")
+    ap.add_argument("--nT",             type=int,   default=8,       help="number of replicas")
+    ap.add_argument("--steps-per-swap", type=int,   default=500,     help="local MC steps per replica per swap cycle")
+    ap.add_argument("--n-cycles",       type=int,   default=4000,    help="number of swap cycles")
+    ap.add_argument("--dh",             type=float, default=378.96,  help="contact enthalpy dh")
+    ap.add_argument("--ds",             type=float, default=1.39686, help="contact entropy ds")
+    ap.add_argument("--seed",           type=int,   default=42,      help="RNG seed")
     ap.add_argument("--out-prefix",     type=str,   default="remd_out", help="prefix for all output files")
-    ap.add_argument("--rg-bins",        type=int,   default=80,     help="bins for P(Rg) histograms")
-    ap.add_argument("--burnin-frac",    type=float, default=0.7,    help="fraction of trajectory to discard as burnin")
-    ap.add_argument("--n-workers",      type=int,   default=1,      help="parallel workers for local sweeps (1 = serial)")
-    ap.add_argument("--timing",         action="store_true",        help="print sweep/swap/total wall times")
-    ap.add_argument("--quick-test",     action="store_true",        help="run smoke-test (N=20, nT=4, 20 cycles) and exit")
+    ap.add_argument("--rg-bins",        type=int,   default=80,      help="bins for P(Rg) histograms")
+    ap.add_argument("--burnin-frac",    type=float, default=0.7,     help="fraction of trajectory to discard as burnin")
+    ap.add_argument("--n-workers",      type=int,   default=1,       help="parallel workers for local sweeps (1 = serial)")
+    ap.add_argument("--timing",         action="store_true",         help="print sweep/swap/total wall times")
+    ap.add_argument("--quick-test",     action="store_true",         help="run smoke-test and exit")
     args = ap.parse_args()
 
     if args.quick_test:
