@@ -5,24 +5,65 @@ Model
 -----
 P_model(m|T) ∝ P0(m) * exp[-b(T) * m]
 
-where P0(m) is the athermal (T→∞) baseline from a SAW / lattice simulation.
-The function b(T) depends on the chosen model (--model flag).
+where P0(m) is the athermal (T→∞) baseline from a SAW / lattice simulation
+and b(T) is the reduced bias (contact coupling), chosen via --model.
 
-Supported models
-----------------
-hs            b(T) = h/T - s                                      (default)
+Supported b(T) models
+---------------------
+hs            b(T) = h/T - s
+                Enthalpy/entropy decomposition.  Tc = h/s.  DEFAULT.
+
 tc_scale      b(T) = A * (Tc/T - 1)
-hs_quadratic  b(T) = h/T - s + a2 * x(T)^2
-poly2         b(T) = a0 + a1*x(T) + a2*x(T)^2
-              where x(T) = (T - Tref) / Tscale
+                Parameterized directly by the transition temperature Tc.
 
-Input contact histograms are rebinned onto integer m before fitting.
-A scalar --contact_offset is subtracted from ct_centers prior to rebinning.
+hs_quadratic  b(T) = h/T - s + a2*x(T)^2,  x = (T-Tref)/Tscale
+                Quadratic correction to hs; use when hs residuals are
+                asymmetric about Tc.
 
-If the athermal baseline NPZ contains a joint histogram P0(m, Rg)
-(keys: c_edges, rg_edges, crg_prob), P(Rg|T) is also predicted by
-reweighting the joint baseline.  Use --fit-rg to include Rg loss in the
-optimization objective.
+poly2         b(T) = a0 + a1*x + a2*x^2,  x = (T-Tref)/Tscale
+                Flexible polynomial; fit Tref/Tscale to center x on data.
+
+poly3         b(T) = a0 + a1*x + a2*x^2 + a3*x^3,  x = (T-Tref)/Tscale
+                Cubic polynomial.  WARNING: very flexible; can overfit when
+                the number of temperatures is small relative to parameters.
+                Always compare validation loss against a simpler model.
+
+heat_capacity b(T) = [dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0))] / T
+                Gibbs free energy model with non-zero heat capacity of
+                folding dCp.  At dCp=0 recovers the hs model.  Use --T0
+                to set the reference temperature T0 (default: midpoint of
+                temperature range).  dCp > 0 creates a cold-denaturation
+                branch; dCp < 0 sharpens the transition.
+
+Why validation loss matters
+---------------------------
+Fitting contact distributions at every temperature can overfit: the optimizer
+finds parameters that memorize noise or ledges in the histograms rather than
+the underlying thermodynamics.  Hold out a subset of temperatures with
+--holdout-every or --holdout-indices and inspect the validation loss to detect
+overfitting.  For poly3 especially, the validation loss often exceeds the
+training loss substantially even on clean data.
+
+How to run (quick start)
+------------------------
+  python fit_lattice_contact_model.py \\
+      --remd remd_distributions_30mer.npz \\
+      --baseline single_uniform_chain2_athermal_dists_joint_N30_T1_seed42.npz \\
+      --contact_offset 29 --model hs --loss js --holdout-every 3 \\
+      --outdir fits/my_run
+
+Comparing models
+----------------
+Run with --outdir for each model.  Compare the train and validation losses
+from train_validation_loss.csv (lower is better on the validation set).
+Prefer a simpler model when its validation loss is similar to a richer one.
+
+Rg prediction
+-------------
+If the baseline NPZ contains a joint P0(m, Rg) (keys c_edges, rg_edges,
+crg_prob), P(Rg|T) is predicted for every temperature by marginalizing over
+m with Boltzmann weights.  Use --fit-rg to include Rg in the objective
+(requires observed rg_hists in the REMD file).
 """
 
 from __future__ import annotations
@@ -294,6 +335,27 @@ def _b_poly2(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
     return float(params[0]) + float(params[1]) * x + float(params[2]) * x * x
 
 
+def _b_poly3(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
+    x = (T - Tref) / Tscale
+    return (
+        float(params[0])
+        + float(params[1]) * x
+        + float(params[2]) * x * x
+        + float(params[3]) * x * x * x
+    )
+
+
+def _b_heat_capacity(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
+    """b(T) = dg(T)/T, dg = dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0)).
+
+    Tref is used as T0 (set via --T0 or defaults to midpoint of T range).
+    """
+    T0 = Tref
+    dh0, ds0, dCp = float(params[0]), float(params[1]), float(params[2])
+    dg = dh0 - T * ds0 + dCp * ((T - T0) - T * np.log(T / T0))
+    return dg / T
+
+
 def _tc_hs(params: np.ndarray) -> Optional[float]:
     s = float(params[1])
     return float(params[0]) / s if abs(s) > 1e-15 else None
@@ -335,6 +397,28 @@ MODEL_REGISTRY: Dict[str, Dict] = {
         "raw_b_fn": _b_poly2,
         "derived_Tc": None,
         "description": "b(T) = a0 + a1*x(T) + a2*x(T)^2,  x = (T-Tref)/Tscale",
+    },
+    "poly3": {
+        "param_names": ["a0", "a1", "a2", "a3"],
+        "x0": [0.0, 0.0, 0.0, 0.0],
+        "bounds": [(-20.0, 20.0), (-20.0, 20.0), (-20.0, 20.0), (-20.0, 20.0)],
+        "raw_b_fn": _b_poly3,
+        "derived_Tc": None,
+        "description": (
+            "b(T) = a0 + a1*x + a2*x^2 + a3*x^3,  x = (T-Tref)/Tscale  "
+            "[WARNING: flexible — verify with validation loss to avoid overfitting]"
+        ),
+    },
+    "heat_capacity": {
+        "param_names": ["dh0", "ds0", "dCp"],
+        "x0": [750.0, 2.8, 0.0],
+        "bounds": [(-10000.0, 10000.0), (-50.0, 50.0), (-1000.0, 1000.0)],
+        "raw_b_fn": _b_heat_capacity,
+        "derived_Tc": None,
+        "description": (
+            "b(T) = [dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0))] / T  "
+            "(set T0 via --T0; defaults to midpoint of temperature range)"
+        ),
     },
 }
 
@@ -581,6 +665,15 @@ def main() -> None:
         "--Tscale", type=float, default=None,
         help="Scale for x(T). Default: full temperature range (Tmax - Tmin).",
     )
+    ap.add_argument(
+        "--T0", type=float, default=None,
+        help=(
+            "Reference temperature T0 for the heat_capacity model. "
+            "Affects dg(T) = dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0)). "
+            "Defaults to midpoint of temperature range (same default as --Tref). "
+            "Ignored for other models."
+        ),
+    )
 
     # loss function
     ap.add_argument(
@@ -618,6 +711,16 @@ def main() -> None:
     # optimization
     ap.add_argument("--n_restarts", type=int, default=8)
     ap.add_argument("--seed", type=int, default=123)
+
+    # bootstrap
+    ap.add_argument(
+        "--bootstrap", type=int, default=0, metavar="N",
+        help="Number of bootstrap replicates over training temperatures (0 = skip).",
+    )
+    ap.add_argument(
+        "--bootstrap-seed", type=int, default=None, dest="bootstrap_seed",
+        help="RNG seed for bootstrap resampling (defaults to --seed).",
+    )
     args = ap.parse_args()
 
     # -----------------------------------------------------------------------
@@ -816,6 +919,9 @@ def main() -> None:
     Tmin, Tmax = float(temps.min()), float(temps.max())
     Tref = float(args.Tref) if args.Tref is not None else 0.5 * (Tmin + Tmax)
     Tscale = float(args.Tscale) if args.Tscale is not None else max(Tmax - Tmin, 1.0)
+    # For heat_capacity, --T0 overrides --Tref to set the thermodynamic reference T0
+    if args.model == "heat_capacity" and args.T0 is not None:
+        Tref = float(args.T0)
 
     b_fn = make_b_fn(args.model, Tref, Tscale)
     loss_fn = _get_loss_fn(args.loss)
@@ -835,8 +941,10 @@ def main() -> None:
     has_val = len(val_idx) > 0
 
     print(f"Model : {args.model}  —  {spec['description']}")
-    if args.model in ("hs_quadratic", "poly2"):
+    if args.model in ("hs_quadratic", "poly2", "poly3"):
         print(f"  Tref={Tref:.4g},  Tscale={Tscale:.4g}")
+    elif args.model == "heat_capacity":
+        print(f"  T0={Tref:.4g}")
     print(f"  Parameters: {param_names}")
     print(f"  Temperature range: [{Tmin:.4g}, {Tmax:.4g}]  ({len(temps)} temps)")
     print(f"  Loss: {args.loss}  |  train: {len(train_idx)} temps"
@@ -1120,6 +1228,165 @@ def main() -> None:
     with open(json_path, "w") as fh:
         json.dump(metadata, fh, indent=2, cls=_NpEncoder)
     print(f"Saved: {json_path}")
+
+    # -----------------------------------------------------------------------
+    # Bootstrap uncertainty estimation
+    # -----------------------------------------------------------------------
+    boot_csv_path = plot_dir / "bootstrap_params.csv"
+    boot_json_path = plot_dir / "bootstrap_summary.json"
+
+    if args.bootstrap > 0:
+        bseed = args.bootstrap_seed if args.bootstrap_seed is not None else args.seed
+        bstrap_rng = np.random.default_rng(bseed)
+        n_train = len(train_idx)
+
+        boot_records: List[Dict[str, Any]] = []
+        n_boot_failed = 0
+
+        print(f"\nBootstrap ({args.bootstrap} replicates, seed={bseed}):")
+
+        for bi in range(args.bootstrap):
+            # Resample training indices with replacement
+            local_idx = bstrap_rng.integers(0, n_train, size=n_train)
+            boot_temps_b = train_temps[local_idx]
+            boot_ct_b = p_obs_ct_train[local_idx]
+
+            if args.fit_rg:
+                boot_rg_b = p_obs_rg_train[local_idx]
+                obj_args_b = (
+                    boot_temps_b, m_centers, boot_ct_b, p0_mass,
+                    crg_prob, c_edges_joint, boot_rg_b,
+                    b_fn, loss_fn, float(args.rg_weight),
+                )
+                obj_fn_b = objective_combined
+            else:
+                obj_args_b = (boot_temps_b, m_centers, boot_ct_b, p0_mass, b_fn, loss_fn)
+                obj_fn_b = objective
+
+            best_b = None
+            best_b_val = float("inf")
+            try:
+                for x0 in x0s:
+                    res = minimize(
+                        obj_fn_b, x0,
+                        args=obj_args_b,
+                        method="L-BFGS-B",
+                        bounds=bounds,
+                        options={"maxiter": 800},
+                    )
+                    if res.fun < best_b_val:
+                        best_b_val = float(res.fun)
+                        best_b = res
+            except Exception as exc:
+                print(f"  replicate {bi:4d}: FAILED ({exc})")
+                n_boot_failed += 1
+                continue
+
+            if best_b is None:
+                print(f"  replicate {bi:4d}: FAILED (no successful minimize)")
+                n_boot_failed += 1
+                continue
+
+            params_b = best_b.x
+
+            # Post-fit losses evaluated on the original (non-resampled) temperature sets
+            train_loss_b = objective(
+                params_b, train_temps, m_centers, p_obs_ct_train, p0_mass, b_fn, loss_fn
+            )
+            val_loss_b = (
+                objective(
+                    params_b, temps[val_idx], m_centers, p_obs_mass[val_idx],
+                    p0_mass, b_fn, loss_fn,
+                )
+                if has_val else float("nan")
+            )
+            all_loss_b = objective(
+                params_b, temps, m_centers, p_obs_mass, p0_mass, b_fn, loss_fn
+            )
+
+            Tc_b: Optional[float] = None
+            if spec["derived_Tc"] is not None:
+                Tc_b = spec["derived_Tc"](params_b)
+
+            record: Dict[str, Any] = {"bootstrap_index": bi}
+            for pname, pval in zip(param_names, params_b):
+                record[pname] = float(pval)
+            if Tc_b is not None:
+                record["Tc"] = float(Tc_b)
+            record["train_loss"] = float(train_loss_b)
+            if has_val:
+                record["validation_loss"] = float(val_loss_b)
+            record["all_loss"] = float(all_loss_b)
+            boot_records.append(record)
+
+            interval = max(1, args.bootstrap // 5)
+            if (bi + 1) % interval == 0 or bi == args.bootstrap - 1:
+                print(f"  {bi + 1}/{args.bootstrap} done")
+
+        n_boot_success = len(boot_records)
+
+        if n_boot_success == 0:
+            print(
+                f"WARNING: All {args.bootstrap} bootstrap replicates failed. "
+                f"bootstrap_params.csv and bootstrap_summary.json not saved."
+            )
+        else:
+            if n_boot_failed > 0:
+                print(f"  {n_boot_failed} replicate(s) failed and were excluded.")
+
+            # CSV: header derived from first record (preserves column order)
+            boot_header = list(boot_records[0].keys())
+            with open(boot_csv_path, "w", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(boot_header)
+                for rec in boot_records:
+                    writer.writerow([rec.get(col, "") for col in boot_header])
+            print(f"Saved: {boot_csv_path}")
+
+            # Summary statistics
+            param_boot_stats: Dict[str, Dict[str, float]] = {}
+            for pname in param_names:
+                arr = np.array([r[pname] for r in boot_records], dtype=float)
+                param_boot_stats[pname] = {"mean": float(arr.mean()), "std": float(arr.std())}
+
+            derived_boot_stats: Dict[str, Dict[str, float]] = {}
+            if spec["derived_Tc"] is not None:
+                tc_arr = np.array(
+                    [r["Tc"] for r in boot_records if "Tc" in r], dtype=float
+                )
+                if tc_arr.size > 0:
+                    derived_boot_stats["Tc"] = {
+                        "mean": float(tc_arr.mean()), "std": float(tc_arr.std())
+                    }
+
+            loss_boot_stats: Dict[str, Dict[str, float]] = {}
+            for lkey in ("train_loss", "validation_loss", "all_loss"):
+                if lkey in boot_records[0]:
+                    lv = np.array(
+                        [r[lkey] for r in boot_records if lkey in r], dtype=float
+                    )
+                    lv = lv[np.isfinite(lv)]
+                    if lv.size > 0:
+                        loss_boot_stats[lkey] = {
+                            "mean": float(lv.mean()), "std": float(lv.std())
+                        }
+
+            boot_summary: Dict[str, Any] = {
+                "n_bootstrap": int(args.bootstrap),
+                "n_success": int(n_boot_success),
+                "n_failed": int(n_boot_failed),
+                "bootstrap_seed": int(bseed),
+                "model": args.model,
+                "loss": args.loss,
+                "fit_rg": bool(args.fit_rg),
+                "rg_weight": float(args.rg_weight),
+                "params": param_boot_stats,
+                "derived": derived_boot_stats,
+                "losses": loss_boot_stats,
+            }
+            with open(boot_json_path, "w") as fh:
+                json.dump(boot_summary, fh, indent=2, cls=_NpEncoder)
+            print(f"Saved: {boot_json_path}")
 
     # -----------------------------------------------------------------------
     # Plots
