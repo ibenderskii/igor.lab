@@ -258,6 +258,15 @@ def build_baseline_mass_on_integer(
     if "c_edges" in b.files and "crg_prob" in b.files:
         c_edges = np.asarray(b["c_edges"], dtype=float)
         crg_prob = np.asarray(b["crg_prob"], dtype=float)
+        if c_edges.ndim != 1:
+            raise ValueError(f"baseline c_edges must be 1D, got shape {c_edges.shape}")
+        if crg_prob.ndim != 2:
+            raise ValueError(f"baseline crg_prob must be 2D, got shape {crg_prob.shape}")
+        if len(c_edges) != crg_prob.shape[0] + 1:
+            raise ValueError(
+                f"c_edges length must equal crg_prob.shape[0] + 1: "
+                f"len(c_edges)={len(c_edges)}, crg_prob.shape[0]={crg_prob.shape[0]}"
+            )
         p_c = crg_prob.sum(axis=1)          # marginalize over Rg
         p_c = np.clip(p_c, 0.0, None)
         if p_c.sum() <= 0:
@@ -820,6 +829,31 @@ def main() -> None:
     ct_centers_native = ct_centers_raw - float(args.contact_offset)  # after offset
     ct_pdf = np.asarray(d["ct_hists"], dtype=float)
 
+    if temps.ndim != 1:
+        raise ValueError(f"temps must be 1D, got shape {temps.shape}")
+    if ct_centers_raw.ndim != 1:
+        raise ValueError(f"ct_centers must be 1D, got shape {ct_centers_raw.shape}")
+    if ct_pdf.ndim != 2:
+        raise ValueError(
+            f"ct_hists must be 2D with shape (n_temps, n_contact_bins), got shape {ct_pdf.shape}"
+        )
+    if ct_pdf.shape[0] != len(temps):
+        raise ValueError(
+            f"ct_hists first dimension must match temps: "
+            f"ct_hists.shape[0]={ct_pdf.shape[0]}, len(temps)={len(temps)}"
+        )
+    if ct_pdf.shape[1] != len(ct_centers_raw):
+        raise ValueError(
+            f"ct_hists second dimension must match ct_centers: "
+            f"ct_hists.shape[1]={ct_pdf.shape[1]}, len(ct_centers)={len(ct_centers_raw)}"
+        )
+    if not np.all(np.isfinite(temps)):
+        raise ValueError("temps contains non-finite values")
+    if not np.all(np.isfinite(ct_centers_raw)):
+        raise ValueError("ct_centers contains non-finite values")
+    if not np.all(np.isfinite(ct_pdf)):
+        raise ValueError("ct_hists contains non-finite values")
+
     # Detect observed Rg (try both capitalizations)
     _rg_centers_key = next(
         (k for k in ("rg_centers", "Rg_centers") if k in d.files), None
@@ -929,6 +963,32 @@ def main() -> None:
     if has_obs_rg:
         rg_centers_obs = np.asarray(d[_rg_centers_key], dtype=float)
         rg_hists_obs = np.asarray(d[_rg_hists_key], dtype=float)
+
+        if rg_centers_obs.ndim != 1:
+            raise ValueError(
+                f"{_rg_centers_key} must be 1D, got shape {rg_centers_obs.shape}"
+            )
+        if rg_hists_obs.ndim != 2:
+            raise ValueError(
+                f"{_rg_hists_key} must be 2D with shape (n_temps, n_rg_bins), "
+                f"got shape {rg_hists_obs.shape}"
+            )
+        if rg_hists_obs.shape[0] != len(temps):
+            raise ValueError(
+                f"{_rg_hists_key} first dimension must match temps: "
+                f"{_rg_hists_key}.shape[0]={rg_hists_obs.shape[0]}, len(temps)={len(temps)}"
+            )
+        if rg_hists_obs.shape[1] != len(rg_centers_obs):
+            raise ValueError(
+                f"{_rg_hists_key} second dimension must match {_rg_centers_key}: "
+                f"{_rg_hists_key}.shape[1]={rg_hists_obs.shape[1]}, "
+                f"len({_rg_centers_key})={len(rg_centers_obs)}"
+            )
+        if not np.all(np.isfinite(rg_centers_obs)):
+            raise ValueError(f"{_rg_centers_key} contains non-finite values")
+        if not np.all(np.isfinite(rg_hists_obs)):
+            raise ValueError(f"{_rg_hists_key} contains non-finite values")
+
         # Convert each obs PDF to probability mass on native grid
         p_obs_rg_native = np.array(
             [pdf_to_mass(rg_hists_obs[i], rg_centers_obs)[0] for i in range(len(temps))]
@@ -939,6 +999,36 @@ def main() -> None:
         c_edges_joint = np.asarray(b_data["c_edges"], dtype=float)
         rg_edges_model = np.asarray(b_data["rg_edges"], dtype=float)
         rg_centers_model = 0.5 * (rg_edges_model[:-1] + rg_edges_model[1:])
+
+        if c_edges_joint.ndim != 1:
+            raise ValueError(f"baseline c_edges must be 1D, got shape {c_edges_joint.shape}")
+        if rg_edges_model.ndim != 1:
+            raise ValueError(f"baseline rg_edges must be 1D, got shape {rg_edges_model.shape}")
+        if crg_prob.ndim != 2:
+            raise ValueError(f"baseline crg_prob must be 2D, got shape {crg_prob.shape}")
+        expected_crg_shape = (len(c_edges_joint) - 1, len(rg_edges_model) - 1)
+        if crg_prob.shape != expected_crg_shape:
+            raise ValueError(
+                f"baseline crg_prob shape must be (len(c_edges)-1, len(rg_edges)-1): "
+                f"got {crg_prob.shape}, expected {expected_crg_shape}"
+            )
+        if not np.all(np.isfinite(c_edges_joint)):
+            raise ValueError("baseline c_edges contains non-finite values")
+        if not np.all(np.isfinite(rg_edges_model)):
+            raise ValueError("baseline rg_edges contains non-finite values")
+        if not np.all(np.isfinite(crg_prob)):
+            raise ValueError("baseline crg_prob contains non-finite values")
+        if np.any(np.diff(c_edges_joint) <= 0):
+            raise ValueError("baseline c_edges must be strictly increasing")
+        if np.any(np.diff(rg_edges_model) <= 0):
+            raise ValueError("baseline rg_edges must be strictly increasing")
+        c_widths = np.diff(c_edges_joint)
+        if not np.allclose(c_widths, 1.0, rtol=1e-3, atol=1e-6):
+            print(
+                "WARNING: baseline c_edges do not appear to have unit-width contact bins. "
+                f"Contact bin widths range from {c_widths.min():.6g} to {c_widths.max():.6g}. "
+                "This may affect mapping the joint baseline P0(m,Rg) onto integer contact bins."
+            )
 
     if has_obs_rg and has_joint_baseline:
         # Rebin observed Rg PDFs onto the model Rg grid for loss computation

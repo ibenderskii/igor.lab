@@ -182,20 +182,26 @@ def attempt_crankshaft(chain, occ) -> Tuple[bool, list, set]:
 
 
 def attempt_end_move(chain, occ) -> Tuple[bool, list, set]:
-    """Symmetric end move; no Hastings correction needed."""
+    """Symmetric end move: move one end to a random empty neighbor of its anchor."""
     n = len(chain)
-    end = 0 if random.random() < 0.5 else n-1
-    anchor = 1 if end == 0 else n-2
-    v = random.choice(NN_VECS)
-    r_new = _add(chain[end], v)
-    if r_new in occ:
-        return False, chain, occ
-    if _sub(r_new, chain[anchor]) not in NN_VECS:
-        return False, chain, occ
-    new_chain = chain.copy()
+    end = 0 if random.random() < 0.5 else n - 1
+    anchor = 1 if end == 0 else n - 2
+
     old = chain[end]
+    occ_without_old = occ - {old}
+
+    v = random.choice(NN_VECS)
+    r_new = _add(chain[anchor], v)
+
+    if r_new == old:
+        return False, chain, occ
+    if r_new in occ_without_old:
+        return False, chain, occ
+
+    new_chain = chain.copy()
     new_chain[end] = r_new
-    return True, new_chain, (occ - {old}) | {r_new}
+    new_occ = occ_without_old | {r_new}
+    return True, new_chain, new_occ
 
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
@@ -730,6 +736,12 @@ def run_quick_test() -> None:
                 assert not math.isnan(r["C_mean"]),  f"NaN C_mean at T={r['T']}"
                 assert not math.isnan(r["Rg_mean"]), f"NaN Rg_mean at T={r['T']}"
 
+        # Sanity check: attempt_end_move accepts at least occasionally
+        chain5 = [(0,0,0),(1,0,0),(2,0,0),(3,0,0),(4,0,0)]
+        occ5 = set(chain5)
+        n_accepted = sum(attempt_end_move(chain5, occ5)[0] for _ in range(200))
+        assert n_accepted > 0, "attempt_end_move never accepted in 200 trials (bug?)"
+
         print(f"  quick-test n_workers={n_workers}: PASSED")
     print("quick-test complete.")
 
@@ -759,6 +771,25 @@ def main() -> None:
     ap.add_argument("--timing",         action="store_true",         help="print sweep/swap/total wall times")
     ap.add_argument("--quick-test",     action="store_true",         help="run smoke-test and exit")
     args = ap.parse_args()
+
+    if args.N < 3:
+        raise ValueError("--N must be >= 3")
+    if args.nT < 2:
+        raise ValueError("--nT must be >= 2")
+    if args.steps_per_swap < 1:
+        raise ValueError("--steps-per-swap must be >= 1")
+    if args.n_cycles < 1:
+        raise ValueError("--n-cycles must be >= 1")
+    if args.rg_bins < 1:
+        raise ValueError("--rg-bins must be >= 1")
+    if args.n_workers < 1:
+        raise ValueError("--n-workers must be >= 1")
+    if not (0.0 <= args.burnin_frac < 1.0):
+        raise ValueError("--burnin-frac must be in [0, 1)")
+    if args.Tmin <= 0 or args.Tmax <= 0:
+        raise ValueError("Temperatures must be positive")
+    if args.Tmax <= args.Tmin:
+        raise ValueError("--Tmax must be greater than --Tmin")
 
     if args.quick_test:
         run_quick_test()
