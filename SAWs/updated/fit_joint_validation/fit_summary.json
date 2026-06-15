@@ -1,0 +1,77 @@
+{
+  "timestamp": "2026-06-15T04:17:18.279580+00:00",
+  "remd_path": "remd_endmove_smoke_distributions.npz",
+  "baseline_path": "synthetic_joint_baseline.npz",
+  "model": "hs",
+  "model_description": "b(T) = h/T - s",
+  "param_names": [
+    "h",
+    "s"
+  ],
+  "params": {
+    "h": 222.51239924486322,
+    "s": 0.6317692949466098
+  },
+  "derived": {
+    "Tc": 352.20514992528643
+  },
+  "loss": "js",
+  "Tref": 330.0,
+  "Tscale": 100.0,
+  "contact_offset": 0.0,
+  "n_temps": 4,
+  "n_train": 2,
+  "n_val": 2,
+  "temps_all": [
+    280.0,
+    313.3333333333333,
+    346.6666666666667,
+    380.0
+  ],
+  "temps_train": [
+    313.3333333333333,
+    380.0
+  ],
+  "temps_val": [
+    280.0,
+    346.6666666666667
+  ],
+  "train_indices": [
+    1,
+    3
+  ],
+  "val_indices": [
+    0,
+    2
+  ],
+  "contact_range_native": [
+    0.0,
+    11.0
+  ],
+  "contact_range_shifted": [
+    0.0,
+    11.0
+  ],
+  "remd_integer_range": [
+    0,
+    11
+  ],
+  "baseline_integer_range": [
+    0,
+    19
+  ],
+  "support_overlap_n": 12,
+  "support_overlap_of_remd": 12,
+  "support_overlap_pct": 100.0,
+  "has_joint_baseline": true,
+  "has_obs_rg": true,
+  "rg_grid_overlap_pct": 100.0,
+  "fit_rg": true,
+  "rg_weight": 0.25,
+  "train_loss": 0.5317898758953357,
+  "val_loss": 0.5482942352484568,
+  "all_loss": 1.0800841111437924,
+  "rg_train_loss": 1.0217064602270796,
+  "rg_val_loss": 0.9484077816181982,
+  "rg_all_loss": 1.9701142418452777
+}

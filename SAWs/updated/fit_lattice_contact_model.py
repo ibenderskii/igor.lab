@@ -273,6 +273,13 @@ def build_baseline_mass_on_integer(
             raise ValueError("baseline crg_prob marginal over Rg sums to 0")
         p_c /= p_c.sum()
         c_centers_joint = 0.5 * (c_edges[:-1] + c_edges[1:])
+        c_widths = np.diff(c_edges)
+        if not np.allclose(c_widths, 1.0, rtol=1e-3, atol=1e-6):
+            print(
+                "WARNING: baseline c_edges do not appear to have unit-width contact bins. "
+                f"Contact bin widths range from {c_widths.min():.6g} to {c_widths.max():.6g}. "
+                "This may affect mapping the joint baseline P0(m,Rg) onto integer contact bins."
+            )
         # p_c sums to 1 and bin_width ≈ 1 → can be treated as a PDF
         _, p0 = rebin_pdf_mass_to_integer_bins(c_centers_joint, p_c, m_min=m0, m_max=m1)
         if p0.sum() <= 0:
@@ -302,6 +309,10 @@ def _get_baseline_integer_range(baseline_npz: str) -> Tuple[int, int]:
         return int(c_vals.min()), int(c_vals.max())
     if "c_edges" in b.files:
         c_edges = np.asarray(b["c_edges"], dtype=float)
+        if c_edges.ndim != 1:
+            raise ValueError(f"baseline c_edges must be 1D, got shape {c_edges.shape}")
+        if len(c_edges) < 2:
+            raise ValueError(f"baseline c_edges must have at least 2 entries, got {len(c_edges)}")
         c_centers = 0.5 * (c_edges[:-1] + c_edges[1:])
         return int(round(c_centers.min())), int(round(c_centers.max()))
     if "ct_centers" in b.files:
