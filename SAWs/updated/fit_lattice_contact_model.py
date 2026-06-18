@@ -206,6 +206,59 @@ def rebin_pdf_to_mass(
     return p_out
 
 
+def rebin_mass_between_edges(
+    source_edges: np.ndarray,
+    source_mass: np.ndarray,
+    target_edges: np.ndarray,
+) -> np.ndarray:
+    """Rebin probability mass from arbitrary source_edges onto target_edges.
+
+    Treats source_mass[j] as mass spread uniformly across [source_edges[j],
+    source_edges[j+1]) (piecewise-constant density) and integrates the density
+    over each target bin.  Returns probability mass per target bin, normalized
+    to sum to 1.  Unlike rebin_pdf_to_mass, the source grid need not be
+    evenly spaced.
+    """
+    source_edges = np.asarray(source_edges, dtype=float)
+    source_mass = np.asarray(source_mass, dtype=float)
+    target_edges = np.asarray(target_edges, dtype=float)
+
+    if source_edges.ndim != 1 or target_edges.ndim != 1:
+        raise ValueError("source_edges and target_edges must be 1D")
+    if source_mass.ndim != 1:
+        raise ValueError("source_mass must be 1D")
+    if len(source_edges) != len(source_mass) + 1:
+        raise ValueError("len(source_edges) must equal len(source_mass) + 1")
+    if np.any(np.diff(source_edges) <= 0):
+        raise ValueError("source_edges must be strictly increasing")
+    if np.any(np.diff(target_edges) <= 0):
+        raise ValueError("target_edges must be strictly increasing")
+
+    widths = np.diff(source_edges)
+    dens = np.zeros_like(source_mass, dtype=float)
+    mask = widths > 0
+    dens[mask] = source_mass[mask] / widths[mask]
+
+    out = np.zeros(len(target_edges) - 1, dtype=float)
+    j = 0
+    for i in range(len(out)):
+        a, b = float(target_edges[i]), float(target_edges[i + 1])
+        while j < len(dens) and source_edges[j + 1] <= a:
+            j += 1
+        jj = j
+        while jj < len(dens) and source_edges[jj] < b:
+            left = max(a, source_edges[jj])
+            right = min(b, source_edges[jj + 1])
+            if right > left:
+                out[i] += dens[jj] * (right - left)
+            jj += 1
+
+    s = out.sum()
+    if s > 0:
+        out /= s
+    return out
+
+
 def build_baseline_mass_on_integer(
     m_centers_int: np.ndarray, baseline_npz: str
 ) -> np.ndarray:
@@ -781,6 +834,16 @@ def main() -> None:
         "--rg-weight", type=float, default=1.0, dest="rg_weight",
         help="Weight of Rg loss relative to contact loss when --fit-rg is active.",
     )
+    ap.add_argument(
+        "--rg-scale",
+        type=float,
+        default=1.0,
+        dest="rg_scale",
+        help=(
+            "Scale factor converting lattice Rg units into observed/molecular Rg units: "
+            "Rg_observed_units = rg_scale * Rg_lattice. Default 1.0 preserves old behavior."
+        ),
+    )
 
     # held-out validation
     ap.add_argument(
@@ -810,6 +873,9 @@ def main() -> None:
         help="RNG seed for bootstrap resampling (defaults to --seed).",
     )
     args = ap.parse_args()
+
+    if args.rg_scale <= 0:
+        raise ValueError("--rg-scale must be positive")
 
     # -----------------------------------------------------------------------
     # Output directory setup
@@ -935,7 +1001,9 @@ def main() -> None:
     rg_grid_overlap_pct: Optional[float] = None
     if has_obs_rg and has_joint_baseline:
         _rg_c_arr = np.asarray(d[_rg_centers_key], dtype=float)
-        _rg_edges_model = np.asarray(b_data["rg_edges"], dtype=float)
+        # Baseline rg_edges are in lattice units; scale to observed/comparison units.
+        _rg_edges_model_lattice = np.asarray(b_data["rg_edges"], dtype=float)
+        _rg_edges_model = args.rg_scale * _rg_edges_model_lattice
         rg_obs_min = float(_rg_c_arr.min())
         rg_obs_max = float(_rg_c_arr.max())
         rg_model_min = float(_rg_edges_model.min())
@@ -947,8 +1015,10 @@ def main() -> None:
             100.0 * max(0.0, rg_ov_hi - rg_ov_lo) / obs_range
             if obs_range > 0 else 0.0
         )
+        print(f"  Rg scale:       {args.rg_scale:.8g} observed units per lattice unit")
         print(f"  Rg obs range:   [{rg_obs_min:.4g}, {rg_obs_max:.4g}]")
-        print(f"  Rg model range: [{rg_model_min:.4g}, {rg_model_max:.4g}]")
+        print(f"  Rg model range (lattice): [{float(_rg_edges_model_lattice.min()):.4g}, {float(_rg_edges_model_lattice.max()):.4g}]")
+        print(f"  Rg model range (scaled):  [{rg_model_min:.4g}, {rg_model_max:.4g}]")
         print(f"  Rg grid overlap: {rg_grid_overlap_pct:.1f}% of obs Rg range")
         if rg_grid_overlap_pct < 50.0:
             print(
@@ -966,8 +1036,10 @@ def main() -> None:
     rg_hists_obs: Optional[np.ndarray] = None
     p_obs_rg_native: Optional[np.ndarray] = None      # mass on obs grid
     p_obs_rg_model_grid: Optional[np.ndarray] = None  # mass rebinned to model grid
-    rg_centers_model: Optional[np.ndarray] = None
-    rg_edges_model: Optional[np.ndarray] = None
+    rg_centers_model: Optional[np.ndarray] = None        # scaled (comparison units)
+    rg_edges_model: Optional[np.ndarray] = None          # scaled (comparison units)
+    rg_centers_model_lattice: Optional[np.ndarray] = None  # raw lattice units
+    rg_edges_model_lattice: Optional[np.ndarray] = None    # raw lattice units
     crg_prob: Optional[np.ndarray] = None
     c_edges_joint: Optional[np.ndarray] = None
 
@@ -1008,8 +1080,15 @@ def main() -> None:
     if has_joint_baseline:
         crg_prob = np.asarray(b_data["crg_prob"], dtype=float)
         c_edges_joint = np.asarray(b_data["c_edges"], dtype=float)
-        rg_edges_model = np.asarray(b_data["rg_edges"], dtype=float)
-        rg_centers_model = 0.5 * (rg_edges_model[:-1] + rg_edges_model[1:])
+        # Raw lattice-unit Rg grid (crg_prob is indexed on these lattice bins).
+        rg_edges_model_lattice = np.asarray(b_data["rg_edges"], dtype=float)
+        rg_centers_model_lattice = 0.5 * (
+            rg_edges_model_lattice[:-1] + rg_edges_model_lattice[1:]
+        )
+        # Comparison/output Rg grid in observed/molecular units.  Scaling the
+        # axis does not change the probability mass in each bin.
+        rg_edges_model = args.rg_scale * rg_edges_model_lattice
+        rg_centers_model = args.rg_scale * rg_centers_model_lattice
 
         if c_edges_joint.ndim != 1:
             raise ValueError(f"baseline c_edges must be 1D, got shape {c_edges_joint.shape}")
@@ -1220,14 +1299,18 @@ def main() -> None:
     # -----------------------------------------------------------------------
     rg_mod_mass: Optional[np.ndarray] = None
     if has_joint_baseline:
-        _, rg_mod_mass = predict_rg_from_joint(
-            crg_prob=crg_prob,      # type: ignore[arg-type]
-            c_edges=c_edges_joint,  # type: ignore[arg-type]
-            rg_edges=rg_edges_model,  # type: ignore[arg-type]
+        # Predict on the raw lattice Rg bins (crg_prob is indexed by them),
+        # then relabel the axis into scaled/comparison units.  rg_mod_mass is
+        # probability mass and is unchanged by the axis scaling.
+        rg_centers_lattice_pred, rg_mod_mass = predict_rg_from_joint(
+            crg_prob=crg_prob,                # type: ignore[arg-type]
+            c_edges=c_edges_joint,            # type: ignore[arg-type]
+            rg_edges=rg_edges_model_lattice,  # type: ignore[arg-type]
             temps=temps,
             params=params_fit,
             b_fn=b_fn,
         )
+        rg_centers_model = args.rg_scale * rg_centers_lattice_pred
 
     # -----------------------------------------------------------------------
     # Post-fit Rg loss breakdown (if obs Rg and joint baseline both available)
@@ -1251,6 +1334,16 @@ def main() -> None:
         rg_all_loss = _rg_loss_sum(rg_mod_mass, p_obs_rg_model_grid, loss_fn)
 
         print(f"\nRg loss ({args.loss}, on model Rg grid):")
+        if rg_edges_model_lattice is not None and rg_edges_model is not None:
+            print(f"  Rg scale: {args.rg_scale:.6g} observed units per lattice unit")
+            print(
+                f"  Rg model range, lattice units: "
+                f"[{float(rg_edges_model_lattice.min()):.6g}, {float(rg_edges_model_lattice.max()):.6g}]"
+            )
+            print(
+                f"  Rg model range, scaled units:  "
+                f"[{float(rg_edges_model.min()):.6g}, {float(rg_edges_model.max()):.6g}]"
+            )
         print(f"  train      ({len(train_idx):3d} temps) : {rg_train_loss:.6g}")
         if has_val:
             print(f"  validation ({len(val_idx):3d} temps) : {rg_val_loss:.6g}")
@@ -1289,14 +1382,23 @@ def main() -> None:
         all_loss=all_loss,
         fit_rg=bool(args.fit_rg),
         rg_weight=float(args.rg_weight),
+        rg_scale=float(args.rg_scale),
         rg_train_loss=rg_train_loss,
         rg_val_loss=rg_val_loss,
         rg_all_loss=rg_all_loss,
     )
     # Rg arrays
     if rg_centers_model is not None:
+        # Canonical keys now carry observed/comparison units (scaled).
         save_kwargs["rg_centers"] = rg_centers_model
         save_kwargs["rg_centers0"] = rg_centers_model   # backward compat alias
+        save_kwargs["rg_centers_scaled"] = rg_centers_model
+    if rg_edges_model is not None:
+        save_kwargs["rg_edges_scaled"] = rg_edges_model
+    if rg_centers_model_lattice is not None:
+        save_kwargs["rg_centers_lattice"] = rg_centers_model_lattice
+    if rg_edges_model_lattice is not None:
+        save_kwargs["rg_edges_lattice"] = rg_edges_model_lattice
     if rg_mod_mass is not None:
         save_kwargs["rg_mod_mass"] = rg_mod_mass
     if p_obs_rg_model_grid is not None:
@@ -1386,6 +1488,7 @@ def main() -> None:
         "rg_grid_overlap_pct": rg_grid_overlap_pct,
         "fit_rg": bool(args.fit_rg),
         "rg_weight": float(args.rg_weight),
+        "rg_scale": float(args.rg_scale),
         "train_loss": float(train_loss),
         "val_loss": None if not has_val else float(val_loss),
         "all_loss": float(all_loss),
@@ -1393,6 +1496,13 @@ def main() -> None:
         "rg_val_loss": None if (not has_rg_scoring or not has_val) else float(rg_val_loss),
         "rg_all_loss": None if not has_rg_scoring else float(rg_all_loss),
     }
+    if has_joint_baseline and rg_edges_model_lattice is not None and rg_edges_model is not None:
+        metadata["rg_model_range_lattice"] = [
+            float(rg_edges_model_lattice.min()), float(rg_edges_model_lattice.max())
+        ]
+        metadata["rg_model_range_scaled"] = [
+            float(rg_edges_model.min()), float(rg_edges_model.max())
+        ]
 
     with open(json_path, "w") as fh:
         json.dump(metadata, fh, indent=2, cls=_NpEncoder)
@@ -1673,7 +1783,7 @@ def main() -> None:
                 rg_centers_model, rg_mod_mass[i],
                 color=color, alpha=0.85, lw=1.8, ls=ls,
             )
-        ax4.set_xlabel("Rg")
+        ax4.set_xlabel("Rg (observed units; lattice Rg scaled by --rg-scale)")
         ax4.set_ylabel("P(Rg)")
         obs_note = "obs (faint, native grid) vs " if has_obs_rg else ""
         ax4.set_title(
@@ -1692,10 +1802,12 @@ def main() -> None:
 
     # --- 7. Rg residual heatmap (if obs Rg available and joint baseline) ---
     if has_rg_scoring and rg_mod_mass is not None and rg_centers_obs is not None and p_obs_rg_native is not None:
-        # Rebin model Rg mass onto obs Rg grid for residual computation
+        # Rebin model Rg mass (on scaled model edges) onto obs Rg grid for
+        # residual computation.  rebin_mass_between_edges treats rg_mod_mass as
+        # probability mass on rg_edges_model (scaled) and is robust to uneven grids.
         rg_edges_obs = centers_to_edges(rg_centers_obs)
         rg_mod_on_obs_grid = np.array([
-            rebin_pdf_to_mass(rg_centers_model, rg_mod_mass[i], rg_edges_obs)
+            rebin_mass_between_edges(rg_edges_model, rg_mod_mass[i], rg_edges_obs)
             for i in range(len(temps))
         ])
         residuals = p_obs_rg_native - rg_mod_on_obs_grid  # shape: (n_temps, n_rg_obs)

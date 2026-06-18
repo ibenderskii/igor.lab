@@ -22,9 +22,14 @@ Canonical (existing):
     Ts          temperatures, shape (nT,)
     c_vals      integer contact counts [0, maxC], shape (maxC+1,)
     Pc          P(m|T) probability mass, shape (nT, maxC+1), rows sum to 1
-    rg_edges    Rg histogram edges, shape (rg_bins+1,)
-    rg_centers  Rg bin centers, shape (rg_bins,)
+    rg_edges    Rg histogram edges (output units = rg_scale*lattice), shape (rg_bins+1,)
+    rg_centers  Rg bin centers (output units = rg_scale*lattice), shape (rg_bins,)
     Prg         P(Rg|T) probability mass, shape (nT, rg_bins), rows sum to 1
+
+Rg scaling (rg_scale; default 1.0 = lattice units):
+    rg_scale            scalar conversion factor, Rg_output = rg_scale*Rg_lattice
+    rg_edges_lattice    raw lattice-unit Rg histogram edges, shape (rg_bins+1,)
+    rg_centers_lattice  raw lattice-unit Rg bin centers, shape (rg_bins,)
 
 Compatibility aliases for fit_lattice_contact_model.py:
     temps       = Ts
@@ -448,8 +453,16 @@ def run_remd(
 def compute_statistics(
     replicas: list[Replica],
     burnin_frac: float = 0.7,
+    rg_scale: float = 1.0,
 ) -> list[dict]:
-    """Compute means and stds over the last (1-burnin_frac) of each trajectory."""
+    """Compute means and stds over the last (1-burnin_frac) of each trajectory.
+
+    Rg is sampled in lattice units.  ``rg_scale`` converts it to output units:
+    Rg_output = rg_scale * Rg_lattice.  Both the raw lattice values
+    (Rg_mean_lattice, Rg_std_lattice) and the scaled output values
+    (Rg_mean, Rg_std) are returned.  Physics is unaffected (rg_scale only
+    rescales the reported Rg).
+    """
     results = []
     for rep in replicas:
         n = len(rep.E_traj)
@@ -459,14 +472,19 @@ def compute_statistics(
         C_arr  = np.array(rep.C_traj[s:],  dtype=float)
         Rg_arr = np.array(rep.Rg_traj[s:], dtype=float)
 
+        Rg_mean_lattice = float(np.nanmean(Rg_arr))
+        Rg_std_lattice  = float(np.nanstd(Rg_arr, ddof=0))
+
         results.append({
             "T":        rep.T,
             "E_mean":   float(np.nanmean(E_arr)),
             "E_std":    float(np.nanstd(E_arr,  ddof=0)),
             "C_mean":   float(np.nanmean(C_arr)),
             "C_std":    float(np.nanstd(C_arr,  ddof=0)),
-            "Rg_mean":  float(np.nanmean(Rg_arr)),
-            "Rg_std":   float(np.nanstd(Rg_arr, ddof=0)),
+            "Rg_mean_lattice": Rg_mean_lattice,
+            "Rg_std_lattice":  Rg_std_lattice,
+            "Rg_mean":  rg_scale * Rg_mean_lattice,
+            "Rg_std":   rg_scale * Rg_std_lattice,
             "local_acc_rate": rep.local_acc_rate,
         })
     return results
@@ -476,43 +494,51 @@ def build_distributions(
     replicas: list[Replica],
     rg_bins: int = 80,
     burnin_frac: float = 0.7,
+    rg_scale: float = 1.0,
 ) -> dict:
     """
     Build P(m|T) and P(Rg|T) from post-burnin replica trajectories.
 
-    Returns a dict with both the canonical keys (Ts, c_vals, Pc, rg_edges,
-    rg_centers, Prg) and compatibility aliases for fit_lattice_contact_model.py
-    (temps, ct_centers, ct_hists, rg_hists).
+    Rg is sampled and histogrammed in lattice units; ``rg_scale`` converts the
+    saved Rg axis to output units (Rg_output = rg_scale * Rg_lattice).  The
+    histogram is probability mass and is unchanged by scaling the axis.
+
+    Returns a dict with the canonical keys (Ts, c_vals, Pc, rg_edges,
+    rg_centers, Prg) carrying scaled/output Rg units, the raw lattice Rg grid
+    (rg_edges_lattice, rg_centers_lattice), the scale metadata (rg_scale), and
+    compatibility aliases for fit_lattice_contact_model.py (temps, ct_centers,
+    ct_hists, rg_hists).
     """
     nT = len(replicas)
     Ts = np.array([rep.T for rep in replicas], dtype=float)
 
-    C_arrs:  list[np.ndarray] = []
-    Rg_arrs: list[np.ndarray] = []
+    C_arrs:        list[np.ndarray] = []
+    Rg_arrs_lattice: list[np.ndarray] = []
     for rep in replicas:
         n = len(rep.C_traj)
         s = int(math.floor(n * burnin_frac))
         C_arrs.append(np.array(rep.C_traj[s:],  dtype=float))
-        Rg_arrs.append(np.array(rep.Rg_traj[s:], dtype=float))
+        Rg_arrs_lattice.append(np.array(rep.Rg_traj[s:], dtype=float))
 
     maxC = max(
         (int(np.nanmax(a)) for a in C_arrs if a.size > 0),
         default=0,
     )
 
-    rg_all = np.concatenate([a[np.isfinite(a)] for a in Rg_arrs if a.size > 0])
+    # Build the Rg grid from the raw lattice Rg samples.
+    rg_all = np.concatenate([a[np.isfinite(a)] for a in Rg_arrs_lattice if a.size > 0])
     if rg_all.size > 0:
         rg_lo, rg_hi = float(rg_all.min()), float(rg_all.max())
         pad = 0.02 * (rg_hi - rg_lo) if rg_hi > rg_lo else 1e-9
     else:
         rg_lo, rg_hi, pad = 0.0, 1.0, 0.0
-    rg_edges   = np.linspace(rg_lo - pad, rg_hi + pad, rg_bins + 1)
-    rg_centers = 0.5 * (rg_edges[:-1] + rg_edges[1:])
+    rg_edges_lattice   = np.linspace(rg_lo - pad, rg_hi + pad, rg_bins + 1)
+    rg_centers_lattice = 0.5 * (rg_edges_lattice[:-1] + rg_edges_lattice[1:])
 
     Pc  = np.full((nT, maxC + 1), np.nan, dtype=float)
     Prg = np.full((nT, rg_bins),  np.nan, dtype=float)
 
-    for i, (C_arr, Rg_arr) in enumerate(zip(C_arrs, Rg_arrs)):
+    for i, (C_arr, Rg_arr) in enumerate(zip(C_arrs, Rg_arrs_lattice)):
         if C_arr.size > 0:
             c_int = np.rint(C_arr).astype(int)
             row   = np.zeros(maxC + 1, dtype=float)
@@ -524,21 +550,30 @@ def build_distributions(
 
         rg = Rg_arr[np.isfinite(Rg_arr)]
         if rg.size > 0:
-            counts, _ = np.histogram(rg, bins=rg_edges)
+            counts, _ = np.histogram(rg, bins=rg_edges_lattice)
             s = counts.sum()
             if s > 0:
                 Prg[i] = counts.astype(float) / s
 
+    # Scaled / output-unit Rg axis.  Probability mass (Prg) is unchanged.
+    rg_edges_scaled   = rg_scale * rg_edges_lattice
+    rg_centers_scaled = rg_scale * rg_centers_lattice
+
     c_vals = np.arange(maxC + 1, dtype=int)
 
     return {
-        # Canonical keys (backward-compatible)
+        # Canonical keys (Rg axis in scaled/output units)
         "Ts":         Ts,
         "c_vals":     c_vals,
         "Pc":         Pc,
-        "rg_edges":   rg_edges,
-        "rg_centers": rg_centers,
+        "rg_edges":   rg_edges_scaled,
+        "rg_centers": rg_centers_scaled,
         "Prg":        Prg,
+        # Raw lattice-unit Rg grid
+        "rg_edges_lattice":   rg_edges_lattice,
+        "rg_centers_lattice": rg_centers_lattice,
+        # Scale metadata
+        "rg_scale":   float(rg_scale),
         # Aliases for fit_lattice_contact_model.py
         "temps":      Ts,
         "ct_centers": c_vals.astype(float),
@@ -553,7 +588,11 @@ def build_distributions(
 
 def save_results_csv(results: list[dict], out_prefix: str) -> str:
     path = f"{out_prefix}_results.csv"
-    keys = ["T", "E_mean", "E_std", "C_mean", "C_std", "Rg_mean", "Rg_std", "local_acc_rate"]
+    keys = [
+        "T", "E_mean", "E_std", "C_mean", "C_std",
+        "Rg_mean", "Rg_std", "Rg_mean_lattice", "Rg_std_lattice",
+        "local_acc_rate",
+    ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(keys)
@@ -614,7 +653,7 @@ def plot_observables(results: list[dict], out_prefix: str) -> None:
     for (y, ye, ylabel, title, tag) in [
         (E_means,  E_errs,  "Energy E (mean ± std)",           "E vs T",        "E_vs_T"),
         (C_means,  C_errs,  "Contacts m (mean ± std)",          "Contacts vs T", "contacts_vs_T"),
-        (Rg_means, Rg_errs, "Radius of gyration (mean ± std)", "Rg vs T",       "Rg_vs_T"),
+        (Rg_means, Rg_errs, "Radius of gyration Rg (output units)", "Rg vs T",       "Rg_vs_T"),
     ]:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.errorbar(Ts, y, yerr=ye, marker="o", linestyle="-", capsize=3)
@@ -644,7 +683,7 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
             ax_rg.plot(rg_centers, Prg[i], color=col, alpha=0.7, linewidth=1.0)
         if np.any(np.isfinite(Pc[i])):
             ax_c.plot(c_vals, Pc[i], color=col, alpha=0.7, linewidth=1.0)
-    ax_rg.set_xlabel("Rg");      ax_rg.set_ylabel("P(Rg)");  ax_rg.set_title("P(Rg) by temperature")
+    ax_rg.set_xlabel("Rg (output units)");      ax_rg.set_ylabel("P(Rg)");  ax_rg.set_title("P(Rg) by temperature")
     ax_c.set_xlabel("Contacts"); ax_c.set_ylabel("P(m)");    ax_c.set_title("P(m) by temperature")
     fig.colorbar(sm, ax=ax_rg, label="T")
     fig.colorbar(sm, ax=ax_c,  label="T")
@@ -658,7 +697,7 @@ def plot_distributions(dist: dict, out_prefix: str) -> None:
     for i, T in enumerate(Ts):
         if np.any(np.isfinite(Prg[i])):
             ax.plot(rg_centers, Prg[i], color=cmap(norm(T)), alpha=0.7, linewidth=1.0)
-    ax.set_xlabel("Rg"); ax.set_ylabel("P(Rg)"); ax.set_title("P(Rg) colored by T")
+    ax.set_xlabel("Rg (output units)"); ax.set_ylabel("P(Rg)"); ax.set_title("P(Rg) colored by T")
     fig.colorbar(sm, ax=ax, label="T")
     fig.tight_layout()
     out = f"{out_prefix}_Prg_vs_T.png"
@@ -730,11 +769,46 @@ def run_quick_test() -> None:
                     s = float(finite.sum())
                     assert abs(s - 1.0) < 1e-6, f"Prg[{i}] not normalised: sum={s}"
 
+            # --- rg_scale != 1.0 mini-check ---
+            dist_scaled = build_distributions(
+                reps, rg_bins=40, burnin_frac=0.5, rg_scale=0.5
+            )
+            np.testing.assert_allclose(
+                dist_scaled["rg_centers"], 0.5 * dist_scaled["rg_centers_lattice"]
+            )
+            np.testing.assert_allclose(
+                dist_scaled["rg_edges"], 0.5 * dist_scaled["rg_edges_lattice"]
+            )
+            assert float(dist_scaled["rg_scale"]) == 0.5, "rg_scale metadata mismatch"
+            # rg_hists rows still sum to 1 (probability mass unchanged by scaling)
+            for i, row in enumerate(dist_scaled["rg_hists"]):
+                finite = row[np.isfinite(row)]
+                if finite.size > 0:
+                    s = float(finite.sum())
+                    assert abs(s - 1.0) < 1e-6, f"scaled rg_hists[{i}] not normalised: sum={s}"
+            # contact aliases unchanged by rg_scale
+            np.testing.assert_array_equal(dist_scaled["c_vals"], dist["c_vals"])
+            np.testing.assert_array_equal(
+                dist_scaled["ct_centers"], dist_scaled["c_vals"].astype(float)
+            )
+            for i in range(dist["Pc"].shape[0]):
+                a, b = dist["Pc"][i], dist_scaled["Pc"][i]
+                fa, fb = np.isfinite(a), np.isfinite(b)
+                np.testing.assert_array_equal(fa, fb)
+                np.testing.assert_allclose(a[fa], b[fb])
+
             stats = compute_statistics(reps, burnin_frac=0.5)
             for r in stats:
                 assert not math.isnan(r["E_mean"]),  f"NaN E_mean at T={r['T']}"
                 assert not math.isnan(r["C_mean"]),  f"NaN C_mean at T={r['T']}"
                 assert not math.isnan(r["Rg_mean"]), f"NaN Rg_mean at T={r['T']}"
+
+            # compute_statistics rg_scale consistency
+            stats_scaled = compute_statistics(reps, burnin_frac=0.5, rg_scale=0.5)
+            for r in stats_scaled:
+                if not math.isnan(r["Rg_mean_lattice"]):
+                    np.testing.assert_allclose(r["Rg_mean"], 0.5 * r["Rg_mean_lattice"])
+                    np.testing.assert_allclose(r["Rg_std"], 0.5 * r["Rg_std_lattice"])
 
         # Sanity check: attempt_end_move accepts at least occasionally
         chain5 = [(0,0,0),(1,0,0),(2,0,0),(3,0,0),(4,0,0)]
@@ -755,19 +829,26 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Self-contained REMD for lattice polymer with T-dependent Hamiltonian.",
     )
-    ap.add_argument("--N",              type=int,   default=300,     help="chain length")
+    ap.add_argument("--N",              type=int,   default=44,     help="chain length")
     ap.add_argument("--Tmin",           type=float, default=280.0,   help="lowest temperature")
-    ap.add_argument("--Tmax",           type=float, default=380.0,   help="highest temperature")
-    ap.add_argument("--nT",             type=int,   default=8,       help="number of replicas")
+    ap.add_argument("--Tmax",           type=float, default=360.0,   help="highest temperature")
+    ap.add_argument("--nT",             type=int,   default=64,       help="number of replicas")
     ap.add_argument("--steps-per-swap", type=int,   default=500,     help="local MC steps per replica per swap cycle")
     ap.add_argument("--n-cycles",       type=int,   default=4000,    help="number of swap cycles")
-    ap.add_argument("--dh",             type=float, default=378.96,  help="contact enthalpy dh")
-    ap.add_argument("--ds",             type=float, default=1.39686, help="contact entropy ds")
+    ap.add_argument("--dh",             type=float, default=373.328,  help="contact enthalpy dh")
+    ap.add_argument("--ds",             type=float, default=1.42479, help="contact entropy ds")
     ap.add_argument("--seed",           type=int,   default=42,      help="RNG seed")
     ap.add_argument("--out-prefix",     type=str,   default="remd_out", help="prefix for all output files")
-    ap.add_argument("--rg-bins",        type=int,   default=80,      help="bins for P(Rg) histograms")
+    ap.add_argument("--rg-bins",        type=int,   default=60,      help="bins for P(Rg) histograms")
     ap.add_argument("--burnin-frac",    type=float, default=0.7,     help="fraction of trajectory to discard as burnin")
     ap.add_argument("--n-workers",      type=int,   default=1,       help="parallel workers for local sweeps (1 = serial)")
+    ap.add_argument(
+        "--rg-scale", type=float, default=1.0,
+        help=(
+            "Scale factor for reporting/outputting Rg. "
+            "Rg_output = rg_scale * Rg_lattice. Default 1.0 preserves lattice units."
+        ),
+    )
     ap.add_argument("--timing",         action="store_true",         help="print sweep/swap/total wall times")
     ap.add_argument("--quick-test",     action="store_true",         help="run smoke-test and exit")
     args = ap.parse_args()
@@ -790,6 +871,8 @@ def main() -> None:
         raise ValueError("Temperatures must be positive")
     if args.Tmax <= args.Tmin:
         raise ValueError("--Tmax must be greater than --Tmin")
+    if args.rg_scale <= 0:
+        raise ValueError("--rg-scale must be positive")
 
     if args.quick_test:
         run_quick_test()
@@ -818,8 +901,13 @@ def main() -> None:
         rate = swap_accs[k] / max(1, swap_props[k])
         print(f"  T={Ts[k]:.1f} <-> T={Ts[k+1]:.1f}  {swap_accs[k]}/{swap_props[k]} = {rate:.3f}")
 
-    results = compute_statistics(replicas, burnin_frac=args.burnin_frac)
-    dist    = build_distributions(replicas, rg_bins=args.rg_bins, burnin_frac=args.burnin_frac)
+    results = compute_statistics(
+        replicas, burnin_frac=args.burnin_frac, rg_scale=args.rg_scale
+    )
+    dist    = build_distributions(
+        replicas, rg_bins=args.rg_bins, burnin_frac=args.burnin_frac,
+        rg_scale=args.rg_scale,
+    )
 
     save_results_csv(results, args.out_prefix)
     save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
