@@ -2,11 +2,22 @@
 """
 Self-contained replica exchange Monte Carlo for the lattice polymer model.
 
-Hamiltonian:  H(C; T) = m(C) * (dh - T*ds)
-Reduced potential:  u(C, T) = H(C, T) / T = m(C) * (dh/T - ds)
+Sampling rule:  P(C|T) ∝ exp[-u(C,T)],  u(C,T) = m(C) * b(T)
+Implied energy: H(C;T) = T * u(C,T) = m(C) * T * b(T)
 
-Because H depends explicitly on T, the standard REMD swap criterion must use
-the reduced potential rather than a temperature-independent energy:
+where m(C) is the non-bonded contact count and b(T) is a model-specific
+reduced contact bias.  The supported b(T) models mirror
+fit_lattice_contact_model.py: hs, tc_scale, hs_quadratic, poly2, poly3,
+heat_capacity (see MODEL_REGISTRY).  The default model is hs:
+
+    b(T) = h/T - s
+
+For backward compatibility, when --model hs is used without --params /
+--fit-params-csv, the legacy --dh/--ds flags supply (h, s) = (dh, ds), so
+H(C;T) = m(C)*(dh - T*ds) exactly as before.
+
+Because u depends explicitly on T, the REMD swap criterion uses the reduced
+potential rather than a temperature-independent energy:
 
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)
 
@@ -30,6 +41,12 @@ Rg scaling (rg_scale; default 1.0 = lattice units):
     rg_scale            scalar conversion factor, Rg_output = rg_scale*Rg_lattice
     rg_edges_lattice    raw lattice-unit Rg histogram edges, shape (rg_bins+1,)
     rg_centers_lattice  raw lattice-unit Rg bin centers, shape (rg_bins,)
+
+Model metadata:
+    model_name          name of the b(T) model used for sampling
+    param_names         parameter names for the model, shape (n_params,)
+    model_params        parameter values, shape (n_params,)
+    Tref, Tscale        reference/scale for x=(T-Tref)/Tscale (polynomial models)
 
 Compatibility aliases for fit_lattice_contact_model.py:
     temps       = Ts
@@ -103,23 +120,117 @@ def _apply_rot(M, v: Vec) -> Vec:
     )
 
 
-def energy(chain: List[Vec], occ: set, dh: float, ds: float, T: float) -> float:
-    """H(C;T) = m(C)*(dh - T*ds).
+# ---------------------------------------------------------------------------
+# Reduced-bias model registry (self-contained; mirrors fit_lattice_contact_model.py)
+# ---------------------------------------------------------------------------
+# Each entry defines b(T) = the reduced contact bias.
+# Sampling weight:  P(C|T) ∝ exp[-u(C,T)],  u(C,T) = m(C) * b(T)
 
-    m(C) = number of unique non-bonded nearest-neighbour contacts.
-    This energy depends explicitly on T; with Metropolis beta=1/T the sampled
-    weight is exp(-H/T) = exp(-(dh/T - ds)*m).
+def _b_hs(params, T, Tref, Tscale):
+    return float(params[0]) / T - float(params[1])
+
+
+def _b_tc_scale(params, T, Tref, Tscale):
+    return float(params[0]) * (float(params[1]) / T - 1.0)
+
+
+def _b_hs_quadratic(params, T, Tref, Tscale):
+    x = (T - Tref) / Tscale
+    return float(params[0]) / T - float(params[1]) + float(params[2]) * x * x
+
+
+def _b_poly2(params, T, Tref, Tscale):
+    x = (T - Tref) / Tscale
+    return float(params[0]) + float(params[1]) * x + float(params[2]) * x * x
+
+
+def _b_poly3(params, T, Tref, Tscale):
+    x = (T - Tref) / Tscale
+    return (
+        float(params[0])
+        + float(params[1]) * x
+        + float(params[2]) * x * x
+        + float(params[3]) * x * x * x
+    )
+
+
+def _b_heat_capacity(params, T, Tref, Tscale):
+    T0 = Tref
+    dh0, ds0, dCp = float(params[0]), float(params[1]), float(params[2])
+    dg = dh0 - T * ds0 + dCp * ((T - T0) - T * math.log(T / T0))
+    return dg / T
+
+
+MODEL_REGISTRY = {
+    "hs": {
+        "param_names": ["h", "s"],
+        "raw_b_fn": _b_hs,
+        "description": "b(T) = h/T - s",
+    },
+    "tc_scale": {
+        "param_names": ["A", "Tc"],
+        "raw_b_fn": _b_tc_scale,
+        "description": "b(T) = A*(Tc/T - 1)",
+    },
+    "hs_quadratic": {
+        "param_names": ["h", "s", "a2"],
+        "raw_b_fn": _b_hs_quadratic,
+        "description": "b(T) = h/T - s + a2*x(T)^2",
+    },
+    "poly2": {
+        "param_names": ["a0", "a1", "a2"],
+        "raw_b_fn": _b_poly2,
+        "description": "b(T) = a0 + a1*x + a2*x^2",
+    },
+    "poly3": {
+        "param_names": ["a0", "a1", "a2", "a3"],
+        "raw_b_fn": _b_poly3,
+        "description": "b(T) = a0 + a1*x + a2*x^2 + a3*x^3",
+    },
+    "heat_capacity": {
+        "param_names": ["dh0", "ds0", "dCp"],
+        "raw_b_fn": _b_heat_capacity,
+        "description": "b(T) = [dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0))] / T",
+    },
+}
+
+
+def reduced_bias(model_name, params, T, Tref, Tscale) -> float:
+    """b(T) for the selected model."""
+    return float(MODEL_REGISTRY[model_name]["raw_b_fn"](params, float(T), Tref, Tscale))
+
+
+def reduced_potential(m, T, model_name, params, Tref, Tscale) -> float:
+    """u(C,T) = m(C) * b(T)."""
+    return float(m) * reduced_bias(model_name, params, float(T), Tref, Tscale)
+
+
+def energy_from_contacts(m, T, model_name, params, Tref, Tscale) -> float:
+    """Model-implied temperature-dependent energy H = T * u.
+
+    For hs this is exactly H = m*(h - T*s), preserving old behavior.
+    For other models it is the effective H corresponding to u = m*b(T).
     """
-    cnt = 0
-    N = len(chain)
-    for idx, r in enumerate(chain):
-        prev = chain[idx-1] if idx > 0   else None
-        nxt  = chain[idx+1] if idx < N-1 else None
-        for v in NN_VECS:
-            nbr = _add(r, v)
-            if nbr in occ and nbr not in (prev, nxt):
-                cnt += 1
-    return (0.5 * cnt) * (dh - T * ds)
+    return float(T) * reduced_potential(m, T, model_name, params, Tref, Tscale)
+
+
+def energy(
+    chain: List[Vec],
+    occ: set,
+    T: float,
+    model_name: str,
+    params,
+    Tref: float,
+    Tscale: float,
+) -> float:
+    """H(C;T) = m(C) * T * b(T), generic over the contact-bias model.
+
+    m(C) = number of unique non-bonded nearest-neighbour contacts.  The sampled
+    weight is exp(-u) = exp(-m*b(T)).  For model hs with params (h, s) this
+    reduces to H = m*(h - T*s), i.e. the legacy --dh/--ds behavior.
+    """
+    m = contact_count(chain, occ)
+    return energy_from_contacts(m, T, model_name, params, Tref, Tscale)
 
 
 def contact_count(chain: List[Vec], occ: set) -> float:
@@ -220,25 +331,26 @@ class ChainState:
     E:     float
 
     @classmethod
-    def initial_straight(cls, N: int, dh: float, ds: float, T: float) -> "ChainState":
+    def initial_straight(
+        cls, N: int, T: float, model_name: str, params, Tref: float, Tscale: float
+    ) -> "ChainState":
         chain = [(i, 0, 0) for i in range(N)]
         occ   = set(chain)
-        return cls(chain=chain, occ=occ, E=energy(chain, occ, dh, ds, T))
+        return cls(
+            chain=chain, occ=occ,
+            E=energy(chain, occ, T, model_name, params, Tref, Tscale),
+        )
 
 
 # ---------------------------------------------------------------------------
-# Reduced potential and swap criterion
+# Swap criterion (reduced_potential/reduced_bias defined with the model registry)
 # ---------------------------------------------------------------------------
-
-def reduced_potential(m: float, T: float, dh: float, ds: float) -> float:
-    """u(C, T) = H(C, T) / T = m * (dh/T - ds)."""
-    return m * (dh / T - ds)
-
 
 def swap_log_accept(
     m_i: float, m_j: float,
     T_i: float, T_j: float,
-    dh: float, ds: float,
+    model_name: str, params,
+    Tref: float, Tscale: float,
 ) -> float:
     """
     Log Metropolis ratio for swapping configs C_i (at T_i) and C_j (at T_j).
@@ -246,10 +358,10 @@ def swap_log_accept(
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)
     """
     return (
-        reduced_potential(m_i, T_i, dh, ds)
-        + reduced_potential(m_j, T_j, dh, ds)
-        - reduced_potential(m_j, T_i, dh, ds)
-        - reduced_potential(m_i, T_j, dh, ds)
+        reduced_potential(m_i, T_i, model_name, params, Tref, Tscale)
+        + reduced_potential(m_j, T_j, model_name, params, Tref, Tscale)
+        - reduced_potential(m_j, T_i, model_name, params, Tref, Tscale)
+        - reduced_potential(m_i, T_j, model_name, params, Tref, Tscale)
     )
 
 
@@ -277,10 +389,18 @@ class Replica:
 # MC sweep and swap
 # ---------------------------------------------------------------------------
 
-def mc_sweep(replica: Replica, steps: int, dh: float, ds: float) -> None:
-    """Run `steps` local Metropolis moves on `replica` in-place."""
+def mc_sweep(
+    replica: Replica, steps: int,
+    model_name: str, params, Tref: float, Tscale: float,
+) -> None:
+    """Run `steps` local Metropolis moves on `replica` in-place.
+
+    Acceptance uses the generic reduced potential u = m*b(T):
+        du = u_new - u_old,  accept if du <= 0 or rand < exp(-du).
+    For model hs with params (h, s) this is identical to the legacy
+    beta*dE criterion (du = beta*dE), preserving old sampling exactly.
+    """
     T     = replica.T
-    beta  = 1.0 / T
     state = replica.state
 
     for _ in range(steps):
@@ -289,17 +409,23 @@ def mc_sweep(replica: Replica, steps: int, dh: float, ds: float) -> None:
         ok, chain_new, occ_new = move(state.chain, state.occ)
         if not ok:
             continue
-        dE = energy(chain_new, occ_new, dh, ds, T) - state.E
-        if dE <= 0 or random.random() < math.exp(-beta * dE):
+        m_old = contact_count(state.chain, state.occ)
+        u_old = reduced_potential(m_old, T, model_name, params, Tref, Tscale)
+
+        m_new = contact_count(chain_new, occ_new)
+        u_new = reduced_potential(m_new, T, model_name, params, Tref, Tscale)
+
+        du = u_new - u_old
+        if du <= 0 or random.random() < math.exp(-du):
             state.chain = chain_new
             state.occ   = occ_new
-            state.E     = state.E + dE
+            state.E     = energy_from_contacts(m_new, T, model_name, params, Tref, Tscale)
             replica.local_acc += 1
 
 
 def attempt_swap(
     rep_a: Replica, rep_b: Replica,
-    dh: float, ds: float,
+    model_name: str, params, Tref: float, Tscale: float,
 ) -> bool:
     """
     Attempt a configuration swap between two adjacent replicas.
@@ -309,14 +435,20 @@ def attempt_swap(
     """
     m_a = contact_count(rep_a.state.chain, rep_a.state.occ)
     m_b = contact_count(rep_b.state.chain, rep_b.state.occ)
-    log_acc = swap_log_accept(m_a, m_b, rep_a.T, rep_b.T, dh, ds)
+    log_acc = swap_log_accept(
+        m_a, m_b, rep_a.T, rep_b.T, model_name, params, Tref, Tscale
+    )
 
     accepted = log_acc >= 0 or random.random() < math.exp(log_acc)
     if accepted:
         rep_a.state.chain, rep_b.state.chain = rep_b.state.chain, rep_a.state.chain
         rep_a.state.occ,   rep_b.state.occ   = rep_b.state.occ,   rep_a.state.occ
-        rep_a.state.E = energy(rep_a.state.chain, rep_a.state.occ, dh, ds, rep_a.T)
-        rep_b.state.E = energy(rep_b.state.chain, rep_b.state.occ, dh, ds, rep_b.T)
+        rep_a.state.E = energy(
+            rep_a.state.chain, rep_a.state.occ, rep_a.T, model_name, params, Tref, Tscale
+        )
+        rep_b.state.E = energy(
+            rep_b.state.chain, rep_b.state.occ, rep_b.T, model_name, params, Tref, Tscale
+        )
     return accepted
 
 
@@ -327,14 +459,16 @@ def attempt_swap(
 def evolve_replica_worker(
     replica: "Replica",
     steps: int,
-    dh: float,
-    ds: float,
+    model_name: str,
+    params: list,
+    Tref: float,
+    Tscale: float,
     seed: int,
 ) -> "Replica":
     """Deterministically seeded sweep of one replica."""
     random.seed(seed)
     np.random.seed(seed)
-    mc_sweep(replica, steps, dh, ds)
+    mc_sweep(replica, steps, model_name, params, Tref, Tscale)
     return replica
 
 
@@ -347,8 +481,10 @@ def run_remd(
     Ts: np.ndarray,
     steps_per_swap: int,
     n_cycles: int,
-    dh: float,
-    ds: float,
+    model_name: str,
+    params: list,
+    Tref: float,
+    Tscale: float,
     seed: int | None = None,
     verbose: bool = True,
     n_workers: int = 1,
@@ -373,7 +509,12 @@ def run_remd(
 
     nT = len(Ts)
     replicas: list[Replica] = [
-        Replica(T=float(T), state=ChainState.initial_straight(N, dh, ds, float(T)))
+        Replica(
+            T=float(T),
+            state=ChainState.initial_straight(
+                N, float(T), model_name, params, Tref, Tscale
+            ),
+        )
         for T in Ts
     ]
 
@@ -397,7 +538,8 @@ def run_remd(
                 futures = [
                     executor.submit(
                         evolve_replica_worker, replicas[k],
-                        steps_per_swap, dh, ds, worker_seeds[k],
+                        steps_per_swap, model_name, params, Tref, Tscale,
+                        worker_seeds[k],
                     )
                     for k in range(nT)
                 ]
@@ -405,7 +547,7 @@ def run_remd(
                     replicas[k] = fut.result()
             else:
                 for rep in replicas:
-                    mc_sweep(rep, steps_per_swap, dh, ds)
+                    mc_sweep(rep, steps_per_swap, model_name, params, Tref, Tscale)
 
             t1 = time.perf_counter()
             t_sweep_total += t1 - t0
@@ -413,7 +555,9 @@ def run_remd(
             start = cycle % 2
             for k in range(start, nT - 1, 2):
                 swap_props[k] += 1
-                if attempt_swap(replicas[k], replicas[k + 1], dh, ds):
+                if attempt_swap(
+                    replicas[k], replicas[k + 1], model_name, params, Tref, Tscale
+                ):
                     swap_accs[k] += 1
 
             t2 = time.perf_counter()
@@ -727,25 +871,33 @@ def run_quick_test() -> None:
     import os
     import tempfile
 
-    params = dict(
-        N=20,
-        Ts=np.linspace(300, 360, 4),
-        steps_per_swap=50,
-        n_cycles=20,
-        dh=378.96,
-        ds=1.39686,
-        seed=7,
-    )
+    # --- hs model via legacy dh/ds (params = [h, s]) ---
+    Ts_hs = np.linspace(300, 360, 4)
+    hs_params = [378.96, 1.39686]
+    Tref_hs = 0.5 * (float(Ts_hs.min()) + float(Ts_hs.max()))
+    Tscale_hs = max(float(Ts_hs.max()) - float(Ts_hs.min()), 1.0)
 
     for n_workers in (1, 2):
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = os.path.join(tmpdir, f"qt_w{n_workers}")
-            reps, sp, sa = run_remd(**params, n_workers=n_workers, verbose=False)
+            reps, sp, sa = run_remd(
+                N=20, Ts=Ts_hs, steps_per_swap=50, n_cycles=20,
+                model_name="hs", params=hs_params, Tref=Tref_hs, Tscale=Tscale_hs,
+                seed=7, n_workers=n_workers, verbose=False,
+            )
 
-            save_swap_csv(sp, sa, params["Ts"], prefix)
+            save_swap_csv(sp, sa, Ts_hs, prefix)
             assert os.path.exists(f"{prefix}_swap_rates.csv"), "swap rates CSV missing"
 
             dist = build_distributions(reps, rg_bins=40, burnin_frac=0.5)
+            attach_model_metadata(dist, "hs", ["h", "s"], hs_params, Tref_hs, Tscale_hs)
+
+            # Verify model metadata keys
+            for key in ("model_name", "param_names", "model_params", "Tref", "Tscale"):
+                assert key in dist, f"Missing model metadata key: {key}"
+            assert str(dist["model_name"]) == "hs"
+            np.testing.assert_array_equal(dist["param_names"], np.array(["h", "s"]))
+            np.testing.assert_allclose(dist["model_params"], np.array(hs_params))
 
             # Verify canonical keys present
             for key in ("Ts", "c_vals", "Pc", "rg_edges", "rg_centers", "Prg"):
@@ -817,7 +969,129 @@ def run_quick_test() -> None:
         assert n_accepted > 0, "attempt_end_move never accepted in 200 trials (bug?)"
 
         print(f"  quick-test n_workers={n_workers}: PASSED")
+
+    # --- non-hs models: tc_scale and a polynomial model (poly2) ---
+    def _check_model(model_name, model_params, Ts, seed):
+        param_names = MODEL_REGISTRY[model_name]["param_names"]
+        Tref = 0.5 * (float(Ts.min()) + float(Ts.max()))
+        Tscale = max(float(Ts.max()) - float(Ts.min()), 1.0)
+        reps, _sp, _sa = run_remd(
+            N=20, Ts=Ts, steps_per_swap=50, n_cycles=20,
+            model_name=model_name, params=model_params, Tref=Tref, Tscale=Tscale,
+            seed=seed, n_workers=1, verbose=False,
+        )
+        dist = build_distributions(reps, rg_bins=40, burnin_frac=0.5)
+        attach_model_metadata(dist, model_name, param_names, model_params, Tref, Tscale)
+
+        for key in ("model_name", "param_names", "model_params", "Tref", "Tscale"):
+            assert key in dist, f"[{model_name}] missing metadata key: {key}"
+        assert str(dist["model_name"]) == model_name
+        np.testing.assert_array_equal(dist["param_names"], np.array(param_names))
+        np.testing.assert_allclose(dist["model_params"], np.array(model_params, dtype=float))
+
+        for i, row in enumerate(dist["Pc"]):
+            finite = row[np.isfinite(row)]
+            if finite.size > 0:
+                assert abs(float(finite.sum()) - 1.0) < 1e-6, f"[{model_name}] Pc[{i}] not normalised"
+        for i, row in enumerate(dist["Prg"]):
+            finite = row[np.isfinite(row)]
+            if finite.size > 0:
+                assert abs(float(finite.sum()) - 1.0) < 1e-6, f"[{model_name}] Prg[{i}] not normalised"
+        print(f"  quick-test model={model_name}: PASSED")
+
+    _check_model("tc_scale", [1.0, 300.0], np.linspace(260, 340, 4), seed=11)
+    _check_model("poly2", [0.0, -0.5, 0.0], np.linspace(260, 340, 4), seed=13)
+
     print("quick-test complete.")
+
+
+# ---------------------------------------------------------------------------
+# Model parameter resolution
+# ---------------------------------------------------------------------------
+
+def parse_params_string(params_str: str) -> list[float]:
+    vals = [x.strip() for x in params_str.split(",") if x.strip()]
+    if not vals:
+        raise ValueError("--params was provided but no values were found")
+    return [float(x) for x in vals]
+
+
+def load_fit_params_csv(path: str, model_name: str) -> list[float]:
+    import csv
+
+    needed = MODEL_REGISTRY[model_name]["param_names"]
+    found = {}
+
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        if "parameter" not in reader.fieldnames or "value" not in reader.fieldnames:
+            raise ValueError("fit_params.csv must contain columns: parameter,value")
+        for row in reader:
+            name = row["parameter"]
+            if name in needed:
+                found[name] = float(row["value"])
+
+    missing = [name for name in needed if name not in found]
+    if missing:
+        raise ValueError(
+            f"Missing parameters for model {model_name!r} in {path}: {missing}"
+        )
+
+    return [found[name] for name in needed]
+
+
+def resolve_model_params(
+    args, Ts: np.ndarray
+) -> tuple[str, list[float], list[str], float, float]:
+    model_name = args.model
+    spec = MODEL_REGISTRY[model_name]
+    param_names = spec["param_names"]
+
+    Tmin = float(np.min(Ts))
+    Tmax = float(np.max(Ts))
+    Tref = float(args.Tref) if args.Tref is not None else 0.5 * (Tmin + Tmax)
+    Tscale = float(args.Tscale) if args.Tscale is not None else max(Tmax - Tmin, 1.0)
+
+    if model_name == "heat_capacity" and args.T0 is not None:
+        Tref = float(args.T0)
+
+    if args.fit_params_csv is not None:
+        params = load_fit_params_csv(args.fit_params_csv, model_name)
+    elif args.params is not None:
+        params = parse_params_string(args.params)
+    elif model_name == "hs":
+        # Backward compatibility: old --dh/--ds flags define h and s.
+        params = [float(args.dh), float(args.ds)]
+    else:
+        raise ValueError(
+            f"Model {model_name!r} requires either --params or --fit-params-csv. "
+            f"Expected parameters: {param_names}"
+        )
+
+    if len(params) != len(param_names):
+        raise ValueError(
+            f"Model {model_name!r} expects {len(param_names)} parameters "
+            f"{param_names}, but got {len(params)} values: {params}"
+        )
+
+    return model_name, params, param_names, Tref, Tscale
+
+
+def attach_model_metadata(
+    dist: dict,
+    model_name: str,
+    param_names: list[str],
+    model_params: list[float],
+    Tref: float,
+    Tscale: float,
+) -> dict:
+    """Inject contact-bias model metadata into a distributions dict in place."""
+    dist["model_name"] = model_name
+    dist["param_names"] = np.array(param_names)
+    dist["model_params"] = np.array(model_params, dtype=float)
+    dist["Tref"] = float(Tref)
+    dist["Tscale"] = float(Tscale)
+    return dist
 
 
 # ---------------------------------------------------------------------------
@@ -830,23 +1104,74 @@ def main() -> None:
         description="Self-contained REMD for lattice polymer with T-dependent Hamiltonian.",
     )
     ap.add_argument("--N",              type=int,   default=44,     help="chain length")
-    ap.add_argument("--Tmin",           type=float, default=230.0,   help="lowest temperature")
-    ap.add_argument("--Tmax",           type=float, default=300.0,   help="highest temperature")
-    ap.add_argument("--nT",             type=int,   default=64,       help="number of replicas")
+    ap.add_argument("--Tmin",           type=float, default=280.0,   help="lowest temperature")
+    ap.add_argument("--Tmax",           type=float, default=360.0,   help="highest temperature")
+    ap.add_argument("--nT",             type=int,   default=30,       help="number of replicas")
     ap.add_argument("--steps-per-swap", type=int,   default=500,     help="local MC steps per replica per swap cycle")
     ap.add_argument("--n-cycles",       type=int,   default=4000,    help="number of swap cycles")
-    ap.add_argument("--dh",             type=float, default=312.109,  help="contact enthalpy dh")
-    ap.add_argument("--ds",             type=float, default=1.23278, help="contact entropy ds")
+    ap.add_argument("--dh",             type=float, default=312.109,  help="contact enthalpy dh; used as h when --model hs and --params/--fit-params-csv are not supplied")
+    ap.add_argument("--ds",             type=float, default=1.23278, help="contact entropy ds; used as s when --model hs and --params/--fit-params-csv are not supplied")
     ap.add_argument("--seed",           type=int,   default=42,      help="RNG seed")
     ap.add_argument("--out-prefix",     type=str,   default="remd_out", help="prefix for all output files")
     ap.add_argument("--rg-bins",        type=int,   default=64,      help="bins for P(Rg) histograms")
     ap.add_argument("--burnin-frac",    type=float, default=0.7,     help="fraction of trajectory to discard as burnin")
-    ap.add_argument("--n-workers",      type=int,   default=4,       help="parallel workers for local sweeps (1 = serial)")
+    ap.add_argument("--n-workers",      type=int,   default=6,       help="parallel workers for local sweeps (1 = serial)")
     ap.add_argument(
         "--rg-scale", type=float, default=1.0,
         help=(
             "Scale factor for reporting/outputting Rg. "
             "Rg_output = rg_scale * Rg_lattice. Default 1.0 preserves lattice units."
+        ),
+    )
+    ap.add_argument(
+        "--model",
+        type=str,
+        default="hs",
+        choices=list(MODEL_REGISTRY.keys()),
+        help="Contact-bias model b(T). Default hs preserves old --dh/--ds behavior.",
+    )
+    ap.add_argument(
+        "--params",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated model parameters in the order expected by --model. "
+            "Examples: hs='h,s', tc_scale='A,Tc', poly2='a0,a1,a2'. "
+            "If omitted for hs, --dh and --ds are used."
+        ),
+    )
+    ap.add_argument(
+        "--fit-params-csv",
+        type=str,
+        default=None,
+        dest="fit_params_csv",
+        help=(
+            "Optional fit_params.csv from fit_lattice_contact_model.py. "
+            "If supplied, parameter values are loaded by name for the selected --model."
+        ),
+    )
+    ap.add_argument(
+        "--Tref",
+        type=float,
+        default=None,
+        help=(
+            "Reference temperature for polynomial models x=(T-Tref)/Tscale. "
+            "Default: midpoint of the REMD temperature range."
+        ),
+    )
+    ap.add_argument(
+        "--Tscale",
+        type=float,
+        default=None,
+        help="Scale for x=(T-Tref)/Tscale. Default: Tmax-Tmin.",
+    )
+    ap.add_argument(
+        "--T0",
+        type=float,
+        default=None,
+        help=(
+            "Reference temperature T0 for heat_capacity model. "
+            "Overrides Tref for heat_capacity only."
         ),
     )
     ap.add_argument("--timing",         action="store_true",         help="print sweep/swap/total wall times")
@@ -881,16 +1206,28 @@ def main() -> None:
     Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
     total_steps = args.steps_per_swap * args.n_cycles
 
+    model_name, model_params, param_names, Tref, Tscale = resolve_model_params(args, Ts)
+
     print(
         f"REMD: {args.nT} replicas, T in [{args.Tmin}, {args.Tmax}], "
         f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
     )
+    print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
+    print("Parameters:")
+    for name, val in zip(param_names, model_params):
+        print(f"  {name} = {val:.8g}")
+    print(f"Tref = {Tref:.8g}, Tscale = {Tscale:.8g}")
+    if model_name == "hs" and abs(model_params[1]) > 1e-15:
+        print(f"Derived Tc = {model_params[0] / model_params[1]:.8g}")
+    elif model_name == "tc_scale":
+        print(f"Tc = {model_params[1]:.8g}")
 
     replicas, swap_props, swap_accs = run_remd(
         N=args.N, Ts=Ts,
         steps_per_swap=args.steps_per_swap,
         n_cycles=args.n_cycles,
-        dh=args.dh, ds=args.ds,
+        model_name=model_name, params=model_params,
+        Tref=Tref, Tscale=Tscale,
         seed=args.seed, verbose=True,
         n_workers=args.n_workers,
         timing=args.timing,
@@ -908,6 +1245,7 @@ def main() -> None:
         replicas, rg_bins=args.rg_bins, burnin_frac=args.burnin_frac,
         rg_scale=args.rg_scale,
     )
+    attach_model_metadata(dist, model_name, param_names, model_params, Tref, Tscale)
 
     save_results_csv(results, args.out_prefix)
     save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
