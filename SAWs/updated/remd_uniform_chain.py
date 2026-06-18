@@ -830,18 +830,18 @@ def main() -> None:
         description="Self-contained REMD for lattice polymer with T-dependent Hamiltonian.",
     )
     ap.add_argument("--N",              type=int,   default=44,     help="chain length")
-    ap.add_argument("--Tmin",           type=float, default=280.0,   help="lowest temperature")
-    ap.add_argument("--Tmax",           type=float, default=360.0,   help="highest temperature")
+    ap.add_argument("--Tmin",           type=float, default=230.0,   help="lowest temperature")
+    ap.add_argument("--Tmax",           type=float, default=300.0,   help="highest temperature")
     ap.add_argument("--nT",             type=int,   default=64,       help="number of replicas")
     ap.add_argument("--steps-per-swap", type=int,   default=500,     help="local MC steps per replica per swap cycle")
     ap.add_argument("--n-cycles",       type=int,   default=4000,    help="number of swap cycles")
-    ap.add_argument("--dh",             type=float, default=373.328,  help="contact enthalpy dh")
-    ap.add_argument("--ds",             type=float, default=1.42479, help="contact entropy ds")
+    ap.add_argument("--dh",             type=float, default=312.109,  help="contact enthalpy dh")
+    ap.add_argument("--ds",             type=float, default=1.23278, help="contact entropy ds")
     ap.add_argument("--seed",           type=int,   default=42,      help="RNG seed")
     ap.add_argument("--out-prefix",     type=str,   default="remd_out", help="prefix for all output files")
-    ap.add_argument("--rg-bins",        type=int,   default=60,      help="bins for P(Rg) histograms")
+    ap.add_argument("--rg-bins",        type=int,   default=64,      help="bins for P(Rg) histograms")
     ap.add_argument("--burnin-frac",    type=float, default=0.7,     help="fraction of trajectory to discard as burnin")
-    ap.add_argument("--n-workers",      type=int,   default=1,       help="parallel workers for local sweeps (1 = serial)")
+    ap.add_argument("--n-workers",      type=int,   default=4,       help="parallel workers for local sweeps (1 = serial)")
     ap.add_argument(
         "--rg-scale", type=float, default=1.0,
         help=(
