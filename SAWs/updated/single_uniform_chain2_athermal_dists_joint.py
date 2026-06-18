@@ -139,34 +139,42 @@ def attempt_crankshaft(chain: List[Vec], occ: Set[Vec]):
     return True, new_chain, new_occ
 
 def attempt_end_move(chain: List[Vec], occ: Set[Vec]):
-    """Symmetric end move: pick an end; attempt a random step that preserves the end bond."""
+    """Symmetric end move: move one end to a random empty neighbor of its anchor."""
     n = len(chain)
     end = 0 if random.random() < 0.5 else n - 1
     anchor = 1 if end == 0 else n - 2
 
+    old = chain[end]
+    occ_without_old = occ - {old}
+
     v = random.choice(NN_VECS)
-    r_new = add(chain[end], v)
+    r_new = add(chain[anchor], v)
 
-    # must be empty
-    if r_new in occ:
+    if r_new == old:
         return False, chain, occ
-
-    # must maintain unit bond to anchor
-    if sub(r_new, chain[anchor]) not in NN_VECS:
+    if r_new in occ_without_old:
         return False, chain, occ
 
     new_chain = chain.copy()
-    old = chain[end]
     new_chain[end] = r_new
-    new_occ = (occ - {old}) | {r_new}
+    new_occ = occ_without_old | {r_new}
     return True, new_chain, new_occ
+
+
+def sanity_check_end_move() -> None:
+    """Verify that the end move can accept from a simple straight chain."""
+    chain = [(0,0,0), (1,0,0), (2,0,0), (3,0,0), (4,0,0)]
+    occ = set(chain)
+    n_accept = sum(attempt_end_move(chain, occ)[0] for _ in range(200))
+    if n_accept <= 0:
+        raise RuntimeError("attempt_end_move never accepted in 200 trials")
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
 
 # ------------------------- main -------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--N", type=int, default=300, help="chain length")
+    ap.add_argument("--N", type=int, default=44, help="chain length")
     ap.add_argument("--steps", type=int, default=10_000_000, help="total MC attempted moves")
     ap.add_argument("--T", type=float, default=1.0, help="temperature (ignored; kept for temp_scan compatibility)")
     ap.add_argument("--eps", type=float, default=0.0, help="contact energy (ignored; kept for temp_scan compatibility)")
@@ -178,8 +186,21 @@ def main() -> None:
     ap.add_argument("--no_joint", action="store_true", help="skip writing the joint P(m,Rg) histogram")
     args = ap.parse_args()
 
+    if args.N < 3:
+        raise ValueError("--N must be >= 3")
+    if args.steps < 1:
+        raise ValueError("--steps must be >= 1")
+    if args.rg_bins < 1:
+        raise ValueError("--rg_bins must be >= 1")
+    if not (0.0 <= args.burnin < 1.0):
+        raise ValueError("--burnin must be in [0, 1)")
+    if args.sample_every < 1:
+        raise ValueError("--sample_every must be >= 1")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    sanity_check_end_move()
 
     # initial straight chain
     chain: List[Vec] = [(i, 0, 0) for i in range(args.N)]
@@ -282,6 +303,11 @@ def main() -> None:
         n_samples=int(C_arr.size),
     )
     print(f"DIST_FILE = {dist_file}")
+    print(f"c_prob sum = {float(c_prob.sum()):.6g}")
+    print(f"rg_prob sum = {float(rg_prob.sum()):.6g}")
+    if crg_prob.size > 0:
+        print(f"crg_prob shape = {crg_prob.shape}")
+        print(f"crg_prob sum = {float(crg_prob.sum()):.6g}")
 
 if __name__ == "__main__":
     main()
