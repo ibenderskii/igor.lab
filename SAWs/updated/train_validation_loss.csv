@@ -1,4 +1,5 @@
 split,n_temperatures,loss_name,contact_loss
-train,42,js,2.135724
-validation,22,js,1.1184243
-all,64,js,3.2541483
+train,64,kl,96.225661
+all,64,kl,96.225661
+train_rg,64,rg_kl,4.8930559
+all_rg,64,rg_kl,4.8930559

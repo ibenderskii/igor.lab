@@ -764,7 +764,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--baseline", type=str,
-        default="single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
+        default="dists_44mer_long\single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
         help="Baseline NPZ. For Rg prediction, must contain c_edges, rg_edges, crg_prob.",
     )
     ap.add_argument(
@@ -824,7 +824,7 @@ def main() -> None:
 
     # Rg fitting
     ap.add_argument(
-        "--fit-rg", action="store_true", dest="fit_rg",
+        "--fit-rg", action="store_true", default = 'true', dest="fit_rg",
         help=(
             "Include Rg loss in the optimization objective. Requires joint baseline "
             "P0(m,Rg) and observed Rg histograms."
@@ -837,7 +837,7 @@ def main() -> None:
     ap.add_argument(
         "--rg-scale",
         type=float,
-        default=1.0,
+        default=0.46320503312590167,
         dest="rg_scale",
         help=(
             "Scale factor converting lattice Rg units into observed/molecular Rg units: "
