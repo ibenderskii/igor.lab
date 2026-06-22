@@ -539,6 +539,29 @@ MODEL_REGISTRY: Dict[str, Dict] = {
 }
 
 
+# Shared model-contract version.  Bump only when the model set, parameter names,
+# or b(T) semantics change in a way that breaks cross-script compatibility.
+MODEL_API_VERSION = 1
+
+
+def get_model_contract() -> dict:
+    """Return a callable-free description of the supported contact-bias models.
+
+    Used to verify that this script and remd_uniform_chain_new.py agree on the
+    model API version, model names, and parameter ordering.
+    """
+    return {
+        "model_api_version": MODEL_API_VERSION,
+        "models": {
+            name: {
+                "param_names": list(spec["param_names"]),
+                "description": str(spec["description"]),
+            }
+            for name, spec in MODEL_REGISTRY.items()
+        },
+    }
+
+
 def make_b_fn(
     model_name: str, Tref: float, Tscale: float
 ) -> Callable[[np.ndarray, float], float]:
@@ -764,7 +787,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--baseline", type=str,
-        default="dists_44mer_long\single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
+        default="dists_44mer_long/single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
         help="Baseline NPZ. For Rg prediction, must contain c_edges, rg_edges, crg_prob.",
     )
     ap.add_argument(
@@ -783,7 +806,10 @@ def main() -> None:
         "--out", type=str, default="fit_lattice_contact_model.npz",
         help="Output NPZ path (used when --outdir is not given).",
     )
-    ap.add_argument("--no_plots", action="store_true", help="Skip all plot generation.")
+    ap.add_argument(
+        "--no-plots", "--no_plots", action="store_true", dest="no_plots",
+        help="Skip all plot generation.",
+    )
     ap.add_argument(
         "--show-plots", action="store_true", dest="show_plots",
         help="Show plots interactively in addition to saving them.",
@@ -822,14 +848,22 @@ def main() -> None:
         help="Divergence used as the fitting objective.",
     )
 
-    # Rg fitting
-    ap.add_argument(
-        "--fit-rg", action="store_true", default = 'true', dest="fit_rg",
-        help=(
-            "Include Rg loss in the optimization objective. Requires joint baseline "
-            "P0(m,Rg) and observed Rg histograms."
-        ),
+    # Rg fitting (mutually exclusive; default off so suite behavior is explicit)
+    rg_group = ap.add_mutually_exclusive_group()
+    rg_group.add_argument(
+        "--fit-rg",
+        action="store_true",
+        dest="fit_rg",
+        help="Include Rg loss in the optimization objective.",
     )
+    rg_group.add_argument(
+        "--no-fit-rg",
+        "--no_fit_rg",
+        action="store_false",
+        dest="fit_rg",
+        help="Use the contact-distribution objective only.",
+    )
+    ap.set_defaults(fit_rg=False)
     ap.add_argument(
         "--rg-weight", type=float, default=1.0, dest="rg_weight",
         help="Weight of Rg loss relative to contact loss when --fit-rg is active.",
@@ -1455,16 +1489,30 @@ def main() -> None:
     if Tc_derived is not None:
         derived_dict["Tc"] = float(Tc_derived)
 
+    # Validate temperature metadata before persisting it.
+    if not np.isfinite(Tref):
+        raise ValueError(f"Tref must be finite, got {Tref!r}")
+    if not np.isfinite(Tscale) or Tscale <= 0.0:
+        raise ValueError(f"Tscale must be finite and positive, got {Tscale!r}")
+    if args.model == "heat_capacity" and (not np.isfinite(Tref) or Tref <= 0.0):
+        raise ValueError(f"heat_capacity T0 must be positive, got {Tref!r}")
+
     metadata: Dict[str, Any] = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "model_api_version": MODEL_API_VERSION,
         "remd_path": str(args.remd),
         "baseline_path": str(args.baseline),
         "model": args.model,
         "model_description": spec["description"],
-        "param_names": param_names,
+        "param_names": list(param_names),
         "params": {n: float(v) for n, v in zip(param_names, params_fit)},
         "derived": derived_dict,
         "loss": args.loss,
+        "optimization_success": bool(best.success),
+        "optimization_message": str(best.message),
+        "optimization_iterations": int(best.nit) if hasattr(best, "nit") else None,
+        "optimization_objective_value": float(best_val_obj),
+        "optimization_objective_includes_rg": bool(args.fit_rg),
         "Tref": float(Tref),
         "Tscale": float(Tscale),
         "contact_offset": float(args.contact_offset),
@@ -1496,6 +1544,11 @@ def main() -> None:
         "rg_val_loss": None if (not has_rg_scoring or not has_val) else float(rg_val_loss),
         "rg_all_loss": None if not has_rg_scoring else float(rg_all_loss),
     }
+    # For heat_capacity, persist the thermodynamic reference temperature as T0
+    # (stored in Tref by this fitter). Keep Tref for backward compatibility.
+    if args.model == "heat_capacity":
+        metadata["T0"] = float(Tref)
+
     if has_joint_baseline and rg_edges_model_lattice is not None and rg_edges_model is not None:
         metadata["rg_model_range_lattice"] = [
             float(rg_edges_model_lattice.min()), float(rg_edges_model_lattice.max())

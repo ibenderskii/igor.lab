@@ -1,0 +1,57 @@
+{
+  "target_remd": "remd_distributions_44mer.npz",
+  "fit_script": "fit_lattice_contact_model.py",
+  "remd_script": "remd_uniform_chain_new.py",
+  "output_root": "model_suite_output",
+
+  "models": [
+    "hs",
+    "tc_scale",
+    "hs_quadratic",
+    "poly2",
+    "poly3",
+    "heat_capacity"
+  ],
+
+  "baselines": [
+    {
+      "name": "joint_baseline_44mer",
+      "path": "dists_44mer_long/single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
+      "contact_offset": 43,
+      "rg_scale": 0.46320503312590167
+    }
+  ],
+
+  "fit": {
+    "loss": "js",
+    "fit_rg": true,
+    "rg_weight": 0.25,
+    "holdout_every": 3,
+    "holdout_indices": null,
+    "train_indices": null,
+    "n_restarts": 8,
+    "seed": 123,
+    "bootstrap": 0,
+    "bootstrap_seed": null,
+    "plots": false
+  },
+
+  "remd": {
+    "N": 44,
+    "steps_per_swap": 1000,
+    "n_cycles": 5000,
+    "rg_bins": 100,
+    "burnin_frac": 0.7,
+    "n_workers": 4,
+    "seeds": [1, 2, 3],
+    "plots": false,
+    "timing": true
+  },
+
+  "comparison": {
+    "include_rg": true,
+    "rg_weight": 0.25,
+    "temperature_tolerance": 1e-10,
+    "make_plots": true
+  }
+}

@@ -205,6 +205,29 @@ MODEL_REGISTRY = {
 }
 
 
+# Shared model-contract version.  Bump only when the model set, parameter names,
+# or b(T) semantics change in a way that breaks cross-script compatibility.
+MODEL_API_VERSION = 1
+
+
+def get_model_contract() -> dict:
+    """Return a callable-free description of the supported contact-bias models.
+
+    Used to verify that this script and fit_lattice_contact_model.py agree on the
+    model API version, model names, and parameter ordering.
+    """
+    return {
+        "model_api_version": MODEL_API_VERSION,
+        "models": {
+            name: {
+                "param_names": list(spec["param_names"]),
+                "description": str(spec["description"]),
+            }
+            for name, spec in MODEL_REGISTRY.items()
+        },
+    }
+
+
 def reduced_bias(model_name, params, T, Tref, Tscale) -> float:
     """b(T) for the selected model."""
     return float(MODEL_REGISTRY[model_name]["raw_b_fn"](params, float(T), Tref, Tscale))
@@ -1466,12 +1489,113 @@ def run_quick_test() -> None:
         )
     print("  quick-test validation regressions: PASSED")
 
+    # -----------------------------------------------------------------------
+    # Part 3 regressions: temperature loading, ladder validation, api-version
+    # -----------------------------------------------------------------------
+    # Exact temperature loading from 'temps'
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "from_temps.npz")
+        np.savez(p, temps=np.array([260.0, 280.0, 300.0, 320.0]))
+        Ts_loaded = load_temperatures_from_npz(p)
+        np.testing.assert_allclose(Ts_loaded, [260.0, 280.0, 300.0, 320.0])
+        # Exact temperature loading from 'Ts' (fallback key)
+        p2 = os.path.join(tmp, "from_Ts.npz")
+        np.savez(p2, Ts=np.array([250.0, 275.0, 305.0]))
+        np.testing.assert_allclose(load_temperatures_from_npz(p2), [250.0, 275.0, 305.0])
+        # Missing both keys -> error
+        p3 = os.path.join(tmp, "no_temps.npz")
+        np.savez(p3, foo=np.array([1.0, 2.0]))
+        _expect_value_error(
+            lambda: load_temperatures_from_npz(p3), "neither", "missing temps key"
+        )
+    print("  quick-test temps-from-npz (temps/Ts): PASSED")
+
+    # Ladder validation: reject non-increasing, duplicates, too-short, nonpositive
+    _expect_value_error(
+        lambda: validate_temperature_ladder(np.array([300.0, 280.0, 320.0])),
+        "increasing", "non-increasing ladder",
+    )
+    _expect_value_error(
+        lambda: validate_temperature_ladder(np.array([300.0, 300.0])),
+        "increasing", "duplicate ladder",
+    )
+    _expect_value_error(
+        lambda: validate_temperature_ladder(np.array([300.0])),
+        "at least two", "too-short ladder",
+    )
+    _expect_value_error(
+        lambda: validate_temperature_ladder(np.array([-1.0, 300.0])),
+        "positive", "nonpositive ladder",
+    )
+    np.testing.assert_allclose(
+        validate_temperature_ladder(np.array([260.0, 280.0, 300.0])),
+        [260.0, 280.0, 300.0],
+    )
+    print("  quick-test temperature-ladder validation: PASSED")
+
+    # Summary model_api_version handling: absent OK, future version rejected
+    with tempfile.TemporaryDirectory() as tmp:
+        base = {
+            "model": "poly2",
+            "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+            "Tref": 300.0, "Tscale": 80.0,
+        }
+        p_nover = _write_summary(tmp, base, name="no_ver.json")
+        assert load_fit_summary_json(p_nover)["model_name"] == "poly2"
+        p_curr = _write_summary(
+            tmp, {**base, "model_api_version": MODEL_API_VERSION}, name="cur.json"
+        )
+        assert load_fit_summary_json(p_curr)["model_name"] == "poly2"
+        p_future = _write_summary(
+            tmp, {**base, "model_api_version": MODEL_API_VERSION + 1}, name="fut.json"
+        )
+        _expect_value_error(
+            lambda: load_fit_summary_json(p_future), "newer", "future api version"
+        )
+    print("  quick-test summary api-version handling: PASSED")
+
     print("quick-test complete.")
 
 
 # ---------------------------------------------------------------------------
 # Model parameter resolution
 # ---------------------------------------------------------------------------
+
+def validate_temperature_ladder(Ts: np.ndarray) -> np.ndarray:
+    """Validate an explicit REMD temperature ladder.
+
+    Requires a one-dimensional array of at least two finite, positive,
+    strictly increasing temperatures with no duplicates.  Returns the array as
+    float64.
+    """
+    Ts = np.asarray(Ts, dtype=float)
+    if Ts.ndim != 1:
+        raise ValueError("Temperature ladder must be one-dimensional")
+    if Ts.size < 2:
+        raise ValueError("Temperature ladder must have at least two entries")
+    if not np.all(np.isfinite(Ts)):
+        raise ValueError("Temperature ladder must contain only finite values")
+    if not np.all(Ts > 0.0):
+        raise ValueError("Temperature ladder must contain only positive temperatures")
+    diffs = np.diff(Ts)
+    if not np.all(diffs > 0.0):
+        raise ValueError(
+            "Temperature ladder must be strictly increasing with no duplicates"
+        )
+    return Ts
+
+
+def load_temperatures_from_npz(path: str) -> np.ndarray:
+    """Load an exact temperature ladder from an NPZ, trying 'temps' then 'Ts'."""
+    with np.load(path) as data:
+        for key in ("temps", "Ts"):
+            if key in data:
+                return validate_temperature_ladder(np.asarray(data[key], dtype=float))
+        raise ValueError(
+            f"{path!r} contains neither 'temps' nor 'Ts' temperature key "
+            f"(found: {list(data.keys())})"
+        )
+
 
 def validate_temperature_metadata(
     model_name: str,
@@ -1683,6 +1807,24 @@ def load_fit_summary_json(path: str) -> dict:
             f"fit_summary.json {path!r} must contain a JSON object/dictionary "
             f"at the root."
         )
+
+    # Model-API-version handshake: absent is accepted for backward compatibility;
+    # a version newer than we support is a hard error.
+    api_version = summary.get("model_api_version", None)
+    if api_version is not None:
+        try:
+            api_version_int = int(api_version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"fit_summary.json {path!r} has non-integer "
+                f"model_api_version: {api_version!r}"
+            ) from exc
+        if api_version_int > MODEL_API_VERSION:
+            raise ValueError(
+                f"fit_summary.json {path!r} model_api_version "
+                f"{api_version_int} is newer than supported version "
+                f"{MODEL_API_VERSION}. Update remd_uniform_chain_new.py."
+            )
 
     required = ("model", "params", "Tref", "Tscale")
     missing_fields = [k for k in required if k not in summary]
@@ -1945,6 +2087,56 @@ def attach_model_metadata(
     return dist
 
 
+def attach_run_metadata(
+    dist: dict,
+    *,
+    seed: int,
+    N: int,
+    steps_per_swap: int,
+    n_cycles: int,
+    burnin_frac: float,
+    n_workers: int,
+) -> dict:
+    """Inject simulation provenance into a distributions dict in place.
+
+    Adds run/seed metadata and the model API version without removing or
+    altering any existing canonical or model-metadata keys.
+    """
+    dist["seed"] = int(seed)
+    dist["N"] = int(N)
+    dist["steps_per_swap"] = int(steps_per_swap)
+    dist["n_cycles"] = int(n_cycles)
+    dist["burnin_frac"] = float(burnin_frac)
+    dist["n_workers"] = int(n_workers)
+    dist["model_api_version"] = int(MODEL_API_VERSION)
+    return dist
+
+
+def _json_safe(obj):
+    """Recursively convert NumPy scalars/arrays to plain Python for json.dump."""
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
+
+def save_run_summary(summary: dict, path: str) -> str:
+    """Write the REMD run-summary JSON (NumPy-safe)."""
+    with open(path, "w") as fh:
+        json.dump(_json_safe(summary), fh, indent=2)
+    print(f"Saved {path}")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2043,14 +2235,46 @@ def main() -> None:
             "Overrides Tref for heat_capacity only."
         ),
     )
+    temp_group = ap.add_mutually_exclusive_group()
+    temp_group.add_argument(
+        "--temps-from-npz",
+        type=str,
+        default=None,
+        dest="temps_from_npz",
+        help=(
+            "Load the exact REMD temperature ladder from an NPZ file. "
+            "The loader checks keys 'temps' and then 'Ts'. "
+            "When supplied, this overrides Tmin, Tmax, and nT."
+        ),
+    )
+    temp_group.add_argument(
+        "--temps",
+        type=str,
+        default=None,
+        help="Explicit comma-separated temperature ladder.",
+    )
+    ap.add_argument(
+        "--no-plots",
+        action="store_true",
+        dest="no_plots",
+        help="Skip all plot generation (CSV and NPZ outputs are still written).",
+    )
+    ap.add_argument(
+        "--run-summary-json",
+        type=str,
+        default=None,
+        dest="run_summary_json",
+        help=(
+            "Optional path for the REMD run summary JSON. "
+            "Default: <out-prefix>_run_summary.json."
+        ),
+    )
     ap.add_argument("--timing",         action="store_true",         help="print sweep/swap/total wall times")
     ap.add_argument("--quick-test",     action="store_true",         help="run smoke-test and exit")
     args = ap.parse_args()
 
     if args.N < 3:
         raise ValueError("--N must be >= 3")
-    if args.nT < 2:
-        raise ValueError("--nT must be >= 2")
     if args.steps_per_swap < 1:
         raise ValueError("--steps-per-swap must be >= 1")
     if args.n_cycles < 1:
@@ -2061,10 +2285,6 @@ def main() -> None:
         raise ValueError("--n-workers must be >= 1")
     if not (0.0 <= args.burnin_frac < 1.0):
         raise ValueError("--burnin-frac must be in [0, 1)")
-    if args.Tmin <= 0 or args.Tmax <= 0:
-        raise ValueError("Temperatures must be positive")
-    if args.Tmax <= args.Tmin:
-        raise ValueError("--Tmax must be greater than --Tmin")
     if args.rg_scale <= 0:
         raise ValueError("--rg-scale must be positive")
 
@@ -2072,8 +2292,35 @@ def main() -> None:
         run_quick_test()
         return
 
-    Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
+    # Temperature ladder resolution: --temps-from-npz > --temps > linspace.
+    if args.temps_from_npz is not None:
+        Ts = load_temperatures_from_npz(args.temps_from_npz)
+        temp_source = f"npz:{args.temps_from_npz}"
+    elif args.temps is not None:
+        Ts = validate_temperature_ladder(
+            np.array(parse_params_string(args.temps), dtype=float)
+        )
+        temp_source = "cli:--temps"
+    else:
+        if args.nT < 2:
+            raise ValueError("--nT must be >= 2")
+        if args.Tmin <= 0 or args.Tmax <= 0:
+            raise ValueError("Temperatures must be positive")
+        if args.Tmax <= args.Tmin:
+            raise ValueError("--Tmax must be greater than --Tmin")
+        Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
+        temp_source = "linspace"
+
+    nT = len(Ts)
+    Tmin_resolved, Tmax_resolved = float(Ts.min()), float(Ts.max())
+    diffs = np.diff(Ts)
+    temperature_uniform = bool(nT >= 2 and np.allclose(diffs, diffs[0]))
     total_steps = args.steps_per_swap * args.n_cycles
+    print(
+        f"Temperature ladder ({temp_source}): {nT} replicas, "
+        f"min={Tmin_resolved:.6g}, max={Tmax_resolved:.6g}, "
+        f"uniform={temperature_uniform}"
+    )
 
     (
         model_name, model_params, param_names, Tref, Tscale,
@@ -2081,7 +2328,7 @@ def main() -> None:
     ) = resolve_model_params(args, Ts)
 
     print(
-        f"REMD: {args.nT} replicas, T in [{args.Tmin}, {args.Tmax}], "
+        f"REMD: {nT} replicas, T in [{Tmin_resolved:.6g}, {Tmax_resolved:.6g}], "
         f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
     )
     print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
@@ -2101,6 +2348,7 @@ def main() -> None:
     elif model_name == "tc_scale":
         print(f"Tc = {model_params[1]:.8g}")
 
+    t_run_start = time.perf_counter()
     replicas, swap_props, swap_accs = run_remd(
         N=args.N, Ts=Ts,
         steps_per_swap=args.steps_per_swap,
@@ -2111,15 +2359,19 @@ def main() -> None:
         n_workers=args.n_workers,
         timing=args.timing,
     )
+    wall_time_seconds = time.perf_counter() - t_run_start
 
     print("\nSwap acceptance rates by pair:")
+    swap_rates = []
     for k in range(len(swap_props)):
         rate = swap_accs[k] / max(1, swap_props[k])
+        swap_rates.append(float(rate))
         print(f"  T={Ts[k]:.1f} <-> T={Ts[k+1]:.1f}  {swap_accs[k]}/{swap_props[k]} = {rate:.3f}")
 
     results = compute_statistics(
         replicas, burnin_frac=args.burnin_frac, rg_scale=args.rg_scale
     )
+    local_acceptance_rates = [float(r["local_acc_rate"]) for r in results]
     dist    = build_distributions(
         replicas, rg_bins=args.rg_bins, burnin_frac=args.burnin_frac,
         rg_scale=args.rg_scale,
@@ -2128,12 +2380,69 @@ def main() -> None:
         dist, model_name, param_names, model_params, Tref, Tscale,
         parameter_source=parameter_source, fit_summary_json=fit_summary_json,
     )
+    attach_run_metadata(
+        dist,
+        seed=args.seed, N=args.N,
+        steps_per_swap=args.steps_per_swap, n_cycles=args.n_cycles,
+        burnin_frac=args.burnin_frac, n_workers=args.n_workers,
+    )
 
-    save_results_csv(results, args.out_prefix)
-    save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
-    save_distributions(dist, args.out_prefix)
-    plot_observables(results, args.out_prefix)
-    plot_distributions(dist, args.out_prefix)
+    results_path = save_results_csv(results, args.out_prefix)
+    swap_path = save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
+    dist_path = save_distributions(dist, args.out_prefix)
+    output_files = {
+        "results_csv": results_path,
+        "swap_rates_csv": swap_path,
+        "distributions_npz": dist_path,
+    }
+    if not args.no_plots:
+        plot_observables(results, args.out_prefix)
+        plot_distributions(dist, args.out_prefix)
+
+    swap_rates_arr = np.array(swap_rates, dtype=float) if swap_rates else np.array([])
+    run_summary = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "model_api_version": MODEL_API_VERSION,
+        "model": model_name,
+        "param_names": list(param_names),
+        "params": [float(v) for v in model_params],
+        "Tref": float(Tref),
+        "Tscale": float(Tscale),
+        "parameter_source": parameter_source,
+        "fit_summary_json": fit_summary_json,
+        "temperatures": [float(t) for t in Ts],
+        "temperature_count": int(nT),
+        "temperature_min": float(Tmin_resolved),
+        "temperature_max": float(Tmax_resolved),
+        "temperature_uniform": temperature_uniform,
+        "temperature_source": temp_source,
+        "N": int(args.N),
+        "steps_per_swap": int(args.steps_per_swap),
+        "n_cycles": int(args.n_cycles),
+        "total_steps_per_replica": int(total_steps),
+        "seed": int(args.seed),
+        "n_workers": int(args.n_workers),
+        "burnin_frac": float(args.burnin_frac),
+        "rg_bins": int(args.rg_bins),
+        "rg_scale": float(args.rg_scale),
+        "wall_time_seconds": float(wall_time_seconds),
+        "swap_rates": swap_rates,
+        "swap_rate_min": float(swap_rates_arr.min()) if swap_rates_arr.size else None,
+        "swap_rate_mean": float(swap_rates_arr.mean()) if swap_rates_arr.size else None,
+        "swap_rate_median": float(np.median(swap_rates_arr)) if swap_rates_arr.size else None,
+        "local_acceptance_rates": local_acceptance_rates,
+        "output_files": output_files,
+    }
+    if model_name == "heat_capacity":
+        run_summary["T0"] = float(Tref)
+
+    run_summary_path = (
+        args.run_summary_json
+        if args.run_summary_json is not None
+        else f"{args.out_prefix}_run_summary.json"
+    )
+    save_run_summary(run_summary, run_summary_path)
+    output_files["run_summary_json"] = run_summary_path
 
 
 if __name__ == "__main__":
