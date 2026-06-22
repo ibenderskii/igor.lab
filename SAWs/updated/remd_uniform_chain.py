@@ -12,6 +12,15 @@ heat_capacity (see MODEL_REGISTRY).  The default model is hs:
 
     b(T) = h/T - s
 
+Loading fitted models
+---------------------
+The preferred way to reproduce a fitted contact-energy model is
+--fit-summary-json, which loads the model name, parameters, Tref, Tscale (and
+the effective heat_capacity T0) directly from fit_summary.json.  Alternatively
+--fit-params-csv loads fit_params.csv and, when a companion fit_summary.json is
+present in the same directory, automatically infers and validates the model,
+Tref, Tscale, and heat_capacity T0 from it.
+
 For backward compatibility, when --model hs is used without --params /
 --fit-params-csv, the legacy --dh/--ds flags supply (h, s) = (dh, ds), so
 H(C;T) = m(C)*(dh - T*ds) exactly as before.
@@ -971,16 +980,34 @@ def run_quick_test() -> None:
 
         print(f"  quick-test n_workers={n_workers}: PASSED")
 
-    # --- non-hs models: tc_scale and a polynomial model (poly2) ---
-    def _check_model(model_name, model_params, Ts, seed):
+    # --- tiny serial REMD run for every supported model ---
+    def _check_model_run(model_name, model_params, Ts, Tref, Tscale, seed):
         param_names = MODEL_REGISTRY[model_name]["param_names"]
-        Tref = 0.5 * (float(Ts.min()) + float(Ts.max()))
-        Tscale = max(float(Ts.max()) - float(Ts.min()), 1.0)
+
+        # b(T) and the swap criterion must stay finite across the ladder.
+        for T in Ts:
+            assert math.isfinite(
+                reduced_bias(model_name, model_params, float(T), Tref, Tscale)
+            ), f"[{model_name}] non-finite reduced_bias at T={T}"
+        for (Ti, Tj) in zip(Ts[:-1], Ts[1:]):
+            la = swap_log_accept(
+                3.0, 7.0, float(Ti), float(Tj),
+                model_name, model_params, Tref, Tscale,
+            )
+            assert math.isfinite(la), f"[{model_name}] non-finite swap_log_accept"
+
         reps, _sp, _sa = run_remd(
-            N=20, Ts=Ts, steps_per_swap=50, n_cycles=20,
+            N=20, Ts=Ts, steps_per_swap=30, n_cycles=15,
             model_name=model_name, params=model_params, Tref=Tref, Tscale=Tscale,
             seed=seed, n_workers=1, verbose=False,
         )
+
+        # Every recorded trajectory value must be finite.
+        for rep in reps:
+            assert all(math.isfinite(e) for e in rep.E_traj), f"[{model_name}] non-finite E"
+            assert all(math.isfinite(c) for c in rep.C_traj), f"[{model_name}] non-finite C"
+            assert all(math.isfinite(r) for r in rep.Rg_traj), f"[{model_name}] non-finite Rg"
+
         dist = build_distributions(reps, rg_bins=40, burnin_frac=0.5)
         attach_model_metadata(dist, model_name, param_names, model_params, Tref, Tscale)
 
@@ -989,6 +1016,8 @@ def run_quick_test() -> None:
         assert str(dist["model_name"]) == model_name
         np.testing.assert_array_equal(dist["param_names"], np.array(param_names))
         np.testing.assert_allclose(dist["model_params"], np.array(model_params, dtype=float))
+        assert float(dist["Tref"]) == float(Tref)
+        assert float(dist["Tscale"]) == float(Tscale)
 
         for i, row in enumerate(dist["Pc"]):
             finite = row[np.isfinite(row)]
@@ -1000,8 +1029,20 @@ def run_quick_test() -> None:
                 assert abs(float(finite.sum()) - 1.0) < 1e-6, f"[{model_name}] Prg[{i}] not normalised"
         print(f"  quick-test model={model_name}: PASSED")
 
-    _check_model("tc_scale", [1.0, 300.0], np.linspace(260, 340, 4), seed=11)
-    _check_model("poly2", [0.0, -0.5, 0.0], np.linspace(260, 340, 4), seed=13)
+    model_cases = [
+        {"model": "hs",            "params": [300.0, 1.0],            "Tref": 300.0, "Tscale": 80.0},
+        {"model": "tc_scale",      "params": [1.0, 300.0],           "Tref": 300.0, "Tscale": 80.0},
+        {"model": "hs_quadratic",  "params": [300.0, 1.0, 0.1],      "Tref": 300.0, "Tscale": 80.0},
+        {"model": "poly2",         "params": [0.0, -0.5, 0.05],      "Tref": 300.0, "Tscale": 80.0},
+        {"model": "poly3",         "params": [0.0, -0.5, 0.05, 0.01], "Tref": 300.0, "Tscale": 80.0},
+        {"model": "heat_capacity", "params": [300.0, 1.0, 0.1],      "Tref": 300.0, "Tscale": 80.0},
+    ]
+    Ts_models = np.linspace(260.0, 340.0, 4)
+    for k, case in enumerate(model_cases):
+        _check_model_run(
+            case["model"], case["params"], Ts_models,
+            case["Tref"], case["Tscale"], seed=11 + k,
+        )
 
     # -----------------------------------------------------------------------
     # fit_summary.json loading and resolve_model_params precedence tests
@@ -1223,6 +1264,208 @@ def run_quick_test() -> None:
         assert str(dist["fit_summary_json"]) == p
     print("  quick-test REMD-from-summary: PASSED")
 
+    # -----------------------------------------------------------------------
+    # Part J: CSV companion-summary tests
+    # -----------------------------------------------------------------------
+    def _write_csv(dirpath, rows, name="fit_params.csv"):
+        path = os.path.join(dirpath, name)
+        with open(path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["parameter", "value"])
+            for n, v in rows:
+                w.writerow([n, v])
+        return path
+
+    poly2_summary = {
+        "model": "poly2",
+        "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+        "Tref": 300.0, "Tscale": 80.0,
+    }
+    poly2_rows = [("a0", 0.1), ("a1", -0.5), ("a2", 0.03)]
+
+    # J1: infer poly2 from companion summary, no --model supplied
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, poly2_rows)
+        _write_summary(tmp, poly2_summary)
+        (model_name, params, _, Tref, Tscale, src, summ) = resolve_model_params(
+            _make_args(fit_params_csv=csvp), Ts_resolve
+        )
+        assert model_name == "poly2", model_name
+        assert src == "fit_params_csv_with_summary", src
+        assert Tref == 300.0 and Tscale == 80.0, (Tref, Tscale)
+        assert summ is not None
+    print("  quick-test CSV infer poly2 from summary: PASSED")
+
+    # J2: explicit matching model succeeds
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, poly2_rows)
+        _write_summary(tmp, poly2_summary)
+        (model_name, _, _, _, _, src, _) = resolve_model_params(
+            _make_args(fit_params_csv=csvp, model="poly2"), Ts_resolve
+        )
+        assert model_name == "poly2" and src == "fit_params_csv_with_summary"
+    print("  quick-test CSV explicit matching model: PASSED")
+
+    # J3: explicit conflicting model raises
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, poly2_rows)
+        _write_summary(tmp, poly2_summary)
+        try:
+            resolve_model_params(
+                _make_args(fit_params_csv=csvp, model="poly3"), Ts_resolve
+            )
+            raise AssertionError("expected model conflict error")
+        except ValueError as e:
+            assert "conflicts with model" in str(e), str(e)
+    print("  quick-test CSV conflicting model: PASSED")
+
+    # J4: CSV/summary parameter mismatch raises
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, [("a0", 0.1), ("a1", -0.4), ("a2", 0.03)])
+        _write_summary(tmp, poly2_summary)
+        try:
+            resolve_model_params(_make_args(fit_params_csv=csvp), Ts_resolve)
+            raise AssertionError("expected CSV/summary param mismatch error")
+        except ValueError as e:
+            assert "do not match" in str(e), str(e)
+    print("  quick-test CSV/summary param mismatch: PASSED")
+
+    # J5: CLI Tref conflict raises
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, poly2_rows)
+        _write_summary(tmp, poly2_summary)
+        try:
+            resolve_model_params(
+                _make_args(fit_params_csv=csvp, Tref=310.0), Ts_resolve
+            )
+            raise AssertionError("expected Tref conflict error")
+        except ValueError as e:
+            assert "Tref" in str(e), str(e)
+    print("  quick-test CSV CLI Tref conflict: PASSED")
+
+    # J6: CLI Tscale conflict raises
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, poly2_rows)
+        _write_summary(tmp, poly2_summary)
+        try:
+            resolve_model_params(
+                _make_args(fit_params_csv=csvp, Tscale=100.0), Ts_resolve
+            )
+            raise AssertionError("expected Tscale conflict error")
+        except ValueError as e:
+            assert "Tscale" in str(e), str(e)
+    print("  quick-test CSV CLI Tscale conflict: PASSED")
+
+    # J7: heat_capacity T0 conflict raises
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, [("dh0", 500.0), ("ds0", 1.5), ("dCp", 0.2)])
+        _write_summary(tmp, {
+            "model": "heat_capacity",
+            "params": {"dh0": 500.0, "ds0": 1.5, "dCp": 0.2},
+            "Tref": 300.0, "Tscale": 80.0,
+        })
+        try:
+            resolve_model_params(
+                _make_args(fit_params_csv=csvp, T0=310.0), Ts_resolve
+            )
+            raise AssertionError("expected T0 conflict error")
+        except ValueError as e:
+            assert "T0" in str(e), str(e)
+    print("  quick-test CSV heat_capacity T0 conflict: PASSED")
+
+    # J8: no companion summary -> CSV-only path still works
+    with tempfile.TemporaryDirectory() as tmp:
+        csvp = _write_csv(tmp, poly2_rows)
+        (model_name, _, _, Tref, Tscale, src, summ) = resolve_model_params(
+            _make_args(fit_params_csv=csvp, model="poly2", Tref=300.0, Tscale=80.0),
+            Ts_resolve,
+        )
+        assert model_name == "poly2"
+        assert src == "fit_params_csv", src
+        assert summ is None
+        assert Tref == 300.0 and Tscale == 80.0
+    print("  quick-test CSV-only (no companion): PASSED")
+
+    # -----------------------------------------------------------------------
+    # Part K: validation regression tests
+    # -----------------------------------------------------------------------
+    def _expect_value_error(thunk, needle, label):
+        try:
+            thunk()
+            raise AssertionError(f"{label}: expected ValueError")
+        except ValueError as e:
+            assert needle in str(e), f"{label}: {e}"
+
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="poly2", params="0.1,nan,0.3"), Ts_resolve
+        ),
+        "finite float", "params nan",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="poly2", params="0.1,inf,0.3"), Ts_resolve
+        ),
+        "finite float", "params inf",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="poly2", params="0,-0.5,0.05", Tscale=0.0), Ts_resolve
+        ),
+        "Tscale", "Tscale=0",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="poly2", params="0,-0.5,0.05", Tscale=-1.0), Ts_resolve
+        ),
+        "Tscale", "Tscale=-1",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="poly2", params="0,-0.5,0.05", Tscale=float("nan")),
+            Ts_resolve,
+        ),
+        "Tscale", "Tscale=nan",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="heat_capacity", params="500,1.5,0.2", T0=0.0),
+            Ts_resolve,
+        ),
+        "T0", "heat_capacity T0=0",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="heat_capacity", params="500,1.5,0.2", T0=-5.0),
+            Ts_resolve,
+        ),
+        "T0", "heat_capacity T0<0",
+    )
+    _expect_value_error(
+        lambda: resolve_model_params(
+            _make_args(model="poly2", params="0,-0.5,0.05", T0=300.0), Ts_resolve
+        ),
+        "--T0 is only valid", "T0 for poly2",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dupcsv = _write_csv(
+            tmp, [("a0", 0.1), ("a1", -0.5), ("a1", -0.6), ("a2", 0.03)],
+            name="dup.csv",
+        )
+        _expect_value_error(
+            lambda: load_fit_params_csv(dupcsv, "poly2"),
+            "Duplicate", "duplicate CSV param",
+        )
+        nfcsv = _write_csv(
+            tmp, [("a0", 0.1), ("a1", "nan"), ("a2", 0.03)], name="nf.csv",
+        )
+        _expect_value_error(
+            lambda: load_fit_params_csv(nfcsv, "poly2"),
+            "finite", "nonfinite CSV value",
+        )
+    print("  quick-test validation regressions: PASSED")
+
     print("quick-test complete.")
 
 
@@ -1230,27 +1473,185 @@ def run_quick_test() -> None:
 # Model parameter resolution
 # ---------------------------------------------------------------------------
 
+def validate_temperature_metadata(
+    model_name: str,
+    Tref: float,
+    Tscale: float,
+    source_description: str,
+) -> None:
+    """Validate resolved temperature metadata (finite Tref/Tscale, positive scale).
+
+    For heat_capacity the reference temperature additionally serves as the
+    thermodynamic T0 and must be positive.  ``source_description`` is used to
+    make error messages point at the originating parameter source.
+    """
+    if not math.isfinite(Tref):
+        raise ValueError(
+            f"{source_description}: Tref/T0 must be finite, got {Tref!r}"
+        )
+
+    if not math.isfinite(Tscale):
+        raise ValueError(
+            f"{source_description}: Tscale must be finite, got {Tscale!r}"
+        )
+
+    if Tscale <= 0.0:
+        raise ValueError(
+            f"{source_description}: Tscale must be positive, got {Tscale!r}"
+        )
+
+    if model_name == "heat_capacity" and Tref <= 0.0:
+        raise ValueError(
+            f"{source_description}: heat_capacity T0 must be positive, "
+            f"got {Tref!r}"
+        )
+
+
+def validate_model_params(
+    model_name: str,
+    params,
+    source_description: str,
+) -> list[float]:
+    """Validate parameter count and finiteness; return floats in registry order.
+
+    The parameter order always comes from MODEL_REGISTRY[model_name];
+    ``params`` is expected to already be in that order.
+    """
+    param_names = MODEL_REGISTRY[model_name]["param_names"]
+
+    if len(params) != len(param_names):
+        raise ValueError(
+            f"{source_description}: model {model_name!r} expects "
+            f"{len(param_names)} parameters {param_names}, "
+            f"but received {len(params)} values: {params}"
+        )
+
+    checked = []
+    for name, value in zip(param_names, params):
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{source_description}: parameter {name!r} could not be "
+                f"converted to float: {value!r}"
+            ) from exc
+
+        if not math.isfinite(value_float):
+            raise ValueError(
+                f"{source_description}: parameter {name!r} must be finite, "
+                f"got {value_float!r}"
+            )
+
+        checked.append(value_float)
+
+    return checked
+
+
+def validate_cli_against_summary(
+    args,
+    model_name: str,
+    summary_Tref: float,
+    summary_Tscale: float,
+    summary_path: str,
+) -> None:
+    """Ensure explicit CLI Tref/Tscale/T0 agree with companion summary metadata.
+
+    summary_Tref is the effective reference temperature (== T0 for the
+    heat_capacity model).  Conflicting values are rejected rather than silently
+    overridden.  --T0 is only meaningful for heat_capacity.
+    """
+    if args.Tscale is not None and not np.isclose(
+        float(args.Tscale), summary_Tscale, rtol=1e-10, atol=1e-12
+    ):
+        raise ValueError(
+            f"--Tscale {args.Tscale} conflicts with Tscale {summary_Tscale} "
+            f"stored in {summary_path}"
+        )
+
+    if model_name == "heat_capacity":
+        # --T0 and --Tref (if given) are both compared against the effective
+        # reference temperature; they are not applied independently.
+        if args.T0 is not None and not np.isclose(
+            float(args.T0), summary_Tref, rtol=1e-10, atol=1e-12
+        ):
+            raise ValueError(
+                f"--T0 {args.T0} conflicts with heat_capacity reference "
+                f"temperature {summary_Tref} stored in {summary_path}"
+            )
+        if args.Tref is not None and not np.isclose(
+            float(args.Tref), summary_Tref, rtol=1e-10, atol=1e-12
+        ):
+            raise ValueError(
+                f"--Tref {args.Tref} conflicts with heat_capacity reference "
+                f"temperature {summary_Tref} stored in {summary_path}"
+            )
+    else:
+        if args.T0 is not None:
+            raise ValueError("--T0 is only valid for the heat_capacity model")
+        if args.Tref is not None and not np.isclose(
+            float(args.Tref), summary_Tref, rtol=1e-10, atol=1e-12
+        ):
+            raise ValueError(
+                f"--Tref {args.Tref} conflicts with Tref {summary_Tref} stored "
+                f"in {summary_path}"
+            )
+
+
 def parse_params_string(params_str: str) -> list[float]:
+    """Parse a comma-separated --params string into finite floats.
+
+    Rejects an empty string and any value that is not a finite float (nan/inf),
+    reporting the offending 1-based position.  The model-specific count check is
+    performed separately via validate_model_params.
+    """
     vals = [x.strip() for x in params_str.split(",") if x.strip()]
     if not vals:
         raise ValueError("--params was provided but no values were found")
-    return [float(x) for x in vals]
+    out: list[float] = []
+    for i, x in enumerate(vals, start=1):
+        try:
+            v = float(x)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--params value {i} is not a finite float: {x!r}"
+            ) from exc
+        if not math.isfinite(v):
+            raise ValueError(f"--params value {i} is not a finite float: {x!r}")
+        out.append(v)
+    return out
 
 
 def load_fit_params_csv(path: str, model_name: str) -> list[float]:
     import csv
 
+    if not Path(path).exists():
+        raise FileNotFoundError(f"fit_params.csv not found: {path}")
+
     needed = MODEL_REGISTRY[model_name]["param_names"]
-    found = {}
+    found: dict[str, float] = {}
 
     with open(path, newline="") as fh:
         reader = csv.DictReader(fh)
-        if "parameter" not in reader.fieldnames or "value" not in reader.fieldnames:
+        if (
+            reader.fieldnames is None
+            or "parameter" not in reader.fieldnames
+            or "value" not in reader.fieldnames
+        ):
             raise ValueError("fit_params.csv must contain columns: parameter,value")
         for row in reader:
             name = row["parameter"]
-            if name in needed:
-                found[name] = float(row["value"])
+            if name not in needed:
+                # Ignore derived/extra rows (e.g. Tc) that are not parameters.
+                continue
+            if name in found:
+                raise ValueError(f"Duplicate parameter {name!r} in {path}")
+            raw = row["value"]
+            try:
+                found[name] = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Parameter {name!r} in {path} is not numeric: {raw!r}"
+                ) from exc
 
     missing = [name for name in needed if name not in found]
     if missing:
@@ -1258,7 +1659,10 @@ def load_fit_params_csv(path: str, model_name: str) -> list[float]:
             f"Missing parameters for model {model_name!r} in {path}: {missing}"
         )
 
-    return [found[name] for name in needed]
+    # Registry order + finite-value validation.
+    return validate_model_params(
+        model_name, [found[name] for name in needed], f"fit_params.csv {path!r}"
+    )
 
 
 def load_fit_summary_json(path: str) -> dict:
@@ -1310,15 +1714,12 @@ def load_fit_summary_json(path: str) -> dict:
             f"{model_name!r}: {missing_params}. Expected: {param_names}"
         )
 
-    params: list[float] = []
-    for name in param_names:  # registry order, NOT JSON insertion order
-        val = float(raw_params[name])
-        if not math.isfinite(val):
-            raise ValueError(
-                f"fit_summary.json {path!r} parameter {name!r} is not finite: "
-                f"{raw_params[name]!r}"
-            )
-        params.append(val)
+    # Registry order (NOT JSON insertion order) + finite-value validation.
+    params = validate_model_params(
+        model_name,
+        [raw_params[name] for name in param_names],
+        f"fit_summary.json {path!r}",
+    )
 
     if model_name == "heat_capacity":
         Tref = float(summary.get("T0", summary["Tref"]))
@@ -1326,21 +1727,9 @@ def load_fit_summary_json(path: str) -> dict:
         Tref = float(summary["Tref"])
     Tscale = float(summary["Tscale"])
 
-    if not math.isfinite(Tref):
-        raise ValueError(f"fit_summary.json {path!r} Tref is not finite: {Tref!r}")
-    if not math.isfinite(Tscale):
-        raise ValueError(
-            f"fit_summary.json {path!r} Tscale is not finite: {Tscale!r}"
-        )
-    if Tscale <= 0.0:
-        raise ValueError(
-            f"fit_summary.json {path!r} Tscale must be positive, got {Tscale!r}"
-        )
-    if model_name == "heat_capacity" and Tref <= 0.0:
-        raise ValueError(
-            f"fit_summary.json {path!r} heat_capacity reference temperature "
-            f"(T0) must be positive, got {Tref!r}"
-        )
+    validate_temperature_metadata(
+        model_name, Tref, Tscale, f"fit_summary.json {path!r}"
+    )
 
     return {
         "model_name": model_name,
@@ -1380,6 +1769,17 @@ def resolve_model_params(
             "--fit-params-csv, or --params."
         )
 
+    # Defensive validation of the temperature ladder (for automated workflows).
+    Ts = np.asarray(Ts, dtype=float)
+    if Ts.ndim != 1:
+        raise ValueError("Ts (temperature ladder) must be one-dimensional")
+    if Ts.size == 0:
+        raise ValueError("Ts (temperature ladder) must be nonempty")
+    if not np.all(np.isfinite(Ts)):
+        raise ValueError("Ts (temperature ladder) must contain only finite values")
+    if not np.all(Ts > 0.0):
+        raise ValueError("Ts (temperature ladder) must contain only positive temperatures")
+
     Tmin = float(np.min(Ts))
     Tmax = float(np.max(Ts))
 
@@ -1406,111 +1806,113 @@ def resolve_model_params(
             )
 
         # Any explicitly supplied Tref/Tscale/T0 must agree with the summary.
-        if args.Tscale is not None and not np.isclose(
-            float(args.Tscale), Tscale, rtol=1e-10, atol=1e-12
-        ):
-            raise ValueError(
-                f"--Tscale {args.Tscale} conflicts with Tscale {Tscale} stored "
-                f"in fit_summary.json"
-            )
-        if model_name == "heat_capacity":
-            # Both --T0 and --Tref (if given) are compared against the effective
-            # reference temperature; they are not applied independently.
-            if args.T0 is not None and not np.isclose(
-                float(args.T0), Tref, rtol=1e-10, atol=1e-12
-            ):
-                raise ValueError(
-                    f"--T0 {args.T0} conflicts with heat_capacity reference "
-                    f"temperature {Tref} stored in fit_summary.json"
-                )
-            if args.Tref is not None and not np.isclose(
-                float(args.Tref), Tref, rtol=1e-10, atol=1e-12
-            ):
-                raise ValueError(
-                    f"--Tref {args.Tref} conflicts with heat_capacity reference "
-                    f"temperature {Tref} stored in fit_summary.json"
-                )
-        else:
-            if args.Tref is not None and not np.isclose(
-                float(args.Tref), Tref, rtol=1e-10, atol=1e-12
-            ):
-                raise ValueError(
-                    f"--Tref {args.Tref} conflicts with Tref {Tref} stored in "
-                    f"fit_summary.json"
-                )
+        validate_cli_against_summary(
+            args, model_name, Tref, Tscale, summary["source_path"]
+        )
 
         return (
             model_name, params, param_names, Tref, Tscale,
             "fit_summary_json", summary["source_path"],
         )
 
-    # Resolve model for the remaining (non-summary) cases.
+    # --- Case B: --fit-params-csv supplied ---------------------------------
+    if args.fit_params_csv is not None:
+        csv_path = Path(args.fit_params_csv)
+        candidate_summary = csv_path.with_name("fit_summary.json")
+
+        if candidate_summary.exists():
+            # Companion summary is authoritative for model + temperature metadata.
+            companion = load_fit_summary_json(str(candidate_summary))
+            summary_model = companion["model_name"]
+            if args.model is None:
+                model_name = summary_model
+            elif args.model != summary_model:
+                raise ValueError(
+                    f"--model {args.model} conflicts with model {summary_model} "
+                    f"stored in companion fit_summary.json"
+                )
+            else:
+                model_name = args.model
+
+            param_names = MODEL_REGISTRY[model_name]["param_names"]
+            csv_params = load_fit_params_csv(str(csv_path), model_name)
+
+            if not np.allclose(
+                np.asarray(csv_params, dtype=float),
+                np.asarray(companion["params"], dtype=float),
+                rtol=1e-10, atol=1e-12,
+            ):
+                raise ValueError(
+                    f"CSV parameters {csv_params} do not match companion "
+                    f"fit_summary.json parameters {companion['params']} "
+                    f"({companion['source_path']})."
+                )
+
+            validate_cli_against_summary(
+                args, model_name, companion["Tref"], companion["Tscale"],
+                companion["source_path"],
+            )
+            Tref = companion["Tref"]
+            Tscale = companion["Tscale"]
+            validate_temperature_metadata(
+                model_name, Tref, Tscale,
+                f"companion fit_summary.json {companion['source_path']!r}",
+            )
+            print(f"Loaded companion metadata from {companion['source_path']}")
+            return (
+                model_name, csv_params, param_names, Tref, Tscale,
+                "fit_params_csv_with_summary", companion["source_path"],
+            )
+
+        # No companion summary: preserve original CSV-only behavior.
+        model_name = args.model if args.model is not None else "hs"
+        if args.T0 is not None and model_name != "heat_capacity":
+            raise ValueError(
+                "--T0 is only valid when --model heat_capacity is used"
+            )
+        param_names = MODEL_REGISTRY[model_name]["param_names"]
+        Tref, Tscale = _default_Tref_Tscale()
+        if model_name == "heat_capacity" and args.T0 is not None:
+            Tref = float(args.T0)
+        csv_params = load_fit_params_csv(str(csv_path), model_name)
+        validate_temperature_metadata(
+            model_name, Tref, Tscale, "CSV-only pathway (CLI/default Tref/Tscale)"
+        )
+        return (
+            model_name, csv_params, param_names, Tref, Tscale,
+            "fit_params_csv", None,
+        )
+
+    # Resolve model for the remaining (non-CSV, non-summary) cases.
     model_name = args.model if args.model is not None else "hs"
+    if args.T0 is not None and model_name != "heat_capacity":
+        raise ValueError("--T0 is only valid when --model heat_capacity is used")
     param_names = MODEL_REGISTRY[model_name]["param_names"]
     Tref, Tscale = _default_Tref_Tscale()
     if model_name == "heat_capacity" and args.T0 is not None:
         Tref = float(args.T0)
 
-    # --- Case B: --fit-params-csv supplied ---------------------------------
-    if args.fit_params_csv is not None:
-        params = load_fit_params_csv(args.fit_params_csv, model_name)
-        parameter_source = "fit_params_csv"
-        summary_path: str | None = None
-
-        # Optional companion summary lookup next to the CSV.
-        candidate = Path(args.fit_params_csv).with_name("fit_summary.json")
-        if candidate.exists():
-            companion = load_fit_summary_json(str(candidate))
-            if companion["model_name"] != model_name:
-                raise ValueError(
-                    f"Companion fit_summary.json {str(candidate)!r} model "
-                    f"{companion['model_name']} does not match selected model "
-                    f"{model_name}."
-                )
-            if not np.allclose(
-                np.array(companion["params"], dtype=float),
-                np.array(params, dtype=float),
-            ):
-                raise ValueError(
-                    f"Companion fit_summary.json {str(candidate)!r} parameters "
-                    f"{companion['params']} do not match CSV parameters {params}."
-                )
-            Tref = companion["Tref"]
-            Tscale = companion["Tscale"]
-            summary_path = companion["source_path"]
-            parameter_source = "fit_params_csv_with_summary"
-            print(f"Loaded companion metadata from {summary_path}")
-
-        if len(params) != len(param_names):
-            raise ValueError(
-                f"Model {model_name!r} expects {len(param_names)} parameters "
-                f"{param_names}, but got {len(params)} values: {params}"
-            )
-        return (
-            model_name, params, param_names, Tref, Tscale,
-            parameter_source, summary_path,
-        )
-
     # --- Case C: --params supplied -----------------------------------------
     if args.params is not None:
         params = parse_params_string(args.params)
         parameter_source = "params_cli"
+        source_desc = "--params"
     # --- Case D: no explicit source ----------------------------------------
     elif model_name == "hs":
         # Backward compatibility: old --dh/--ds flags define h and s.
-        params = [float(args.dh), float(args.ds)]
+        params = [args.dh, args.ds]
         parameter_source = "legacy_dh_ds"
+        source_desc = "legacy --dh/--ds"
     else:
         raise ValueError(
             f"Model {model_name!r} requires one of --params, --fit-params-csv, "
             f"or --fit-summary-json. Expected parameters: {param_names}"
         )
 
-    if len(params) != len(param_names):
-        raise ValueError(
-            f"Model {model_name!r} expects {len(param_names)} parameters "
-            f"{param_names}, but got {len(params)} values: {params}"
-        )
+    params = validate_model_params(model_name, params, source_desc)
+    validate_temperature_metadata(
+        model_name, Tref, Tscale, f"{source_desc} (CLI/default Tref/Tscale)"
+    )
 
     return model_name, params, param_names, Tref, Tscale, parameter_source, None
 
@@ -1612,8 +2014,9 @@ def main() -> None:
         default=None,
         dest="fit_params_csv",
         help=(
-            "Optional fit_params.csv from fit_lattice_contact_model.py. "
-            "If supplied, parameter values are loaded by name for the selected --model."
+            "Load fitted parameters from fit_params.csv. If a companion "
+            "fit_summary.json exists in the same directory, the model, Tref, "
+            "Tscale, and heat-capacity T0 are inferred and validated automatically."
         ),
     )
     ap.add_argument(
