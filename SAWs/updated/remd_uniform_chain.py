@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import json
 import math
 import random
 import time
@@ -1002,6 +1003,226 @@ def run_quick_test() -> None:
     _check_model("tc_scale", [1.0, 300.0], np.linspace(260, 340, 4), seed=11)
     _check_model("poly2", [0.0, -0.5, 0.0], np.linspace(260, 340, 4), seed=13)
 
+    # -----------------------------------------------------------------------
+    # fit_summary.json loading and resolve_model_params precedence tests
+    # -----------------------------------------------------------------------
+    def _make_args(**overrides):
+        """Build a CLI-like namespace with the same defaults resolve uses."""
+        defaults = dict(
+            model=None, params=None, fit_params_csv=None, fit_summary_json=None,
+            dh=312.109, ds=1.23278, Tref=None, Tscale=None, T0=None,
+        )
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def _write_summary(dirpath, obj, name="fit_summary.json"):
+        path = os.path.join(dirpath, name)
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+        return path
+
+    Ts_resolve = np.linspace(220.0, 320.0, 8)
+
+    # Test 1: poly2 summary loading
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly2",
+            "param_names": ["a0", "a1", "a2"],
+            "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+            "Tref": 300.0,
+            "Tscale": 80.0,
+        })
+        (model_name, params, param_names, Tref, Tscale,
+         src, summ) = resolve_model_params(_make_args(fit_summary_json=p), Ts_resolve)
+        assert model_name == "poly2", model_name
+        assert param_names == ["a0", "a1", "a2"], param_names
+        np.testing.assert_allclose(params, [0.1, -0.5, 0.03])
+        assert Tref == 300.0 and Tscale == 80.0, (Tref, Tscale)
+        assert src == "fit_summary_json", src
+        assert summ == p, summ
+    print("  quick-test fit_summary poly2 loading: PASSED")
+
+    # Test 2: heat_capacity summary loading (Tref -> T0, and future T0 override)
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "heat_capacity",
+            "params": {"dh0": 500.0, "ds0": 1.5, "dCp": 0.2},
+            "Tref": 300.0,
+            "Tscale": 80.0,
+        })
+        _, _, _, Tref, _, _, _ = resolve_model_params(
+            _make_args(fit_summary_json=p), Ts_resolve
+        )
+        assert Tref == 300.0, Tref
+
+        p2 = _write_summary(tmp, {
+            "model": "heat_capacity",
+            "params": {"dh0": 500.0, "ds0": 1.5, "dCp": 0.2},
+            "Tref": 300.0,
+            "T0": 305.0,
+            "Tscale": 80.0,
+        }, name="fit_summary_t0.json")
+        _, _, _, Tref2, _, _, _ = resolve_model_params(
+            _make_args(fit_summary_json=p2), Ts_resolve
+        )
+        assert Tref2 == 305.0, Tref2
+    print("  quick-test fit_summary heat_capacity T0: PASSED")
+
+    # Test 3: parameter ordering independent of JSON insertion order
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly3",
+            "params": {"a2": 2.0, "a0": 0.0, "a3": 3.0, "a1": 1.0},
+            "Tref": 300.0,
+            "Tscale": 80.0,
+        })
+        _, params, param_names, _, _, _, _ = resolve_model_params(
+            _make_args(fit_summary_json=p), Ts_resolve
+        )
+        assert param_names == ["a0", "a1", "a2", "a3"], param_names
+        np.testing.assert_allclose(params, [0.0, 1.0, 2.0, 3.0])
+    print("  quick-test fit_summary param ordering: PASSED")
+
+    # Test 4: model mismatch between --model and summary
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly2",
+            "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+            "Tref": 300.0, "Tscale": 80.0,
+        })
+        try:
+            resolve_model_params(
+                _make_args(fit_summary_json=p, model="poly3"), Ts_resolve
+            )
+            raise AssertionError("expected model mismatch error")
+        except ValueError as e:
+            assert "conflicts with model" in str(e), str(e)
+    print("  quick-test fit_summary model mismatch: PASSED")
+
+    # Test 5: conflicting Tref
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly2",
+            "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+            "Tref": 300.0, "Tscale": 80.0,
+        })
+        try:
+            resolve_model_params(
+                _make_args(fit_summary_json=p, Tref=310.0), Ts_resolve
+            )
+            raise AssertionError("expected Tref conflict error")
+        except ValueError as e:
+            assert "Tref" in str(e), str(e)
+        # Agreeing Tref within tolerance is accepted.
+        _, _, _, Tref, _, _, _ = resolve_model_params(
+            _make_args(fit_summary_json=p, Tref=300.0), Ts_resolve
+        )
+        assert Tref == 300.0
+    print("  quick-test fit_summary Tref conflict: PASSED")
+
+    # Test 6: ambiguous sources
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly2",
+            "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+            "Tref": 300.0, "Tscale": 80.0,
+        })
+        for extra in (dict(params="0,0,0"), dict(fit_params_csv="x.csv")):
+            try:
+                resolve_model_params(
+                    _make_args(fit_summary_json=p, **extra), Ts_resolve
+                )
+                raise AssertionError("expected ambiguous-source error")
+            except ValueError as e:
+                assert "only one model parameter source" in str(e), str(e)
+    print("  quick-test ambiguous sources: PASSED")
+
+    # Test 7: missing parameter (poly3 summary missing a3)
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly3",
+            "params": {"a0": 0.0, "a1": 1.0, "a2": 2.0},
+            "Tref": 300.0, "Tscale": 80.0,
+        })
+        try:
+            resolve_model_params(_make_args(fit_summary_json=p), Ts_resolve)
+            raise AssertionError("expected missing-parameter error")
+        except ValueError as e:
+            assert "missing parameter" in str(e).lower(), str(e)
+    print("  quick-test missing parameter: PASSED")
+
+    # Test 8: old hs fallback (no summary, no csv, no params, no model)
+    (model_name, params, param_names, Tref, Tscale,
+     src, summ) = resolve_model_params(_make_args(), Ts_resolve)
+    assert model_name == "hs", model_name
+    np.testing.assert_allclose(params, [312.109, 1.23278])
+    assert src == "legacy_dh_ds", src
+    assert summ is None
+    print("  quick-test legacy hs fallback: PASSED")
+
+    # Companion-summary discovery for --fit-params-csv
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = os.path.join(tmp, "fit_params.csv")
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["parameter", "value"])
+            for n, v in zip(["a0", "a1", "a2"], [0.1, -0.5, 0.03]):
+                w.writerow([n, v])
+        _write_summary(tmp, {
+            "model": "poly2",
+            "params": {"a0": 0.1, "a1": -0.5, "a2": 0.03},
+            "Tref": 300.0, "Tscale": 80.0,
+        })
+        (model_name, params, _, Tref, Tscale,
+         src, summ) = resolve_model_params(
+            _make_args(fit_params_csv=csv_path, model="poly2"), Ts_resolve
+        )
+        assert src == "fit_params_csv_with_summary", src
+        assert Tref == 300.0 and Tscale == 80.0, (Tref, Tscale)
+        assert summ is not None
+    print("  quick-test companion summary discovery: PASSED")
+
+    # Test 9: small REMD run loaded from a summary file
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write_summary(tmp, {
+            "model": "poly2",
+            "param_names": ["a0", "a1", "a2"],
+            "params": {"a0": 0.0, "a1": -0.5, "a2": 0.0},
+            "Tref": 300.0,
+            "Tscale": 80.0,
+        })
+        Ts_run = np.linspace(260, 340, 4)
+        (model_name, params, param_names, Tref, Tscale,
+         src, summ) = resolve_model_params(
+            _make_args(fit_summary_json=p), Ts_run
+        )
+        reps, _sp, _sa = run_remd(
+            N=20, Ts=Ts_run, steps_per_swap=50, n_cycles=20,
+            model_name=model_name, params=params, Tref=Tref, Tscale=Tscale,
+            seed=5, n_workers=1, verbose=False,
+        )
+        dist = build_distributions(reps, rg_bins=20, burnin_frac=0.5)
+        attach_model_metadata(
+            dist, model_name, param_names, params, Tref, Tscale,
+            parameter_source=src, fit_summary_json=summ,
+        )
+        for i, row in enumerate(dist["Pc"]):
+            finite = row[np.isfinite(row)]
+            if finite.size > 0:
+                assert abs(float(finite.sum()) - 1.0) < 1e-6, f"Pc[{i}] not normalised"
+        for i, row in enumerate(dist["Prg"]):
+            finite = row[np.isfinite(row)]
+            if finite.size > 0:
+                assert abs(float(finite.sum()) - 1.0) < 1e-6, f"Prg[{i}] not normalised"
+        assert str(dist["model_name"]) == "poly2"
+        np.testing.assert_array_equal(dist["param_names"], np.array(["a0", "a1", "a2"]))
+        np.testing.assert_allclose(dist["model_params"], np.array([0.0, -0.5, 0.0]))
+        assert float(dist["Tref"]) == 300.0
+        assert float(dist["Tscale"]) == 80.0
+        assert str(dist["parameter_source"]) == "fit_summary_json"
+        assert str(dist["fit_summary_json"]) == p
+    print("  quick-test REMD-from-summary: PASSED")
+
     print("quick-test complete.")
 
 
@@ -1040,32 +1261,249 @@ def load_fit_params_csv(path: str, model_name: str) -> list[float]:
     return [found[name] for name in needed]
 
 
+def load_fit_summary_json(path: str) -> dict:
+    """Load and validate fit_summary.json from fit_lattice_contact_model.py.
+
+    Returns a normalized dictionary carrying the model name, parameters in
+    registry order, parameter names, Tref, Tscale, and the source path.  The
+    parameter order is always taken from MODEL_REGISTRY (never from JSON
+    insertion order).  For the heat_capacity model the thermodynamic reference
+    temperature is taken from a future ``T0`` field if present, otherwise from
+    ``Tref`` (where the fitter currently stores it).
+    """
+    with open(path) as fh:
+        summary = json.load(fh)
+
+    if not isinstance(summary, dict):
+        raise ValueError(
+            f"fit_summary.json {path!r} must contain a JSON object/dictionary "
+            f"at the root."
+        )
+
+    required = ("model", "params", "Tref", "Tscale")
+    missing_fields = [k for k in required if k not in summary]
+    if missing_fields:
+        raise ValueError(
+            f"fit_summary.json {path!r} is missing required field(s): "
+            f"{missing_fields}"
+        )
+
+    model_name = summary["model"]
+    if model_name not in MODEL_REGISTRY:
+        raise ValueError(
+            f"fit_summary.json {path!r} specifies unknown model "
+            f"{model_name!r}. Known models: {list(MODEL_REGISTRY.keys())}"
+        )
+
+    raw_params = summary["params"]
+    if not isinstance(raw_params, dict):
+        raise ValueError(
+            f"fit_summary.json {path!r} field 'params' must be a dictionary "
+            f"mapping parameter name -> value."
+        )
+
+    param_names = MODEL_REGISTRY[model_name]["param_names"]
+    missing_params = [name for name in param_names if name not in raw_params]
+    if missing_params:
+        raise ValueError(
+            f"fit_summary.json {path!r} is missing parameter(s) for model "
+            f"{model_name!r}: {missing_params}. Expected: {param_names}"
+        )
+
+    params: list[float] = []
+    for name in param_names:  # registry order, NOT JSON insertion order
+        val = float(raw_params[name])
+        if not math.isfinite(val):
+            raise ValueError(
+                f"fit_summary.json {path!r} parameter {name!r} is not finite: "
+                f"{raw_params[name]!r}"
+            )
+        params.append(val)
+
+    if model_name == "heat_capacity":
+        Tref = float(summary.get("T0", summary["Tref"]))
+    else:
+        Tref = float(summary["Tref"])
+    Tscale = float(summary["Tscale"])
+
+    if not math.isfinite(Tref):
+        raise ValueError(f"fit_summary.json {path!r} Tref is not finite: {Tref!r}")
+    if not math.isfinite(Tscale):
+        raise ValueError(
+            f"fit_summary.json {path!r} Tscale is not finite: {Tscale!r}"
+        )
+    if Tscale <= 0.0:
+        raise ValueError(
+            f"fit_summary.json {path!r} Tscale must be positive, got {Tscale!r}"
+        )
+    if model_name == "heat_capacity" and Tref <= 0.0:
+        raise ValueError(
+            f"fit_summary.json {path!r} heat_capacity reference temperature "
+            f"(T0) must be positive, got {Tref!r}"
+        )
+
+    return {
+        "model_name": model_name,
+        "param_names": list(param_names),
+        "params": params,
+        "Tref": Tref,
+        "Tscale": Tscale,
+        "source_path": str(path),
+    }
+
+
 def resolve_model_params(
     args, Ts: np.ndarray
-) -> tuple[str, list[float], list[str], float, float]:
-    model_name = args.model
-    spec = MODEL_REGISTRY[model_name]
-    param_names = spec["param_names"]
+) -> tuple[str, list[float], list[str], float, float, str, str | None]:
+    """Resolve the contact-bias model and its parameters.
+
+    Precedence of explicit parameter sources (mutually exclusive):
+        1. --fit-summary-json
+        2. --fit-params-csv  (with optional companion fit_summary.json)
+        3. --params
+        4. legacy --dh/--ds (hs only)
+
+    Returns (model_name, params, param_names, Tref, Tscale, parameter_source,
+    fit_summary_json) where fit_summary_json is the summary path when one was
+    used, else None.
+    """
+    # Reject ambiguous combinations of explicit sources.
+    explicit = [
+        ("--fit-summary-json", args.fit_summary_json is not None),
+        ("--fit-params-csv", args.fit_params_csv is not None),
+        ("--params", args.params is not None),
+    ]
+    n_explicit = sum(1 for _, present in explicit if present)
+    if n_explicit > 1:
+        raise ValueError(
+            "Choose only one model parameter source: --fit-summary-json, "
+            "--fit-params-csv, or --params."
+        )
 
     Tmin = float(np.min(Ts))
     Tmax = float(np.max(Ts))
-    Tref = float(args.Tref) if args.Tref is not None else 0.5 * (Tmin + Tmax)
-    Tscale = float(args.Tscale) if args.Tscale is not None else max(Tmax - Tmin, 1.0)
 
+    def _default_Tref_Tscale() -> tuple[float, float]:
+        Tref = float(args.Tref) if args.Tref is not None else 0.5 * (Tmin + Tmax)
+        Tscale = (
+            float(args.Tscale) if args.Tscale is not None else max(Tmax - Tmin, 1.0)
+        )
+        return Tref, Tscale
+
+    # --- Case A: --fit-summary-json supplied -------------------------------
+    if args.fit_summary_json is not None:
+        summary = load_fit_summary_json(args.fit_summary_json)
+        model_name = summary["model_name"]
+        param_names = summary["param_names"]
+        params = summary["params"]
+        Tref = summary["Tref"]
+        Tscale = summary["Tscale"]
+
+        if args.model is not None and args.model != model_name:
+            raise ValueError(
+                f"--model {args.model} conflicts with model {model_name} "
+                f"stored in fit_summary.json"
+            )
+
+        # Any explicitly supplied Tref/Tscale/T0 must agree with the summary.
+        if args.Tscale is not None and not np.isclose(
+            float(args.Tscale), Tscale, rtol=1e-10, atol=1e-12
+        ):
+            raise ValueError(
+                f"--Tscale {args.Tscale} conflicts with Tscale {Tscale} stored "
+                f"in fit_summary.json"
+            )
+        if model_name == "heat_capacity":
+            # Both --T0 and --Tref (if given) are compared against the effective
+            # reference temperature; they are not applied independently.
+            if args.T0 is not None and not np.isclose(
+                float(args.T0), Tref, rtol=1e-10, atol=1e-12
+            ):
+                raise ValueError(
+                    f"--T0 {args.T0} conflicts with heat_capacity reference "
+                    f"temperature {Tref} stored in fit_summary.json"
+                )
+            if args.Tref is not None and not np.isclose(
+                float(args.Tref), Tref, rtol=1e-10, atol=1e-12
+            ):
+                raise ValueError(
+                    f"--Tref {args.Tref} conflicts with heat_capacity reference "
+                    f"temperature {Tref} stored in fit_summary.json"
+                )
+        else:
+            if args.Tref is not None and not np.isclose(
+                float(args.Tref), Tref, rtol=1e-10, atol=1e-12
+            ):
+                raise ValueError(
+                    f"--Tref {args.Tref} conflicts with Tref {Tref} stored in "
+                    f"fit_summary.json"
+                )
+
+        return (
+            model_name, params, param_names, Tref, Tscale,
+            "fit_summary_json", summary["source_path"],
+        )
+
+    # Resolve model for the remaining (non-summary) cases.
+    model_name = args.model if args.model is not None else "hs"
+    param_names = MODEL_REGISTRY[model_name]["param_names"]
+    Tref, Tscale = _default_Tref_Tscale()
     if model_name == "heat_capacity" and args.T0 is not None:
         Tref = float(args.T0)
 
+    # --- Case B: --fit-params-csv supplied ---------------------------------
     if args.fit_params_csv is not None:
         params = load_fit_params_csv(args.fit_params_csv, model_name)
-    elif args.params is not None:
+        parameter_source = "fit_params_csv"
+        summary_path: str | None = None
+
+        # Optional companion summary lookup next to the CSV.
+        candidate = Path(args.fit_params_csv).with_name("fit_summary.json")
+        if candidate.exists():
+            companion = load_fit_summary_json(str(candidate))
+            if companion["model_name"] != model_name:
+                raise ValueError(
+                    f"Companion fit_summary.json {str(candidate)!r} model "
+                    f"{companion['model_name']} does not match selected model "
+                    f"{model_name}."
+                )
+            if not np.allclose(
+                np.array(companion["params"], dtype=float),
+                np.array(params, dtype=float),
+            ):
+                raise ValueError(
+                    f"Companion fit_summary.json {str(candidate)!r} parameters "
+                    f"{companion['params']} do not match CSV parameters {params}."
+                )
+            Tref = companion["Tref"]
+            Tscale = companion["Tscale"]
+            summary_path = companion["source_path"]
+            parameter_source = "fit_params_csv_with_summary"
+            print(f"Loaded companion metadata from {summary_path}")
+
+        if len(params) != len(param_names):
+            raise ValueError(
+                f"Model {model_name!r} expects {len(param_names)} parameters "
+                f"{param_names}, but got {len(params)} values: {params}"
+            )
+        return (
+            model_name, params, param_names, Tref, Tscale,
+            parameter_source, summary_path,
+        )
+
+    # --- Case C: --params supplied -----------------------------------------
+    if args.params is not None:
         params = parse_params_string(args.params)
+        parameter_source = "params_cli"
+    # --- Case D: no explicit source ----------------------------------------
     elif model_name == "hs":
         # Backward compatibility: old --dh/--ds flags define h and s.
         params = [float(args.dh), float(args.ds)]
+        parameter_source = "legacy_dh_ds"
     else:
         raise ValueError(
-            f"Model {model_name!r} requires either --params or --fit-params-csv. "
-            f"Expected parameters: {param_names}"
+            f"Model {model_name!r} requires one of --params, --fit-params-csv, "
+            f"or --fit-summary-json. Expected parameters: {param_names}"
         )
 
     if len(params) != len(param_names):
@@ -1074,7 +1512,7 @@ def resolve_model_params(
             f"{param_names}, but got {len(params)} values: {params}"
         )
 
-    return model_name, params, param_names, Tref, Tscale
+    return model_name, params, param_names, Tref, Tscale, parameter_source, None
 
 
 def attach_model_metadata(
@@ -1084,13 +1522,24 @@ def attach_model_metadata(
     model_params: list[float],
     Tref: float,
     Tscale: float,
+    parameter_source: str | None = None,
+    fit_summary_json: str | None = None,
 ) -> dict:
-    """Inject contact-bias model metadata into a distributions dict in place."""
+    """Inject contact-bias model metadata into a distributions dict in place.
+
+    The existing metadata keys (model_name, param_names, model_params, Tref,
+    Tscale) are preserved unchanged.  Optional provenance keys parameter_source
+    and fit_summary_json are added when supplied.
+    """
     dist["model_name"] = model_name
     dist["param_names"] = np.array(param_names)
     dist["model_params"] = np.array(model_params, dtype=float)
     dist["Tref"] = float(Tref)
     dist["Tscale"] = float(Tscale)
+    if parameter_source is not None:
+        dist["parameter_source"] = str(parameter_source)
+    if fit_summary_json is not None:
+        dist["fit_summary_json"] = str(fit_summary_json)
     return dist
 
 
@@ -1126,9 +1575,26 @@ def main() -> None:
     ap.add_argument(
         "--model",
         type=str,
-        default="hs",
+        default=None,
         choices=list(MODEL_REGISTRY.keys()),
-        help="Contact-bias model b(T). Default hs preserves old --dh/--ds behavior.",
+        help=(
+            "Contact-bias model b(T). If --fit-summary-json is supplied, the "
+            "model is loaded from the summary (and --model, if given, must "
+            "match it). Otherwise the default model is hs, which preserves the "
+            "old --dh/--ds behavior."
+        ),
+    )
+    ap.add_argument(
+        "--fit-summary-json",
+        type=str,
+        default=None,
+        dest="fit_summary_json",
+        help=(
+            "Load the fitted model, parameters, Tref, and Tscale directly from "
+            "fit_summary.json produced by fit_lattice_contact_model.py. "
+            "This is the preferred input for hs_quadratic, poly2, poly3, and "
+            "heat_capacity models."
+        ),
     )
     ap.add_argument(
         "--params",
@@ -1206,17 +1672,27 @@ def main() -> None:
     Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
     total_steps = args.steps_per_swap * args.n_cycles
 
-    model_name, model_params, param_names, Tref, Tscale = resolve_model_params(args, Ts)
+    (
+        model_name, model_params, param_names, Tref, Tscale,
+        parameter_source, fit_summary_json,
+    ) = resolve_model_params(args, Ts)
 
     print(
         f"REMD: {args.nT} replicas, T in [{args.Tmin}, {args.Tmax}], "
         f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
     )
     print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
+    print(f"Parameter source: {parameter_source}")
+    if fit_summary_json is not None:
+        print(f"Fit summary: {fit_summary_json}")
     print("Parameters:")
     for name, val in zip(param_names, model_params):
         print(f"  {name} = {val:.8g}")
-    print(f"Tref = {Tref:.8g}, Tscale = {Tscale:.8g}")
+    if model_name == "heat_capacity":
+        print(f"T0 = {Tref:.8g}")
+        print(f"Tscale = {Tscale:.8g}")
+    else:
+        print(f"Tref = {Tref:.8g}, Tscale = {Tscale:.8g}")
     if model_name == "hs" and abs(model_params[1]) > 1e-15:
         print(f"Derived Tc = {model_params[0] / model_params[1]:.8g}")
     elif model_name == "tc_scale":
@@ -1245,7 +1721,10 @@ def main() -> None:
         replicas, rg_bins=args.rg_bins, burnin_frac=args.burnin_frac,
         rg_scale=args.rg_scale,
     )
-    attach_model_metadata(dist, model_name, param_names, model_params, Tref, Tscale)
+    attach_model_metadata(
+        dist, model_name, param_names, model_params, Tref, Tscale,
+        parameter_source=parameter_source, fit_summary_json=fit_summary_json,
+    )
 
     save_results_csv(results, args.out_prefix)
     save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
