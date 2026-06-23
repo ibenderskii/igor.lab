@@ -3,9 +3,9 @@
 run_model_suite.py — subprocess orchestrator for the lattice contact-model suite.
 
 For every baseline x every selected contact-bias model this script:
-  1. fits the model to the target REMD distributions (fit_lattice_contact_model.py),
+  1. fits the model to the target REMD distributions (fit_lattice_contact_model_chat.py),
   2. loads the resulting fit_summary.json,
-  3. runs one or more lattice REMD replicates (remd_uniform_chain_new.py),
+  3. runs one or more lattice REMD replicates (remd_uniform_chain_new_chat.py),
   4. compares simulated outputs to the target with a standardized metric,
   5. writes a per-baseline comparison table and a provenance manifest.
 
@@ -2191,8 +2191,8 @@ def run_quick_test() -> None:
 
         config = {
             "target_remd": str(target),
-            "fit_script": str(here / "fit_lattice_contact_model.py"),
-            "remd_script": str(here / "remd_uniform_chain_new.py"),
+            "fit_script": str(here / "fit_lattice_contact_model_chat.py"),
+            "remd_script": str(here / "remd_uniform_chain_new_chat.py"),
             "output_root": str(tmp / "out"),
             "models": list(SUPPORTED_MODELS),
             "baselines": [{
