@@ -16,7 +16,7 @@
   "baselines": [
     {
       "name": "joint_baseline_44mer",
-      "path": "dists_44mer_long/single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
+      "path": "single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
       "contact_offset": 43,
       "rg_scale": 0.46320503312590167
     }
