@@ -1,7 +1,7 @@
 {
   "target_remd": "remd_distributions_44mer.npz",
-  "fit_script": "fit_lattice_contact_model.py",
-  "remd_script": "remd_uniform_chain_new.py",
+  "fit_script": "fit_lattice_contact_model_chat.py",
+  "remd_script": "remd_uniform_chain_new_chat.py",
   "output_root": "model_suite_output",
 
   "models": [
@@ -25,7 +25,7 @@
   "fit": {
     "loss": "js",
     "fit_rg": true,
-    "rg_weight": 0.25,
+    "rg_weight": 0.5,
     "holdout_every": 3,
     "holdout_indices": null,
     "train_indices": null,
@@ -42,7 +42,7 @@
     "n_cycles": 5000,
     "rg_bins": 100,
     "burnin_frac": 0.7,
-    "n_workers": 4,
+    "n_workers": 8,
     "seeds": [1, 2, 3],
     "plots": false,
     "timing": true
@@ -50,7 +50,7 @@
 
   "comparison": {
     "include_rg": true,
-    "rg_weight": 0.25,
+    "rg_weight": 0.5,
     "temperature_tolerance": 1e-10,
     "make_plots": true
   }
