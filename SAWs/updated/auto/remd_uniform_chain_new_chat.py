@@ -545,6 +545,8 @@ def run_remd(
     verbose: bool = True,
     n_workers: int = 1,
     timing: bool = False,
+    diagnostics: bool = False,
+    diag_store: dict | None = None,
 ) -> tuple[list[Replica], np.ndarray, np.ndarray]:
     """
     Run REMD.
@@ -575,6 +577,18 @@ def run_remd(
 
     swap_props = np.zeros(nT - 1, dtype=int)
     swap_accs  = np.zeros(nT - 1, dtype=int)
+
+    # Optional walker (configuration) identity tracking.  Lanes are temperature-
+    # fixed; a "walker" is a configuration that migrates between lanes via swaps.
+    # lane_walker[k] = walker currently in lane k; walker_lane[w] = lane of w.
+    # Both are plain NumPy integer arrays (bounded memory, no Python objects).
+    track_walkers = bool(diagnostics)
+    if track_walkers:
+        lane_walker = np.arange(nT, dtype=np.int64)
+        walker_lane = np.arange(nT, dtype=np.int64)
+        walker_temp_index = np.empty((n_cycles, nT), dtype=np.int32)
+    else:
+        walker_temp_index = None
 
     report_every = max(1, n_cycles // 20)
     base_seed = seed if seed is not None else 0
@@ -619,6 +633,13 @@ def run_remd(
                     replicas[k], replicas[k + 1], model_name, params, Tref, Tscale
                 ):
                     swap_accs[k] += 1
+                    if track_walkers:
+                        wa = lane_walker[k]
+                        wb = lane_walker[k + 1]
+                        lane_walker[k] = wb
+                        lane_walker[k + 1] = wa
+                        walker_lane[wa] = k + 1
+                        walker_lane[wb] = k
 
             t2 = time.perf_counter()
             t_swap_total += t2 - t1
@@ -627,6 +648,9 @@ def run_remd(
                 rep.E_traj.append(rep.state.E)
                 rep.C_traj.append(contact_count(rep.state.chain, rep.state.occ))
                 rep.Rg_traj.append(radius_of_gyration(rep.state.chain))
+
+            if track_walkers:
+                walker_temp_index[cycle] = walker_lane
 
             if verbose and (cycle + 1) % report_every == 0:
                 rates = " ".join(
@@ -649,6 +673,9 @@ def run_remd(
             f"  swaps {t_swap_total:.2f}s  |"
             f"  total {total:.2f}s"
         )
+
+    if track_walkers and diag_store is not None:
+        diag_store["walker_temp_index"] = walker_temp_index
 
     return replicas, swap_props, swap_accs
 
@@ -790,6 +817,356 @@ def build_distributions(
 
 
 # ---------------------------------------------------------------------------
+# Convergence and mixing diagnostics (optional; never alters canonical output)
+# ---------------------------------------------------------------------------
+# These diagnostics are computed in the main process from data the REMD loop
+# already produces (per-lane post-burn-in observable trajectories and, when
+# diagnostics are enabled, a walker temperature-index trajectory).  They do not
+# touch the sampling rule, the swap criterion, the canonical distributions, or
+# the multiprocessing path.
+
+# Default thresholds for convergence/mixing warnings.  Every threshold is
+# overridable from the CLI (and therefore from the suite config) and is recorded
+# verbatim in run_diagnostics.json so a run is self-describing.
+DEFAULT_DIAG_THRESHOLDS = {
+    "min_round_trips": 1,        # warn if total low->high->low round trips < this
+    "min_temp_coverage": 0.5,    # warn if any walker visits < this fraction of T
+    "min_ess": 50.0,             # warn if any lane/observable ESS < this
+    "max_drift": 1.0,            # warn if |early-late drift| / std > this
+    "min_swap_rate": 0.05,       # warn if any adjacent swap rate < this
+}
+DEFAULT_DIAG_N_BLOCKS = 5
+
+
+def _autocovariance(x: np.ndarray) -> np.ndarray:
+    """Biased autocovariance (lags 0..n-1) via FFT; acov[0] is the variance."""
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    x = x - x.mean()
+    size = 1
+    while size < 2 * n:
+        size *= 2
+    f = np.fft.rfft(x, n=size)
+    acov = np.fft.irfft(f * np.conjugate(f), n=size)[:n].real
+    acov /= float(n)
+    return acov
+
+
+def integrated_autocorr_time(x) -> dict:
+    """Integrated autocorrelation time via Geyer's initial-positive-sequence rule.
+
+    Estimator (Geyer 1992): with normalized autocorrelations rho_k, form the
+    paired sums Gamma_m = rho_{2m} + rho_{2m+1}.  The initial positive sequence
+    truncates at the first m with Gamma_m <= 0, and
+
+        tau_int = 2 * sum_{m=0..M} Gamma_m - 1,   ESS = n / tau_int.
+
+    This is a documented, robust, monotone truncation that avoids summing noisy
+    high-lag autocorrelations.  Returns a dict with tau_int, ess, n_samples and
+    the method label.  A (near-)constant series is reported as tau_int = 1.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n < 2:
+        return {"tau_int": float("nan"), "ess": float("nan"),
+                "n_samples": int(n), "method": "insufficient_samples"}
+    acov = _autocovariance(x)
+    var = acov[0]
+    if not np.isfinite(var) or var <= 0.0:
+        return {"tau_int": 1.0, "ess": float(n), "n_samples": int(n),
+                "method": "constant_series"}
+    rho = acov / var
+    gamma_sum = 0.0
+    m = 0
+    max_m = (n - 1) // 2
+    while m <= max_m:
+        idx = 2 * m
+        g = rho[idx] + (rho[idx + 1] if (idx + 1) < n else 0.0)
+        if g <= 0.0:
+            break
+        gamma_sum += g
+        m += 1
+    tau = 2.0 * gamma_sum - 1.0
+    if not np.isfinite(tau) or tau < 1.0:
+        tau = 1.0
+    ess = n / tau
+    if ess > n:
+        ess = float(n)
+    return {"tau_int": float(tau), "ess": float(ess), "n_samples": int(n),
+            "method": "geyer_initial_positive_sequence"}
+
+
+def early_late_drift(x) -> dict:
+    """Compare the mean of the first half vs the second half of a series.
+
+    Returns the raw drift (late - early) and the drift expressed in units of the
+    series standard deviation (drift_in_std), which is the scale used for the
+    configurable drift warning.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n < 2:
+        return {"early_mean": float("nan"), "late_mean": float("nan"),
+                "drift": float("nan"), "drift_in_std": float("nan")}
+    half = n // 2
+    early = float(x[:half].mean())
+    late = float(x[half:].mean())
+    drift = late - early
+    sd = float(x.std(ddof=0))
+    return {"early_mean": early, "late_mean": late, "drift": float(drift),
+            "drift_in_std": float(drift / sd) if sd > 0.0 else 0.0}
+
+
+def block_mean_stability(x, n_blocks: int) -> dict:
+    """Stability of block means over `n_blocks` contiguous blocks.
+
+    Reports the block means, their standard deviation, and the block-mean range
+    normalized by the overall standard deviation (a scale-free stability index).
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = x.size
+    nb = max(1, int(n_blocks))
+    if n < 1:
+        return {"n_blocks": int(nb), "block_means": [],
+                "block_mean_std": float("nan"),
+                "block_mean_range_over_std": float("nan")}
+    nb = min(nb, n)
+    blocks = np.array_split(x, nb)
+    bm = np.array([float(b.mean()) for b in blocks if b.size > 0], dtype=float)
+    overall = float(x.std(ddof=0))
+    bms = float(bm.std(ddof=0)) if bm.size > 1 else 0.0
+    rng = float(bm.max() - bm.min()) if bm.size > 0 else 0.0
+    return {"n_blocks": int(bm.size),
+            "block_means": [float(v) for v in bm],
+            "block_mean_std": bms,
+            "block_mean_range_over_std": (rng / overall) if overall > 0.0 else 0.0}
+
+
+def analyze_walker_trajectory(path, nT: int) -> dict:
+    """Mixing diagnostics for one walker's temperature-index trajectory.
+
+    `path` is the sequence of temperature indices (0 = lowest T, nT-1 = highest)
+    occupied by a single walker across cycles.  Computes:
+      - temperature-occupancy histogram and fraction of states visited;
+      - first-passage times low->high and high->low;
+      - complete L->H->L and H->L->H round-trip counts and durations.
+    Round trips are counted on the sequence of extreme-temperature touches, so
+    an alternating L,H,L,H,... record yields overlapping (shared-endpoint) trips
+    in the conventional REMD sense.
+    """
+    path = np.asarray(path).astype(int)
+    n = path.size
+    occ = np.bincount(path, minlength=nT)[:nT] if nT > 0 else np.array([], dtype=int)
+    visited = int(np.count_nonzero(occ))
+    frac = (visited / float(nT)) if nT > 0 else 0.0
+
+    bottom, top = 0, nT - 1
+    events = []  # (cycle, 'L'|'H') at each *change* of extreme touched
+    cur = None
+    for c in range(n):
+        v = int(path[c])
+        if v == bottom:
+            lab = "L"
+        elif v == top:
+            lab = "H"
+        else:
+            continue
+        if lab != cur:
+            events.append((c, lab))
+            cur = lab
+
+    lh, hl = [], []
+    for i in range(len(events) - 1):
+        a, b = events[i], events[i + 1]
+        if a[1] == "L" and b[1] == "H":
+            lh.append(b[0] - a[0])
+        elif a[1] == "H" and b[1] == "L":
+            hl.append(b[0] - a[0])
+
+    dur_lhl, dur_hlh = [], []
+    for i in range(len(events) - 2):
+        a, b, c2 = events[i], events[i + 1], events[i + 2]
+        if a[1] == "L" and b[1] == "H" and c2[1] == "L":
+            dur_lhl.append(c2[0] - a[0])
+        elif a[1] == "H" and b[1] == "L" and c2[1] == "H":
+            dur_hlh.append(c2[0] - a[0])
+
+    all_dur = dur_lhl + dur_hlh
+    return {
+        "occupancy": occ.astype(int),
+        "n_visited": visited,
+        "fraction_visited": float(frac),
+        "first_passage_low_to_high": (int(lh[0]) if lh else None),
+        "first_passage_high_to_low": (int(hl[0]) if hl else None),
+        "n_round_trips_low": int(len(dur_lhl)),    # complete low->high->low
+        "n_round_trips_high": int(len(dur_hlh)),   # complete high->low->high
+        "n_round_trips": int(len(dur_lhl) + len(dur_hlh)),
+        "round_trip_durations_low": [int(d) for d in dur_lhl],
+        "round_trip_durations_high": [int(d) for d in dur_hlh],
+        "mean_round_trip_duration": (float(np.mean(all_dur)) if all_dur else None),
+    }
+
+
+def _post_burnin_slice(n: int, burnin_frac: float) -> int:
+    return int(math.floor(n * burnin_frac))
+
+
+def compute_run_diagnostics(
+    replicas: list,
+    swap_props: np.ndarray,
+    swap_accs: np.ndarray,
+    walker_temp_index: np.ndarray,
+    Ts: np.ndarray,
+    burnin_frac: float,
+    n_blocks: int,
+    thresholds: dict,
+    rg_scale: float = 1.0,
+) -> dict:
+    """Assemble per-lane convergence and per-walker mixing diagnostics + warnings.
+
+    Lane convergence (autocorrelation/ESS/drift/block stability) is computed on
+    the post-burn-in segment of each temperature lane (matching the canonical
+    distributions).  Walker mixing (round trips, coverage) uses the full
+    temperature-index trajectory, because burn-in is part of mixing.
+    """
+    nT = len(replicas)
+    Ts = np.asarray(Ts, dtype=float)
+    thr = dict(DEFAULT_DIAG_THRESHOLDS)
+    thr.update(thresholds or {})
+
+    lane_conv = []
+    for i, rep in enumerate(replicas):
+        n = len(rep.C_traj)
+        s = _post_burnin_slice(n, burnin_frac)
+        C = np.asarray(rep.C_traj[s:], dtype=float)
+        E = np.asarray(rep.E_traj[s:], dtype=float)
+        Rg = np.asarray(rep.Rg_traj[s:], dtype=float) * float(rg_scale)
+        entry = {
+            "temperature_index": int(i),
+            "temperature": float(Ts[i]) if i < Ts.size else float("nan"),
+            "n_post_burnin": int(C.size),
+        }
+        for name, arr in (("contacts", C), ("rg", Rg), ("energy", E)):
+            ac = integrated_autocorr_time(arr)
+            dr = early_late_drift(arr)
+            bl = block_mean_stability(arr, n_blocks)
+            entry[name] = {
+                "mean": float(np.nanmean(arr)) if arr.size else float("nan"),
+                "std": float(np.nanstd(arr, ddof=0)) if arr.size else float("nan"),
+                "tau_int": ac["tau_int"],
+                "ess": ac["ess"],
+                "n_samples": ac["n_samples"],
+                "acf_method": ac["method"],
+                "drift": dr["drift"],
+                "drift_in_std": dr["drift_in_std"],
+                "early_mean": dr["early_mean"],
+                "late_mean": dr["late_mean"],
+                "block_mean_std": bl["block_mean_std"],
+                "block_mean_range_over_std": bl["block_mean_range_over_std"],
+                "block_means": bl["block_means"],
+            }
+        lane_conv.append(entry)
+
+    wti = np.asarray(walker_temp_index)
+    n_walkers = wti.shape[1] if wti.ndim == 2 else 0
+    walker_diag = []
+    for w in range(n_walkers):
+        wd = analyze_walker_trajectory(wti[:, w], nT)
+        wd["walker"] = int(w)
+        walker_diag.append(wd)
+
+    swap_rates = []
+    for k in range(len(swap_props)):
+        p = int(swap_props[k])
+        a = int(swap_accs[k])
+        swap_rates.append((a / p) if p > 0 else float("nan"))
+    swap_rates_arr = np.array(swap_rates, dtype=float)
+    finite_swap = swap_rates_arr[np.isfinite(swap_rates_arr)]
+
+    # --- summary scalars used for warnings and cross-run aggregation ---
+    def _obs_esss(name):
+        return [lane[name]["ess"] for lane in lane_conv
+                if np.isfinite(lane[name]["ess"])]
+
+    def _obs_taus(name):
+        return [lane[name]["tau_int"] for lane in lane_conv
+                if np.isfinite(lane[name]["tau_int"])]
+
+    ess_contacts = _obs_esss("contacts")
+    drift_contacts = [abs(lane["contacts"]["drift_in_std"]) for lane in lane_conv
+                      if np.isfinite(lane["contacts"]["drift_in_std"])]
+    coverage = [w["fraction_visited"] for w in walker_diag]
+    rt_low = [w["n_round_trips_low"] for w in walker_diag]
+    total_round_trips = int(sum(rt_low))
+
+    summary = {
+        "n_temperatures": int(nT),
+        "n_walkers": int(n_walkers),
+        "total_round_trips_low": total_round_trips,
+        "min_round_trips_per_walker": int(min(rt_low)) if rt_low else 0,
+        "median_round_trips_per_walker": float(np.median(rt_low)) if rt_low else 0.0,
+        "min_temp_coverage": float(min(coverage)) if coverage else float("nan"),
+        "median_temp_coverage": float(np.median(coverage)) if coverage else float("nan"),
+        "min_ess_contacts": float(min(ess_contacts)) if ess_contacts else float("nan"),
+        "median_ess_contacts": float(np.median(ess_contacts)) if ess_contacts else float("nan"),
+        "total_ess_contacts": float(sum(ess_contacts)) if ess_contacts else float("nan"),
+        "max_autocorr_contacts": float(max(_obs_taus("contacts"))) if _obs_taus("contacts") else float("nan"),
+        "max_autocorr_rg": float(max(_obs_taus("rg"))) if _obs_taus("rg") else float("nan"),
+        "max_drift_contacts": float(max(drift_contacts)) if drift_contacts else float("nan"),
+        "min_swap_rate": float(finite_swap.min()) if finite_swap.size else float("nan"),
+        "median_swap_rate": float(np.median(finite_swap)) if finite_swap.size else float("nan"),
+    }
+
+    # --- threshold-driven warnings (structured + recorded) ---
+    warnings = []
+
+    def _warn(kind, message, value, threshold):
+        warnings.append({"type": kind, "message": message,
+                         "value": (None if value is None or (isinstance(value, float)
+                                   and not math.isfinite(value)) else value),
+                         "threshold": threshold})
+
+    if total_round_trips < int(thr["min_round_trips"]):
+        _warn("round_trips",
+              f"total low->high->low round trips {total_round_trips} < "
+              f"{thr['min_round_trips']}",
+              total_round_trips, thr["min_round_trips"])
+    if coverage and min(coverage) < float(thr["min_temp_coverage"]):
+        _warn("temperature_coverage",
+              f"minimum walker temperature coverage {min(coverage):.3f} < "
+              f"{thr['min_temp_coverage']}",
+              float(min(coverage)), thr["min_temp_coverage"])
+    if ess_contacts and min(ess_contacts) < float(thr["min_ess"]):
+        _warn("low_ess",
+              f"minimum contact ESS {min(ess_contacts):.1f} < {thr['min_ess']}",
+              float(min(ess_contacts)), thr["min_ess"])
+    if drift_contacts and max(drift_contacts) > float(thr["max_drift"]):
+        _warn("drift",
+              f"maximum |contact drift|/std {max(drift_contacts):.3f} > "
+              f"{thr['max_drift']}",
+              float(max(drift_contacts)), thr["max_drift"])
+    if finite_swap.size and float(finite_swap.min()) < float(thr["min_swap_rate"]):
+        _warn("swap_rate",
+              f"minimum adjacent swap rate {float(finite_swap.min()):.3f} < "
+              f"{thr['min_swap_rate']}",
+              float(finite_swap.min()), thr["min_swap_rate"])
+
+    return {
+        "thresholds": {k: thr[k] for k in DEFAULT_DIAG_THRESHOLDS},
+        "n_blocks": int(n_blocks),
+        "burnin_frac": float(burnin_frac),
+        "summary": summary,
+        "swap_rates": swap_rates,
+        "lane_convergence": lane_conv,
+        "walkers": walker_diag,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Saving
 # ---------------------------------------------------------------------------
 
@@ -832,6 +1209,125 @@ def save_distributions(dist: dict, out_prefix: str) -> str:
     """Save distributions NPZ with canonical keys and fitting-script aliases."""
     path = f"{out_prefix}_distributions.npz"
     np.savez_compressed(path, **dist)
+    print(f"Saved {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Saving: diagnostics (separate files; canonical outputs untouched)
+# ---------------------------------------------------------------------------
+
+def save_diagnostics_json(diagnostics: dict, out_prefix: str) -> str:
+    path = f"{out_prefix}_diagnostics.json"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe(diagnostics), fh, indent=2, allow_nan=False)
+    print(f"Saved {path}")
+    return path
+
+
+CONVERGENCE_CSV_COLUMNS = [
+    "temperature_index", "temperature", "observable", "n_samples", "mean", "std",
+    "tau_int", "ess", "drift", "drift_in_std", "block_mean_std",
+    "block_mean_range_over_std", "acf_method",
+]
+
+
+def save_convergence_csv(diagnostics: dict, out_prefix: str) -> str:
+    path = f"{out_prefix}_convergence.csv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(CONVERGENCE_CSV_COLUMNS)
+        for lane in diagnostics["lane_convergence"]:
+            for obs in ("contacts", "rg", "energy"):
+                d = lane[obs]
+                w.writerow([
+                    lane["temperature_index"], lane["temperature"], obs,
+                    d["n_samples"], d["mean"], d["std"], d["tau_int"], d["ess"],
+                    d["drift"], d["drift_in_std"], d["block_mean_std"],
+                    d["block_mean_range_over_std"], d["acf_method"],
+                ])
+    print(f"Saved {path}")
+    return path
+
+
+ROUND_TRIPS_CSV_COLUMNS = [
+    "walker", "fraction_visited", "n_visited", "first_passage_low_to_high",
+    "first_passage_high_to_low", "n_round_trips_low", "n_round_trips_high",
+    "n_round_trips", "mean_round_trip_duration",
+]
+
+
+def save_round_trips_csv(diagnostics: dict, out_prefix: str) -> str:
+    path = f"{out_prefix}_round_trips.csv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(ROUND_TRIPS_CSV_COLUMNS)
+        for wd in diagnostics["walkers"]:
+            w.writerow([
+                wd["walker"], wd["fraction_visited"], wd["n_visited"],
+                wd["first_passage_low_to_high"], wd["first_passage_high_to_low"],
+                wd["n_round_trips_low"], wd["n_round_trips_high"],
+                wd["n_round_trips"], wd["mean_round_trip_duration"],
+            ])
+    print(f"Saved {path}")
+    return path
+
+
+def save_walker_occupancy_csv(diagnostics: dict, out_prefix: str) -> str:
+    path = f"{out_prefix}_walker_occupancy.csv"
+    nT = int(diagnostics["summary"]["n_temperatures"])
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        header = ["walker", "fraction_visited"] + [
+            f"occupancy_T{i}" for i in range(nT)
+        ]
+        w.writerow(header)
+        for wd in diagnostics["walkers"]:
+            occ = list(wd["occupancy"])
+            occ = occ + [0] * (nT - len(occ))
+            w.writerow([wd["walker"], wd["fraction_visited"]]
+                       + [int(v) for v in occ[:nT]])
+    print(f"Saved {path}")
+    return path
+
+
+def save_diagnostic_trajectories_npz(
+    replicas: list,
+    walker_temp_index: np.ndarray,
+    Ts: np.ndarray,
+    burnin_frac: float,
+    out_prefix: str,
+    rg_scale: float = 1.0,
+) -> str:
+    """Save compressed post-burn-in C/Rg/E and walker temperature-index traces.
+
+    Arrays are stored as compact NumPy arrays (not Python objects):
+        contacts_post  (nT, n_post)
+        rg_post        (nT, n_post)   in output units (rg_scale applied)
+        energy_post    (nT, n_post)
+        walker_temp_index_post (n_post, n_walkers)
+    """
+    path = f"{out_prefix}_diagnostic_trajectories.npz"
+    n_cycles = max((len(r.C_traj) for r in replicas), default=0)
+    s = _post_burnin_slice(n_cycles, burnin_frac)
+    C = np.array([np.asarray(r.C_traj[s:], dtype=np.float32) for r in replicas])
+    E = np.array([np.asarray(r.E_traj[s:], dtype=np.float32) for r in replicas])
+    Rg = np.array(
+        [np.asarray(r.Rg_traj[s:], dtype=np.float32) * np.float32(rg_scale)
+         for r in replicas]
+    )
+    wti = np.asarray(walker_temp_index)
+    wti_post = wti[s:].astype(np.int16) if wti.ndim == 2 else wti
+    np.savez_compressed(
+        path,
+        Ts=np.asarray(Ts, dtype=float),
+        burnin_start_cycle=int(s),
+        contacts_post=C,
+        rg_post=Rg,
+        energy_post=E,
+        walker_temp_index_post=wti_post,
+    )
     print(f"Saved {path}")
     return path
 
@@ -1584,7 +2080,130 @@ def run_quick_test() -> None:
         )
     print("  quick-test summary api-version handling: PASSED")
 
+    run_diagnostics_quick_test()
+
     print("quick-test complete.")
+
+
+def run_diagnostics_quick_test() -> None:
+    """Unit + smoke tests for the convergence/mixing diagnostics."""
+    import os
+    import tempfile
+
+    rng = np.random.RandomState(0)
+
+    # --- Integrated autocorrelation time on IID noise: tau ~ 1, ESS ~ n ----
+    iid = rng.standard_normal(4000)
+    ac = integrated_autocorr_time(iid)
+    assert 0.5 < ac["tau_int"] < 2.0, ac
+    assert ac["ess"] > 0.4 * iid.size, ac
+    assert ac["method"] == "geyer_initial_positive_sequence"
+
+    # --- AR(1): tau_int should approach (1+phi)/(1-phi) ---------------------
+    phi = 0.8
+    n = 60000
+    x = np.empty(n)
+    x[0] = 0.0
+    noise = rng.standard_normal(n)
+    for t in range(1, n):
+        x[t] = phi * x[t - 1] + noise[t]
+    ac_ar = integrated_autocorr_time(x)
+    tau_expected = (1.0 + phi) / (1.0 - phi)  # = 9.0
+    assert abs(ac_ar["tau_int"] - tau_expected) < 0.25 * tau_expected, (
+        ac_ar, tau_expected
+    )
+    assert ac_ar["ess"] < 0.5 * n, ac_ar  # correlated -> far fewer eff. samples
+
+    # --- constant series is reported cleanly --------------------------------
+    ac_const = integrated_autocorr_time(np.full(100, 3.0))
+    assert ac_const["method"] == "constant_series"
+    assert ac_const["tau_int"] == 1.0 and ac_const["ess"] == 100.0
+    print("  diagnostics quick-test autocorr/ESS (IID, AR1, constant): PASSED")
+
+    # --- drift / block stability --------------------------------------------
+    drift_series = np.concatenate([np.zeros(500), np.ones(500)])
+    dr = early_late_drift(drift_series)
+    assert abs(dr["drift"] - 1.0) < 1e-9, dr
+    assert dr["drift_in_std"] > 0.5, dr
+    bl = block_mean_stability(np.arange(100, dtype=float), n_blocks=5)
+    assert len(bl["block_means"]) == 5 and bl["block_mean_std"] > 0
+    print("  diagnostics quick-test drift/block stability: PASSED")
+
+    # --- walker analysis: known round trips ---------------------------------
+    nT = 4
+    # Build a path: bottom -> top -> bottom -> top -> bottom = 2 L->H->L trips.
+    up = list(range(0, nT))            # 0,1,2,3
+    down = list(range(nT - 1, -1, -1))  # 3,2,1,0
+    path = np.array([0] + up[1:] + down[1:] + up[1:] + down[1:], dtype=int)
+    wd = analyze_walker_trajectory(path, nT)
+    assert wd["n_round_trips_low"] == 2, wd
+    assert wd["n_round_trips_high"] == 1, wd
+    assert wd["fraction_visited"] == 1.0, wd
+    assert wd["first_passage_low_to_high"] is not None
+    assert wd["mean_round_trip_duration"] is not None
+
+    # --- walker analysis: no round trips (stuck near the bottom) ------------
+    stuck = np.array([0, 0, 1, 0, 1, 1, 0, 0], dtype=int)  # never reaches top
+    wd0 = analyze_walker_trajectory(stuck, nT)
+    assert wd0["n_round_trips_low"] == 0 and wd0["n_round_trips"] == 0, wd0
+    assert wd0["first_passage_low_to_high"] is None, wd0
+    assert wd0["fraction_visited"] < 1.0, wd0
+    print("  diagnostics quick-test walker round trips (known/none): PASSED")
+
+    # --- deterministic 1-worker vs 2-worker diagnostics smoke ---------------
+    Ts = np.linspace(300.0, 360.0, 5)
+    hs_params = [378.96, 1.39686]
+    Tref = 0.5 * (float(Ts.min()) + float(Ts.max()))
+    Tscale = max(float(Ts.max()) - float(Ts.min()), 1.0)
+    thresholds = dict(DEFAULT_DIAG_THRESHOLDS)
+    for n_workers in (1, 2):
+        diag_store: dict = {}
+        reps, sp, sa = run_remd(
+            N=18, Ts=Ts, steps_per_swap=40, n_cycles=60,
+            model_name="hs", params=hs_params, Tref=Tref, Tscale=Tscale,
+            seed=3, n_workers=n_workers, verbose=False,
+            diagnostics=True, diag_store=diag_store,
+        )
+        wti = diag_store["walker_temp_index"]
+        assert wti.shape == (60, len(Ts)), wti.shape
+        # Each cycle's walker->lane mapping must be a permutation of 0..nT-1.
+        for c in range(wti.shape[0]):
+            assert sorted(wti[c].tolist()) == list(range(len(Ts))), c
+        diag = compute_run_diagnostics(
+            reps, sp, sa, wti, Ts, burnin_frac=0.5, n_blocks=4,
+            thresholds=thresholds, rg_scale=1.0,
+        )
+        assert diag["summary"]["n_walkers"] == len(Ts)
+        assert len(diag["lane_convergence"]) == len(Ts)
+        assert len(diag["walkers"]) == len(Ts)
+        # Occupancy histograms must sum to the number of cycles for each walker.
+        for w in diag["walkers"]:
+            assert int(np.sum(w["occupancy"])) == wti.shape[0]
+        # Round-trip count is the conservation: total cycles spent at each lane.
+        lane_totals = np.zeros(len(Ts), dtype=int)
+        for w in diag["walkers"]:
+            lane_totals += np.asarray(w["occupancy"], dtype=int)
+        assert int(lane_totals.sum()) == wti.size
+
+        # Saving the diagnostics files round-trips through JSON (no NaN/Inf).
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "run")
+            save_diagnostics_json(diag, prefix)
+            save_convergence_csv(diag, prefix)
+            save_round_trips_csv(diag, prefix)
+            save_walker_occupancy_csv(diag, prefix)
+            save_diagnostic_trajectories_npz(
+                reps, wti, Ts, burnin_frac=0.5, out_prefix=prefix
+            )
+            for suffix in ("_diagnostics.json", "_convergence.csv",
+                           "_round_trips.csv", "_walker_occupancy.csv",
+                           "_diagnostic_trajectories.npz"):
+                assert os.path.exists(prefix + suffix), suffix
+            reloaded = json.loads(
+                open(prefix + "_diagnostics.json", encoding="utf-8").read()
+            )
+            assert "summary" in reloaded and "warnings" in reloaded
+        print(f"  diagnostics quick-test smoke n_workers={n_workers}: PASSED")
 
 
 # ---------------------------------------------------------------------------
@@ -2305,6 +2924,48 @@ def main() -> None:
     )
     ap.add_argument("--timing",         action="store_true",         help="print sweep/swap/total wall times")
     ap.add_argument("--quick-test",     action="store_true",         help="run smoke-test and exit")
+
+    # --- Optional convergence/mixing diagnostics (off by default) -----------
+    ap.add_argument(
+        "--diagnostics", action="store_true", dest="diagnostics",
+        help=(
+            "Compute and save REMD convergence/mixing diagnostics "
+            "(walker round trips, ESS/autocorrelation, drift, block stability). "
+            "Off by default; canonical outputs are unchanged either way."
+        ),
+    )
+    ap.add_argument(
+        "--diagnostic-trajectories", action="store_true",
+        dest="diagnostic_trajectories",
+        help=(
+            "Also save post-burn-in C/Rg/E and walker temperature-index traces "
+            "to <out-prefix>_diagnostic_trajectories.npz (enables cross-seed "
+            "Rhat downstream). Requires --diagnostics."
+        ),
+    )
+    ap.add_argument("--diag-n-blocks", type=int, default=DEFAULT_DIAG_N_BLOCKS,
+                    dest="diag_n_blocks",
+                    help="number of blocks for block-mean stability")
+    ap.add_argument("--diag-min-round-trips", type=int,
+                    default=DEFAULT_DIAG_THRESHOLDS["min_round_trips"],
+                    dest="diag_min_round_trips",
+                    help="warn if total low->high->low round trips is below this")
+    ap.add_argument("--diag-min-temp-coverage", type=float,
+                    default=DEFAULT_DIAG_THRESHOLDS["min_temp_coverage"],
+                    dest="diag_min_temp_coverage",
+                    help="warn if any walker visits less than this fraction of T")
+    ap.add_argument("--diag-min-ess", type=float,
+                    default=DEFAULT_DIAG_THRESHOLDS["min_ess"],
+                    dest="diag_min_ess",
+                    help="warn if any lane/observable ESS is below this")
+    ap.add_argument("--diag-max-drift", type=float,
+                    default=DEFAULT_DIAG_THRESHOLDS["max_drift"],
+                    dest="diag_max_drift",
+                    help="warn if |early-late drift|/std exceeds this")
+    ap.add_argument("--diag-min-swap-rate", type=float,
+                    default=DEFAULT_DIAG_THRESHOLDS["min_swap_rate"],
+                    dest="diag_min_swap_rate",
+                    help="warn if any adjacent swap rate is below this")
     args = ap.parse_args()
 
     if args.N < 3:
@@ -2321,6 +2982,10 @@ def main() -> None:
         raise ValueError("--burnin-frac must be in [0, 1)")
     if not math.isfinite(args.rg_scale) or args.rg_scale <= 0:
         raise ValueError("--rg-scale must be finite and positive")
+    if args.diagnostic_trajectories and not args.diagnostics:
+        raise ValueError("--diagnostic-trajectories requires --diagnostics")
+    if args.diagnostics and args.diag_n_blocks < 1:
+        raise ValueError("--diag-n-blocks must be >= 1")
 
     if args.quick_test:
         run_quick_test()
@@ -2389,6 +3054,7 @@ def main() -> None:
     elif model_name == "tc_scale":
         print(f"Tc = {model_params[1]:.8g}")
 
+    diag_store: dict = {}
     t_run_start = time.perf_counter()
     replicas, swap_props, swap_accs = run_remd(
         N=args.N, Ts=Ts,
@@ -2399,6 +3065,8 @@ def main() -> None:
         seed=args.seed, verbose=True,
         n_workers=args.n_workers,
         timing=args.timing,
+        diagnostics=args.diagnostics,
+        diag_store=diag_store,
     )
     wall_time_seconds = time.perf_counter() - t_run_start
 
@@ -2443,6 +3111,57 @@ def main() -> None:
         "swap_rates_csv": swap_path,
         "distributions_npz": dist_path,
     }
+
+    # --- Optional diagnostics (computed/saved separately from canonical output) -
+    diagnostics_result = None
+    diagnostics_overhead_seconds = 0.0
+    if args.diagnostics:
+        t_diag = time.perf_counter()
+        thresholds = {
+            "min_round_trips": args.diag_min_round_trips,
+            "min_temp_coverage": args.diag_min_temp_coverage,
+            "min_ess": args.diag_min_ess,
+            "max_drift": args.diag_max_drift,
+            "min_swap_rate": args.diag_min_swap_rate,
+        }
+        walker_temp_index = diag_store.get("walker_temp_index")
+        if walker_temp_index is None:
+            raise RuntimeError(
+                "diagnostics requested but walker trajectory was not recorded"
+            )
+        diagnostics_result = compute_run_diagnostics(
+            replicas, swap_props, swap_accs, walker_temp_index, Ts,
+            burnin_frac=args.burnin_frac, n_blocks=args.diag_n_blocks,
+            thresholds=thresholds, rg_scale=args.rg_scale,
+        )
+        output_files["diagnostics_json"] = save_diagnostics_json(
+            diagnostics_result, args.out_prefix
+        )
+        output_files["convergence_csv"] = save_convergence_csv(
+            diagnostics_result, args.out_prefix
+        )
+        output_files["round_trips_csv"] = save_round_trips_csv(
+            diagnostics_result, args.out_prefix
+        )
+        output_files["walker_occupancy_csv"] = save_walker_occupancy_csv(
+            diagnostics_result, args.out_prefix
+        )
+        if args.diagnostic_trajectories:
+            output_files["diagnostic_trajectories_npz"] = (
+                save_diagnostic_trajectories_npz(
+                    replicas, walker_temp_index, Ts,
+                    burnin_frac=args.burnin_frac, out_prefix=args.out_prefix,
+                    rg_scale=args.rg_scale,
+                )
+            )
+        diagnostics_overhead_seconds = time.perf_counter() - t_diag
+        for w in diagnostics_result["warnings"]:
+            print(f"  [diagnostic warning] {w['message']}")
+        print(
+            f"Diagnostics: {len(diagnostics_result['warnings'])} warning(s); "
+            f"computed in {diagnostics_overhead_seconds:.2f}s"
+        )
+
     if not args.no_plots:
         if plt is None or cm is None or mcolors is None:
             raise RuntimeError(
@@ -2485,7 +3204,15 @@ def main() -> None:
         "swap_rate_median": float(np.median(swap_rates_finite)) if swap_rates_finite.size else None,
         "local_acceptance_rates": local_acceptance_rates,
         "output_files": output_files,
+        "diagnostics_enabled": bool(args.diagnostics),
     }
+    if diagnostics_result is not None:
+        run_summary["diagnostics_overhead_seconds"] = float(
+            diagnostics_overhead_seconds
+        )
+        run_summary["diagnostics_summary"] = diagnostics_result["summary"]
+        run_summary["diagnostics_thresholds"] = diagnostics_result["thresholds"]
+        run_summary["diagnostics_warnings"] = diagnostics_result["warnings"]
     if model_name == "heat_capacity":
         run_summary["T0"] = float(Tref)
 

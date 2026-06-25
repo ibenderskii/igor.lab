@@ -45,13 +45,32 @@
     "n_workers": 8,
     "seeds": [1, 2, 3],
     "plots": false,
-    "timing": true
+    "timing": true,
+    "diagnostics": {
+      "enabled": true,
+      "trajectories": true,
+      "n_blocks": 5,
+      "min_round_trips": 1,
+      "min_temp_coverage": 0.5,
+      "min_ess": 50.0,
+      "max_drift": 1.0,
+      "min_swap_rate": 0.05,
+      "rhat_threshold": 1.1
+    }
   },
 
   "comparison": {
     "include_rg": true,
     "rg_weight": 0.5,
     "temperature_tolerance": 1e-10,
-    "make_plots": true
+    "make_plots": true,
+    "statistics": {
+      "enabled": true,
+      "alpha": 0.05,
+      "bootstrap_replicates": 10000,
+      "seed": 12345,
+      "practical_equivalence_epsilon": 0.001,
+      "multiple_testing": "holm"
+    }
   }
 }

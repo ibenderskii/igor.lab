@@ -1,0 +1,43 @@
+{
+  "model": "hs",
+  "loss": "js",
+  "param_names": [
+    "h",
+    "s"
+  ],
+  "params": [
+    330.52867487382156,
+    1.2892904622160057
+  ],
+  "hessian": {
+    "matrix": [
+      [
+        0.0024027679692541068,
+        -0.7796620927514744
+      ],
+      [
+        -0.7796620927514744,
+        254.25355584137114
+      ]
+    ],
+    "eigenvalues": [
+      1.19537859821061e-05,
+      254.2559466555544
+    ],
+    "condition_number": 21269909.55301994,
+    "positive_definite": true,
+    "curvature_length_scales": [
+      289.23125370845,
+      0.8891348220850551
+    ],
+    "note": "Local objective-curvature diagnostics only. The JS/KL objective on normalized histograms is NOT a log-likelihood; inverse-Hessian quantities are curvature scales, not statistical standard errors."
+  },
+  "restart_stability": {
+    "n_restarts": 6,
+    "n_success": 6,
+    "best_objective": 2.673108560948141,
+    "distinct_minima": true,
+    "n_distinct_objectives": 2,
+    "max_param_spread": 1626.9144028863593
+  }
+}

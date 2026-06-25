@@ -1,0 +1,241 @@
+{
+  "timestamp": "2026-06-25T18:28:16.369893+00:00",
+  "production_scalar": 0.46320503312590167,
+  "bootstrap": 60,
+  "seed": 123,
+  "confidence": 0.95,
+  "split_schemes": "blocked_low,blocked_mid,blocked_high,every_third_phase",
+  "meaningful_rel_improvement_threshold": 0.05,
+  "guardrail": "A temperature-dependent geometric scale may indicate model misspecification rather than a real unit conversion. The constant multiplicative mapping is preferred unless a richer mapping improves held-out Rg JS on every split and by a practically meaningful margin.",
+  "resampling_assumptions": "Coefficient uncertainty from resampling temperatures with replacement (temperatures are the replicate units). Per-T s(T) error bars are a local JS-curvature half-width, not a sampling interval. Histogram-bin resampling not performed: target Rg is a normalized density, not raw counts.",
+  "models": [
+    {
+      "label": "hs:boot_smoke",
+      "model": "hs",
+      "Tref_mapping": 318.3529375,
+      "Tscale_mapping": 80.0,
+      "scale_guess": 0.46474618703141585,
+      "poor_overlap": false,
+      "median_js_at_optimal_scale": 0.011617219176130943,
+      "s_opt_mean": 0.46357296359609146,
+      "s_opt_std": 0.003368992946824376,
+      "s_opt_min": 0.4594690188316099,
+      "s_opt_max": 0.47418158013741185,
+      "all_temp_fits": {
+        "multiplicative": {
+          "params": {
+            "s0": 0.46114797817979636
+          },
+          "js_mean": 0.01333306746046166
+        },
+        "affine": {
+          "params": {
+            "a": 0.467331793867492,
+            "c": -0.013646555115247712
+          },
+          "js_mean": 0.013248903193931422
+        },
+        "tlinear_scale": {
+          "params": {
+            "s0": 0.46202958588646614,
+            "s1": -0.003462755048314051
+          },
+          "js_mean": 0.0132890518655916
+        }
+      },
+      "bootstrap_ci": {
+        "multiplicative": {
+          "s0": {
+            "median": 0.46114975104580525,
+            "ci_low": 0.46097835036006685,
+            "ci_high": 0.46219554697578247,
+            "n": 60
+          }
+        },
+        "affine": {
+          "a": {
+            "median": 0.4673361509994328,
+            "ci_low": 0.4613537865405483,
+            "ci_high": 0.468122969479283,
+            "n": 60
+          },
+          "c": {
+            "median": -0.013690884383669825,
+            "ci_low": -0.016156154624251174,
+            "ci_high": -0.0006643895640556148,
+            "n": 60
+          }
+        },
+        "tlinear_scale": {
+          "s0": {
+            "median": 0.4620252568802118,
+            "ci_low": 0.4618080829901376,
+            "ci_high": 0.4646200053391222,
+            "n": 60
+          },
+          "s1": {
+            "median": -0.003438320558965935,
+            "ci_low": -0.004821247642695715,
+            "ci_high": 0.005232701032632573,
+            "n": 60
+          }
+        }
+      },
+      "slope_s1": {
+        "median": -0.003438320558965935,
+        "ci": [
+          -0.004821247642695715,
+          0.005232701032632573
+        ],
+        "distinguishable_from_zero": false,
+        "effect_size_rel_scale_change": 0.007441845457070717
+      },
+      "held_out_improvement_vs_constant": {
+        "affine": {
+          "val_js_mean_improvement_per_split": [
+            8.13129557592114e-06,
+            -1.476103946747992e-05,
+            5.578705173478124e-05,
+            9.809823680599107e-05,
+            6.999363067180728e-05,
+            8.001573940987113e-05
+          ],
+          "mean_improvement": 4.9544152455148656e-05,
+          "min_improvement": -1.476103946747992e-05,
+          "mean_relative_improvement": 0.0035147648225545545,
+          "improves_all_splits": false
+        },
+        "tlinear_scale": {
+          "val_js_mean_improvement_per_split": [
+            -6.55038327973187e-05,
+            -8.113971056511807e-06,
+            -0.000397520408255702,
+            4.8872456045026547e-05,
+            5.049141745494014e-05,
+            3.090740306875041e-05
+          ],
+          "mean_improvement": -5.6811155923469234e-05,
+          "min_improvement": -0.000397520408255702,
+          "mean_relative_improvement": -0.0031196357828995208,
+          "improves_all_splits": false
+        }
+      },
+      "stable_and_meaningful": false,
+      "recommendation": "constant multiplicative"
+    },
+    {
+      "label": "hs_quadratic:split_sens_run",
+      "model": "hs_quadratic",
+      "Tref_mapping": 318.3529375,
+      "Tscale_mapping": 80.0,
+      "scale_guess": 0.46453380532480587,
+      "poor_overlap": false,
+      "median_js_at_optimal_scale": 0.011601013354061359,
+      "s_opt_mean": 0.46372226075250467,
+      "s_opt_std": 0.0035839276720113257,
+      "s_opt_min": 0.45952840056786154,
+      "s_opt_max": 0.4742439433361835,
+      "all_temp_fits": {
+        "multiplicative": {
+          "params": {
+            "s0": 0.4611059405137848
+          },
+          "js_mean": 0.01309307501402671
+        },
+        "affine": {
+          "params": {
+            "a": 0.4670582554581778,
+            "c": -0.012984729661638352
+          },
+          "js_mean": 0.013031500625786735
+        },
+        "tlinear_scale": {
+          "params": {
+            "s0": 0.4618950659874922,
+            "s1": -0.002684902087419557
+          },
+          "js_mean": 0.013074226745625533
+        }
+      },
+      "bootstrap_ci": {
+        "multiplicative": {
+          "s0": {
+            "median": 0.46111550961530434,
+            "ci_low": 0.46095167419289795,
+            "ci_high": 0.46263289887779774,
+            "n": 60
+          }
+        },
+        "affine": {
+          "a": {
+            "median": 0.466864525867702,
+            "ci_low": 0.46092442010559376,
+            "ci_high": 0.46794490694544666,
+            "n": 60
+          },
+          "c": {
+            "median": -0.012076887621254084,
+            "ci_low": -0.014723991656130166,
+            "ci_high": 0.0002505678488692915,
+            "n": 60
+          }
+        },
+        "tlinear_scale": {
+          "s0": {
+            "median": 0.4619153394740726,
+            "ci_low": 0.4611151175185635,
+            "ci_high": 0.4626593386665415,
+            "n": 60
+          },
+          "s1": {
+            "median": -0.0027282280485688612,
+            "ci_low": -0.003491453151816559,
+            "ci_high": 7.065039515577305e-05,
+            "n": 60
+          }
+        }
+      },
+      "slope_s1": {
+        "median": -0.0027282280485688612,
+        "ci": [
+          -0.003491453151816559,
+          7.065039515577305e-05
+        ],
+        "distinguishable_from_zero": false,
+        "effect_size_rel_scale_change": 0.005906337840339241
+      },
+      "held_out_improvement_vs_constant": {
+        "affine": {
+          "val_js_mean_improvement_per_split": [
+            -4.796817419139461e-05,
+            9.40239767984602e-07,
+            0.00016473764944433325,
+            5.798361780145339e-07,
+            6.464194624283132e-07,
+            1.6854492897386275e-06
+          ],
+          "mean_improvement": 2.0103569991850787e-05,
+          "min_improvement": -4.796817419139461e-05,
+          "mean_relative_improvement": 0.0009839238041297277,
+          "improves_all_splits": false
+        },
+        "tlinear_scale": {
+          "val_js_mean_improvement_per_split": [
+            -0.00011905991610627539,
+            6.0105895159021094e-06,
+            -8.82795611058286e-05,
+            2.0929124661272017e-05,
+            2.0624144577445838e-05,
+            1.3958520428306032e-05
+          ],
+          "mean_improvement": -2.4302849671529667e-05,
+          "min_improvement": -0.00011905991610627539,
+          "mean_relative_improvement": -0.0018338948889508272,
+          "improves_all_splits": false
+        }
+      },
+      "stable_and_meaningful": false,
+      "recommendation": "constant multiplicative"
+    }
+  ]
+}

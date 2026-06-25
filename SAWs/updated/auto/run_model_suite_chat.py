@@ -63,6 +63,16 @@ REMD_COMPLETION_FILES = (
     "run_distributions.npz",
     "run_run_summary.json",
 )
+# Additional completion files required only when REMD diagnostics are enabled.
+# Kept separate so older runs and the resume fingerprint are unaffected when
+# diagnostics are off.
+REMD_DIAGNOSTIC_FILES = (
+    "run_diagnostics.json",
+    "run_convergence.csv",
+    "run_round_trips.csv",
+    "run_walker_occupancy.csv",
+)
+REMD_DIAGNOSTIC_TRAJECTORY_FILE = "run_diagnostic_trajectories.npz"
 
 # Numeric b(T) cross-check grid (Part 6).
 BFN_CHECK_T = (250.0, 300.0, 350.0)
@@ -157,11 +167,32 @@ DEFAULT_FIT = {
 DEFAULT_REMD = {
     "N": None, "steps_per_swap": 1000, "n_cycles": 5000, "rg_bins": 100,
     "burnin_frac": 0.7, "n_workers": 1, "seeds": [1], "plots": False,
-    "timing": False,
+    "timing": False, "diagnostics": None,
+}
+# Diagnostics sub-config defaults (backward compatible: disabled).
+DEFAULT_REMD_DIAGNOSTICS = {
+    "enabled": False,
+    "trajectories": False,   # save post-burn-in traces (needed for cross-seed Rhat)
+    "n_blocks": 5,
+    "min_round_trips": 1,
+    "min_temp_coverage": 0.5,
+    "min_ess": 50.0,
+    "max_drift": 1.0,
+    "min_swap_rate": 0.05,
+    "rhat_threshold": 1.1,   # cross-seed convergence flag (suite-side)
 }
 DEFAULT_COMPARISON = {
     "include_rg": False, "rg_weight": 1.0, "temperature_tolerance": 1e-10,
-    "make_plots": False,
+    "make_plots": False, "statistics": None,
+}
+# Paired model-comparison statistics defaults (backward compatible: disabled).
+DEFAULT_COMPARISON_STATISTICS = {
+    "enabled": False,
+    "alpha": 0.05,
+    "bootstrap_replicates": 10000,
+    "seed": 12345,
+    "practical_equivalence_epsilon": 0.001,
+    "multiple_testing": "holm",
 }
 
 
@@ -300,6 +331,33 @@ def validate_config(cfg: dict) -> dict:
             raise ValueError(f"Baseline {name!r}: remd.seeds contains duplicates")
         remd["seeds"] = seeds
 
+        diag = _merge(DEFAULT_REMD_DIAGNOSTICS, remd.get("diagnostics"))
+        diag["enabled"] = bool(diag.get("enabled", False))
+        diag["trajectories"] = bool(diag.get("trajectories", False))
+        try:
+            diag["n_blocks"] = int(diag["n_blocks"])
+            diag["min_round_trips"] = int(diag["min_round_trips"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Baseline {name!r}: remd.diagnostics.n_blocks and "
+                f"min_round_trips must be integers"
+            ) from exc
+        if diag["n_blocks"] < 1:
+            raise ValueError(f"Baseline {name!r}: remd.diagnostics.n_blocks must be >= 1")
+        if diag["min_round_trips"] < 0:
+            raise ValueError(
+                f"Baseline {name!r}: remd.diagnostics.min_round_trips must be >= 0"
+            )
+        for fkey in ("min_temp_coverage", "min_ess", "max_drift",
+                     "min_swap_rate", "rhat_threshold"):
+            fv = float(diag[fkey])
+            if not np.isfinite(fv) or fv < 0:
+                raise ValueError(
+                    f"Baseline {name!r}: remd.diagnostics.{fkey} must be finite and >= 0"
+                )
+            diag[fkey] = fv
+        remd["diagnostics"] = diag
+
         contact_offset = float(b["contact_offset"])
         rg_scale = float(b.get("rg_scale", 1.0))
         if not np.isfinite(contact_offset):
@@ -318,6 +376,41 @@ def validate_config(cfg: dict) -> dict:
             )
         comp["temperature_tolerance"] = temp_tol
         comp["rg_weight"] = rg_cmp_weight
+
+        stats = _merge(DEFAULT_COMPARISON_STATISTICS, comp.get("statistics"))
+        stats["enabled"] = bool(stats.get("enabled", False))
+        try:
+            stats["bootstrap_replicates"] = int(stats["bootstrap_replicates"])
+            stats["seed"] = int(stats["seed"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Baseline {name!r}: comparison.statistics.bootstrap_replicates "
+                f"and seed must be integers"
+            ) from exc
+        if stats["bootstrap_replicates"] < 1:
+            raise ValueError(
+                f"Baseline {name!r}: comparison.statistics.bootstrap_replicates "
+                f"must be >= 1"
+            )
+        for fkey in ("alpha", "practical_equivalence_epsilon"):
+            fv = float(stats[fkey])
+            if not np.isfinite(fv) or fv < 0:
+                raise ValueError(
+                    f"Baseline {name!r}: comparison.statistics.{fkey} must be "
+                    f"finite and >= 0"
+                )
+            stats[fkey] = fv
+        if not (0.0 < stats["alpha"] < 1.0):
+            raise ValueError(
+                f"Baseline {name!r}: comparison.statistics.alpha must be in (0, 1)"
+            )
+        if str(stats["multiple_testing"]).lower() not in ("holm", "none"):
+            raise ValueError(
+                f"Baseline {name!r}: comparison.statistics.multiple_testing must "
+                f"be 'holm' or 'none'"
+            )
+        stats["multiple_testing"] = str(stats["multiple_testing"]).lower()
+        comp["statistics"] = stats
         # Exactly-one split option (None allowed = no split).
         n_split = sum(
             1 for k in ("train_indices", "holdout_indices", "holdout_every")
@@ -728,14 +821,48 @@ def build_remd_command(cfg, baseline, fit_dir: Path, seed: int,
         cmd += ["--timing"]
     if not remd.get("plots", False):
         cmd += ["--no-plots"]
+    diag = remd.get("diagnostics") or {}
+    if diag.get("enabled", False):
+        cmd += [
+            "--diagnostics",
+            "--diag-n-blocks", str(int(diag["n_blocks"])),
+            "--diag-min-round-trips", str(int(diag["min_round_trips"])),
+            "--diag-min-temp-coverage", str(diag["min_temp_coverage"]),
+            "--diag-min-ess", str(diag["min_ess"]),
+            "--diag-max-drift", str(diag["max_drift"]),
+            "--diag-min-swap-rate", str(diag["min_swap_rate"]),
+        ]
+        if diag.get("trajectories", False):
+            cmd += ["--diagnostic-trajectories"]
     return cmd
 
 
 def validate_remd_outputs(seed_dir: Path, fit_summary: dict,
-                          target_temps: np.ndarray, tol: float) -> dict:
+                          target_temps: np.ndarray, tol: float,
+                          diag_cfg: dict | None = None) -> dict:
     for fname in REMD_COMPLETION_FILES:
         if not (seed_dir / fname).exists():
             return {"status": "failed", "error": f"missing {fname}"}
+    diag_cfg = diag_cfg or {}
+    if diag_cfg.get("enabled", False):
+        for fname in REMD_DIAGNOSTIC_FILES:
+            if not (seed_dir / fname).exists():
+                return {"status": "failed",
+                        "error": f"missing diagnostic output {fname}"}
+        try:
+            diag = json.loads((seed_dir / "run_diagnostics.json").read_text())
+        except Exception as exc:
+            return {"status": "failed",
+                    "error": f"invalid run_diagnostics.json: {exc}"}
+        if not isinstance(diag, dict) or "summary" not in diag \
+                or "warnings" not in diag:
+            return {"status": "failed",
+                    "error": "run_diagnostics.json missing summary/warnings"}
+        if diag_cfg.get("trajectories", False) and not (
+            seed_dir / REMD_DIAGNOSTIC_TRAJECTORY_FILE
+        ).exists():
+            return {"status": "failed",
+                    "error": f"missing {REMD_DIAGNOSTIC_TRAJECTORY_FILE}"}
     try:
         run_summary = json.loads((seed_dir / "run_run_summary.json").read_text())
     except Exception as exc:
@@ -1078,12 +1205,298 @@ PER_TEMP_COLUMNS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Cross-seed convergence diagnostics (Part 11): ESS/autocorr/round-trips/Rhat
+# ---------------------------------------------------------------------------
+
+try:  # optional: exact inverse-normal CDF for rank-normalized Rhat
+    from scipy.special import ndtri as _ndtri
+except Exception:  # pragma: no cover - scipy may be absent
+    _ndtri = None
+
+
+def _inv_normal_cdf(p):
+    """Inverse standard-normal CDF (Acklam approximation; NumPy-only fallback)."""
+    if _ndtri is not None:
+        return _ndtri(p)
+    p = np.asarray(p, dtype=float)
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    x = np.empty_like(p)
+    lo = p < plow
+    hi = p > phigh
+    mid = (~lo) & (~hi)
+    if np.any(lo):
+        q = np.sqrt(-2 * np.log(p[lo]))
+        x[lo] = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if np.any(hi):
+        q = np.sqrt(-2 * np.log(1 - p[hi]))
+        x[hi] = -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                 ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if np.any(mid):
+        q = p[mid] - 0.5
+        r = q * q
+        x[mid] = (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+                 (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+    return x
+
+
+def _rankdata_average(a):
+    """Average-tie ranks (1..n), NumPy-only (scipy.stats.rankdata equivalent)."""
+    a = np.asarray(a, dtype=float)
+    n = a.size
+    sorter = np.argsort(a, kind="mergesort")
+    inv = np.empty(n, dtype=int)
+    inv[sorter] = np.arange(n)
+    a_sorted = a[sorter]
+    obs = np.concatenate(([True], a_sorted[1:] != a_sorted[:-1]))
+    dense = np.cumsum(obs)[inv]
+    count = np.concatenate((np.nonzero(obs)[0], [n]))
+    return 0.5 * (count[dense] + count[dense - 1] + 1)
+
+
+def split_rhat(chains) -> float:
+    """Standard split-Rhat for a list of 1-D chains (NumPy-only).
+
+    Each chain is split into two halves to detect within-chain non-stationarity.
+    Returns NaN when there is insufficient data.
+    """
+    chains = [np.asarray(c, dtype=float) for c in chains]
+    chains = [c[np.isfinite(c)] for c in chains if c.size >= 4]
+    if len(chains) < 2:
+        return float("nan")
+    split = []
+    for c in chains:
+        h = c.size // 2
+        if h < 2:
+            continue
+        split.append(c[:h])
+        split.append(c[h:2 * h])
+    if len(split) < 2:
+        return float("nan")
+    N = min(s.size for s in split)
+    split = [s[:N] for s in split]
+    means = np.array([s.mean() for s in split], dtype=float)
+    vars = np.array([s.var(ddof=1) for s in split], dtype=float)
+    W = float(vars.mean())
+    if W <= 0.0:
+        return 1.0 if float(means.var(ddof=1)) <= 0.0 else float("inf")
+    B = N * float(means.var(ddof=1))
+    var_hat = (N - 1) / N * W + B / N
+    return float(np.sqrt(var_hat / W))
+
+
+def rank_normalized_split_rhat(chains) -> float:
+    """Rank-normalized split-Rhat (Vehtari et al. 2021), NumPy-only.
+
+    Pools all draws, replaces them with normal scores of their average ranks
+    (Blom transform), then computes split-Rhat.  Robust to heavy tails and is
+    invariant to monotone reparameterization.
+    """
+    chains = [np.asarray(c, dtype=float) for c in chains]
+    chains = [c[np.isfinite(c)] for c in chains if c.size >= 4]
+    if len(chains) < 2:
+        return float("nan")
+    sizes = [c.size for c in chains]
+    pooled = np.concatenate(chains)
+    n = pooled.size
+    ranks = _rankdata_average(pooled)
+    z = _inv_normal_cdf((ranks - 3.0 / 8.0) / (n - 0.25))
+    # Re-split z back into the original chains.
+    out, start = [], 0
+    for sz in sizes:
+        out.append(z[start:start + sz])
+        start += sz
+    return split_rhat(out)
+
+
+def _load_seed_diagnostics(seed_dir: Path) -> dict:
+    path = seed_dir / "run_diagnostics.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_seed_traj(seed_dir: Path):
+    path = seed_dir / REMD_DIAGNOSTIC_TRAJECTORY_FILE
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=True) as d:
+            return {
+                "contacts_post": np.asarray(d["contacts_post"], dtype=float),
+                "rg_post": np.asarray(d["rg_post"], dtype=float),
+                "energy_post": np.asarray(d["energy_post"], dtype=float),
+            }
+    except Exception:
+        return None
+
+
+DIAG_PER_TEMP_COLUMNS = [
+    "baseline", "model", "temperature_index", "temperature", "n_seeds",
+    "ess_contacts_min", "ess_contacts_median", "ess_contacts_total",
+    "tau_contacts_max", "ess_rg_min", "ess_rg_median", "tau_rg_max",
+    "drift_contacts_max", "seed_mean_contacts_std", "seed_mean_rg_std",
+    "rhat_contacts", "rhat_rg",
+]
+
+
+def aggregate_seed_diagnostics(rec, baseline, target_temps):
+    """Aggregate per-seed REMD diagnostics for one model into row + per-T rows.
+
+    Returns (row_additions, per_temp_diag_rows).  Only ok seeds contribute.
+    Cross-seed Rhat is computed when trajectory NPZs are present for >= 2 seeds.
+    """
+    diag_cfg = baseline["remd"].get("diagnostics") or {}
+    raw = baseline["raw_name"]
+    n_temps = int(target_temps.size)
+
+    seed_diags, seed_trajs = [], []
+    for srec in rec.get("seeds", {}).values():
+        if srec.get("status") != "ok":
+            continue
+        sd = _load_seed_diagnostics(Path(srec["seed_dir"]))
+        if sd:
+            seed_diags.append(sd)
+            seed_trajs.append(_load_seed_traj(Path(srec["seed_dir"])))
+
+    add = {"convergence_status": "unknown"}
+    per_temp = []
+    if not seed_diags:
+        return add, per_temp
+
+    # Per-temperature collection across seeds.
+    rhat_thr = float(diag_cfg.get("rhat_threshold", 1.1))
+    all_ess_c, all_tau_c, all_drift_c, all_ess_rg, all_tau_rg = [], [], [], [], []
+    all_rhat_c, all_rhat_rg = [], []
+    total_ess_c = 0.0
+    cov_min, rt_totals, rt_min_walker = [], [], []
+    for sd in seed_diags:
+        summ = sd.get("summary", {})
+        cov_min.append(_f(summ.get("min_temp_coverage")))
+        rt_totals.append(_f(summ.get("total_round_trips_low")))
+        rt_min_walker.append(_f(summ.get("min_round_trips_per_walker")))
+
+    for t in range(n_temps):
+        ess_c, tau_c, drift_c, ess_rg, tau_rg = [], [], [], [], []
+        mean_c, mean_rg = [], []
+        for sd in seed_diags:
+            lanes = sd.get("lane_convergence", [])
+            if t >= len(lanes):
+                continue
+            lane = lanes[t]
+            c = lane.get("contacts", {})
+            r = lane.get("rg", {})
+            ess_c.append(_f(c.get("ess")))
+            tau_c.append(_f(c.get("tau_int")))
+            drift_c.append(abs(_f(c.get("drift_in_std"))))
+            ess_rg.append(_f(r.get("ess")))
+            tau_rg.append(_f(r.get("tau_int")))
+            mean_c.append(_f(c.get("mean")))
+            mean_rg.append(_f(r.get("mean")))
+
+        # Cross-seed Rhat from trajectories at this temperature.
+        rhat_c = rhat_rg = float("nan")
+        traj_chains_c = [tr["contacts_post"][t] for tr in seed_trajs
+                         if tr is not None and t < tr["contacts_post"].shape[0]]
+        traj_chains_rg = [tr["rg_post"][t] for tr in seed_trajs
+                          if tr is not None and t < tr["rg_post"].shape[0]]
+        if len(traj_chains_c) >= 2:
+            rhat_c = rank_normalized_split_rhat(traj_chains_c)
+        if len(traj_chains_rg) >= 2:
+            rhat_rg = rank_normalized_split_rhat(traj_chains_rg)
+
+        ess_c_f = [v for v in ess_c if np.isfinite(v)]
+        ess_rg_f = [v for v in ess_rg if np.isfinite(v)]
+        per_temp.append({
+            "baseline": raw, "model": rec.get("model"),
+            "temperature_index": t,
+            "temperature": float(target_temps[t]),
+            "n_seeds": len(seed_diags),
+            "ess_contacts_min": _safe_min(ess_c),
+            "ess_contacts_median": _safe_mean(ess_c) if not ess_c_f else float(np.median(ess_c_f)),
+            "ess_contacts_total": float(sum(ess_c_f)) if ess_c_f else float("nan"),
+            "tau_contacts_max": _safe_max(tau_c),
+            "ess_rg_min": _safe_min(ess_rg),
+            "ess_rg_median": float(np.median(ess_rg_f)) if ess_rg_f else float("nan"),
+            "tau_rg_max": _safe_max(tau_rg),
+            "drift_contacts_max": _safe_max(drift_c),
+            "seed_mean_contacts_std": _safe_std(mean_c),
+            "seed_mean_rg_std": _safe_std(mean_rg),
+            "rhat_contacts": rhat_c,
+            "rhat_rg": rhat_rg,
+        })
+        all_ess_c += ess_c_f
+        all_tau_c += [v for v in tau_c if np.isfinite(v)]
+        all_drift_c += [v for v in drift_c if np.isfinite(v)]
+        all_ess_rg += ess_rg_f
+        all_tau_rg += [v for v in tau_rg if np.isfinite(v)]
+        if np.isfinite(rhat_c):
+            all_rhat_c.append(rhat_c)
+        if np.isfinite(rhat_rg):
+            all_rhat_rg.append(rhat_rg)
+        total_ess_c += float(sum(ess_c_f))
+
+    add["diag_n_seeds"] = len(seed_diags)
+    add["diag_min_ess_contacts"] = _safe_min(all_ess_c)
+    add["diag_median_ess_contacts"] = float(np.median(all_ess_c)) if all_ess_c else float("nan")
+    add["diag_total_ess_contacts"] = float(total_ess_c) if all_ess_c else float("nan")
+    add["diag_max_autocorr_contacts"] = _safe_max(all_tau_c)
+    add["diag_max_autocorr_rg"] = _safe_max(all_tau_rg)
+    add["diag_min_ess_rg"] = _safe_min(all_ess_rg)
+    add["diag_total_round_trips"] = float(sum(v for v in rt_totals if np.isfinite(v)))
+    add["diag_min_round_trips_total"] = _safe_min(rt_totals)
+    add["diag_min_round_trips_per_walker"] = _safe_min(rt_min_walker)
+    add["diag_min_temp_coverage"] = _safe_min(cov_min)
+    add["diag_max_drift_contacts"] = _safe_max(all_drift_c)
+    add["diag_seed_mean_contacts_dispersion"] = _safe_mean(
+        [p["seed_mean_contacts_std"] for p in per_temp]
+    )
+    add["diag_seed_mean_rg_dispersion"] = _safe_mean(
+        [p["seed_mean_rg_std"] for p in per_temp]
+    )
+    add["diag_max_rhat_contacts"] = _safe_max(all_rhat_c)
+    add["diag_max_rhat_rg"] = _safe_max(all_rhat_rg)
+
+    # Convergence-qualified status (does NOT change numeric ranks).
+    reasons = []
+    if np.isfinite(_f(add["diag_min_round_trips_total"])) and \
+            _f(add["diag_min_round_trips_total"]) < int(diag_cfg.get("min_round_trips", 1)):
+        reasons.append("round_trips")
+    if np.isfinite(_f(add["diag_min_ess_contacts"])) and \
+            _f(add["diag_min_ess_contacts"]) < float(diag_cfg.get("min_ess", 50.0)):
+        reasons.append("low_ess")
+    if np.isfinite(_f(add["diag_min_temp_coverage"])) and \
+            _f(add["diag_min_temp_coverage"]) < float(diag_cfg.get("min_temp_coverage", 0.5)):
+        reasons.append("temp_coverage")
+    if np.isfinite(_f(add["diag_max_drift_contacts"])) and \
+            _f(add["diag_max_drift_contacts"]) > float(diag_cfg.get("max_drift", 1.0)):
+        reasons.append("drift")
+    if np.isfinite(_f(add["diag_max_rhat_contacts"])) and \
+            _f(add["diag_max_rhat_contacts"]) > rhat_thr:
+        reasons.append("rhat")
+    add["convergence_status"] = "unreliable" if reasons else "reliable"
+    add["convergence_flags"] = ";".join(reasons)
+    return add, per_temp
+
+
 def build_comparison_rows(suite_state, log: Logger):
     """Return (aggregated rows, per-temperature rows) for all completed jobs."""
     cfg = suite_state["config"]
     target_path = cfg["target_remd"]
     target_temps = validate_target_npz(target_path)
-    rows, per_temp_rows = [], []
+    rows, per_temp_rows, per_temp_diag_rows = [], [], []
 
     for baseline in cfg["baselines"]:
         bname = baseline["name"]
@@ -1143,6 +1556,12 @@ def build_comparison_rows(suite_state, log: Logger):
                         comb = comb + rg_weight * np.nan_to_num(
                             cs["rg_js_tr"], nan=0.0
                         )
+
+                    # Scalar score per (model, seed) for paired statistics:
+                    # validation combined JS when a split exists, else all-T.
+                    seed_score = (_idx_mean(comb, val_idx) if val_idx.size
+                                  else _safe_mean(comb))
+                    rec.setdefault("seed_scores", {})[seed] = float(seed_score)
 
                     acc["ctr_train"].append(_idx_mean(cs["contact_js_tr"], train_idx))
                     acc["ctr_val"].append(_idx_mean(cs["contact_js_tr"], val_idx))
@@ -1231,11 +1650,21 @@ def build_comparison_rows(suite_state, log: Logger):
                     row["status"] = "partial"
                 else:
                     row["status"] = "ok"
+
+            # Cross-seed convergence diagnostics (only when enabled).
+            if (baseline["remd"].get("diagnostics") or {}).get("enabled", False) \
+                    and row["fit_status"] == "ok":
+                rec["model"] = model
+                diag_add, diag_pt = aggregate_seed_diagnostics(
+                    rec, baseline, target_temps
+                )
+                row.update(diag_add)
+                per_temp_diag_rows.extend(diag_pt)
             baseline_rows.append(row)
 
         _assign_ranks(baseline_rows, log)
         rows.extend(baseline_rows)
-    return rows, per_temp_rows
+    return rows, per_temp_rows, per_temp_diag_rows
 
 
 def _assign_ranks(rows: list[dict], log: Logger) -> None:
@@ -1312,13 +1741,21 @@ COMPARISON_COLUMNS = [
     "mean_contacts_mae_mean",
     "mean_rg_rmse_mean", "mean_rg_rmse_std", "mean_rg_mae_mean",
     "swap_rate_min_mean", "swap_rate_median_mean", "local_acceptance_mean",
+    "diag_n_seeds", "diag_min_ess_contacts", "diag_median_ess_contacts",
+    "diag_total_ess_contacts", "diag_min_ess_rg",
+    "diag_max_autocorr_contacts", "diag_max_autocorr_rg",
+    "diag_total_round_trips", "diag_min_round_trips_total",
+    "diag_min_round_trips_per_walker", "diag_min_temp_coverage",
+    "diag_max_drift_contacts", "diag_seed_mean_contacts_dispersion",
+    "diag_seed_mean_rg_dispersion", "diag_max_rhat_contacts",
+    "diag_max_rhat_rg", "convergence_status", "convergence_flags",
     "has_validation", "fit_rank", "simulation_rank", "simulation_rank_note",
     "fit_status", "status",
 ]
 
 
 def write_comparison(rows, per_temp_rows, comparison_dir: Path,
-                     log: Logger) -> None:
+                     log: Logger, per_temp_diag_rows=None) -> None:
     comparison_dir.mkdir(parents=True, exist_ok=True)
     csv_path = comparison_dir / "model_comparison.csv"
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
@@ -1340,6 +1777,20 @@ def write_comparison(rows, per_temp_rows, comparison_dir: Path,
     with open(pt_json, "w", encoding="utf-8") as fh:
         json.dump(_json_safe(per_temp_rows), fh, indent=2, allow_nan=False)
     log(f"Wrote {csv_path}, {json_path}, {pt_csv}, {pt_json}")
+
+    if per_temp_diag_rows:
+        diag_csv = comparison_dir / "per_temperature_diagnostics.csv"
+        with open(diag_csv, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(DIAG_PER_TEMP_COLUMNS)
+            for r in per_temp_diag_rows:
+                w.writerow([_csv_safe_value(r.get(c, ""))
+                            for c in DIAG_PER_TEMP_COLUMNS])
+        diag_json = comparison_dir / "per_temperature_diagnostics.json"
+        with open(diag_json, "w", encoding="utf-8") as fh:
+            json.dump(_json_safe(per_temp_diag_rows), fh, indent=2,
+                      allow_nan=False)
+        log(f"Wrote {diag_csv}, {diag_json}")
 
 
 def _csv_safe_value(value):
@@ -1389,11 +1840,384 @@ def _baseline_signature(b) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Paired model-comparison statistics (Part 12)
+# ---------------------------------------------------------------------------
+# All inference here is paired across the (few) independent seeds. With ~3 seeds
+# the design has very low inferential power, so effect sizes, uncertainty, and
+# practical equivalence are reported alongside (de-emphasized) p-values.
+
+PAIRWISE_COLUMNS = [
+    "baseline", "model_a", "model_b", "n_paired", "mean_delta", "median_delta",
+    "std_delta", "se_delta", "ci_low", "ci_high", "p_sign_flip", "p_holm",
+    "p_method", "effect_size_dz", "effect_size_reliable", "frac_a_won",
+    "frac_b_won", "frac_tie", "prob_a_better", "prob_practical_equivalent",
+    "favored",
+]
+SEED_SCORE_COLUMNS = ["baseline", "model", "seed", "score", "score_scope"]
+RANK_STABILITY_COLUMNS = [
+    "baseline", "model", "n_parameters", "n_seeds", "mean_rank", "median_rank",
+    "std_rank", "prob_rank1", "n_seed_wins", "mean_score", "seed_ranks",
+]
+
+
+def _holm_adjust(pvals):
+    """Holm-Bonferroni step-down adjustment; preserves input order."""
+    m = len(pvals)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: (float("inf") if pvals[i] is None
+                                            or not np.isfinite(pvals[i])
+                                            else pvals[i]))
+    adj = [None] * m
+    running = 0.0
+    for rank, idx in enumerate(order):
+        p = pvals[idx]
+        if p is None or not np.isfinite(p):
+            adj[idx] = None
+            continue
+        val = (m - rank) * p
+        running = max(running, val)
+        adj[idx] = float(min(1.0, running))
+    return adj
+
+
+def _sign_flip_p(deltas):
+    """Exact two-sided paired sign-flip permutation p-value (statistic = mean).
+
+    Enumerates all 2^n sign assignments when feasible (n <= 22); returns the
+    fraction with |mean(signed delta)| >= |observed mean|.  NaN for n == 0.
+    """
+    import itertools
+    d = np.asarray([x for x in deltas if np.isfinite(x)], dtype=float)
+    n = d.size
+    if n == 0:
+        return float("nan"), "none"
+    obs = abs(float(d.mean()))
+    tol = 1e-12
+    if n <= 22:
+        count = 0
+        total = 0
+        for signs in itertools.product((1.0, -1.0), repeat=n):
+            stat = abs(float(np.dot(signs, d) / n))
+            total += 1
+            if stat >= obs - tol:
+                count += 1
+        return float(count) / float(total), "exact_sign_flip"
+    # Fallback for large n: deterministic sampled sign flips.
+    rng = np.random.RandomState(0)
+    reps = 20000
+    flips = rng.choice((1.0, -1.0), size=(reps, n))
+    stats = np.abs((flips * d).mean(axis=1))
+    return float(np.mean(stats >= obs - tol)), "sampled_sign_flip"
+
+
+def _paired_bootstrap_means(deltas, n_rep, seed):
+    """Deterministic bootstrap of the mean paired difference (resample seeds)."""
+    d = np.asarray([x for x in deltas if np.isfinite(x)], dtype=float)
+    n = d.size
+    if n == 0:
+        return np.array([], dtype=float)
+    rng = np.random.RandomState(int(seed))
+    idx = rng.randint(0, n, size=(int(n_rep), n))
+    return d[idx].mean(axis=1)
+
+
+def compute_pair_stats(scores_a, scores_b, model_a, model_b, seeds_common,
+                       n_rep, seed, eps, alpha):
+    """Paired statistics for delta = score_A - score_B over common seeds."""
+    deltas = np.array([scores_a[s] - scores_b[s] for s in seeds_common],
+                      dtype=float)
+    deltas = deltas[np.isfinite(deltas)]
+    n = deltas.size
+    out = {
+        "model_a": model_a, "model_b": model_b, "n_paired": int(n),
+        "mean_delta": float("nan"), "median_delta": float("nan"),
+        "std_delta": float("nan"), "se_delta": float("nan"),
+        "ci_low": float("nan"), "ci_high": float("nan"),
+        "p_sign_flip": float("nan"), "p_method": "none",
+        "effect_size_dz": float("nan"), "effect_size_reliable": False,
+        "frac_a_won": float("nan"), "frac_b_won": float("nan"),
+        "frac_tie": float("nan"), "prob_a_better": float("nan"),
+        "prob_practical_equivalent": float("nan"), "favored": "n/a",
+    }
+    if n == 0:
+        return out
+    mean_d = float(deltas.mean())
+    std_d = float(deltas.std(ddof=1)) if n > 1 else 0.0
+    out["mean_delta"] = mean_d
+    out["median_delta"] = float(np.median(deltas))
+    out["std_delta"] = std_d
+    out["se_delta"] = (std_d / math.sqrt(n)) if n > 1 else float("nan")
+    tol = 1e-12
+    out["frac_a_won"] = float(np.mean(deltas < -tol))   # A better => delta<0
+    out["frac_b_won"] = float(np.mean(deltas > tol))
+    out["frac_tie"] = float(np.mean(np.abs(deltas) <= tol))
+    p, method = _sign_flip_p(deltas)
+    out["p_sign_flip"] = p
+    out["p_method"] = method
+    if std_d > 0:
+        out["effect_size_dz"] = mean_d / std_d
+    elif mean_d == 0:
+        out["effect_size_dz"] = 0.0
+    else:
+        out["effect_size_dz"] = float("inf") if mean_d > 0 else float("-inf")
+    out["effect_size_reliable"] = bool(n >= 5)
+    boots = _paired_bootstrap_means(deltas, n_rep, seed)
+    if boots.size:
+        out["ci_low"] = float(np.percentile(boots, 100.0 * alpha / 2.0))
+        out["ci_high"] = float(np.percentile(boots, 100.0 * (1.0 - alpha / 2.0)))
+        out["prob_a_better"] = float(np.mean(boots < 0.0))
+        out["prob_practical_equivalent"] = float(np.mean(np.abs(boots) < eps))
+    if mean_d < -tol:
+        out["favored"] = model_a
+    elif mean_d > tol:
+        out["favored"] = model_b
+    else:
+        out["favored"] = "tie"
+    return out
+
+
+def compute_rank_stability(model_scores, models, n_rep, seed):
+    """Per-seed ranks, summary, and paired-bootstrap rank-1 probability.
+
+    `model_scores` maps model -> {seed: score}.  Per-seed ranks use all models
+    present at that seed (average ranks for ties); the bootstrap rank-1
+    probability uses the seeds common to every included model.
+    """
+    seeds_by_model = {m: set(model_scores.get(m, {})) for m in models}
+    all_seeds = sorted(set().union(*seeds_by_model.values())) if models else []
+
+    # Per-seed ranks (1 = best/lowest score).
+    seed_ranks = {m: {} for m in models}
+    seed_wins = {m: 0 for m in models}
+    for s in all_seeds:
+        present = [m for m in models if s in model_scores.get(m, {})]
+        if not present:
+            continue
+        vals = np.array([model_scores[m][s] for m in present], dtype=float)
+        ranks = _rankdata_average(vals)
+        best = float(vals.min())
+        for m, r, v in zip(present, ranks, vals):
+            seed_ranks[m][s] = float(r)
+            if abs(v - best) <= 1e-12:
+                seed_wins[m] += 1
+
+    common = [s for s in all_seeds
+              if all(s in model_scores.get(m, {}) for m in models)]
+    prob_rank1 = {m: float("nan") for m in models}
+    if len(common) >= 1 and len(models) >= 2:
+        rng = np.random.RandomState(int(seed) + 7919)
+        mat = np.array([[model_scores[m][s] for s in common] for m in models],
+                       dtype=float)
+        wins = np.zeros(len(models), dtype=float)
+        nrep = int(n_rep)
+        for _ in range(nrep):
+            pick = rng.randint(0, len(common), size=len(common))
+            means = mat[:, pick].mean(axis=1)
+            mn = means.min()
+            winners = np.where(np.abs(means - mn) <= 1e-12)[0]
+            wins[winners] += 1.0 / winners.size
+        prob_rank1 = {m: float(wins[i] / nrep) for i, m in enumerate(models)}
+
+    rows = []
+    for m in models:
+        rks = [seed_ranks[m][s] for s in sorted(seed_ranks[m])]
+        sc = list(model_scores.get(m, {}).values())
+        rows.append({
+            "model": m,
+            "n_seeds": len(rks),
+            "mean_rank": float(np.mean(rks)) if rks else float("nan"),
+            "median_rank": float(np.median(rks)) if rks else float("nan"),
+            "std_rank": float(np.std(rks, ddof=0)) if rks else float("nan"),
+            "prob_rank1": prob_rank1[m],
+            "n_seed_wins": int(seed_wins[m]),
+            "mean_score": float(np.mean(sc)) if sc else float("nan"),
+            "seed_ranks": ";".join(
+                f"{s}:{seed_ranks[m][s]:.3g}" for s in sorted(seed_ranks[m])
+            ),
+        })
+    return rows
+
+
+def _parsimony_recommendation(models, model_scores, pair_lookup, n_params, eps):
+    """Recommend the simplest model indistinguishable from the best (1-SE/PE)."""
+    means = {m: (np.mean(list(model_scores[m].values()))
+                 if model_scores.get(m) else float("inf")) for m in models}
+    ranked = sorted(models, key=lambda m: means[m])
+    if not ranked:
+        return {"best_model": None, "recommended_model": None, "reason": "no models"}
+    best = ranked[0]
+    candidates = [best]
+    for m in models:
+        if m == best:
+            continue
+        key = (best, m) if (best, m) in pair_lookup else (m, best)
+        ps = pair_lookup.get(key)
+        if not ps or not ps.get("n_paired"):
+            continue
+        mean_d = abs(_f(ps.get("mean_delta")))
+        se = _f(ps.get("se_delta"))
+        ci_low, ci_high = _f(ps.get("ci_low")), _f(ps.get("ci_high"))
+        ci_includes_0 = (np.isfinite(ci_low) and np.isfinite(ci_high)
+                         and ci_low <= 0.0 <= ci_high)
+        within_1se = np.isfinite(se) and mean_d <= se
+        practically_equiv = mean_d < eps
+        if ci_includes_0 or within_1se or practically_equiv:
+            candidates.append(m)
+    rec = min(
+        candidates,
+        key=lambda m: (n_params.get(m, float("inf")), means[m]),
+    )
+    reason = ("best model is already simplest among indistinguishable set"
+              if rec == best else
+              f"{rec} is statistically/practically indistinguishable from the "
+              f"best model {best} but has fewer parameters")
+    return {"best_model": best, "recommended_model": rec, "reason": reason}
+
+
+def run_pairwise_statistics(suite_state, rows, comparison_dir: Path, log: Logger):
+    """Compute paired model-comparison statistics; write CSV/JSON; return summary.
+
+    Reuses the per-seed scalar scores collected during comparison (no REMD
+    rerun).  Returns a per-baseline result structure for plotting and the report.
+    """
+    cfg = suite_state["config"]
+    pairwise_rows, seed_rows, rank_rows = [], [], []
+    summary = {}
+
+    for baseline in cfg["baselines"]:
+        stats_cfg = baseline["comparison"].get("statistics") or {}
+        if not stats_cfg.get("enabled", False):
+            continue
+        bname, raw = baseline["name"], baseline["raw_name"]
+        n_rep = int(stats_cfg["bootstrap_replicates"])
+        seed = int(stats_cfg["seed"])
+        eps = float(stats_cfg["practical_equivalence_epsilon"])
+        alpha = float(stats_cfg["alpha"])
+        do_holm = stats_cfg.get("multiple_testing", "holm") == "holm"
+
+        # Gather per-(model, seed) scores for fit-ok models with scores.
+        model_scores = {}
+        n_params = {}
+        for model in cfg["models"]:
+            rec = suite_state["models"].get((bname, model), {})
+            if rec.get("status") not in ("ok", "partial") and \
+                    rec.get("summary") is None:
+                continue
+            ss = {int(s): float(v) for s, v in rec.get("seed_scores", {}).items()
+                  if np.isfinite(_f(v))}
+            if ss:
+                model_scores[model] = ss
+                summ = rec.get("summary") or {}
+                n_params[model] = len(summ.get("param_names", []))
+        models = [m for m in cfg["models"] if m in model_scores]
+        score_scope = ("validation" if any(r.get("has_validation")
+                       for r in rows if r["baseline"] == raw) else "all")
+
+        for model in models:
+            for s in sorted(model_scores[model]):
+                seed_rows.append({
+                    "baseline": raw, "model": model, "seed": s,
+                    "score": model_scores[model][s], "score_scope": score_scope,
+                })
+
+        # Pairwise comparisons (i < j in configured model order).
+        base_pairs = []
+        for i in range(len(models)):
+            for j in range(i + 1, len(models)):
+                a, b = models[i], models[j]
+                common = sorted(set(model_scores[a]) & set(model_scores[b]))
+                ps = compute_pair_stats(
+                    model_scores[a], model_scores[b], a, b, common,
+                    n_rep, seed, eps, alpha,
+                )
+                ps["baseline"] = raw
+                base_pairs.append(ps)
+        if do_holm:
+            adj = _holm_adjust([p["p_sign_flip"] for p in base_pairs])
+        else:
+            adj = [p["p_sign_flip"] for p in base_pairs]
+        for p, a in zip(base_pairs, adj):
+            p["p_holm"] = a
+        pairwise_rows.extend(base_pairs)
+
+        # Rank stability.
+        brank = compute_rank_stability(model_scores, models, n_rep, seed)
+        for r in brank:
+            r["baseline"] = raw
+            r["n_parameters"] = n_params.get(r["model"], 0)
+        rank_rows.extend(brank)
+
+        # Parsimony + interpretation summary.
+        pair_lookup = {(p["model_a"], p["model_b"]): p for p in base_pairs}
+        pars = _parsimony_recommendation(models, model_scores, pair_lookup,
+                                         n_params, eps)
+        n_seeds_min = min((len(model_scores[m]) for m in models), default=0)
+        raw_winner = min(models, key=lambda m: np.mean(
+            list(model_scores[m].values()))) if models else None
+        supported = [
+            {"model_a": p["model_a"], "model_b": p["model_b"],
+             "p_holm": p["p_holm"], "mean_delta": p["mean_delta"]}
+            for p in base_pairs
+            if p["p_holm"] is not None and np.isfinite(p["p_holm"])
+            and p["p_holm"] < alpha
+        ]
+        equivalent = [
+            {"model_a": p["model_a"], "model_b": p["model_b"],
+             "prob_practical_equivalent": p["prob_practical_equivalent"],
+             "mean_delta": p["mean_delta"]}
+            for p in base_pairs
+            if np.isfinite(_f(p["prob_practical_equivalent"]))
+            and _f(p["prob_practical_equivalent"]) >= 0.5
+        ]
+        summary[raw] = {
+            "settings": {"alpha": alpha, "bootstrap_replicates": n_rep,
+                         "seed": seed, "practical_equivalence_epsilon": eps,
+                         "multiple_testing": stats_cfg.get("multiple_testing")},
+            "n_models": len(models), "min_paired_seeds": int(n_seeds_min),
+            "low_power": bool(n_seeds_min <= 3),
+            "raw_winner": raw_winner,
+            "parsimony": pars,
+            "statistically_supported_differences": supported,
+            "practical_equivalences": equivalent,
+        }
+
+    if not summary:
+        return None
+
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    _write_rows_csv(comparison_dir / "pairwise_model_comparison.csv",
+                    PAIRWISE_COLUMNS, pairwise_rows)
+    with open(comparison_dir / "pairwise_model_comparison.json", "w",
+              encoding="utf-8") as fh:
+        json.dump(_json_safe(pairwise_rows), fh, indent=2, allow_nan=False)
+    _write_rows_csv(comparison_dir / "seed_level_model_scores.csv",
+                    SEED_SCORE_COLUMNS, seed_rows)
+    _write_rows_csv(comparison_dir / "model_rank_stability.csv",
+                    RANK_STABILITY_COLUMNS, rank_rows)
+    with open(comparison_dir / "model_statistics_summary.json", "w",
+              encoding="utf-8") as fh:
+        json.dump(_json_safe(summary), fh, indent=2, allow_nan=False)
+    log(f"Wrote pairwise statistics ({len(pairwise_rows)} pairs) to "
+        f"{comparison_dir}")
+    return {"summary": summary, "pairwise_rows": pairwise_rows,
+            "seed_rows": seed_rows, "rank_rows": rank_rows}
+
+
+def _write_rows_csv(path: Path, columns, rows):
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(columns)
+        for r in rows:
+            w.writerow([_csv_safe_value(r.get(c, "")) for c in columns])
+
+
+# ---------------------------------------------------------------------------
 # Plots (Part 14)
 # ---------------------------------------------------------------------------
 
 def make_plots(suite_state, rows, per_temp_rows, remd_mod, comparison_dir: Path,
-               log: Logger) -> None:
+               log: Logger, per_temp_diag_rows=None) -> None:
     """Generate per-baseline diagnostic plots (best-effort; never fatal)."""
     try:
         import matplotlib
@@ -1481,7 +2305,79 @@ def make_plots(suite_state, rows, per_temp_rows, remd_mod, comparison_dir: Path,
         _bar(plt, models, [r.get("remd_fit_contact_js_mean") for r in brows],
              "REMD↔fit contact JS", f"{raw}: REMD reproduces analytic fit?",
              _save, "9_remd_vs_fit_convergence")
+
+        # --- Convergence-diagnostics plots (only when diagnostics ran) ------
+        dpts = [p for p in (per_temp_diag_rows or []) if p["baseline"] == raw]
+        if dpts:
+            # 10. Swap rate vs adjacent-pair temperature (per model).
+            _swap_rate_vs_T(plt, suite_state, bname, models, _save,
+                            f"{raw}: swap rate vs T", "10_swap_rate_vs_T")
+            # 11. ESS (contacts) vs temperature.
+            _diag_vs_T(plt, dpts, "ess_contacts_min", "min contact ESS (seeds)",
+                       f"{raw}: ESS vs T", _save, "11_ess_vs_T")
+            # 12. Integrated autocorrelation time (contacts) vs temperature.
+            _diag_vs_T(plt, dpts, "tau_contacts_max",
+                       "max contact autocorr time (seeds)",
+                       f"{raw}: autocorr time vs T", _save, "12_autocorr_vs_T")
+            # 13. Walker round trips by model (total low->high->low).
+            _bar(plt, models, [r.get("diag_total_round_trips") for r in brows],
+                 "total round trips (all seeds)", f"{raw}: walker round trips",
+                 _save, "13_walker_round_trips")
+            # 14. Cross-seed rank-normalized split-Rhat (contacts) vs T.
+            if any(np.isfinite(_f(p.get("rhat_contacts"))) for p in dpts):
+                _diag_vs_T(plt, dpts, "rhat_contacts",
+                           "cross-seed split-Rhat (contacts)",
+                           f"{raw}: cross-seed Rhat vs T", _save,
+                           "14_cross_seed_rhat", hline=1.1)
     log(f"Wrote plots to {plots_dir}")
+
+
+def _diag_vs_T(plt, dpts, key, ylabel, title, save, tag, hline=None):
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    models = sorted({p["model"] for p in dpts})
+    for i, m in enumerate(models):
+        s = {}
+        for p in dpts:
+            if p["model"] != m:
+                continue
+            v = _f(p.get(key))
+            if np.isfinite(v):
+                s[float(p["temperature"])] = v
+        if s:
+            xs = sorted(s)
+            ax.plot(xs, [s[x] for x in xs], marker=".",
+                    color=_model_color(plt, i, len(models)), label=m)
+    if hline is not None:
+        ax.axhline(hline, color="gray", lw=0.8, ls="--")
+    ax.set_xlabel("temperature"); ax.set_ylabel(ylabel); ax.set_title(title)
+    ax.legend(fontsize=8, ncol=2)
+    save(fig, tag)
+
+
+def _swap_rate_vs_T(plt, suite_state, bname, models, save, title, tag):
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    for i, model in enumerate(models):
+        rec = suite_state["models"].get((bname, model), {})
+        rates_by_pair = {}
+        for srec in rec.get("seeds", {}).values():
+            if srec.get("status") != "ok":
+                continue
+            rs = (srec.get("run_summary") or {}).get("swap_rates") or []
+            for k, v in enumerate(rs):
+                fv = _f(v)
+                if np.isfinite(fv):
+                    rates_by_pair.setdefault(k, []).append(fv)
+        if rates_by_pair:
+            ks = sorted(rates_by_pair)
+            ax.plot(ks, [float(np.mean(rates_by_pair[k])) for k in ks],
+                    marker=".", color=_model_color(plt, i, len(models)),
+                    label=model)
+    ax.axhline(0.05, color="gray", lw=0.8, ls="--")
+    ax.set_xlabel("adjacent pair index (low->high T)")
+    ax.set_ylabel("mean swap rate (seeds)")
+    ax.set_title(title)
+    ax.legend(fontsize=8, ncol=2)
+    save(fig, tag)
 
 
 def _nan0(v):
@@ -1583,12 +2479,193 @@ def _bofT(plt, suite_state, bname, models, remd_mod, temps, title, save, tag):
     save(fig, tag)
 
 
+def make_statistics_plots(stats_result, comparison_dir: Path, log: Logger):
+    """Plots for paired model statistics (best-effort; never fatal)."""
+    if not stats_result:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        log(f"Statistics plots skipped (matplotlib unavailable): {exc}")
+        return
+    plots_dir = comparison_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    pairwise = stats_result["pairwise_rows"]
+    seed_rows = stats_result["seed_rows"]
+    rank_rows = stats_result["rank_rows"]
+
+    for raw in sorted({p["baseline"] for p in pairwise}):
+        prs = [p for p in pairwise if p["baseline"] == raw]
+        models = sorted({p["model_a"] for p in prs} | {p["model_b"] for p in prs})
+        if len(models) < 2:
+            continue
+        idx = {m: i for i, m in enumerate(models)}
+
+        def _matrix(key, antisym):
+            M = np.full((len(models), len(models)), np.nan)
+            for p in prs:
+                i, j = idx[p["model_a"]], idx[p["model_b"]]
+                v = _f(p.get(key))
+                M[i, j] = v
+                if antisym:
+                    M[j, i] = -v
+                else:
+                    M[j, i] = v
+            return M
+
+        # 1. Mean-difference heatmap (delta = row - col; negative favors row).
+        Md = _matrix("mean_delta", antisym=True)
+        _heatmap(plt, Md, models, f"{raw}: mean paired delta (row-col)",
+                 "delta (negative favors row model)", plots_dir,
+                 f"{raw}__stats_mean_delta_heatmap.png", cmap="coolwarm",
+                 center0=True)
+        # 2. Practical-equivalence probability heatmap.
+        Mp = _matrix("prob_practical_equivalent", antisym=False)
+        _heatmap(plt, Mp, models, f"{raw}: P(practical equivalence)",
+                 "probability", plots_dir,
+                 f"{raw}__stats_practical_equivalence_heatmap.png",
+                 cmap="viridis", center0=False)
+
+        # 3. Per-seed model rank plot.
+        rrows = [r for r in rank_rows if r["baseline"] == raw]
+        srows = [s for s in seed_rows if s["baseline"] == raw]
+        seeds = sorted({s["seed"] for s in srows})
+        if seeds:
+            fig, ax = plt.subplots(figsize=(7.5, 4.5))
+            for i, m in enumerate(models):
+                pts = {}
+                for r in rrows:
+                    if r["model"] != m:
+                        continue
+                    for tok in str(r.get("seed_ranks", "")).split(";"):
+                        if ":" in tok:
+                            sk, rk = tok.split(":")
+                            pts[int(sk)] = float(rk)
+                xs = [s for s in seeds if s in pts]
+                if xs:
+                    ax.plot(xs, [pts[s] for s in xs], marker="o",
+                            color=_model_color(plt, i, len(models)), label=m)
+            ax.invert_yaxis()
+            ax.set_xlabel("seed"); ax.set_ylabel("rank (1 = best)")
+            ax.set_title(f"{raw}: per-seed model rank")
+            ax.legend(fontsize=8, ncol=2)
+            fig.tight_layout()
+            fig.savefig(plots_dir / f"{raw}__stats_per_seed_rank.png", dpi=140)
+            plt.close(fig)
+
+            # 4. Paired line plot: score per model, one line per seed.
+            fig, ax = plt.subplots(figsize=(7.5, 4.5))
+            by_seed = {}
+            for s in srows:
+                by_seed.setdefault(s["seed"], {})[s["model"]] = _f(s["score"])
+            xpos = np.arange(len(models))
+            for k, sd in enumerate(seeds):
+                ys = [by_seed.get(sd, {}).get(m, np.nan) for m in models]
+                ax.plot(xpos, ys, marker="o", alpha=0.8,
+                        color=_model_color(plt, k, len(seeds)),
+                        label=f"seed {sd}")
+            ax.set_xticks(xpos); ax.set_xticklabels(models, rotation=30)
+            ax.set_ylabel("combined JS score"); ax.set_title(
+                f"{raw}: paired per-seed scores")
+            ax.legend(fontsize=8, ncol=2)
+            fig.tight_layout()
+            fig.savefig(plots_dir / f"{raw}__stats_paired_scores.png", dpi=140)
+            plt.close(fig)
+    log(f"Wrote statistics plots to {plots_dir}")
+
+
+def _heatmap(plt, M, labels, title, cbar_label, plots_dir, fname, cmap,
+             center0):
+    fig, ax = plt.subplots(figsize=(1.4 + 0.7 * len(labels),
+                                    1.2 + 0.7 * len(labels)))
+    kw = {"cmap": cmap}
+    if center0:
+        vmax = np.nanmax(np.abs(M)) if np.any(np.isfinite(M)) else 1.0
+        kw.update({"vmin": -vmax, "vmax": vmax})
+    im = ax.imshow(M, **kw)
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45,
+                                                          ha="right", fontsize=7)
+    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=7)
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            if np.isfinite(M[i, j]):
+                ax.text(j, i, f"{M[i, j]:.2g}", ha="center", va="center",
+                        fontsize=6, color="black")
+    ax.set_title(title, fontsize=9)
+    fig.colorbar(im, ax=ax, label=cbar_label, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(plots_dir / fname, dpi=140)
+    plt.close(fig)
+
+
+def _statistics_report_lines(raw, bstat, stats_result, ok_rows):
+    """Restrained statistical-interpretation block for one baseline."""
+    pars = bstat.get("parsimony", {})
+    n_seeds = bstat.get("min_paired_seeds", 0)
+    lines = ["### Statistical model comparison (paired across seeds)", ""]
+    if bstat.get("low_power"):
+        lines += [
+            f"_Only {n_seeds} independent seed(s): inferential power is very "
+            f"low. Treat p-values as weak evidence; prefer effect sizes, "
+            f"bootstrap uncertainty, and practical equivalence below._", "",
+        ]
+    lines += [f"- **Raw winner (lowest mean combined JS):** "
+              f"{bstat.get('raw_winner')}"]
+
+    supported = bstat.get("statistically_supported_differences", [])
+    if supported:
+        txt = ", ".join(
+            f"{d['model_a']} vs {d['model_b']} (Holm p={_fmt(d['p_holm'])})"
+            for d in supported)
+        lines += [f"- **Statistically supported differences "
+                  f"(Holm p < alpha):** {txt}"]
+    else:
+        lines += ["- **Statistically supported differences:** none survive "
+                  "multiple-testing correction at this sample size"]
+
+    equiv = bstat.get("practical_equivalences", [])
+    if equiv:
+        txt = ", ".join(
+            f"{d['model_a']}~{d['model_b']} "
+            f"(P={_fmt(d['prob_practical_equivalent'])})" for d in equiv)
+        lines += [f"- **Practically equivalent pairs (P|delta|<eps >= 0.5):** "
+                  f"{txt}"]
+    else:
+        lines += ["- **Practically equivalent pairs:** none"]
+
+    rec = pars.get("recommended_model")
+    best = pars.get("best_model")
+    lines += [f"- **Parsimonious recommendation:** {rec} "
+              f"({pars.get('reason', '')})"]
+
+    # Convergence-qualified recommendation when Priority-11 diagnostics exist.
+    conv_by_model = {r["model"]: r.get("convergence_status")
+                     for r in ok_rows
+                     if r.get("convergence_status") not in (None, "unknown")}
+    if conv_by_model:
+        rec_status = conv_by_model.get(rec)
+        if rec_status == "unreliable":
+            reliable = [m for m, s in conv_by_model.items() if s == "reliable"]
+            lines += [f"- **Convergence-qualified recommendation:** the "
+                      f"parsimonious pick {rec} is convergence-flagged as "
+                      f"UNRELIABLE; prefer a convergence-reliable model "
+                      f"({', '.join(reliable) if reliable else 'none available'})."]
+        else:
+            lines += [f"- **Convergence-qualified recommendation:** {rec} "
+                      f"passes convergence diagnostics (status="
+                      f"{rec_status or 'n/a'})."]
+    lines += [""]
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Report (Part 14)
 # ---------------------------------------------------------------------------
 
 def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
-                 log: Logger) -> None:
+                 log: Logger, stats_result=None) -> None:
     cfg = suite_state["config"]
     lines = ["# Model suite report", "",
              f"Generated: {now_iso()}", "",
@@ -1690,6 +2767,47 @@ def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
                   f"- Convergence warnings (min swap rate < 0.05): "
                   f"{', '.join(lowswap) if lowswap else 'none'}", ""]
 
+        # Convergence diagnostics (only when REMD diagnostics were enabled).
+        diag_rows = [r for r in ok if r.get("convergence_status") not in
+                     (None, "unknown")]
+        if diag_rows:
+            unreliable = [r["model"] for r in diag_rows
+                          if r.get("convergence_status") == "unreliable"]
+            lines += [
+                "### Convergence diagnostics", "",
+                "_Raw ranks above are unchanged; the status column below "
+                "qualifies whether a low JS is trustworthy. A model flagged "
+                "**unreliable** failed one or more convergence thresholds and "
+                "its score should not be trusted regardless of rank._", "",
+                "| model | status | min ESS | max τ | round trips | "
+                "min coverage | max drift | max Rhat | flags |",
+                "|---|---|---|---|---|---|---|---|---|",
+            ]
+            for r in diag_rows:
+                status = r.get("convergence_status", "unknown")
+                badge = ("UNRELIABLE" if status == "unreliable"
+                         else "ok" if status == "reliable" else status)
+                lines.append(
+                    f"| {r['model']} | {badge} | "
+                    f"{_fmt(r.get('diag_min_ess_contacts'))} | "
+                    f"{_fmt(r.get('diag_max_autocorr_contacts'))} | "
+                    f"{_fmt(r.get('diag_total_round_trips'))} | "
+                    f"{_fmt(r.get('diag_min_temp_coverage'))} | "
+                    f"{_fmt(r.get('diag_max_drift_contacts'))} | "
+                    f"{_fmt(r.get('diag_max_rhat_contacts'))} | "
+                    f"{r.get('convergence_flags', '')} |"
+                )
+            lines += [""]
+            if unreliable:
+                lines += [f"- **Unreliable (convergence-flagged):** "
+                          f"{', '.join(unreliable)}", ""]
+
+        # Paired statistical model comparison (only when enabled).
+        bstat = (stats_result or {}).get("summary", {}).get(raw) \
+            if stats_result else None
+        if bstat:
+            lines += _statistics_report_lines(raw, bstat, stats_result, ok)
+
     if global_ranking:
         lines += ["## Global cross-baseline ranking", "",
                   "_All baselines share contact_offset, Rg units, and metric config._",
@@ -1707,7 +2825,15 @@ def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
               f"- `{comparison_dir / 'model_comparison.csv'}`",
               f"- `{comparison_dir / 'per_temperature_metrics.csv'}`",
               f"- `{comparison_dir / 'plots'}`",
-              f"- `{Path(cfg['output_root']) / 'manifest.json'}`", ""]
+              f"- `{Path(cfg['output_root']) / 'manifest.json'}`"]
+    if stats_result:
+        lines += [
+            f"- `{comparison_dir / 'pairwise_model_comparison.csv'}`",
+            f"- `{comparison_dir / 'seed_level_model_scores.csv'}`",
+            f"- `{comparison_dir / 'model_rank_stability.csv'}`",
+            f"- `{comparison_dir / 'model_statistics_summary.json'}`",
+        ]
+    lines += [""]
 
     path = comparison_dir / "report.md"
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -1886,18 +3012,28 @@ def run_suite(config_path: str, args) -> dict:
         return suite_state
 
     # Comparison (Part 11 subset) + manifest (Part 10).
-    rows, per_temp_rows = build_comparison_rows(suite_state, log)
+    rows, per_temp_rows, per_temp_diag_rows = build_comparison_rows(
+        suite_state, log
+    )
     comparison_dir = output_root / "comparison"
-    write_comparison(rows, per_temp_rows, comparison_dir, log)
+    write_comparison(rows, per_temp_rows, comparison_dir, log,
+                     per_temp_diag_rows=per_temp_diag_rows)
     global_ranking = cross_baseline_global_ranking(suite_state, rows)
     suite_state["global_ranking"] = global_ranking
+
+    # Paired model-comparison statistics (optional; reuses per-seed scores).
+    stats_result = run_pairwise_statistics(suite_state, rows, comparison_dir, log)
+
     make_any_plots = any(
         b["comparison"].get("make_plots", False)
         for b in cfg["baselines"]
     )
     if make_any_plots:
-        make_plots(suite_state, rows, per_temp_rows, remd_mod, comparison_dir, log)
-    write_report(suite_state, rows, global_ranking, comparison_dir, log)
+        make_plots(suite_state, rows, per_temp_rows, remd_mod, comparison_dir,
+                   log, per_temp_diag_rows=per_temp_diag_rows)
+        make_statistics_plots(stats_result, comparison_dir, log)
+    write_report(suite_state, rows, global_ranking, comparison_dir, log,
+                 stats_result=stats_result)
     write_manifest(suite_state, config_path, log)
     log("=== model suite complete ===")
     return suite_state
@@ -1977,6 +3113,7 @@ def _do_remd(cfg, baseline, fit_dir, seed, seed_dir, remd_cmd, rec, srec,
     seed_dir.mkdir(parents=True, exist_ok=True)
     summary = rec["summary"]
     tol = float(baseline["comparison"]["temperature_tolerance"])
+    diag_cfg = baseline["remd"].get("diagnostics") or {}
     signature_path = seed_dir / "suite_job.json"
     signature = make_job_signature(
         "remd", remd_cmd,
@@ -1991,7 +3128,7 @@ def _do_remd(cfg, baseline, fit_dir, seed, seed_dir, remd_cmd, rec, srec,
         and _completion_ok(seed_dir, REMD_COMPLETION_FILES)
         and signature_matches(signature_path, signature)
     ):
-        v = validate_remd_outputs(seed_dir, summary, target_temps, tol)
+        v = validate_remd_outputs(seed_dir, summary, target_temps, tol, diag_cfg)
         if v["status"] == "ok":
             srec["status"] = "ok"
             srec["run_summary"] = _load_run_summary(seed_dir)
@@ -2013,7 +3150,7 @@ def _do_remd(cfg, baseline, fit_dir, seed, seed_dir, remd_cmd, rec, srec,
         signature_path.unlink()
     prov = run_subprocess(remd_cmd, seed_dir / "stdout.log")
     v = (
-        validate_remd_outputs(seed_dir, summary, target_temps, tol)
+        validate_remd_outputs(seed_dir, summary, target_temps, tol, diag_cfg)
         if prov["returncode"] == 0
         else {"status": "failed", "error": f"subprocess exited with code {prov['returncode']}"}
     )
@@ -2098,6 +3235,75 @@ def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers):
              c_vals=np.asarray(m, dtype=int), c_prob=np.asarray(p0, dtype=float))
 
 
+def _pairwise_statistics_unit_tests() -> None:
+    """Synthetic paired-statistics scenarios (clear winner, tie, equivalence,
+    missing/failed seed, single paired seed)."""
+    n_rep, seed, eps, alpha = 2000, 42, 0.01, 0.05
+
+    # 1. Clear winner: A strictly below B at every seed.
+    a = {1: 0.10, 2: 0.11, 3: 0.09}
+    b = {1: 0.30, 2: 0.31, 3: 0.29}
+    common = sorted(set(a) & set(b))
+    ps = compute_pair_stats(a, b, "A", "B", common, n_rep, seed, eps, alpha)
+    assert ps["n_paired"] == 3 and ps["mean_delta"] < 0
+    assert ps["favored"] == "A" and ps["frac_a_won"] == 1.0
+    assert ps["prob_a_better"] > 0.99
+    assert ps["ci_high"] < 0  # whole CI favors A
+    assert ps["p_method"] == "exact_sign_flip"
+
+    # 2. Exact tie: identical scores -> delta 0, p = 1, all ties.
+    t = {1: 0.2, 2: 0.2, 3: 0.2}
+    pst = compute_pair_stats(t, dict(t), "A", "B", [1, 2, 3], n_rep, seed,
+                             eps, alpha)
+    assert pst["mean_delta"] == 0.0 and pst["favored"] == "tie"
+    assert pst["frac_tie"] == 1.0 and abs(pst["p_sign_flip"] - 1.0) < 1e-12
+    assert abs(pst["prob_practical_equivalent"] - 1.0) < 1e-12
+
+    # 3. Practical equivalence: constant tiny gap below epsilon.
+    a3 = {1: 0.100, 2: 0.100, 3: 0.100}
+    b3 = {1: 0.100 + eps / 2, 2: 0.100 + eps / 2, 3: 0.100 + eps / 2}
+    ps3 = compute_pair_stats(a3, b3, "A", "B", [1, 2, 3], n_rep, seed, eps, alpha)
+    assert abs(ps3["mean_delta"]) < eps
+    assert ps3["prob_practical_equivalent"] > 0.99
+
+    # 4. Missing seed in one model: pairing only on common seeds.
+    am = {1: 0.1, 2: 0.2, 3: 0.3}
+    bm = {1: 0.15, 3: 0.35}            # seed 2 absent
+    common_m = sorted(set(am) & set(bm))
+    psm = compute_pair_stats(am, bm, "A", "B", common_m, n_rep, seed, eps, alpha)
+    assert psm["n_paired"] == 2, psm["n_paired"]
+
+    # 5. Failed seed: excluded upstream -> behaves like a missing seed here.
+    #    (seed 2 score never recorded for B because that REMD seed failed.)
+    assert sorted(set(am) & set(bm)) == [1, 3]
+
+    # 6. Only one paired seed: degenerate but must not crash.
+    a1 = {1: 0.10}
+    b1 = {1: 0.20}
+    ps1 = compute_pair_stats(a1, b1, "A", "B", [1], n_rep, seed, eps, alpha)
+    assert ps1["n_paired"] == 1 and ps1["favored"] == "A"
+    assert not np.isfinite(ps1["se_delta"])      # SE undefined for n=1
+    assert ps1["effect_size_reliable"] is False
+    assert abs(ps1["p_sign_flip"] - 1.0) < 1e-12  # n=1 -> p=1
+
+    # Holm monotonicity / clamping.
+    adj = _holm_adjust([0.01, 0.04, 0.20])
+    assert adj[0] <= adj[1] <= adj[2] and all(x <= 1.0 for x in adj)
+
+    # Rank stability: A is best at every seed -> mean rank 1, high prob_rank1.
+    ms = {"A": a, "B": b, "C": {1: 0.5, 2: 0.5, 3: 0.5}}
+    rk = compute_rank_stability(ms, ["A", "B", "C"], n_rep, seed)
+    rk_by = {r["model"]: r for r in rk}
+    assert rk_by["A"]["mean_rank"] == 1.0 and rk_by["A"]["n_seed_wins"] == 3
+    assert rk_by["A"]["prob_rank1"] > 0.99
+
+    # Deterministic bootstrap: identical inputs -> identical CI.
+    c1 = compute_pair_stats(a, b, "A", "B", common, n_rep, seed, eps, alpha)
+    c2 = compute_pair_stats(a, b, "A", "B", common, n_rep, seed, eps, alpha)
+    assert c1["ci_low"] == c2["ci_low"] and c1["ci_high"] == c2["ci_high"]
+    print("  suite quick-test pairwise-statistics scenarios: PASSED")
+
+
 def run_quick_test() -> None:
     """End-to-end tiny suite run on synthetic data, plus unit checks."""
     import tempfile
@@ -2169,6 +3375,23 @@ def run_quick_test() -> None:
         inp.write_text("changed")
         sig2 = make_job_signature("test", ["cmd", "--x"], {"input": str(inp)})
         assert sig1 != sig2
+
+    # Cross-seed Rhat: identical/IID chains -> ~1; divergent chains -> >> 1.
+    rng = np.random.RandomState(7)
+    iid_chains = [rng.standard_normal(500) for _ in range(4)]
+    rhat_iid = rank_normalized_split_rhat(iid_chains)
+    assert np.isfinite(rhat_iid) and rhat_iid < 1.05, rhat_iid
+    shifted = [rng.standard_normal(500) + off for off in (0.0, 5.0, 10.0, 15.0)]
+    rhat_bad = rank_normalized_split_rhat(shifted)
+    assert rhat_bad > 1.2, rhat_bad
+    # Plain split-Rhat agrees on the easy IID case.
+    assert split_rhat(iid_chains) < 1.1
+    # Average-rank ties match a hand-computed example.
+    np.testing.assert_allclose(
+        _rankdata_average([10.0, 10.0, 20.0]), [1.5, 1.5, 3.0]
+    )
+
+    _pairwise_statistics_unit_tests()
     print("  suite quick-test unit checks: PASSED")
 
     here = Path(__file__).resolve().parent
@@ -2206,11 +3429,24 @@ def run_quick_test() -> None:
                 "holdout_every": 2, "plots": False,
             },
             "remd": {
-                "N": 12, "steps_per_swap": 20, "n_cycles": 8, "rg_bins": 16,
-                "burnin_frac": 0.5, "n_workers": 1, "seeds": [1], "plots": False,
+                "N": 12, "steps_per_swap": 20, "n_cycles": 16, "rg_bins": 16,
+                "burnin_frac": 0.5, "n_workers": 1, "seeds": [1, 2],
+                "plots": False,
+                "diagnostics": {
+                    "enabled": True, "trajectories": True, "n_blocks": 3,
+                    "min_round_trips": 1, "min_temp_coverage": 0.5,
+                    "min_ess": 5.0, "max_drift": 2.0, "min_swap_rate": 0.01,
+                },
             },
-            "comparison": {"include_rg": True, "rg_weight": 0.25,
-                           "make_plots": True},
+            "comparison": {
+                "include_rg": True, "rg_weight": 0.25, "make_plots": True,
+                "statistics": {
+                    "enabled": True, "alpha": 0.05,
+                    "bootstrap_replicates": 500, "seed": 12345,
+                    "practical_equivalence_epsilon": 0.01,
+                    "multiple_testing": "holm",
+                },
+            },
         }
         config_path = tmp / "config.json"
         config_path.write_text(json.dumps(config, indent=2))
@@ -2245,7 +3481,7 @@ def run_quick_test() -> None:
         assert rg_finite, "no finite Rg JS computed (Rg path not exercised)"
 
         # Report mentions every model.
-        report = (out / "comparison/report.md").read_text()
+        report = (out / "comparison/report.md").read_text(encoding="utf-8")
         for model in SUPPORTED_MODELS:
             assert model in report, f"report missing {model}"
 
@@ -2267,6 +3503,73 @@ def run_quick_test() -> None:
         )
         print(f"  suite quick-test end-to-end ({n_ok}/6 models simulated, "
               f"Rg+plots+report): PASSED")
+
+        # --- Diagnostics outputs (diagnostics enabled in the config above) --
+        for model in SUPPORTED_MODELS:
+            sd = out / "synthetic" / model / "remd" / "seed_1"
+            if not (sd / "run_distributions.npz").exists():
+                continue
+            for fn in ("run_diagnostics.json", "run_convergence.csv",
+                       "run_round_trips.csv", "run_walker_occupancy.csv",
+                       "run_diagnostic_trajectories.npz"):
+                assert (sd / fn).exists(), f"missing per-seed diagnostic {fn} ({model})"
+        # Suite-level cross-seed diagnostics CSV + columns + report section.
+        diag_csv = out / "comparison" / "per_temperature_diagnostics.csv"
+        assert diag_csv.exists(), "missing per_temperature_diagnostics.csv"
+        diag_text = diag_csv.read_text()
+        assert "rhat_contacts" in diag_text and "ess_contacts_min" in diag_text
+        cmp_text = (out / "comparison/model_comparison.csv").read_text()
+        for col in ("convergence_status", "diag_min_ess_contacts",
+                    "diag_total_round_trips", "diag_max_rhat_contacts"):
+            assert col in cmp_text, f"comparison CSV missing column {col}"
+        assert "convergence_status" in {k for r in rows for k in r}, \
+            "rows lack convergence_status"
+        # A cross-seed Rhat must have been computed for at least one (model, T).
+        assert any(np.isfinite(_f(r.get("diag_max_rhat_contacts"))) for r in rows), \
+            "no cross-seed Rhat computed"
+        assert "Convergence diagnostics" in report, \
+            "report missing convergence diagnostics section"
+        # Diagnostic plots present.
+        dplots = list((out / "comparison" / "plots").glob("*_ess_vs_T.png"))
+        assert dplots, "missing ESS-vs-T diagnostic plot"
+        print("  suite quick-test diagnostics (per-seed files, cross-seed "
+              "Rhat, columns, report, plots): PASSED")
+
+        # --- Paired statistics outputs (statistics enabled in config above) -
+        comp = out / "comparison"
+        for fn in ("pairwise_model_comparison.csv",
+                   "pairwise_model_comparison.json",
+                   "seed_level_model_scores.csv",
+                   "model_rank_stability.csv",
+                   "model_statistics_summary.json"):
+            assert (comp / fn).exists(), f"missing statistics output {fn}"
+        pw = json.loads((comp / "pairwise_model_comparison.json").read_text())
+        assert pw, "no pairwise comparisons produced"
+        # Every pair must carry the required scalar fields and a Holm p-value.
+        for p in pw:
+            for k in ("n_paired", "mean_delta", "ci_low", "ci_high",
+                      "p_sign_flip", "p_holm", "prob_a_better",
+                      "prob_practical_equivalent", "favored"):
+                assert k in p, f"pairwise row missing {k}"
+        # n_pairs == C(n_models, 2) for the single synthetic baseline.
+        n_models = len({p["model_a"] for p in pw} | {p["model_b"] for p in pw})
+        assert len(pw) == n_models * (n_models - 1) // 2, len(pw)
+        pw_csv = (comp / "pairwise_model_comparison.csv").read_text()
+        for col in ("effect_size_dz", "prob_practical_equivalent", "p_holm"):
+            assert col in pw_csv, f"pairwise CSV missing column {col}"
+        rk_csv = (comp / "model_rank_stability.csv").read_text()
+        assert "prob_rank1" in rk_csv and "n_seed_wins" in rk_csv
+        ssum = json.loads((comp / "model_statistics_summary.json").read_text())
+        assert ssum, "empty statistics summary"
+        bkey = next(iter(ssum))
+        assert "parsimony" in ssum[bkey] and "raw_winner" in ssum[bkey]
+        assert ssum[bkey]["low_power"] is True  # only 2-3 seeds
+        assert "Statistical model comparison" in report, \
+            "report missing statistics section"
+        splots = list((comp / "plots").glob("*stats_mean_delta_heatmap.png"))
+        assert splots, "missing pairwise mean-delta heatmap"
+        print("  suite quick-test paired statistics (5 files, columns, report, "
+              "plots): PASSED")
 
     print("suite quick-test complete.")
 
