@@ -3,9 +3,9 @@
 run_model_suite.py — subprocess orchestrator for the lattice contact-model suite.
 
 For every baseline x every selected contact-bias model this script:
-  1. fits the model to the target REMD distributions (fit_lattice_contact_model_chat.py),
+  1. fits the model to the target REMD distributions (fit_lattice_contact_model_2.py),
   2. loads the resulting fit_summary.json,
-  3. runs one or more lattice REMD replicates (remd_uniform_chain_new_chat.py),
+  3. runs one or more lattice REMD replicates (remd_uniform_chain_2.py),
   4. compares simulated outputs to the target with a standardized metric,
   5. writes a per-baseline comparison table and a provenance manifest.
 
@@ -57,6 +57,57 @@ FIT_COMPLETION_FILES = (
     "fit_params.csv",
     "train_validation_loss.csv",
 )
+# Completion outputs required by each newer fitter analysis when enabled.
+# Filenames verified directly against fit_lattice_contact_model_2.py drivers.
+# Plot files are deliberately excluded (they only exist when plotting is on and
+# are never treated as completion markers).
+FIT_BOOTSTRAP_FILES = (
+    "bootstrap_summary.json",
+    "bootstrap_params.csv",
+    "bootstrap_covariance.csv",
+    "bootstrap_correlation.csv",
+    "bootstrap_bands_by_temperature.csv",
+)
+FIT_BOOTSTRAP_PREDICTION_BANDS_FILE = "bootstrap_prediction_bands.npz"
+FIT_UNCERTAINTY_FILES = (
+    "uncertainty_diagnostics.json",
+    "restart_diagnostics.csv",
+)
+FIT_SPLIT_FILES = (
+    "split_sensitivity.csv",
+    "split_sensitivity_per_temperature.csv",
+    "split_parameter_stability.csv",
+    "split_sensitivity_summary.json",
+)
+FIT_RGW_FILES = (
+    "rg_weight_sensitivity.csv",
+    "rg_weight_per_temperature.csv",
+    "rg_weight_parameter_path.csv",
+    "rg_weight_summary.json",
+)
+
+
+def expected_fit_outputs(fit_cfg: dict) -> tuple[str, ...]:
+    """Completion files the fitter must produce for the given fit configuration.
+
+    Always includes the primary fit files. When an optional analysis is enabled
+    its documented completion outputs are appended so post-run validation,
+    resume, stale detection, force cleanup, and the manifest all agree on the
+    full output set. Plot files are never required.
+    """
+    files: list[str] = list(FIT_COMPLETION_FILES)
+    bs = fit_cfg.get("bootstrap") or {}
+    if bs.get("enabled"):
+        files += list(FIT_BOOTSTRAP_FILES)
+        if bs.get("save_prediction_bands"):
+            files.append(FIT_BOOTSTRAP_PREDICTION_BANDS_FILE)
+    if (fit_cfg.get("uncertainty_diagnostics") or {}).get("enabled"):
+        files += list(FIT_UNCERTAINTY_FILES)
+    if (fit_cfg.get("split_sensitivity") or {}).get("enabled"):
+        files += list(FIT_SPLIT_FILES)
+    if (fit_cfg.get("rg_weight_sensitivity") or {}).get("enabled"):
+        files += list(FIT_RGW_FILES)
+    return tuple(files)
 REMD_COMPLETION_FILES = (
     "run_results.csv",
     "run_swap_rates.csv",
@@ -159,10 +210,52 @@ REQUIRED_TOP = ("target_remd", "fit_script", "remd_script", "output_root",
 SUPPORTED_MODELS = ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3",
                     "heat_capacity")
 
+# Supported values for the fitter's newer analyses (verified against
+# fit_lattice_contact_model_2.py: build_split_schemes() and the --bootstrap-method
+# choices). Kept here so the orchestrator can validate config without importing
+# the fitter.
+SUPPORTED_SPLIT_SCHEMES = (
+    "every_third_phase", "kfold", "blocked_low", "blocked_mid", "blocked_high",
+    "random",
+)
+SUPPORTED_BOOTSTRAP_METHODS = ("temperature",)
+# Parameter names that are "extra" terms whose interval containing zero is a
+# meaningful identifiability signal (a2/a3 polynomial corrections, dCp heat
+# capacity). Used only for reporting, never for fitting.
+EXTRA_TERM_PARAMS = ("a2", "a3", "dCp")
+
 DEFAULT_FIT = {
     "loss": "js", "fit_rg": False, "rg_weight": 1.0, "holdout_every": None,
     "holdout_indices": None, "train_indices": None, "n_restarts": 8,
     "seed": 123, "bootstrap": 0, "bootstrap_seed": None, "plots": False,
+}
+# Defaults for the newer fitter analyses (all backward compatible: disabled).
+# Mirrors the fitter's own argparse defaults so a bare {"enabled": true} block
+# produces the same behavior as running the fitter with just the enabling flag.
+DEFAULT_FIT_BOOTSTRAP = {
+    "enabled": None,            # None -> derive from replicates > 0
+    "replicates": 0,
+    "seed": None,              # None -> fitter falls back to fit.seed
+    "method": "temperature",
+    "confidence": 0.95,
+    "correlation_threshold": 0.9,
+    "save_prediction_bands": False,
+}
+DEFAULT_FIT_UNCERTAINTY = {"enabled": False}
+DEFAULT_FIT_SPLIT = {
+    "enabled": False,
+    "schemes": list(SUPPORTED_SPLIT_SCHEMES),
+    "config_json": None,
+    "seed": None,              # None -> fitter falls back to fit.seed
+    "kfold_k": 5,
+    "blocked_fraction": 0.2,
+    "random_fraction": 0.2,
+    "random_repeats": 5,
+}
+DEFAULT_FIT_RGW = {
+    "enabled": False,
+    "weights": None,
+    "normalization_diagnostics": False,
 }
 DEFAULT_REMD = {
     "N": None, "steps_per_swap": 1000, "n_cycles": 5000, "rg_bins": 100,
@@ -215,9 +308,22 @@ def resolve_config_paths(cfg: dict, config_path: str) -> dict:
     cfg = dict(cfg)
     for key in ("target_remd", "fit_script", "remd_script", "output_root"):
         cfg[key] = _resolve(cfg[key])
-    cfg["baselines"] = [
-        {**b, "path": _resolve(b["path"])} for b in cfg["baselines"]
-    ]
+    new_baselines = []
+    for b in cfg["baselines"]:
+        nb = {**b, "path": _resolve(b["path"])}
+        # Resolve the optional custom split-sensitivity JSON relative to the
+        # config file so it can be hashed into the fit job signature.
+        fit = nb.get("fit")
+        if isinstance(fit, dict):
+            ss = fit.get("split_sensitivity")
+            if isinstance(ss, dict) and ss.get("config_json"):
+                fit = dict(fit)
+                ss = dict(ss)
+                ss["config_json"] = _resolve(ss["config_json"])
+                fit["split_sensitivity"] = ss
+                nb["fit"] = fit
+        new_baselines.append(nb)
+    cfg["baselines"] = new_baselines
     return cfg
 
 
@@ -227,6 +333,244 @@ def _merge(defaults: dict, override: dict | None) -> dict:
         for k, v in override.items():
             out[k] = v
     return out
+
+
+def _as_float_list(value, label: str, name: str) -> list[float]:
+    """Coerce a list or comma string of numbers to a list of floats."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [t.strip() for t in value.split(",") if t.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ValueError(
+            f"Baseline {name!r}: {label} must be a list or comma-separated string"
+        )
+    out: list[float] = []
+    for it in items:
+        try:
+            out.append(float(it))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Baseline {name!r}: {label} contains a non-numeric value {it!r}"
+            ) from exc
+    return out
+
+
+def _as_str_list(value, label: str, name: str) -> list[str]:
+    """Coerce a list or comma string into a list of non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [t.strip() for t in value.split(",") if t.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = [str(t).strip() for t in value if str(t).strip()]
+    else:
+        raise ValueError(
+            f"Baseline {name!r}: {label} must be a list or comma-separated string"
+        )
+    return items
+
+
+def _normalize_fit_analyses(fit: dict, name: str) -> dict:
+    """Normalize + validate the newer fitter-analysis config blocks.
+
+    Produces canonical nested dicts at fit['bootstrap'], fit['uncertainty_diagnostics'],
+    fit['split_sensitivity'], and fit['rg_weight_sensitivity'] while preserving
+    backward compatibility with the legacy flat keys.
+
+    Precedence rule for bootstrap: if fit['bootstrap'] is a JSON object it defines
+    the bootstrap analysis (and the legacy flat fit['bootstrap_seed'] is folded in
+    only when the object omits 'seed'); if it is a scalar (legacy form) it is the
+    replicate count, fit['bootstrap_seed'] is the seed, and the analysis is enabled
+    iff replicates > 0. File-dependent checks (custom split JSON existence and the
+    Rg-weight data requirements) are performed later in run_suite preflight where
+    the resolved paths and NPZ contents are available.
+    """
+    fit = dict(fit)
+
+    # ---- bootstrap -------------------------------------------------------
+    raw_bs = fit.get("bootstrap")
+    legacy_seed = fit.get("bootstrap_seed")
+    if isinstance(raw_bs, dict):
+        bs = _merge(DEFAULT_FIT_BOOTSTRAP, raw_bs)
+        seed = bs.get("seed", legacy_seed)
+        if seed is None:
+            seed = legacy_seed
+        enabled_field = raw_bs.get("enabled", None)
+    else:
+        bs = dict(DEFAULT_FIT_BOOTSTRAP)
+        bs["replicates"] = raw_bs if raw_bs is not None else 0
+        seed = legacy_seed
+        enabled_field = None
+    try:
+        replicates = int(bs.get("replicates", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Baseline {name!r}: fit.bootstrap.replicates must be an integer"
+        ) from exc
+    if replicates < 0:
+        raise ValueError(f"Baseline {name!r}: fit.bootstrap.replicates must be >= 0")
+    enabled = bool(enabled_field) if enabled_field is not None else (replicates > 0)
+    method = str(bs.get("method", "temperature"))
+    try:
+        confidence = float(bs.get("confidence", 0.95))
+        corr_thr = float(bs.get("correlation_threshold", 0.9))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Baseline {name!r}: fit.bootstrap.confidence and "
+            f"correlation_threshold must be numbers"
+        ) from exc
+    save_bands = bool(bs.get("save_prediction_bands", False))
+    if seed is not None:
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Baseline {name!r}: fit.bootstrap.seed must be an integer"
+            ) from exc
+    if enabled:
+        if replicates < 1:
+            raise ValueError(
+                f"Baseline {name!r}: fit.bootstrap.replicates must be >= 1 when "
+                f"bootstrap is enabled"
+            )
+        if not (0.0 < confidence < 1.0):
+            raise ValueError(
+                f"Baseline {name!r}: fit.bootstrap.confidence must be in (0, 1)"
+            )
+        if not (0.0 < corr_thr <= 1.0):
+            raise ValueError(
+                f"Baseline {name!r}: fit.bootstrap.correlation_threshold must be "
+                f"in (0, 1]"
+            )
+        if method not in SUPPORTED_BOOTSTRAP_METHODS:
+            raise ValueError(
+                f"Baseline {name!r}: fit.bootstrap.method {method!r} unsupported; "
+                f"choose from {list(SUPPORTED_BOOTSTRAP_METHODS)}"
+            )
+    fit["bootstrap"] = {
+        "enabled": bool(enabled), "replicates": replicates, "seed": seed,
+        "method": method, "confidence": confidence,
+        "correlation_threshold": corr_thr,
+        "save_prediction_bands": save_bands,
+    }
+    fit.pop("bootstrap_seed", None)
+
+    # ---- uncertainty diagnostics ----------------------------------------
+    raw_unc = fit.get("uncertainty_diagnostics")
+    if isinstance(raw_unc, dict):
+        unc_enabled = bool(raw_unc.get("enabled", False))
+    else:
+        unc_enabled = bool(raw_unc)
+    fit["uncertainty_diagnostics"] = {"enabled": unc_enabled}
+
+    # ---- validation-split sensitivity -----------------------------------
+    raw_ss = fit.get("split_sensitivity")
+    ss = _merge(DEFAULT_FIT_SPLIT, raw_ss if isinstance(raw_ss, dict) else None)
+    if not isinstance(raw_ss, dict) and raw_ss is not None:
+        ss["enabled"] = bool(raw_ss)
+    ss_enabled = bool(ss.get("enabled", False))
+    schemes = _as_str_list(ss.get("schemes"), "fit.split_sensitivity.schemes", name)
+    if not schemes:
+        schemes = list(SUPPORTED_SPLIT_SCHEMES)
+    try:
+        kfold_k = int(ss.get("kfold_k", 5))
+        random_repeats = int(ss.get("random_repeats", 5))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Baseline {name!r}: fit.split_sensitivity.kfold_k and random_repeats "
+            f"must be integers"
+        ) from exc
+    try:
+        blocked_fraction = float(ss.get("blocked_fraction", 0.2))
+        random_fraction = float(ss.get("random_fraction", 0.2))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Baseline {name!r}: fit.split_sensitivity.blocked_fraction and "
+            f"random_fraction must be numbers"
+        ) from exc
+    ss_seed = ss.get("seed")
+    if ss_seed is not None:
+        try:
+            ss_seed = int(ss_seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Baseline {name!r}: fit.split_sensitivity.seed must be an integer"
+            ) from exc
+    config_json = ss.get("config_json")
+    if config_json is not None and not isinstance(config_json, str):
+        raise ValueError(
+            f"Baseline {name!r}: fit.split_sensitivity.config_json must be a path string"
+        )
+    if ss_enabled:
+        if not schemes:
+            raise ValueError(
+                f"Baseline {name!r}: fit.split_sensitivity.schemes is empty"
+            )
+        bad = [s for s in schemes if s not in SUPPORTED_SPLIT_SCHEMES]
+        if bad:
+            raise ValueError(
+                f"Baseline {name!r}: unsupported split scheme(s) {bad}; choose "
+                f"from {list(SUPPORTED_SPLIT_SCHEMES)}"
+            )
+        if kfold_k < 2:
+            raise ValueError(
+                f"Baseline {name!r}: fit.split_sensitivity.kfold_k must be >= 2"
+            )
+        if not (0.0 < blocked_fraction < 1.0):
+            raise ValueError(
+                f"Baseline {name!r}: fit.split_sensitivity.blocked_fraction must "
+                f"be in (0, 1)"
+            )
+        if not (0.0 < random_fraction < 1.0):
+            raise ValueError(
+                f"Baseline {name!r}: fit.split_sensitivity.random_fraction must "
+                f"be in (0, 1)"
+            )
+        if random_repeats < 1:
+            raise ValueError(
+                f"Baseline {name!r}: fit.split_sensitivity.random_repeats must be >= 1"
+            )
+    fit["split_sensitivity"] = {
+        "enabled": ss_enabled, "schemes": schemes, "config_json": config_json,
+        "seed": ss_seed, "kfold_k": kfold_k, "blocked_fraction": blocked_fraction,
+        "random_fraction": random_fraction, "random_repeats": random_repeats,
+    }
+
+    # ---- Rg-weight sensitivity ------------------------------------------
+    raw_rgw = fit.get("rg_weight_sensitivity")
+    rgw = _merge(DEFAULT_FIT_RGW, raw_rgw if isinstance(raw_rgw, dict) else None)
+    if not isinstance(raw_rgw, dict) and raw_rgw is not None:
+        rgw["enabled"] = bool(raw_rgw)
+    rgw_enabled = bool(rgw.get("enabled", False))
+    weights = _as_float_list(rgw.get("weights"),
+                             "fit.rg_weight_sensitivity.weights", name)
+    norm_diag = bool(rgw.get("normalization_diagnostics", False))
+    if rgw_enabled:
+        if not weights:
+            raise ValueError(
+                f"Baseline {name!r}: fit.rg_weight_sensitivity.weights must be a "
+                f"non-empty list when enabled"
+            )
+        for w in weights:
+            if not np.isfinite(w) or w < 0:
+                raise ValueError(
+                    f"Baseline {name!r}: fit.rg_weight_sensitivity.weights must "
+                    f"all be finite and >= 0 (got {w!r})"
+                )
+        if not fit.get("fit_rg", False):
+            raise ValueError(
+                f"Baseline {name!r}: fit.rg_weight_sensitivity requires fit.fit_rg=true "
+                f"(and a joint baseline with target Rg data)"
+            )
+    fit["rg_weight_sensitivity"] = {
+        "enabled": rgw_enabled,
+        "weights": sorted(set(weights)) if weights else [],
+        "normalization_diagnostics": norm_diag,
+    }
+    return fit
 
 
 def validate_config(cfg: dict) -> dict:
@@ -274,22 +618,15 @@ def validate_config(cfg: dict) -> dict:
             raise ValueError(f"Baseline {name!r}: fit.loss must be 'js' or 'kl'")
         try:
             n_restarts = int(fit.get("n_restarts", 0))
-            bootstrap = int(fit.get("bootstrap", 0))
             fit_seed = int(fit.get("seed", 123))
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Baseline {name!r}: fit.n_restarts, fit.bootstrap, and fit.seed "
-                "must be integers"
+                f"Baseline {name!r}: fit.n_restarts and fit.seed must be integers"
             ) from exc
         if n_restarts < 1:
             raise ValueError(f"Baseline {name!r}: fit.n_restarts must be >= 1")
-        if bootstrap < 0:
-            raise ValueError(f"Baseline {name!r}: fit.bootstrap must be >= 0")
         fit["n_restarts"] = n_restarts
-        fit["bootstrap"] = bootstrap
         fit["seed"] = fit_seed
-        if fit.get("bootstrap_seed") is not None:
-            fit["bootstrap_seed"] = int(fit["bootstrap_seed"])
         if fit.get("holdout_every") is not None:
             fit["holdout_every"] = int(fit["holdout_every"])
             if fit["holdout_every"] < 1:
@@ -300,6 +637,9 @@ def validate_config(cfg: dict) -> dict:
         if not np.isfinite(fit_rg_weight) or fit_rg_weight < 0:
             raise ValueError(f"Baseline {name!r}: fit.rg_weight must be finite and >= 0")
         fit["rg_weight"] = fit_rg_weight
+        # Normalize and validate the newer fitter analyses (bootstrap,
+        # uncertainty diagnostics, split sensitivity, Rg-weight sensitivity).
+        fit = _normalize_fit_analyses(fit, name)
 
         for field in ("N", "steps_per_swap", "n_cycles", "rg_bins", "n_workers"):
             try:
@@ -716,6 +1056,7 @@ def write_signature(path: Path, signature: dict) -> None:
 
 def build_fit_command(cfg, baseline, model, fit_dir: Path) -> list[str]:
     fit = baseline["fit"]
+    bootstrap = fit.get("bootstrap") or {}
     cmd = [
         sys.executable, cfg["fit_script"],
         "--remd", cfg["target_remd"],
@@ -728,7 +1069,10 @@ def build_fit_command(cfg, baseline, model, fit_dir: Path) -> list[str]:
         "--rg-weight", str(fit["rg_weight"]),
         "--n_restarts", str(fit["n_restarts"]),
         "--seed", str(fit["seed"]),
-        "--bootstrap", str(fit["bootstrap"]),
+        # --bootstrap is always forwarded (0 disables in the fitter) so the
+        # legacy contract is preserved; the extra bootstrap flags below are only
+        # appended when the analysis is actually enabled.
+        "--bootstrap", str(int(bootstrap.get("replicates", 0) or 0)),
     ]
     # Exactly one split option, never null.
     if fit.get("train_indices") is not None:
@@ -740,9 +1084,54 @@ def build_fit_command(cfg, baseline, model, fit_dir: Path) -> list[str]:
     cmd += ["--fit-rg"] if fit["fit_rg"] else ["--no-fit-rg"]
     if not fit.get("plots", False):
         cmd += ["--no-plots"]
-    if fit.get("bootstrap_seed") is not None:
-        cmd += ["--bootstrap-seed", str(int(fit["bootstrap_seed"]))]
+
+    # ---- bootstrap uncertainty / identifiability -------------------------
+    if bootstrap.get("enabled"):
+        cmd += ["--bootstrap-method", str(bootstrap.get("method", "temperature"))]
+        cmd += ["--bootstrap-confidence", str(bootstrap.get("confidence", 0.95))]
+        cmd += ["--bootstrap-correlation-threshold",
+                str(bootstrap.get("correlation_threshold", 0.9))]
+        if bootstrap.get("seed") is not None:
+            cmd += ["--bootstrap-seed", str(int(bootstrap["seed"]))]
+        if bootstrap.get("save_prediction_bands"):
+            cmd += ["--bootstrap-save-prediction-bands"]
+
+    # ---- optimizer-restart / local-curvature diagnostics -----------------
+    if (fit.get("uncertainty_diagnostics") or {}).get("enabled"):
+        cmd += ["--uncertainty-diagnostics"]
+
+    # ---- validation-split sensitivity ------------------------------------
+    ss = fit.get("split_sensitivity") or {}
+    if ss.get("enabled"):
+        cmd += ["--split-sensitivity"]
+        schemes = ss.get("schemes") or list(SUPPORTED_SPLIT_SCHEMES)
+        cmd += ["--split-schemes", ",".join(str(s) for s in schemes)]
+        cmd += ["--split-kfold-k", str(int(ss.get("kfold_k", 5)))]
+        cmd += ["--split-blocked-fraction", str(ss.get("blocked_fraction", 0.2))]
+        cmd += ["--split-random-fraction", str(ss.get("random_fraction", 0.2))]
+        cmd += ["--split-random-repeats", str(int(ss.get("random_repeats", 5)))]
+        if ss.get("seed") is not None:
+            cmd += ["--split-seed", str(int(ss["seed"]))]
+        if ss.get("config_json"):
+            cmd += ["--split-config-json", str(ss["config_json"])]
+
+    # ---- Rg-weight sensitivity / Pareto analysis -------------------------
+    rgw = fit.get("rg_weight_sensitivity") or {}
+    if rgw.get("enabled"):
+        weights = rgw.get("weights") or []
+        cmd += ["--rg-weight-grid",
+                ",".join(_num_str(w) for w in weights)]
+        if rgw.get("normalization_diagnostics"):
+            cmd += ["--rg-weight-normalization-diagnostics"]
     return cmd
+
+
+def _num_str(value) -> str:
+    """Render a number compactly without a trailing '.0' for whole values."""
+    f = float(value)
+    if f.is_integer():
+        return str(int(f))
+    return repr(f)
 
 
 def _csv_indices(value) -> str:
@@ -751,9 +1140,16 @@ def _csv_indices(value) -> str:
     return str(value)
 
 
-def validate_fit_outputs(fit_dir: Path, model: str) -> dict:
-    """Validate fit completion; return a status dict (status in ok/failed)."""
-    for fname in FIT_COMPLETION_FILES:
+def validate_fit_outputs(fit_dir: Path, model: str, fit_cfg: dict | None = None) -> dict:
+    """Validate fit completion; return a status dict (status in ok/failed).
+
+    The required output set is feature-aware: every enabled analysis must have
+    produced its documented completion files (an enabled analysis whose outputs
+    are missing fails the model rather than being silently ignored).
+    """
+    required = (expected_fit_outputs(fit_cfg) if fit_cfg is not None
+                else FIT_COMPLETION_FILES)
+    for fname in required:
         if not (fit_dir / fname).exists():
             return {"status": "failed", "error": f"missing {fname}"}
     try:
@@ -1749,6 +2145,21 @@ COMPARISON_COLUMNS = [
     "diag_max_drift_contacts", "diag_seed_mean_contacts_dispersion",
     "diag_seed_mean_rg_dispersion", "diag_max_rhat_contacts",
     "diag_max_rhat_rg", "convergence_status", "convergence_flags",
+    # Fit-robustness scalar findings (detailed data lives in the supplementary
+    # JSON/CSV outputs and comparison/fit_robustness_summary.json).
+    "bootstrap_enabled", "boot_requested_replicates", "boot_successful_replicates",
+    "boot_failed_replicates", "boot_confidence", "boot_widest_relative_ci",
+    "boot_max_abs_param_correlation", "boot_n_identifiability_warnings",
+    "boot_max_bound_hit_fraction", "boot_extra_terms_ci_include_zero", "boot_status",
+    "split_enabled", "split_n_attempted", "split_n_succeeded",
+    "split_mean_heldout_loss", "split_range_heldout_loss", "split_worst_blocked_low",
+    "split_worst_blocked_mid", "split_worst_blocked_high", "split_max_param_cv",
+    "split_boundary_warnings", "split_stability_status",
+    "rgw_enabled", "rgw_tested_weights", "rgw_production_weight",
+    "rgw_pareto_weights", "rgw_knee_weight", "rgw_contact_loss_range",
+    "rgw_rg_loss_range", "rgw_weight_sensitive", "rgw_status",
+    "unc_enabled", "unc_restart_objective_spread", "unc_n_distinct_minima",
+    "unc_condition_number", "unc_positive_definite", "unc_identifiability_status",
     "has_validation", "fit_rank", "simulation_rank", "simulation_rank_note",
     "fit_status", "status",
 ]
@@ -1799,6 +2210,446 @@ def _csv_safe_value(value):
     if isinstance(value, (float, np.floating)) and not np.isfinite(value):
         return ""
     return value
+
+
+# ---------------------------------------------------------------------------
+# Fit-robustness aggregation (parsers for the fitter's supplementary summaries)
+# ---------------------------------------------------------------------------
+# The fitter remains the single source of truth: these helpers only READ the
+# JSON/CSV it wrote and distill a few scalar findings. They tolerate a disabled
+# analysis, a missing optional field, NaN-like nulls, failed bootstrap
+# replicates, and models for which a derived quantity (Tc) is undefined.
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _num(v):
+    """Float of v if finite, else None (tolerates None / null / NaN strings)."""
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _max_abs_offdiag(matrix) -> float | None:
+    if not isinstance(matrix, list):
+        return None
+    best = None
+    for i, row in enumerate(matrix):
+        if not isinstance(row, list):
+            continue
+        for j, v in enumerate(row):
+            if i == j:
+                continue
+            a = _num(v)
+            if a is None:
+                continue
+            a = abs(a)
+            if best is None or a > best:
+                best = a
+    return best
+
+
+def parse_bootstrap_summary(fit_dir: Path, fit_cfg: dict) -> dict:
+    """Distill bootstrap_summary.json into concise robustness fields."""
+    bs = (fit_cfg.get("bootstrap") or {})
+    if not bs.get("enabled"):
+        return {"enabled": False}
+    path = fit_dir / "bootstrap_summary.json"
+    out: dict = {"enabled": True, "source": "bootstrap_summary.json"}
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        out["status"] = "missing"
+        out["error"] = "bootstrap_summary.json missing or unreadable"
+        return out
+    out["requested_replicates"] = data.get("n_bootstrap")
+    out["successful_replicates"] = data.get("n_success")
+    out["failed_replicates"] = data.get("n_failed")
+    out["confidence"] = _num(data.get("confidence"))
+    params = data.get("params") or {}
+    ci_by_param: dict = {}
+    widest_rel = None
+    for pn, st in params.items():
+        if not isinstance(st, dict):
+            continue
+        lo, hi, fitted = _num(st.get("ci_low")), _num(st.get("ci_high")), _num(st.get("fitted"))
+        ci_by_param[pn] = [lo, hi]
+        if lo is not None and hi is not None and fitted is not None and abs(fitted) > 1e-12:
+            rel = abs(hi - lo) / abs(fitted)
+            if widest_rel is None or rel > widest_rel:
+                widest_rel = rel
+    out["param_confidence_intervals"] = ci_by_param
+    out["widest_relative_ci"] = widest_rel
+    corr = data.get("correlation") or {}
+    out["strongest_abs_param_correlation"] = _max_abs_offdiag(corr.get("matrix"))
+    flagged = corr.get("flagged_pairs") or []
+    out["n_identifiability_warnings"] = len(flagged) if isinstance(flagged, list) else 0
+    out["identifiability_pairs"] = [
+        f"{f.get('param_a')}~{f.get('param_b')}={_fmt(_num(f.get('correlation')))}"
+        for f in flagged if isinstance(f, dict)
+    ]
+    bound = data.get("param_bound_fractions") or {}
+    max_bound = None
+    for pn, fr in bound.items():
+        if isinstance(fr, dict):
+            v = _num(fr.get("at_any"))
+            if v is not None and (max_bound is None or v > max_bound):
+                max_bound = v
+    out["max_bound_hit_fraction"] = max_bound
+    # Extra terms (a2/a3/dCp) whose CI brackets zero -> term may be unnecessary.
+    incl_zero = []
+    for pn in EXTRA_TERM_PARAMS:
+        if pn in ci_by_param:
+            lo, hi = ci_by_param[pn]
+            if lo is not None and hi is not None and lo <= 0.0 <= hi:
+                incl_zero.append(pn)
+    out["extra_terms_ci_include_zero"] = incl_zero
+    # Derived Tc interval (only when defined for this model).
+    derived = data.get("derived") or {}
+    if isinstance(derived.get("Tc"), dict):
+        out["Tc_ci"] = [_num(derived["Tc"].get("ci_low")), _num(derived["Tc"].get("ci_high"))]
+    failed = out.get("failed_replicates") or 0
+    warn = (out["n_identifiability_warnings"] > 0
+            or (max_bound is not None and max_bound >= 0.5)
+            or bool(incl_zero))
+    if not data.get("n_success"):
+        out["status"] = "no_successful_replicates"
+    elif warn or failed:
+        out["status"] = "warn"
+    else:
+        out["status"] = "ok"
+    return out
+
+
+def parse_uncertainty_diagnostics(fit_dir: Path, fit_cfg: dict) -> dict:
+    """Distill uncertainty_diagnostics.json + restart_diagnostics.csv."""
+    if not (fit_cfg.get("uncertainty_diagnostics") or {}).get("enabled"):
+        return {"enabled": False}
+    out: dict = {"enabled": True, "source": "uncertainty_diagnostics.json"}
+    data = _read_json(fit_dir / "uncertainty_diagnostics.json")
+    if not isinstance(data, dict):
+        out["status"] = "missing"
+        out["error"] = "uncertainty_diagnostics.json missing or unreadable"
+        return out
+    hess = data.get("hessian") or {}
+    out["condition_number"] = _num(hess.get("condition_number"))
+    out["positive_definite"] = bool(hess.get("positive_definite")) \
+        if hess.get("positive_definite") is not None else None
+    rs = data.get("restart_stability") or {}
+    out["n_restarts"] = rs.get("n_restarts")
+    out["n_successful_restarts"] = rs.get("n_success")
+    out["n_distinct_minima"] = rs.get("n_distinct_objectives")
+    out["distinct_minima"] = rs.get("distinct_minima")
+    out["max_param_spread"] = _num(rs.get("max_param_spread"))
+    # Restart objective spread (max - min over successful restarts).
+    spread = None
+    objs: list[float] = []
+    rpath = fit_dir / "restart_diagnostics.csv"
+    if rpath.exists():
+        try:
+            with open(rpath, newline="", encoding="utf-8") as fh:
+                for r in csv.DictReader(fh):
+                    if str(r.get("success")) in ("1", "True", "true"):
+                        v = _num(r.get("objective"))
+                        if v is not None:
+                            objs.append(v)
+        except Exception:
+            objs = []
+    if objs:
+        spread = float(max(objs) - min(objs))
+    out["restart_objective_spread"] = spread
+    # The fitter does not export boundary hits for this analysis; report n/a.
+    out["boundary_warnings"] = None
+    cond = out["condition_number"]
+    ill_conditioned = cond is not None and cond > 1e8
+    multi = bool(out.get("distinct_minima"))
+    not_posdef = out["positive_definite"] is False
+    out["identifiability_status"] = (
+        "warn" if (ill_conditioned or multi or not_posdef) else "ok"
+    )
+    return out
+
+
+def parse_split_sensitivity(fit_dir: Path, fit_cfg: dict) -> dict:
+    """Distill split_sensitivity_summary.json into concise stability fields."""
+    if not (fit_cfg.get("split_sensitivity") or {}).get("enabled"):
+        return {"enabled": False}
+    out: dict = {"enabled": True, "source": "split_sensitivity_summary.json"}
+    data = _read_json(fit_dir / "split_sensitivity_summary.json")
+    if not isinstance(data, dict):
+        out["status"] = "missing"
+        out["error"] = "split_sensitivity_summary.json missing or unreadable"
+        return out
+    out["n_attempted"] = data.get("n_splits")
+    out["n_succeeded"] = data.get("n_splits_succeeded")
+    splits = data.get("splits") or []
+    held = []
+    worst = {"blocked_low": None, "blocked_mid": None, "blocked_high": None}
+    n_boundary = 0
+    for sp in splits:
+        if not isinstance(sp, dict):
+            continue
+        if not sp.get("optimization_success", True):
+            continue
+        cv = _num(sp.get("combined_val_loss_mean"))
+        if cv is not None:
+            held.append(cv)
+        scheme = sp.get("scheme")
+        if scheme in worst:
+            cur = worst[scheme]
+            if cv is not None and (cur is None or cv > cur):
+                worst[scheme] = cv
+        bh = sp.get("boundary_hits")
+        if bh:
+            n_boundary += 1
+    out["mean_heldout_combined_loss"] = float(np.mean(held)) if held else None
+    out["range_heldout_combined_loss"] = (
+        float(max(held) - min(held)) if len(held) >= 2 else (0.0 if held else None)
+    )
+    out["worst_blocked_low"] = worst["blocked_low"]
+    out["worst_blocked_mid"] = worst["blocked_mid"]
+    out["worst_blocked_high"] = worst["blocked_high"]
+    stab = data.get("parameter_stability") or {}
+    max_cv = None
+    cv_by_param: dict = {}
+    for pn, st in stab.items():
+        if isinstance(st, dict):
+            v = _num(st.get("cv"))
+            cv_by_param[pn] = v
+            if v is not None and (max_cv is None or v > max_cv):
+                max_cv = v
+    out["param_cv"] = cv_by_param
+    out["max_param_cv"] = max_cv
+    out["boundary_hit_warnings"] = n_boundary
+    # Overall split-stability status: parameters that wander a lot across splits
+    # (CV) or boundary hits indicate sensitivity.
+    if max_cv is None:
+        status = "unknown"
+    elif max_cv > 0.5 or n_boundary > 0:
+        status = "sensitive"
+    elif max_cv > 0.2:
+        status = "moderate"
+    else:
+        status = "stable"
+    out["stability_status"] = status
+    return out
+
+
+def parse_rg_weight_sensitivity(fit_dir: Path, fit_cfg: dict) -> dict:
+    """Distill rg_weight_summary.json into concise Pareto/tradeoff fields."""
+    if not (fit_cfg.get("rg_weight_sensitivity") or {}).get("enabled"):
+        return {"enabled": False}
+    out: dict = {"enabled": True, "source": "rg_weight_summary.json"}
+    data = _read_json(fit_dir / "rg_weight_summary.json")
+    if not isinstance(data, dict):
+        out["status"] = "missing"
+        out["error"] = "rg_weight_summary.json missing or unreadable"
+        return out
+    out["tested_weights"] = data.get("weight_grid") or []
+    out["production_weight"] = _num(data.get("production_weight"))
+    out["pareto_efficient_weights"] = data.get("pareto_efficient_weights") or []
+    out["knee_weight"] = _num(data.get("knee_weight_heuristic"))
+    space = data.get("pareto_space") or "all"
+    ckey = "contact_val_mean" if space == "validation" else "contact_all_mean"
+    rkey = "rg_val_mean" if space == "validation" else "rg_all_mean"
+    per = data.get("per_weight") or []
+    cvals, rvals = [], []
+    param_paths: dict = {}
+    for r in per:
+        if not isinstance(r, dict):
+            continue
+        c, rg = _num(r.get(ckey)), _num(r.get(rkey))
+        if c is not None:
+            cvals.append(c)
+        if rg is not None:
+            rvals.append(rg)
+        for pn, pv in r.items():
+            if pn in ("rg_weight", "is_production", "contact_only_fit",
+                      "pareto_efficient", "is_knee"):
+                continue
+            val = _num(pv)
+            if val is not None and pn in _RGW_PARAM_KEYS:
+                param_paths.setdefault(pn, []).append(val)
+    out["contact_loss_range"] = (
+        float(max(cvals) - min(cvals)) if len(cvals) >= 2 else (0.0 if cvals else None)
+    )
+    out["rg_loss_range"] = (
+        float(max(rvals) - min(rvals)) if len(rvals) >= 2 else (0.0 if rvals else None)
+    )
+    # Strong weight-sensitivity if any parameter's relative spread across weights
+    # is large, or the production weight is Pareto-dominated.
+    max_rel = None
+    for pn, vals in param_paths.items():
+        if len(vals) >= 2:
+            mean = float(np.mean(vals))
+            if abs(mean) > 1e-12:
+                rel = (max(vals) - min(vals)) / abs(mean)
+                if max_rel is None or rel > max_rel:
+                    max_rel = rel
+    prod = out["production_weight"]
+    eff = out["pareto_efficient_weights"]
+    prod_efficient = (prod is not None and isinstance(eff, list)
+                      and any(abs(prod - _num(w)) <= 1e-9 for w in eff
+                              if _num(w) is not None))
+    out["production_weight_pareto_efficient"] = bool(prod_efficient)
+    out["max_param_relative_spread"] = max_rel
+    sensitive = (max_rel is not None and max_rel > 0.5) or not prod_efficient
+    out["weight_sensitive"] = bool(sensitive)
+    out["status"] = "sensitive" if sensitive else "stable"
+    return out
+
+
+# Parameter names across all models (used to recognize parameter columns in the
+# Rg-weight per-weight records without misreading loss columns as parameters).
+_RGW_PARAM_KEYS = {"h", "s", "A", "Tc", "a0", "a1", "a2", "a3", "dh0", "ds0", "dCp"}
+
+
+FIT_ROBUSTNESS_COLUMNS = [
+    "baseline", "model",
+    "bootstrap_enabled", "boot_requested_replicates", "boot_successful_replicates",
+    "boot_failed_replicates", "boot_confidence", "boot_widest_relative_ci",
+    "boot_max_abs_param_correlation", "boot_n_identifiability_warnings",
+    "boot_max_bound_hit_fraction", "boot_extra_terms_ci_include_zero", "boot_status",
+    "split_enabled", "split_n_attempted", "split_n_succeeded",
+    "split_mean_heldout_loss", "split_range_heldout_loss", "split_worst_blocked_low",
+    "split_worst_blocked_mid", "split_worst_blocked_high", "split_max_param_cv",
+    "split_boundary_warnings", "split_stability_status",
+    "rgw_enabled", "rgw_tested_weights", "rgw_production_weight",
+    "rgw_pareto_weights", "rgw_knee_weight", "rgw_contact_loss_range",
+    "rgw_rg_loss_range", "rgw_weight_sensitive", "rgw_status",
+    "unc_enabled", "unc_restart_objective_spread", "unc_n_distinct_minima",
+    "unc_condition_number", "unc_positive_definite", "unc_identifiability_status",
+    "bootstrap_source", "split_source", "rg_weight_source", "uncertainty_source",
+]
+
+
+def _join_list(values) -> str:
+    if not values:
+        return ""
+    return ";".join(_num_str(v) if isinstance(v, (int, float)) else str(v)
+                    for v in values)
+
+
+def collect_fit_robustness(suite_state, rows, log: Logger):
+    """Parse every model's supplementary summaries; merge concise fields into the
+    comparison rows and return a structured record + flat per-model rows.
+
+    Mutates `rows` in place to add the fit-robustness scalar columns. Detailed
+    per-parameter data stays in the JSON/CSV summaries; only the most useful
+    scalars land in model_comparison.csv.
+    """
+    cfg = suite_state["config"]
+    fit_by_name = {b["name"]: b for b in cfg["baselines"]}
+    row_by_key = {(r["baseline"], r["model"]): r for r in rows}
+
+    structured: dict = {}
+    flat_rows: list[dict] = []
+    any_enabled = False
+
+    for baseline in cfg["baselines"]:
+        bname = baseline["name"]
+        raw = baseline["raw_name"]
+        fit_cfg = baseline["fit"]
+        structured[raw] = {}
+        for model in cfg["models"]:
+            rec = suite_state["models"].get((bname, model), {})
+            fit_dir = Path(rec.get("fit_dir", ""))
+            # Only parse when the fit itself succeeded; otherwise the supplementary
+            # files are absent or stale and the row already reflects the failure.
+            fit_ok = rec.get("status") == "ok" or rec.get("summary") is not None
+            boot = parse_bootstrap_summary(fit_dir, fit_cfg) if fit_ok else {"enabled": bool((fit_cfg.get("bootstrap") or {}).get("enabled"))}
+            unc = parse_uncertainty_diagnostics(fit_dir, fit_cfg) if fit_ok else {"enabled": bool((fit_cfg.get("uncertainty_diagnostics") or {}).get("enabled"))}
+            split = parse_split_sensitivity(fit_dir, fit_cfg) if fit_ok else {"enabled": bool((fit_cfg.get("split_sensitivity") or {}).get("enabled"))}
+            rgw = parse_rg_weight_sensitivity(fit_dir, fit_cfg) if fit_ok else {"enabled": bool((fit_cfg.get("rg_weight_sensitivity") or {}).get("enabled"))}
+            if any(d.get("enabled") for d in (boot, unc, split, rgw)):
+                any_enabled = True
+            structured[raw][model] = {
+                "model": model, "bootstrap": boot, "uncertainty_diagnostics": unc,
+                "split_sensitivity": split, "rg_weight_sensitivity": rgw,
+            }
+
+            row = row_by_key.get((raw, model))
+            scalars = {
+                "bootstrap_enabled": bool(boot.get("enabled")),
+                "boot_requested_replicates": boot.get("requested_replicates"),
+                "boot_successful_replicates": boot.get("successful_replicates"),
+                "boot_failed_replicates": boot.get("failed_replicates"),
+                "boot_confidence": boot.get("confidence"),
+                "boot_widest_relative_ci": boot.get("widest_relative_ci"),
+                "boot_max_abs_param_correlation": boot.get("strongest_abs_param_correlation"),
+                "boot_n_identifiability_warnings": boot.get("n_identifiability_warnings"),
+                "boot_max_bound_hit_fraction": boot.get("max_bound_hit_fraction"),
+                "boot_extra_terms_ci_include_zero": _join_list(boot.get("extra_terms_ci_include_zero")),
+                "boot_status": boot.get("status"),
+                "split_enabled": bool(split.get("enabled")),
+                "split_n_attempted": split.get("n_attempted"),
+                "split_n_succeeded": split.get("n_succeeded"),
+                "split_mean_heldout_loss": split.get("mean_heldout_combined_loss"),
+                "split_range_heldout_loss": split.get("range_heldout_combined_loss"),
+                "split_worst_blocked_low": split.get("worst_blocked_low"),
+                "split_worst_blocked_mid": split.get("worst_blocked_mid"),
+                "split_worst_blocked_high": split.get("worst_blocked_high"),
+                "split_max_param_cv": split.get("max_param_cv"),
+                "split_boundary_warnings": split.get("boundary_hit_warnings"),
+                "split_stability_status": split.get("stability_status"),
+                "rgw_enabled": bool(rgw.get("enabled")),
+                "rgw_tested_weights": _join_list(rgw.get("tested_weights")),
+                "rgw_production_weight": rgw.get("production_weight"),
+                "rgw_pareto_weights": _join_list(rgw.get("pareto_efficient_weights")),
+                "rgw_knee_weight": rgw.get("knee_weight"),
+                "rgw_contact_loss_range": rgw.get("contact_loss_range"),
+                "rgw_rg_loss_range": rgw.get("rg_loss_range"),
+                "rgw_weight_sensitive": rgw.get("weight_sensitive"),
+                "rgw_status": rgw.get("status"),
+                "unc_enabled": bool(unc.get("enabled")),
+                "unc_restart_objective_spread": unc.get("restart_objective_spread"),
+                "unc_n_distinct_minima": unc.get("n_distinct_minima"),
+                "unc_condition_number": unc.get("condition_number"),
+                "unc_positive_definite": unc.get("positive_definite"),
+                "unc_identifiability_status": unc.get("identifiability_status"),
+            }
+            if row is not None:
+                row.update(scalars)
+            flat = {"baseline": raw, "model": model}
+            flat.update(scalars)
+            flat["bootstrap_source"] = boot.get("source", "")
+            flat["split_source"] = split.get("source", "")
+            flat["rg_weight_source"] = rgw.get("source", "")
+            flat["uncertainty_source"] = unc.get("source", "")
+            flat_rows.append(flat)
+
+    return {
+        "any_enabled": any_enabled,
+        "structured": structured,
+        "flat_rows": flat_rows,
+    }
+
+
+def write_fit_robustness(robustness, comparison_dir: Path, log: Logger) -> None:
+    """Write the consolidated machine-readable robustness summary + flat CSV."""
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "generated": now_iso(),
+        "any_analysis_enabled": robustness["any_enabled"],
+        "baselines": robustness["structured"],
+    }
+    json_path = comparison_dir / "fit_robustness_summary.json"
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe(summary), fh, indent=2, allow_nan=False)
+    csv_path = comparison_dir / "fit_robustness.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(FIT_ROBUSTNESS_COLUMNS)
+        for r in robustness["flat_rows"]:
+            w.writerow([_csv_safe_value(r.get(c, "")) for c in FIT_ROBUSTNESS_COLUMNS])
+    log(f"Wrote {json_path}, {csv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -2665,7 +3516,7 @@ def _statistics_report_lines(raw, bstat, stats_result, ok_rows):
 # ---------------------------------------------------------------------------
 
 def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
-                 log: Logger, stats_result=None) -> None:
+                 log: Logger, stats_result=None, robustness=None) -> None:
     cfg = suite_state["config"]
     lines = ["# Model suite report", "",
              f"Generated: {now_iso()}", "",
@@ -2808,6 +3659,10 @@ def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
         if bstat:
             lines += _statistics_report_lines(raw, bstat, stats_result, ok)
 
+    # Fit robustness and parameter identifiability (only when any analysis ran).
+    if robustness and robustness.get("any_enabled"):
+        lines += _fit_robustness_report_lines(cfg, rows, robustness)
+
     if global_ranking:
         lines += ["## Global cross-baseline ranking", "",
                   "_All baselines share contact_offset, Rg units, and metric config._",
@@ -2833,11 +3688,226 @@ def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
             f"- `{comparison_dir / 'model_rank_stability.csv'}`",
             f"- `{comparison_dir / 'model_statistics_summary.json'}`",
         ]
+    if robustness and robustness.get("any_enabled"):
+        lines += [
+            f"- `{comparison_dir / 'fit_robustness_summary.json'}`",
+            f"- `{comparison_dir / 'fit_robustness.csv'}`",
+        ]
     lines += [""]
 
     path = comparison_dir / "report.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     log(f"Wrote {path}")
+
+
+def _fit_robustness_report_lines(cfg, rows, robustness) -> list[str]:
+    """Build the fit-robustness report section (restrained language).
+
+    The REMD simulation ranking remains the primary predictive ranking; these
+    fitter diagnostics only qualify it. Detailed per-parameter numbers stay in
+    the supplementary JSON/CSV outputs.
+    """
+    structured = robustness.get("structured", {})
+    lines = ["## Fit robustness and parameter identifiability", "",
+             "_Fitter-side diagnostics. These qualify but never replace the REMD "
+             "simulation ranking. Bootstrap intervals are empirical "
+             "temperature-resampling ranges, not likelihood standard errors._", ""]
+    row_by_key = {(r["baseline"], r["model"]): r for r in rows}
+
+    for baseline in cfg["baselines"]:
+        raw = baseline["raw_name"]
+        per_model = structured.get(raw, {})
+        if not any(
+            d.get("bootstrap", {}).get("enabled")
+            or d.get("split_sensitivity", {}).get("enabled")
+            or d.get("rg_weight_sensitivity", {}).get("enabled")
+            or d.get("uncertainty_diagnostics", {}).get("enabled")
+            for d in per_model.values()
+        ):
+            continue
+        lines += [f"### Baseline: {raw}", "",
+                  "| model | bootstrap success | widest rel CI | max |corr| | "
+                  "split stability | Rg-weight | optimizer/identifiability |",
+                  "|---|---|---|---|---|---|---|"]
+        for model in cfg["models"]:
+            d = per_model.get(model)
+            if not d:
+                continue
+            boot = d.get("bootstrap", {})
+            split = d.get("split_sensitivity", {})
+            rgw = d.get("rg_weight_sensitivity", {})
+            unc = d.get("uncertainty_diagnostics", {})
+            if boot.get("enabled"):
+                ns = boot.get("successful_replicates")
+                nr = boot.get("requested_replicates")
+                boot_cell = f"{ns}/{nr}" if ns is not None and nr is not None else "n/a"
+            else:
+                boot_cell = "off"
+            rel_ci = boot.get("widest_relative_ci")
+            ci_cell = (f"{rel_ci:.2g}" if isinstance(rel_ci, (int, float))
+                       and np.isfinite(rel_ci) else
+                       ("warn" if boot.get("enabled") and rel_ci is None else "n/a"))
+            corr = boot.get("strongest_abs_param_correlation")
+            corr_cell = _fmt(corr) if boot.get("enabled") else "off"
+            split_cell = split.get("stability_status", "off") if split.get("enabled") else "off"
+            rgw_cell = rgw.get("status", "off") if rgw.get("enabled") else "off"
+            unc_cell = unc.get("identifiability_status", "off") if unc.get("enabled") else "off"
+            lines.append(
+                f"| {model} | {boot_cell} | {ci_cell} | {corr_cell} | "
+                f"{split_cell} | {rgw_cell} | {unc_cell} |"
+            )
+        lines += [""]
+
+        # --- Bootstrap uncertainty subsection ---
+        boot_models = {m: d["bootstrap"] for m, d in per_model.items()
+                       if d.get("bootstrap", {}).get("enabled")}
+        if boot_models:
+            lines += ["#### Bootstrap uncertainty", ""]
+            for model, b in boot_models.items():
+                if b.get("status") == "no_successful_replicates":
+                    lines.append(f"- **{model}**: all bootstrap replicates failed; "
+                                 "uncertainty undetermined.")
+                    continue
+                bits = []
+                incl = b.get("extra_terms_ci_include_zero") or []
+                if incl:
+                    bits.append(f"CI brackets zero for {', '.join(incl)} "
+                                "(term may be unnecessary)")
+                pairs = b.get("identifiability_pairs") or []
+                if pairs:
+                    bits.append("strong parameter correlation(s): " + ", ".join(pairs)
+                                + " (possible non-identifiability)")
+                mbf = b.get("max_bound_hit_fraction")
+                if isinstance(mbf, (int, float)) and np.isfinite(mbf) and mbf >= 0.5:
+                    bits.append(f"a parameter hits an optimization bound in "
+                                f"{mbf:.0%} of replicates")
+                failed = b.get("failed_replicates") or 0
+                if failed:
+                    bits.append(f"{failed} replicate(s) failed")
+                msg = "; ".join(bits) if bits else (
+                    "parameters appear well constrained; no intervals bracket "
+                    "zero and no strong correlations flagged")
+                lines.append(f"- **{model}**: {msg}.")
+            lines += [""]
+
+        # --- Validation-split sensitivity subsection ---
+        split_models = {m: d["split_sensitivity"] for m, d in per_model.items()
+                        if d.get("split_sensitivity", {}).get("enabled")}
+        if split_models:
+            lines += ["#### Validation-split sensitivity", ""]
+            for model, s in split_models.items():
+                status = s.get("stability_status", "unknown")
+                na, nok = s.get("n_attempted"), s.get("n_succeeded")
+                cv = s.get("max_param_cv")
+                cv_txt = (f"max parameter CV {cv:.2g}" if isinstance(cv, (int, float))
+                          and np.isfinite(cv) else "parameter CV n/a")
+                bw = s.get("boundary_hit_warnings") or 0
+                extra = f"; {bw} split(s) hit a bound" if bw else ""
+                lines.append(
+                    f"- **{model}**: {status} across {nok}/{na} successful splits "
+                    f"({cv_txt}{extra}); held-out combined loss range "
+                    f"{_fmt(s.get('range_heldout_combined_loss'))}.")
+            lines += [
+                "",
+                "_Estimates are considered stable when parameter estimates and "
+                "ranking change little across interpolation, blocked-low/-mid/-high, "
+                "k-fold, and random holdouts that were enabled._", "",
+            ]
+
+        # --- Rg-weight sensitivity subsection ---
+        rgw_models = {m: d["rg_weight_sensitivity"] for m, d in per_model.items()
+                      if d.get("rg_weight_sensitivity", {}).get("enabled")}
+        if rgw_models:
+            lines += ["#### Rg-weight sensitivity", ""]
+            for model, r in rgw_models.items():
+                prod = r.get("production_weight")
+                eff = r.get("production_weight_pareto_efficient")
+                knee = r.get("knee_weight")
+                near = ("lies on the Pareto frontier" if eff else
+                        "is Pareto-dominated (a different weight improves both losses)")
+                knee_txt = (f"; heuristic knee at weight {_num_str(knee)}"
+                            if isinstance(knee, (int, float)) and np.isfinite(knee)
+                            else "")
+                concl = ("conclusions change materially with the weight"
+                         if r.get("weight_sensitive")
+                         else "conclusions are robust to the weight")
+                lines.append(
+                    f"- **{model}**: production weight {_num_str(prod) if prod is not None else 'n/a'} "
+                    f"{near}{knee_txt}; {concl}.")
+            lines += [""]
+
+    # --- Recommendation qualified by robustness ---
+    lines += _robustness_recommendation_lines(cfg, rows)
+    return lines
+
+
+def _robustness_recommendation_lines(cfg, rows) -> list[str]:
+    """Robustness-qualified recommendation that preserves the REMD ranking.
+
+    Decision hierarchy: (1) flag unreliable REMD convergence, (2) find models
+    practically equivalent to the best REMD score, (3) prefer split-stable ones,
+    (4) prefer those without identifiability/boundary warnings, (5) prefer the
+    simpler model when predictive differences are negligible.
+    """
+    lines = ["### Recommendation qualified by robustness", ""]
+    for baseline in cfg["baselines"]:
+        raw = baseline["raw_name"]
+        brows = [r for r in rows if r["baseline"] == raw
+                 and r.get("simulation_rank") is not None]
+        if not brows:
+            continue
+        brows.sort(key=lambda r: r["simulation_rank"])
+        best = brows[0]
+
+        def _sim(r):
+            return _f(r.get("remd_target_validation_combined_js_mean")
+                      if r.get("has_validation")
+                      else r.get("remd_target_all_combined_js_mean"))
+
+        best_score = _sim(best)
+        # Models practically equivalent to the best REMD score (primary ranking).
+        equiv = [r for r in brows
+                 if np.isfinite(_sim(r)) and np.isfinite(best_score)
+                 and abs(_sim(r) - best_score) <= 1e-3]
+        if not equiv:
+            equiv = [best]
+
+        def _split_stable(r):
+            return r.get("split_stability_status") in (None, "stable", "moderate")
+
+        def _no_warn(r):
+            if r.get("unc_identifiability_status") == "warn":
+                return False
+            if r.get("boot_status") == "warn":
+                return False
+            mbf = _f(r.get("boot_max_bound_hit_fraction"))
+            if np.isfinite(mbf) and mbf >= 0.5:
+                return False
+            return True
+
+        unreliable = best.get("convergence_status") == "unreliable"
+        # Apply the hierarchy among the practically-equivalent set.
+        pool = [r for r in equiv if r.get("convergence_status") != "unreliable"] or equiv
+        stable = [r for r in pool if _split_stable(r)] or pool
+        clean = [r for r in stable if _no_warn(r)] or stable
+        rec = min(clean, key=lambda r: (_f(r.get("n_parameters")), _sim(r)))
+
+        note = []
+        if unreliable:
+            note.append("the top REMD model is convergence-flagged UNRELIABLE; treat "
+                        "its score with caution")
+        if len(equiv) > 1:
+            note.append(f"{len(equiv)} model(s) are within ~1e-3 of the best REMD score")
+        if rec["model"] != best["model"]:
+            note.append(f"among them, **{rec['model']}** is preferred on stability/"
+                        "identifiability/parsimony")
+        suffix = (" (" + "; ".join(note) + ")") if note else ""
+        lines.append(
+            f"- **{raw}:** primary REMD pick is **{best['model']}** "
+            f"(combined JS {_fmt(best_score)}); robustness-qualified recommendation: "
+            f"**{rec['model']}**{suffix}.")
+    lines += [""]
+    return lines
 
 
 def _overfit(r) -> bool:
@@ -2871,6 +3941,7 @@ def write_manifest(suite_state, config_path: str, log: Logger) -> None:
         if Path(b["path"]).exists():
             hashes[f"baseline:{b['name']}"] = sha256_file(b["path"])
 
+    fit_by_name = {b["name"]: b["fit"] for b in cfg["baselines"]}
     manifest = {
         "timestamp": now_iso(),
         "python": sys.executable,
@@ -2882,6 +3953,11 @@ def write_manifest(suite_state, config_path: str, log: Logger) -> None:
                 "status": rec.get("status"),
                 "error": rec.get("error"),
                 "fit_dir": rec.get("fit_dir"),
+                # Feature-aware required outputs for this model's fit, so the
+                # manifest records exactly which files were validated.
+                "expected_fit_outputs": list(
+                    expected_fit_outputs(fit_by_name.get(bn, {}))
+                ),
                 "seeds": {
                     str(s): {"status": sr.get("status"),
                              "error": sr.get("error"),
@@ -2962,6 +4038,32 @@ def run_suite(config_path: str, args) -> dict:
                     f"fit_rg=true requires a joint baseline (c_edges,rg_edges,"
                     f"crg_prob) for {b['name']!r}; found key-set {ks}"
                 )
+        # Custom split-sensitivity JSON must exist (resolved relative to config).
+        ss = b["fit"].get("split_sensitivity") or {}
+        if ss.get("enabled") and ss.get("config_json"):
+            if not Path(ss["config_json"]).exists():
+                raise SuiteError(
+                    f"baseline {b['name']!r}: split_sensitivity.config_json not "
+                    f"found: {ss['config_json']}"
+                )
+        # Rg-weight sensitivity requires fit_rg, target Rg data, and a joint baseline.
+        rgw = b["fit"].get("rg_weight_sensitivity") or {}
+        if rgw.get("enabled"):
+            if not b["fit"].get("fit_rg", False):
+                raise SuiteError(
+                    f"baseline {b['name']!r}: rg_weight_sensitivity requires "
+                    f"fit.fit_rg=true"
+                )
+            if not target_has_rg(cfg["target_remd"]):
+                raise SuiteError(
+                    f"baseline {b['name']!r}: rg_weight_sensitivity requires target "
+                    f"Rg histograms, but {cfg['target_remd']} has none"
+                )
+            if not baseline_is_joint(b["path"]):
+                raise SuiteError(
+                    f"baseline {b['name']!r}: rg_weight_sensitivity requires a joint "
+                    f"baseline (c_edges,rg_edges,crg_prob); found key-set {ks}"
+                )
         log(f"Preflight: baseline {b['name']!r} OK (key-set: {ks}).")
 
     suite_state = {"config": cfg, "models": {}, "jobs": []}
@@ -3016,8 +4118,13 @@ def run_suite(config_path: str, args) -> dict:
         suite_state, log
     )
     comparison_dir = output_root / "comparison"
+    # Parse the fitter's supplementary summaries and merge concise robustness
+    # findings into the comparison rows BEFORE writing model_comparison.csv.
+    robustness = collect_fit_robustness(suite_state, rows, log)
+    suite_state["fit_robustness"] = robustness
     write_comparison(rows, per_temp_rows, comparison_dir, log,
                      per_temp_diag_rows=per_temp_diag_rows)
+    write_fit_robustness(robustness, comparison_dir, log)
     global_ranking = cross_baseline_global_ranking(suite_state, rows)
     suite_state["global_ranking"] = global_ranking
 
@@ -3033,7 +4140,7 @@ def run_suite(config_path: str, args) -> dict:
                    log, per_temp_diag_rows=per_temp_diag_rows)
         make_statistics_plots(stats_result, comparison_dir, log)
     write_report(suite_state, rows, global_ranking, comparison_dir, log,
-                 stats_result=stats_result)
+                 stats_result=stats_result, robustness=robustness)
     write_manifest(suite_state, config_path, log)
     log("=== model suite complete ===")
     return suite_state
@@ -3058,22 +4165,27 @@ def _remove_completion_files(directory: Path, files) -> None:
 def _do_fit(cfg, baseline, model, fit_dir, fit_cmd, rec, suite_state,
             args, log) -> bool:
     fit_dir.mkdir(parents=True, exist_ok=True)
+    fit_cfg = baseline["fit"]
+    completion_files = expected_fit_outputs(fit_cfg)
     signature_path = fit_dir / "suite_job.json"
-    signature = make_job_signature(
-        "fit", fit_cmd,
-        {
-            "fit_script": cfg["fit_script"],
-            "target_remd": cfg["target_remd"],
-            "baseline": baseline["path"],
-        },
-    )
+    # Material inputs hashed into the fit fingerprint. A custom split-sensitivity
+    # JSON is an additional input so changing its contents reruns the fit.
+    sig_inputs = {
+        "fit_script": cfg["fit_script"],
+        "target_remd": cfg["target_remd"],
+        "baseline": baseline["path"],
+    }
+    ss = fit_cfg.get("split_sensitivity") or {}
+    if ss.get("enabled") and ss.get("config_json"):
+        sig_inputs["split_config_json"] = ss["config_json"]
+    signature = make_job_signature("fit", fit_cmd, sig_inputs)
     # Resume: skip only if complete AND valid.
     if (
         args.resume and not args.force
-        and _completion_ok(fit_dir, FIT_COMPLETION_FILES)
+        and _completion_ok(fit_dir, completion_files)
         and signature_matches(signature_path, signature)
     ):
-        v = validate_fit_outputs(fit_dir, model)
+        v = validate_fit_outputs(fit_dir, model, fit_cfg)
         if v["status"] == "ok":
             rec["summary"] = v["summary"]
             log(f"Resume: fit {baseline['name']}/{model} already complete.")
@@ -3082,14 +4194,14 @@ def _do_fit(cfg, baseline, model, fit_dir, fit_cmd, rec, suite_state,
                 "status": "skipped_resume",
             })
             return True
-    elif args.resume and not args.force and _completion_ok(fit_dir, FIT_COMPLETION_FILES):
+    elif args.resume and not args.force and _completion_ok(fit_dir, completion_files):
         log(f"Resume: fit {baseline['name']}/{model} fingerprint changed; rerunning.")
-    _remove_completion_files(fit_dir, FIT_COMPLETION_FILES)
+    _remove_completion_files(fit_dir, completion_files)
     if signature_path.exists():
         signature_path.unlink()
     prov = run_subprocess(fit_cmd, fit_dir / "stdout.log")
     v = (
-        validate_fit_outputs(fit_dir, model)
+        validate_fit_outputs(fit_dir, model, fit_cfg)
         if prov["returncode"] == 0
         else {"status": "failed", "error": f"subprocess exited with code {prov['returncode']}"}
     )
@@ -3304,6 +4416,186 @@ def _pairwise_statistics_unit_tests() -> None:
     print("  suite quick-test pairwise-statistics scenarios: PASSED")
 
 
+def _fit_robustness_unit_tests() -> None:
+    """Synthetic coverage for config normalization/validation, command building,
+    feature-aware outputs, robustness parsers, signatures, and rank invariance."""
+    import tempfile
+
+    def _min_cfg(fit):
+        return {
+            "target_remd": "t.npz", "fit_script": "f.py", "remd_script": "r.py",
+            "output_root": "o", "models": ["hs"],
+            "baselines": [{"name": "b", "path": "b.npz", "contact_offset": 0,
+                           "fit": fit, "remd": {"N": 4}}],
+        }
+
+    def _norm(fit_over):
+        cfg = validate_config(_min_cfg(fit_over))
+        return cfg["baselines"][0]["fit"]
+
+    # 1. Legacy flat config with all new features off still works and disables them.
+    legacy = _norm({"bootstrap": 0, "bootstrap_seed": 7})
+    assert legacy["bootstrap"]["enabled"] is False, legacy["bootstrap"]
+    assert legacy["bootstrap"]["replicates"] == 0
+    assert legacy["bootstrap"]["seed"] == 7  # flat seed folded in
+    assert legacy["uncertainty_diagnostics"]["enabled"] is False
+    assert legacy["split_sensitivity"]["enabled"] is False
+    assert legacy["rg_weight_sensitivity"]["enabled"] is False
+    assert expected_fit_outputs(legacy) == FIT_COMPLETION_FILES
+
+    # Legacy scalar bootstrap > 0 enables the analysis (derived enabled).
+    legacy_on = _norm({"bootstrap": 50})
+    assert legacy_on["bootstrap"]["enabled"] is True
+    assert legacy_on["bootstrap"]["replicates"] == 50
+
+    # 2. Nested full-feature config normalizes and validates.
+    full = _norm({
+        "fit_rg": True, "rg_weight": 0.5,
+        "bootstrap": {"enabled": True, "replicates": 5, "seed": 3,
+                      "confidence": 0.9, "correlation_threshold": 0.8,
+                      "save_prediction_bands": True},
+        "uncertainty_diagnostics": {"enabled": True},
+        "split_sensitivity": {"enabled": True, "schemes": ["blocked_low", "kfold"],
+                              "kfold_k": 3, "seed": 9},
+        "rg_weight_sensitivity": {"enabled": True, "weights": [0, 0.5, 1.0],
+                                  "normalization_diagnostics": True},
+    })
+    assert full["bootstrap"]["enabled"] and full["bootstrap"]["replicates"] == 5
+    assert full["rg_weight_sensitivity"]["weights"] == [0.0, 0.5, 1.0]
+    out = expected_fit_outputs(full)
+    for f in (FIT_BOOTSTRAP_FILES + FIT_UNCERTAINTY_FILES + FIT_SPLIT_FILES
+              + FIT_RGW_FILES + (FIT_BOOTSTRAP_PREDICTION_BANDS_FILE,)):
+        assert f in out, f
+    print("  suite quick-test config normalization + expected outputs: PASSED")
+
+    # 3. Validation rejects bad settings (baseline-specific messages).
+    def _expect_fail(fit_over, needle):
+        try:
+            _norm(fit_over)
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc))
+            return
+        raise AssertionError(f"expected failure for {fit_over}")
+
+    _expect_fail({"bootstrap": {"enabled": True, "replicates": 0}}, "replicates must be >= 1")
+    _expect_fail({"bootstrap": {"enabled": True, "replicates": 5, "confidence": 1.5}},
+                 "confidence must be in (0, 1)")
+    _expect_fail({"bootstrap": {"enabled": True, "replicates": 5,
+                                "correlation_threshold": 0.0}}, "correlation_threshold must be")
+    _expect_fail({"split_sensitivity": {"enabled": True, "schemes": ["nope"]}},
+                 "unsupported split scheme")
+    _expect_fail({"split_sensitivity": {"enabled": True, "kfold_k": 1}}, "kfold_k must be >= 2")
+    _expect_fail({"split_sensitivity": {"enabled": True, "random_repeats": 0}},
+                 "random_repeats must be >= 1")
+    _expect_fail({"split_sensitivity": {"enabled": True, "blocked_fraction": 1.5}},
+                 "blocked_fraction must be in (0, 1)")
+    _expect_fail({"rg_weight_sensitivity": {"enabled": True, "weights": [-1.0]},
+                  "fit_rg": True}, "must all be finite and >= 0")
+    _expect_fail({"rg_weight_sensitivity": {"enabled": True, "weights": [0, 1]},
+                  "fit_rg": False}, "requires fit.fit_rg=true")
+    print("  suite quick-test strict validation rejections: PASSED")
+
+    # 4. build_fit_command forwards exactly the enabled flags.
+    cfg = {"fit_script": "f.py", "target_remd": "t.npz"}
+    baseline = {"path": "b.npz", "contact_offset": 0, "rg_scale": 1.0, "fit": full}
+    cmd = build_fit_command(cfg, baseline, "hs", Path("out"))
+    joined = " ".join(cmd)
+    for flag in ("--bootstrap 5", "--bootstrap-method temperature",
+                 "--bootstrap-confidence 0.9", "--bootstrap-correlation-threshold 0.8",
+                 "--bootstrap-seed 3", "--bootstrap-save-prediction-bands",
+                 "--uncertainty-diagnostics", "--split-sensitivity",
+                 "--split-schemes blocked_low,kfold", "--split-kfold-k 3",
+                 "--split-seed 9", "--rg-weight-grid 0,0.5,1",
+                 "--rg-weight-normalization-diagnostics"):
+        assert flag in joined, flag
+    # Disabled analyses append nothing extra.
+    cmd_off = " ".join(build_fit_command(cfg, {**baseline, "fit": legacy}, "hs", Path("out")))
+    for flag in ("--uncertainty-diagnostics", "--split-sensitivity",
+                 "--rg-weight-grid", "--bootstrap-method"):
+        assert flag not in cmd_off, flag
+    assert "--bootstrap 0" in cmd_off  # legacy contract preserved
+    print("  suite quick-test build_fit_command flag forwarding: PASSED")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        # 5. Enabled analysis with a missing required file fails validation.
+        fdir = tmp / "fit"
+        fdir.mkdir()
+        for fn in FIT_COMPLETION_FILES:
+            (fdir / fn).write_text("{}" if fn.endswith(".json") else "x")
+        # Make fit_summary.json minimally valid so only the bootstrap file is missing.
+        (fdir / "fit_summary.json").write_text(json.dumps({
+            "model": "hs", "param_names": ["h", "s"], "params": {"h": 1.0, "s": 1.0},
+            "Tref": 300.0, "Tscale": 100.0, "optimization_success": True,
+        }))
+        v = validate_fit_outputs(fdir, "hs", full)
+        assert v["status"] == "failed" and "bootstrap_summary.json" in v["error"], v
+        v_off = validate_fit_outputs(fdir, "hs", legacy)
+        # With analyses off the primary files suffice (npz check will still fail on
+        # the dummy, but the bootstrap file is not required).
+        assert "bootstrap_summary.json" not in v_off.get("error", "")
+        print("  suite quick-test missing-enabled-output rejection: PASSED")
+
+        # 6. Bootstrap parser tolerates nulls + failed replicates + undefined Tc.
+        bdir = tmp / "boot"
+        bdir.mkdir()
+        (bdir / "bootstrap_summary.json").write_text(json.dumps({
+            "n_bootstrap": 10, "n_success": 7, "n_failed": 3, "confidence": 0.95,
+            "params": {"h": {"ci_low": None, "ci_high": None, "fitted": 1.0},
+                       "a2": {"ci_low": -1.0, "ci_high": 1.0, "fitted": 0.0}},
+            "derived": {},  # Tc undefined for this model
+            "correlation": {"matrix": [[1.0, None], [None, 1.0]],
+                            "flagged_pairs": []},
+            "param_bound_fractions": {"h": {"at_any": 0.0}, "a2": {"at_any": 0.6}},
+        }))
+        bp = parse_bootstrap_summary(bdir, {"bootstrap": {"enabled": True}})
+        assert bp["successful_replicates"] == 7 and bp["failed_replicates"] == 3
+        assert "a2" in bp["extra_terms_ci_include_zero"]
+        assert bp["max_bound_hit_fraction"] == 0.6
+        assert "Tc_ci" not in bp  # undefined Tc not invented
+        assert bp["status"] == "warn"
+        # Disabled / missing tolerated.
+        assert parse_bootstrap_summary(bdir, {"bootstrap": {"enabled": False}}) == {"enabled": False}
+        miss = parse_bootstrap_summary(tmp / "nope", {"bootstrap": {"enabled": True}})
+        assert miss["status"] == "missing"
+        print("  suite quick-test bootstrap parser tolerance: PASSED")
+
+        # 7. Custom split JSON content is part of the fit signature.
+        sj = tmp / "splits.json"
+        sj.write_text(json.dumps([{"name": "c", "holdout_indices": [0]}]))
+        cmd_sig = ["python", "f.py", "--x"]
+        s1 = make_job_signature("fit", cmd_sig,
+                                {"a": str(sj)})
+        sj.write_text(json.dumps([{"name": "c", "holdout_indices": [1]}]))
+        s2 = make_job_signature("fit", cmd_sig, {"a": str(sj)})
+        assert s1 != s2, "split JSON content must change the fit signature"
+        print("  suite quick-test split-JSON signature sensitivity: PASSED")
+
+    # 8. Robustness scalar fields must not change the primary REMD numeric ranking.
+    base_rows = [
+        {"baseline": "B", "model": "hs", "fit_status": "ok", "n_successful_seeds": 2,
+         "n_parameters": 2, "has_validation": False,
+         "fit_all_contact_loss": 0.10, "remd_target_all_combined_js_mean": 0.20},
+        {"baseline": "B", "model": "poly3", "fit_status": "ok", "n_successful_seeds": 2,
+         "n_parameters": 4, "has_validation": False,
+         "fit_all_contact_loss": 0.05, "remd_target_all_combined_js_mean": 0.10},
+    ]
+    import copy
+    rows_plain = copy.deepcopy(base_rows)
+    rows_robust = copy.deepcopy(base_rows)
+    for r in rows_robust:  # add unrelated robustness fields
+        r.update({"boot_status": "warn", "split_stability_status": "sensitive",
+                  "rgw_status": "stable", "unc_identifiability_status": "warn"})
+    log = Logger(None)
+    _assign_ranks(rows_plain, log)
+    _assign_ranks(rows_robust, log)
+    assert ([r["simulation_rank"] for r in rows_plain]
+            == [r["simulation_rank"] for r in rows_robust]), "ranking changed!"
+    assert rows_plain[1]["simulation_rank"] == 1  # poly3 has lower JS -> rank 1
+    print("  suite quick-test REMD ranking invariance to robustness fields: PASSED")
+
+
 def run_quick_test() -> None:
     """End-to-end tiny suite run on synthetic data, plus unit checks."""
     import tempfile
@@ -3392,6 +4684,7 @@ def run_quick_test() -> None:
     )
 
     _pairwise_statistics_unit_tests()
+    _fit_robustness_unit_tests()
     print("  suite quick-test unit checks: PASSED")
 
     here = Path(__file__).resolve().parent
@@ -3414,8 +4707,8 @@ def run_quick_test() -> None:
 
         config = {
             "target_remd": str(target),
-            "fit_script": str(here / "fit_lattice_contact_model_chat.py"),
-            "remd_script": str(here / "remd_uniform_chain_new_chat.py"),
+            "fit_script": str(here / "fit_lattice_contact_model_2.py"),
+            "remd_script": str(here / "remd_uniform_chain_2.py"),
             "output_root": str(tmp / "out"),
             "models": list(SUPPORTED_MODELS),
             "baselines": [{
@@ -3571,7 +4864,109 @@ def run_quick_test() -> None:
         print("  suite quick-test paired statistics (5 files, columns, report, "
               "plots): PASSED")
 
+    _robustness_end_to_end_quick_test(here)
     print("suite quick-test complete.")
+
+
+def _robustness_end_to_end_quick_test(here: Path) -> None:
+    """Tiny end-to-end run with all newer fitter analyses enabled.
+
+    Exercises feature-aware output validation, supplementary-summary parsing,
+    the robustness machine-readable outputs, and the new report section without
+    perturbing the primary end-to-end test above. Kept small (few temps, 1
+    restart, tiny REMD) so it stays fast.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        temps = [260.0, 280.0, 300.0, 320.0, 340.0, 360.0]
+        target = tmp / "target.npz"
+        baseline = tmp / "baseline.npz"
+        p0, m, rg_centers = _write_synthetic_target(target, temps)
+        _write_synthetic_joint_baseline(baseline, p0, m, rg_centers)
+
+        config = {
+            "target_remd": str(target),
+            "fit_script": str(here / "fit_lattice_contact_model_2.py"),
+            "remd_script": str(here / "remd_uniform_chain_2.py"),
+            "output_root": str(tmp / "out"),
+            "models": ["hs", "hs_quadratic"],
+            "baselines": [{
+                "name": "synthetic", "path": str(baseline),
+                "contact_offset": 0, "rg_scale": 1.0,
+            }],
+            "fit": {
+                "loss": "js", "fit_rg": True, "rg_weight": 0.5, "n_restarts": 1,
+                "seed": 1, "holdout_every": 2, "plots": False,
+                "bootstrap": {"enabled": True, "replicates": 4, "seed": 1,
+                              "confidence": 0.9, "save_prediction_bands": True},
+                "uncertainty_diagnostics": {"enabled": True},
+                "split_sensitivity": {"enabled": True,
+                                      "schemes": ["blocked_low", "blocked_high", "kfold"],
+                                      "kfold_k": 2, "seed": 1},
+                "rg_weight_sensitivity": {"enabled": True, "weights": [0, 0.5, 1.0],
+                                          "normalization_diagnostics": True},
+            },
+            "remd": {
+                "N": 12, "steps_per_swap": 20, "n_cycles": 16, "rg_bins": 16,
+                "burnin_frac": 0.5, "n_workers": 1, "seeds": [1, 2], "plots": False,
+            },
+            "comparison": {"include_rg": True, "rg_weight": 0.25, "make_plots": False},
+        }
+        config_path = tmp / "config.json"
+        config_path.write_text(json.dumps(config, indent=2))
+        args = argparse.Namespace(
+            config=str(config_path), dry_run=False, resume=False, force=False,
+            continue_on_error=True, quick_test=True,
+        )
+        run_suite(str(config_path), args)
+
+        out = Path(config["output_root"])
+        # Per-model supplementary outputs present and validated.
+        for model in ("hs", "hs_quadratic"):
+            fdir = out / "synthetic" / model / "fit"
+            for fn in (FIT_BOOTSTRAP_FILES + FIT_UNCERTAINTY_FILES
+                       + FIT_SPLIT_FILES + FIT_RGW_FILES
+                       + (FIT_BOOTSTRAP_PREDICTION_BANDS_FILE,)):
+                assert (fdir / fn).exists(), f"missing {fn} for {model}"
+
+        comp = out / "comparison"
+        assert (comp / "fit_robustness_summary.json").exists()
+        assert (comp / "fit_robustness.csv").exists()
+        rsum = json.loads((comp / "fit_robustness_summary.json").read_text())
+        assert rsum["any_analysis_enabled"] is True
+        bb = rsum["baselines"]["synthetic"]["hs"]["bootstrap"]
+        assert bb["enabled"] and bb.get("successful_replicates") is not None
+
+        cmp_csv = (comp / "model_comparison.csv").read_text()
+        for col in ("boot_status", "split_stability_status", "rgw_status",
+                    "unc_identifiability_status", "boot_successful_replicates"):
+            assert col in cmp_csv, f"comparison CSV missing {col}"
+
+        report = (comp / "report.md").read_text(encoding="utf-8")
+        for needle in ("## Fit robustness and parameter identifiability",
+                       "#### Bootstrap uncertainty",
+                       "#### Validation-split sensitivity",
+                       "#### Rg-weight sensitivity",
+                       "### Recommendation qualified by robustness"):
+            assert needle in report, f"report missing {needle!r}"
+
+        # Manifest records the feature-aware expected outputs.
+        manifest = json.loads((out / "manifest.json").read_text())
+        ent = manifest["models"]["synthetic/hs"]["expected_fit_outputs"]
+        assert "bootstrap_summary.json" in ent and "rg_weight_summary.json" in ent
+
+        # Resume must skip everything when nothing changed (feature-aware files OK).
+        args_resume = argparse.Namespace(
+            config=str(config_path), dry_run=False, resume=True, force=False,
+            continue_on_error=True, quick_test=True,
+        )
+        state = run_suite(str(config_path), args_resume)
+        skipped = [j for j in state["jobs"] if j.get("status") == "skipped_resume"]
+        assert skipped, "resume skipped nothing despite unchanged feature-aware outputs"
+        print("  suite quick-test robustness end-to-end (outputs, parsing, report, "
+              "resume): PASSED")
 
 
 # ---------------------------------------------------------------------------

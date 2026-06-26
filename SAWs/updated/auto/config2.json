@@ -1,12 +1,11 @@
 {
   "target_remd": "remd_distributions_44mer.npz",
-  "fit_script": "fit_lattice_contact_model_chat.py",
-  "remd_script": "remd_uniform_chain_new_chat.py",
-  "output_root": "model_suite_output",
+  "fit_script": "fit_lattice_contact_model_2.py",
+  "remd_script": "remd_uniform_chain_2.py",
+  "output_root": "model_suite_output_44mer",
 
   "models": [
     "hs",
-    "tc_scale",
     "hs_quadratic",
     "poly2",
     "poly3",
@@ -15,8 +14,8 @@
 
   "baselines": [
     {
-      "name": "joint_baseline_44mer",
-      "path": "single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
+      "name": "final_joint_baseline_44mer",
+      "path": "RnBaseline.npz",
       "contact_offset": 43,
       "rg_scale": 0.46320503312590167
     }
@@ -26,14 +25,50 @@
     "loss": "js",
     "fit_rg": true,
     "rg_weight": 0.5,
-    "holdout_every": 3,
+    "holdout_every": null,
     "holdout_indices": null,
     "train_indices": null,
     "n_restarts": 8,
     "seed": 123,
-    "bootstrap": 0,
-    "bootstrap_seed": null,
-    "plots": false
+    "plots": false,
+
+    "bootstrap": {
+      "enabled": true,
+      "replicates": 200,
+      "seed": 123,
+      "method": "temperature",
+      "confidence": 0.95,
+      "correlation_threshold": 0.9,
+      "save_prediction_bands": true
+    },
+
+    "uncertainty_diagnostics": {
+      "enabled": true
+    },
+
+    "split_sensitivity": {
+      "enabled": true,
+      "schemes": [
+        "every_third_phase",
+        "kfold",
+        "blocked_low",
+        "blocked_mid",
+        "blocked_high",
+        "random"
+      ],
+      "config_json": null,
+      "seed": 123,
+      "kfold_k": 5,
+      "blocked_fraction": 0.2,
+      "random_fraction": 0.2,
+      "random_repeats": 5
+    },
+
+    "rg_weight_sensitivity": {
+      "enabled": true,
+      "weights": [0, 0.1, 0.25, 0.5, 1, 2, 4],
+      "normalization_diagnostics": true
+    }
   },
 
   "remd": {
@@ -42,20 +77,20 @@
     "n_cycles": 5000,
     "rg_bins": 100,
     "burnin_frac": 0.7,
-    "n_workers": 8,
-    "seeds": [1, 2, 3],
-    "plots": false,
+    "n_workers": 16,
+    "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "plots": false, 
     "timing": true,
     "diagnostics": {
       "enabled": true,
       "trajectories": true,
       "n_blocks": 5,
-      "min_round_trips": 1,
-      "min_temp_coverage": 0.5,
-      "min_ess": 50.0,
+      "min_round_trips": 64,
+      "min_temp_coverage": 0.8,
+      "min_ess": 100.0,
       "max_drift": 1.0,
       "min_swap_rate": 0.05,
-      "rhat_threshold": 1.1
+      "rhat_threshold": 1.05
     }
   },
 
