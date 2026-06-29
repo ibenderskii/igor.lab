@@ -1,0 +1,109 @@
+{
+  "timestamp": "2026-06-25T15:42:07.733272+00:00",
+  "target_path": ".\\remd_distributions_44mer.npz",
+  "baseline_path": ".\\single_uniform_chain2_athermal_dists_joint_N44_T1_seed42.npz",
+  "target_keys": [
+    "temps",
+    "rg_centers",
+    "ct_centers",
+    "rg_hists",
+    "ct_hists"
+  ],
+  "n_temps": 64,
+  "temperature_range": [
+    280.0,
+    360.0
+  ],
+  "contact_offsets": [
+    43.0,
+    44.0
+  ],
+  "rg_scale": 0.46320503312590167,
+  "positive_support_threshold": 0.0,
+  "baseline_integer_range": [
+    0,
+    31
+  ],
+  "baseline_internal_gap_contacts": [
+    28,
+    29,
+    30
+  ],
+  "has_rg_analysis": true,
+  "per_offset": [
+    {
+      "offset": 43.0,
+      "target_integer_range": [
+        -3,
+        57
+      ],
+      "union_grid_range": [
+        -3,
+        57
+      ],
+      "max_partition_error": 2.220446049250313e-16,
+      "aggregate": {
+        "mean_total_unsupported": 0.061809916040943956,
+        "max_total_unsupported": 0.1343428580122939,
+        "min_total_unsupported": 0.004024024709390777,
+        "mean_mass_below": 0.00035075062952650687,
+        "mean_mass_above": 0.028534204114935215,
+        "mean_mass_internal_gap": 0.03292496129648223,
+        "mean_positive_support": 0.9381900839590561,
+        "mean_geometric_support": 0.9711150452555383,
+        "mean_negative_mass": 0.00035075062952650687,
+        "max_negative_mass": 0.0010003955936948481,
+        "has_negative_support": true
+      }
+    },
+    {
+      "offset": 44.0,
+      "target_integer_range": [
+        -4,
+        56
+      ],
+      "union_grid_range": [
+        -4,
+        56
+      ],
+      "max_partition_error": 2.220446049250313e-16,
+      "aggregate": {
+        "mean_total_unsupported": 0.05238432569342995,
+        "max_total_unsupported": 0.11407781023674725,
+        "min_total_unsupported": 0.005362196457914912,
+        "mean_mass_below": 0.0022725954369788724,
+        "mean_mass_above": 0.02261011127023608,
+        "mean_mass_internal_gap": 0.027501618986215004,
+        "mean_positive_support": 0.94761567430657,
+        "mean_geometric_support": 0.9751172932927851,
+        "mean_negative_mass": 0.0022725954369788724,
+        "max_negative_mass": 0.004664962570750397,
+        "has_negative_support": true
+      }
+    }
+  ],
+  "rg": {
+    "rg_scale": 0.46320503312590167,
+    "rg_range_scaled": [
+      0.87093674667157,
+      3.3306660986139067
+    ],
+    "offset_independent": true,
+    "aggregate": {
+      "mean_rg_total_unsupported": 0.0015084881244327047,
+      "max_rg_total_unsupported": 0.004996724709496889,
+      "mean_rg_below": 0.0,
+      "mean_rg_above": 0.0,
+      "mean_rg_internal_gap": 0.0015084881244327047,
+      "mean_rg_inside": 1.0
+    }
+  },
+  "best_offsets": {
+    "smallest_mean_unsupported_contact_mass": 44.0,
+    "smallest_max_unsupported_contact_mass": 44.0,
+    "no_negative_shifted_contact_support": null,
+    "no_negative_support_candidates": [],
+    "best_rg_support": 43.0,
+    "best_rg_support_note": "Rg support does not depend on the contact offset; all offsets are equivalent under this criterion."
+  }
+}

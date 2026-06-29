@@ -1,0 +1,202 @@
+{
+  "timestamp": "2026-06-29T13:01:48",
+  "model_api_version": 1,
+  "model": "hs",
+  "param_names": [
+    "h",
+    "s"
+  ],
+  "params": [
+    312.109,
+    1.23278
+  ],
+  "Tref": 320.0,
+  "Tscale": 80.0,
+  "parameter_source": "legacy_dh_ds",
+  "fit_summary_json": null,
+  "temperatures": [
+    280.0,
+    291.42857142857144,
+    302.85714285714283,
+    314.2857142857143,
+    325.7142857142857,
+    337.14285714285717,
+    348.57142857142856,
+    360.0
+  ],
+  "temperature_count": 8,
+  "temperature_min": 280.0,
+  "temperature_max": 360.0,
+  "temperature_uniform": true,
+  "temperature_source": "linspace",
+  "N": 30,
+  "n_beads": 30,
+  "n_steps": 29,
+  "schema_version": 1,
+  "steps_per_swap": 50,
+  "n_cycles": 100,
+  "total_steps_per_replica": 5000,
+  "seed": 42,
+  "n_workers": 2,
+  "burnin_frac": 0.7,
+  "rg_bins": 64,
+  "rg_scale": 1.0,
+  "structural_stride": 1,
+  "structural_bin_definitions": {
+    "scheme": "fixed_short_scaled_long",
+    "min_separation": 3,
+    "short": {
+      "r_min": 3,
+      "r_max": 9
+    },
+    "long": {
+      "r_over_n_min": 0.3333333333333333
+    },
+    "medium": "remaining valid separations not in short or long",
+    "n_beads": 30
+  },
+  "save_configurations": true,
+  "configuration_path": "./test_outputs/remd_structural_test_configurations.h5",
+  "snapshot_stride": 5,
+  "snapshot_start_cycle": 0,
+  "reduced_bias_by_temperature": [
+    -0.11810500000000013,
+    -0.16181774509803937,
+    -0.20223141509433962,
+    -0.23970590909090916,
+    -0.27455061403508774,
+    -0.30703296610169506,
+    -0.33738532786885245,
+    -0.36581055555555564
+  ],
+  "coupling_K_by_temperature": [
+    0.11810500000000013,
+    0.16181774509803937,
+    0.20223141509433962,
+    0.23970590909090916,
+    0.27455061403508774,
+    0.30703296610169506,
+    0.33738532786885245,
+    0.36581055555555564
+  ],
+  "contact_weight_q_by_temperature": [
+    1.1253622682021613,
+    1.175645954555998,
+    1.2241312577864736,
+    1.270875342472545,
+    1.3159391773752496,
+    1.3593857809832217,
+    1.4012789115393056,
+    1.441682098118332
+  ],
+  "wall_time_seconds": 1.4799431000137702,
+  "swap_rates": [
+    0.9,
+    0.96,
+    0.86,
+    0.98,
+    0.9,
+    0.94,
+    0.94
+  ],
+  "swap_rate_min": 0.86,
+  "swap_rate_mean": 0.9257142857142855,
+  "swap_rate_median": 0.94,
+  "local_acceptance_rates": [
+    0.5716,
+    0.5526,
+    0.5314,
+    0.5344,
+    0.5006,
+    0.4748,
+    0.4708,
+    0.4508
+  ],
+  "output_files": {
+    "results_csv": "./test_outputs/remd_structural_test_results.csv",
+    "swap_rates_csv": "./test_outputs/remd_structural_test_swap_rates.csv",
+    "move_acceptance_csv": "./test_outputs/remd_structural_test_move_acceptance.csv",
+    "distributions_npz": "./test_outputs/remd_structural_test_distributions.npz",
+    "configuration_hdf5": "./test_outputs/remd_structural_test_configurations.h5",
+    "diagnostics_json": "./test_outputs/remd_structural_test_diagnostics.json",
+    "convergence_csv": "./test_outputs/remd_structural_test_convergence.csv",
+    "round_trips_csv": "./test_outputs/remd_structural_test_round_trips.csv",
+    "walker_occupancy_csv": "./test_outputs/remd_structural_test_walker_occupancy.csv",
+    "diagnostic_trajectories_npz": "./test_outputs/remd_structural_test_diagnostic_trajectories.npz",
+    "structural_trajectories_npz": "./test_outputs/remd_structural_test_diagnostic_trajectories.npz",
+    "run_summary_json": "./test_outputs/remd_structural_test_run_summary.json"
+  },
+  "diagnostics_enabled": true,
+  "diagnostics_overhead_seconds": 0.019354999996721745,
+  "diagnostics_summary": {
+    "n_temperatures": 8,
+    "n_walkers": 8,
+    "total_round_trips_low": 24,
+    "min_round_trips_per_walker": 2,
+    "median_round_trips_per_walker": 3.0,
+    "min_temp_coverage": 1.0,
+    "median_temp_coverage": 1.0,
+    "min_ess_contacts": 10.911333732057415,
+    "median_ess_contacts": 25.799992014301733,
+    "total_ess_contacts": 190.9170672069352,
+    "max_autocorr_contacts": 2.7494347379239468,
+    "max_autocorr_rg": 2.4354408972718185,
+    "max_drift_contacts": 1.0735219927864692,
+    "min_swap_rate": 0.86,
+    "median_swap_rate": 0.94,
+    "min_ess_rg2": 12.994832464465093,
+    "min_ess_ree2": 24.623792054061067,
+    "min_ess_m_long": 11.265374580693255,
+    "min_ess_smax": 14.11998463821699,
+    "min_ess_largest_component_fraction": 14.119984638216993,
+    "min_ess_key_structural": 10.911333732057415,
+    "min_structural_samples": 30,
+    "max_drift_m_long": 0.8453639444116162
+  },
+  "diagnostics_thresholds": {
+    "min_round_trips": 1,
+    "min_temp_coverage": 0.5,
+    "min_ess": 50.0,
+    "max_drift": 1.0,
+    "min_swap_rate": 0.05,
+    "min_structural_samples": 20
+  },
+  "diagnostics_warnings": [
+    {
+      "type": "low_ess",
+      "message": "minimum contact ESS 10.9 < 50.0",
+      "value": 10.911333732057415,
+      "threshold": 50.0
+    },
+    {
+      "type": "drift",
+      "message": "maximum |contact drift|/std 1.074 > 1.0",
+      "value": 1.0735219927864692,
+      "threshold": 1.0
+    },
+    {
+      "type": "low_ess_contacts",
+      "message": "minimum contact ESS 10.9 < 50.0",
+      "value": 10.911333732057415,
+      "threshold": 50.0
+    },
+    {
+      "type": "low_ess_rg2",
+      "message": "minimum Rg^2 ESS 13.0 < 50.0",
+      "value": 12.994832464465093,
+      "threshold": 50.0
+    },
+    {
+      "type": "low_ess_m_long",
+      "message": "minimum m_long ESS 11.3 < 50.0",
+      "value": 11.265374580693255,
+      "threshold": 50.0
+    },
+    {
+      "type": "low_ess_smax",
+      "message": "minimum S_max ESS 14.1 < 50.0",
+      "value": 14.11998463821699,
+      "threshold": 50.0
+    }
+  ]
+}

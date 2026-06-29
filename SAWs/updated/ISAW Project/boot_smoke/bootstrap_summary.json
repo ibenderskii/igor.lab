@@ -1,0 +1,182 @@
+{
+  "n_bootstrap": 40,
+  "n_success": 40,
+  "n_failed": 0,
+  "bootstrap_seed": 123,
+  "model": "hs",
+  "loss": "js",
+  "fit_rg": true,
+  "rg_weight": 0.5,
+  "params": {
+    "h": {
+      "fitted": 330.52867487382156,
+      "mean": 332.35262165662476,
+      "median": 334.88621533227246,
+      "std": 14.12009409840736,
+      "bias": 1.8239467828032048,
+      "ci_low": 305.73494353375025,
+      "ci_high": 351.13109398674504,
+      "confidence": 0.9,
+      "cv": 0.042485279724965595,
+      "n": 40
+    },
+    "s": {
+      "fitted": 1.2892904622160057,
+      "mean": 1.2952628905042325,
+      "median": 1.303355814903266,
+      "std": 0.04280627325473488,
+      "bias": 0.00597242828822675,
+      "ci_low": 1.2163837525135701,
+      "ci_high": 1.349609427793001,
+      "confidence": 0.9,
+      "cv": 0.03304832831122865,
+      "n": 40
+    }
+  },
+  "derived": {
+    "Tc": {
+      "fitted": 256.3647871137709,
+      "mean": 256.509583818765,
+      "median": 257.03990442264694,
+      "std": 2.5098968936307253,
+      "bias": 0.14479670499412123,
+      "ci_low": 251.3474245127154,
+      "ci_high": 260.1685844373849,
+      "confidence": 0.9,
+      "cv": 0.009784807476839052,
+      "n": 40
+    }
+  },
+  "losses": {
+    "train_loss": {
+      "mean": 2.394444200956718,
+      "median": 2.3936676878536653,
+      "std": 0.0029225114567987564,
+      "ci_low": 2.3914192752893344,
+      "ci_high": 2.4006174382217176,
+      "n": 40
+    },
+    "validation_loss": {
+      "mean": 1.2497363340044458,
+      "median": 1.2488982364438344,
+      "std": 0.0016946621309645886,
+      "ci_low": 1.2483659379366137,
+      "ci_high": 1.2533798896251982,
+      "n": 40
+    },
+    "all_loss": {
+      "mean": 3.6441805349611642,
+      "median": 3.642930465894617,
+      "std": 0.004550328754155479,
+      "ci_low": 3.639769366047445,
+      "ci_high": 3.654341067472378,
+      "n": 40
+    },
+    "rg_train_loss": {
+      "mean": 0.5609272634244684,
+      "median": 0.5615708789277807,
+      "std": 0.004636651022968758,
+      "ci_low": 0.5527071277735124,
+      "ci_high": 0.5660869887553659,
+      "n": 40
+    },
+    "rg_validation_loss": {
+      "mean": 0.29734046002375814,
+      "median": 0.29780299870292065,
+      "std": 0.002899659607269517,
+      "ci_low": 0.29221078607165163,
+      "ci_high": 0.30061559293326123,
+      "n": 40
+    },
+    "rg_all_loss": {
+      "mean": 0.8582677234482265,
+      "median": 0.8593738776307014,
+      "std": 0.007535604677191715,
+      "ci_low": 0.8449179138451639,
+      "ci_high": 0.866702581688627,
+      "n": 40
+    },
+    "combined_train_loss": {
+      "mean": 2.6749078326689526,
+      "median": 2.6741265317625853,
+      "std": 0.001655406303268406,
+      "ci_low": 2.673277195437608,
+      "ci_high": 2.6781165164100558,
+      "n": 40
+    },
+    "combined_validation_loss": {
+      "mean": 1.3984065640163248,
+      "median": 1.398308817322621,
+      "std": 0.0010852278794324477,
+      "ci_low": 1.3971005271840398,
+      "ci_high": 1.4007412288496945,
+      "n": 40
+    },
+    "combined_all_loss": {
+      "mean": 4.073314396685277,
+      "median": 4.072301483937711,
+      "std": 0.002612597715292055,
+      "ci_low": 4.070642322894955,
+      "ci_high": 4.079135587317073,
+      "n": 40
+    }
+  },
+  "uncertainty_kind": "empirical temperature-resampling bootstrap",
+  "uncertainty_note": "These intervals reflect sensitivity to which temperatures were sampled, not likelihood-based statistical error. The JS/KL objective on normalized histograms is not a log-likelihood and the histograms are not raw independent counts, so AIC/BIC and formal standard errors are intentionally not reported.",
+  "bootstrap_method": "temperature",
+  "confidence": 0.9,
+  "fraction_successful": 1.0,
+  "param_bound_fractions": {
+    "h": {
+      "at_lower": 0.0,
+      "at_upper": 0.0,
+      "at_any": 0.0
+    },
+    "s": {
+      "at_lower": 0.0,
+      "at_upper": 0.0,
+      "at_any": 0.0
+    }
+  },
+  "covariance": {
+    "order": [
+      "h",
+      "s"
+    ],
+    "matrix": [
+      [
+        204.48928958756755,
+        0.6192193332589998
+      ],
+      [
+        0.6192193332589998,
+        0.0018793610563682369
+      ]
+    ]
+  },
+  "correlation": {
+    "order": [
+      "h",
+      "s"
+    ],
+    "matrix": [
+      [
+        1.0,
+        0.9988588289432145
+      ],
+      [
+        0.9988588289432145,
+        0.9999999999999999
+      ]
+    ],
+    "threshold": 0.9,
+    "flagged_pairs": [
+      {
+        "param_a": "h",
+        "param_b": "s",
+        "correlation": 0.9988588289432145
+      }
+    ],
+    "possible_non_identifiability": true
+  }
+}

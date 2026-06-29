@@ -1,0 +1,1398 @@
+{
+  "metadata": {
+    "project_name": "3D_ISAW_contact_motif_collapse_analysis",
+    "document_type": "computational_research_plan",
+    "version": "1.0.0",
+    "created_date": "2026-06-29",
+    "scope": "End-to-end computational plan for determining which contact motifs and collective contact structures dominate the approach to the 3D interacting self-avoiding-walk theta collapse.",
+    "primary_research_question": "Which contact lengths, contact-pair topologies, and collective contact-network modes account for the growth of contact fluctuations and the reduction of polymer size as the 3D ISAW approaches collapse?",
+    "secondary_research_questions": [
+      "Do long-range contacts drive global compaction more strongly than short local contacts?",
+      "Are contact motifs cooperative, competitive, or approximately independent?",
+      "Does a single collective covariance mode dominate the approach to collapse?",
+      "Do topology-resolved variables explain polymer size variation that is not captured by total contact number m alone?",
+      "How do the dominant motifs and correlation lengths scale with chain length?",
+      "Can high-temperature graph coefficients and low-temperature defect states be connected to the same motif taxonomy?"
+    ],
+    "intended_outputs": [
+      "Validated per-configuration contact-map dataset",
+      "Motif-resolved thermodynamic observables",
+      "Contact-separation susceptibility matrices",
+      "Contact-motif covariance matrices and eigenmodes",
+      "Conditional free-energy profiles",
+      "Finite-size scaling estimates of pseudocritical and theta-point behavior",
+      "High-temperature graph-expansion coefficients",
+      "Low-temperature compact-state defect analysis",
+      "Reproducible report with figures, tables, and machine-readable summaries"
+    ]
+  },
+  "scientific_model": {
+    "lattice": {
+      "dimension": 3,
+      "geometry": "simple_cubic",
+      "coordination_number": 6,
+      "boundary_conditions": "infinite lattice for single-chain simulations unless a finite box is explicitly introduced for debugging"
+    },
+    "polymer": {
+      "model": "interacting_self_avoiding_walk",
+      "walk_definition": "A sequence of lattice sites r_0,...,r_N with nearest-neighbor bonded steps and no repeated occupied site.",
+      "chain_length_convention": "N denotes the number of steps unless a script explicitly stores the number of beads; every data file must record both n_steps and n_beads to prevent off-by-one errors.",
+      "recommended_chain_lengths": [
+        20,
+        30,
+        44,
+        60,
+        80,
+        100
+      ],
+      "minimum_required_for_initial_pilot": [
+        30,
+        44
+      ]
+    },
+    "contact_definition": {
+      "contact_indicator": "Delta_ij = 1 when beads i and j occupy nearest-neighbor lattice sites and |i-j| > 1; otherwise Delta_ij = 0.",
+      "total_contact_number": "m(omega) = sum_{i<j, |i-j|>1} Delta_ij(omega).",
+      "counting_rule": "Each unordered nonbonded nearest-neighbor pair is counted exactly once.",
+      "parity_constraint": "On the cubic lattice, a nonbonded nearest-neighbor contact can occur only for odd contour separation r = |i-j|.",
+      "minimum_contour_separation": 3
+    },
+    "effective_contact_model": {
+      "effective_free_energy_per_contact": "g_c(T) = h - T s",
+      "dimensionless_contact_coupling": "K(T) = s/k_B - h/(k_B T)",
+      "contact_weight": "q(T) = exp(K(T))",
+      "dimensionless_penalty_form": "b(T) = h/(k_B T) - s/k_B = -K(T)",
+      "configuration_weight": "w(omega,T) = exp(K(T) m(omega)) = q(T)^{m(omega)}",
+      "fixed_length_partition_function": "Z_N(T) = sum_omega q(T)^{m(omega)} = sum_m g_N(m) q(T)^m",
+      "internal_energy_if_h_and_s_are_temperature_independent": "U_N(T) = h <m>",
+      "heat_capacity": "C_V(T) = h^2 Var(m)/(k_B T^2)",
+      "assumptions": [
+        "h and s are treated as temperature independent over the fitted temperature range unless a later model explicitly relaxes this assumption.",
+        "The interaction depends only on nonbonded nearest-neighbor contact number.",
+        "The single-chain model is not assumed to exhibit a true singularity at finite N.",
+        "The theta transition is inferred from finite-size scaling as N tends to infinity."
+      ]
+    }
+  },
+  "global_design_principles": {
+    "separation_of_concerns": [
+      "Configuration generation must be independent of motif analysis.",
+      "Feature extraction must operate on stored coordinates or stored contact maps without rerunning the simulation.",
+      "Thermodynamic reweighting must operate on feature tables rather than simulation internals.",
+      "Finite-size scaling must consume summarized observables with uncertainties, not raw simulation trajectories."
+    ],
+    "reproducibility": [
+      "Every run must record the complete input configuration, git commit, Python version, package versions, random seeds, host name, start time, end time, and command line.",
+      "Random seeds must be explicit and unique per worker.",
+      "Raw data must be immutable after creation.",
+      "Derived data must include provenance links to raw input hashes.",
+      "All analysis scripts must be deterministic given the same inputs."
+    ],
+    "numerical_stability": [
+      "Use log-sum-exp for reweighting and partition-function calculations.",
+      "Use normalized left and right eigenvectors for non-symmetric transfer matrices.",
+      "Use sparse matrices where transfer-matrix state spaces are large.",
+      "Use bootstrap or block-bootstrap uncertainty estimates rather than relying only on asymptotic standard errors."
+    ],
+    "minimum_statistical_requirements": [
+      "At least 8 independent seeds for production simulations.",
+      "Autocorrelation-aware effective sample size must be reported for m, R_g^2, and at least one motif observable.",
+      "No reported temperature point should rely on extrapolation outside the overlap region of sampled histograms without an explicit warning.",
+      "Rare-state support must be checked separately for the high-contact tail."
+    ]
+  },
+  "software_architecture": {
+    "recommended_language": "Python 3.8.8 or newer",
+    "core_packages": [
+      "numpy",
+      "scipy",
+      "pandas",
+      "networkx",
+      "numba",
+      "matplotlib",
+      "h5py or zarr",
+      "pydantic",
+      "joblib or concurrent.futures",
+      "pytest"
+    ],
+    "optional_packages": [
+      "scikit-learn for PCA cross-checks only",
+      "sympy for exact small-N graph coefficients",
+      "sparseqr or scipy.sparse.linalg for transfer-matrix work",
+      "pyarrow for parquet feature tables"
+    ],
+    "recommended_repository_layout": {
+      "configs": "JSON configuration files for simulation and analysis runs.",
+      "src/isaw/model.py": "Core lattice, contact, and Hamiltonian definitions.",
+      "src/isaw/sampling.py": "Monte Carlo, REMD, flat-histogram, or exact-enumeration engines.",
+      "src/isaw/contact_map.py": "Contact-map construction and validation.",
+      "src/isaw/motifs.py": "Loop-length and motif classification.",
+      "src/isaw/contact_graph.py": "Network construction and graph observables.",
+      "src/isaw/reweight.py": "Histogram and configuration-level thermodynamic reweighting.",
+      "src/isaw/covariance.py": "Covariance matrices, susceptibilities, and mode decomposition.",
+      "src/isaw/correlations.py": "Contour and spatial contact-correlation functions.",
+      "src/isaw/free_energy.py": "Conditional free energies and curvature diagnostics.",
+      "src/isaw/series.py": "High- and low-temperature expansion tools.",
+      "src/isaw/fss.py": "Finite-size scaling and pseudocritical analysis.",
+      "src/isaw/io.py": "Schema validation, HDF5/Zarr/NPZ read-write, provenance.",
+      "src/isaw/reporting.py": "Plots, tables, JSON summaries, and markdown report generation.",
+      "scripts": "Thin command-line wrappers only.",
+      "tests": "Unit, integration, regression, and small exact-enumeration tests.",
+      "data/raw": "Immutable simulation output.",
+      "data/derived": "Contact maps, motif tables, covariance products, and reweighted observables.",
+      "reports": "Figures, tables, markdown, and final PDFs."
+    },
+    "command_line_convention": {
+      "required_flags": [
+        "--config",
+        "--output-dir",
+        "--seed or --seed-base",
+        "--log-level"
+      ],
+      "recommended_behavior": [
+        "Every script supports --dry-run.",
+        "Long-running scripts support --resume.",
+        "Every script writes a machine-readable run_manifest.json.",
+        "Every script exits nonzero on failed validation."
+      ]
+    }
+  },
+  "data_schema": {
+    "raw_configuration_record": {
+      "required_fields": {
+        "run_id": "string",
+        "seed": "integer",
+        "worker_id": "integer",
+        "sample_index": "integer",
+        "temperature": "float",
+        "beta": "float",
+        "h": "float",
+        "s": "float",
+        "K": "float",
+        "q": "float",
+        "n_steps": "integer",
+        "n_beads": "integer",
+        "coordinates": "integer array with shape [n_beads,3]",
+        "total_contacts": "integer",
+        "radius_of_gyration_squared": "float",
+        "end_to_end_distance_squared": "float",
+        "energy": "float",
+        "sweep_index": "integer",
+        "replica_id": "integer or null",
+        "walker_id": "integer or null"
+      },
+      "optional_fields": {
+        "asphericity": "float",
+        "shape_anisotropy": "float",
+        "acceptance_statistics": "object",
+        "replica_temperature_history": "reference or null"
+      }
+    },
+    "contact_map_record": {
+      "required_fields": {
+        "run_id": "string",
+        "sample_index": "integer",
+        "contact_pairs": "integer array of shape [m,2] with i<j",
+        "contour_separations": "integer array of length m",
+        "contact_count": "integer"
+      },
+      "validation_constraints": [
+        "Every contact pair must satisfy i<j.",
+        "Every contact pair must satisfy |i-j|>1.",
+        "Coordinate Manhattan distance must equal 1.",
+        "No duplicate contact pair is allowed.",
+        "contact_count must equal the number of rows in contact_pairs.",
+        "All contour separations must be odd on the simple cubic lattice."
+      ]
+    },
+    "motif_feature_record": {
+      "required_fields": {
+        "run_id": "string",
+        "sample_index": "integer",
+        "m": "integer",
+        "m_short": "integer",
+        "m_medium": "integer",
+        "m_long": "integer",
+        "mean_contact_contour_separation": "float or null",
+        "max_contact_contour_separation": "integer or null",
+        "pair_disjoint": "integer",
+        "pair_nested": "integer",
+        "pair_interleaved": "integer",
+        "pair_shared_endpoint": "integer",
+        "pair_fused_or_adjacent": "integer",
+        "contact_graph_components": "integer",
+        "contact_graph_largest_component_vertices": "integer",
+        "contact_graph_largest_component_edges": "integer",
+        "contact_graph_mean_degree_nonisolated": "float",
+        "contact_graph_cycle_rank": "integer",
+        "radius_of_gyration_squared": "float"
+      },
+      "recommended_additional_fields": {
+        "loop_length_histogram": "sparse map from odd r to count m_r",
+        "contact_component_size_histogram": "sparse histogram",
+        "contact_degree_histogram": "sparse histogram",
+        "largest_component_fraction": "float",
+        "number_of_contact_vertices": "integer",
+        "number_of_contact_clusters_with_two_or_more_edges": "integer",
+        "local_contact_density_variance": "float",
+        "asphericity": "float"
+      }
+    }
+  },
+  "phase_plan": [
+    {
+      "phase_id": "P00",
+      "name": "Freeze definitions, conventions, and acceptance criteria",
+      "objective": "Prevent later ambiguity in contact counting, chain length, motif taxonomy, temperature mapping, and file formats.",
+      "theoretical_requirements": [
+        {
+          "item": "Contact definition",
+          "requirement": "Approve the exact nearest-neighbor and nonbonded conditions and the one-count-per-pair convention."
+        },
+        {
+          "item": "Hamiltonian convention",
+          "requirement": "Fix whether h is negative for favorable contacts or whether a positive epsilon is used in E=-epsilon m. All scripts must expose the sign convention explicitly."
+        },
+        {
+          "item": "Temperature map",
+          "requirement": "Use K(T)=s/k_B-h/(k_B T) and q(T)=exp(K). Confirm units for h, s, T, and k_B."
+        },
+        {
+          "item": "Motif taxonomy",
+          "requirement": "Define contour-separation bins and exact logic for disjoint, nested, interleaved, shared-endpoint, and fused pair motifs."
+        },
+        {
+          "item": "Finite-size target",
+          "requirement": "State that the goal is a finite-size structural diagnosis and theta-point scaling, not a finite-N singularity."
+        }
+      ],
+      "code_requirements": [
+        "Create a pydantic configuration model with explicit units and sign conventions.",
+        "Create shared constants and enums for motif labels.",
+        "Create a schema_version field in every output file.",
+        "Create a definitions.md file generated from the configuration schema."
+      ],
+      "inputs": [
+        "Current ISAW simulation conventions",
+        "Current h-s fitted parameter convention",
+        "Target chain lengths and temperature grid"
+      ],
+      "outputs": [
+        "configs/project_definitions.json",
+        "src/isaw/schema.py",
+        "docs/definitions.md"
+      ],
+      "validation_tests": [
+        "Unit test showing one known conformation and its manually counted contacts.",
+        "Unit test verifying q(T)=exp(s/k_B-h/(k_B T)).",
+        "Unit test confirming odd contour separation for all cubic-lattice contacts."
+      ],
+      "acceptance_criteria": [
+        "All later phases import definitions from one source.",
+        "No script contains a private redefinition of contact counting or K(T)."
+      ],
+      "dependencies": []
+    },
+    {
+      "phase_id": "P01",
+      "name": "Audit existing simulation and baseline data",
+      "objective": "Determine whether current 30-mer and 44-mer trajectories contain enough information for topology-resolved analysis.",
+      "theoretical_requirements": [
+        {
+          "item": "Sufficiency of scalar histograms",
+          "requirement": "Recognize that P_0(m) or g_N(m) alone is insufficient to reconstruct contact topology, contact correlations, or a physical transfer matrix."
+        },
+        {
+          "item": "Reweighting support",
+          "requirement": "Quantify temperature regions where sampled contact histograms overlap sufficiently for reweighting."
+        }
+      ],
+      "code_requirements": [
+        "Write inspect_dataset.py to report arrays, shapes, units, metadata, and coordinate availability.",
+        "Write support_audit.py to compare sampled contact support across temperatures and seeds.",
+        "Compute cryptographic hashes for every input file.",
+        "Produce an audit JSON and markdown report."
+      ],
+      "inputs": [
+        "Existing athermal NPZ baselines",
+        "Existing REMD NPZ distributions",
+        "Any saved trajectories or coordinate dumps",
+        "Existing config JSON files"
+      ],
+      "outputs": [
+        "reports/data_audit.json",
+        "reports/data_audit.md",
+        "reports/support_overlap.csv"
+      ],
+      "validation_tests": [
+        "Cross-check stored m against recomputed m when coordinates exist.",
+        "Confirm n_steps versus n_beads convention.",
+        "Confirm temperatures are sorted and unique.",
+        "Confirm probability histograms normalize within tolerance.",
+        "Confirm independent seeds are actually distinct."
+      ],
+      "acceptance_criteria": [
+        "A clear decision is recorded: reuse existing coordinates, rerun simulations, or use a hybrid approach.",
+        "No topology analysis begins from scalar histograms alone."
+      ],
+      "dependencies": [
+        "P00"
+      ]
+    },
+    {
+      "phase_id": "P02",
+      "name": "Generate production configuration ensembles",
+      "objective": "Produce statistically independent, topology-preserving configuration samples across chain lengths and temperatures spanning the swollen, theta, and collapsed regimes.",
+      "theoretical_requirements": [
+        {
+          "item": "Sampling ensemble",
+          "requirement": "Choose canonical sampling at fixed N and T, or REMD across temperatures, while preserving the exact target weight q(T)^m."
+        },
+        {
+          "item": "Ergodicity",
+          "requirement": "Use a move set capable of exploring both swollen and compact conformations. Pivot-only dynamics are not sufficient in dense regimes without additional local moves."
+        },
+        {
+          "item": "Autocorrelation",
+          "requirement": "Estimate integrated autocorrelation times for m, R_g^2, and S_max-like pilot observables."
+        },
+        {
+          "item": "Temperature grid",
+          "requirement": "Choose temperatures with sufficient histogram overlap and adequate replica-exchange acceptance if REMD is used."
+        }
+      ],
+      "code_requirements": [
+        "Extend the current sampler to save periodic coordinate snapshots.",
+        "Save replica and walker identities separately in REMD.",
+        "Support multiple independent workers with deterministic seed derivation.",
+        "Support checkpointing and resume.",
+        "Record acceptance rates by move type and replica-exchange pair.",
+        "Write output in chunked HDF5 or Zarr for large coordinate datasets."
+      ],
+      "recommended_move_set": [
+        "pivot moves",
+        "end moves",
+        "corner flips",
+        "crankshaft moves",
+        "reptation or slithering-snake moves",
+        "optional pull moves if implemented and validated"
+      ],
+      "inputs": [
+        "project_definitions.json",
+        "temperature grid",
+        "chain lengths",
+        "number of sweeps",
+        "sampling interval",
+        "seed list"
+      ],
+      "outputs": [
+        "data/raw/configurations_N{N}_seed{seed}.h5",
+        "data/raw/run_manifest_N{N}_seed{seed}.json",
+        "reports/sampling_diagnostics_N{N}.json"
+      ],
+      "validation_tests": [
+        "Self-avoidance after every accepted move.",
+        "Bond adjacency after every accepted move.",
+        "Detailed-balance test on small enumerated systems.",
+        "Energy difference equals h times contact-number difference for accepted trial moves.",
+        "Replica-exchange acceptance matches the intended Metropolis ratio.",
+        "Round-trip and temperature-occupancy diagnostics for REMD.",
+        "Independent-seed estimates agree within uncertainty."
+      ],
+      "acceptance_criteria": [
+        "Effective sample size is reported and non-negligible for all key observables.",
+        "High-contact states are sampled often enough for the intended collapsed-regime analysis.",
+        "No unresolved detailed-balance or end-move bug remains."
+      ],
+      "dependencies": [
+        "P00",
+        "P01"
+      ]
+    },
+    {
+      "phase_id": "P03",
+      "name": "Construct and validate contact maps",
+      "objective": "Convert each saved conformation into an exact contact list without loss of contour or spatial information.",
+      "theoretical_requirements": [
+        {
+          "item": "Contact-map representation",
+          "requirement": "Use unordered bead-index pairs (i,j) with i<j and |i-j|>1."
+        },
+        {
+          "item": "Spatial lookup",
+          "requirement": "Use a lattice occupancy hash so contact construction is O(N) rather than O(N^2)."
+        }
+      ],
+      "code_requirements": [
+        "Implement build_contact_map(coords) using coordinate-to-index hashing.",
+        "Implement validate_contact_map(coords, pairs).",
+        "Implement vectorized batch extraction or numba acceleration.",
+        "Write contact maps in compressed ragged-array form."
+      ],
+      "algorithm": [
+        "Build a dictionary mapping each occupied lattice coordinate to its bead index.",
+        "For each bead, inspect the six neighboring lattice sites.",
+        "Add pair (i,j) only when the neighbor is occupied, j>i, and |i-j|>1.",
+        "Sort pairs lexicographically and remove duplicates.",
+        "Compute contour separation r=j-i for each pair."
+      ],
+      "inputs": [
+        "Raw coordinates from P02"
+      ],
+      "outputs": [
+        "data/derived/contact_maps_N{N}.h5",
+        "reports/contact_map_validation_N{N}.json"
+      ],
+      "validation_tests": [
+        "Brute-force O(N^2) comparison on random small configurations.",
+        "Known hand-built conformations with exact contact maps.",
+        "All r values are odd.",
+        "Stored m equals len(contact_pairs).",
+        "No bonded pair appears in the contact map."
+      ],
+      "acceptance_criteria": [
+        "Zero discrepancies against brute-force contact counting on the full test suite.",
+        "Contact extraction throughput is fast enough for all production snapshots."
+      ],
+      "dependencies": [
+        "P02"
+      ]
+    },
+    {
+      "phase_id": "P04",
+      "name": "Extract loop-length and contour-separation observables",
+      "objective": "Resolve total contact number into local, intermediate, and long-range contact classes.",
+      "theoretical_requirements": [
+        {
+          "item": "Loop interpretation",
+          "requirement": "A contact (i,j) plus the intervening backbone segment forms a cycle of length l=r+1."
+        },
+        {
+          "item": "Scale-aware bins",
+          "requirement": "Use both fixed bins and N-scaled bins to avoid mistaking a fixed contour separation for a long-range contact as N changes."
+        }
+      ],
+      "recommended_bin_definitions": {
+        "fixed_bins": {
+          "short": "3 <= r <= 9",
+          "medium": "11 <= r < floor(N/3)",
+          "long": "r >= floor(N/3)"
+        },
+        "scaled_bins": {
+          "local": "r/N < 0.1",
+          "mesoscopic": "0.1 <= r/N < 0.33",
+          "global": "r/N >= 0.33"
+        }
+      },
+      "code_requirements": [
+        "Implement loop_length_histogram(contact_pairs, N).",
+        "Implement configurable fixed and scaled binning.",
+        "Store sparse m_r histograms.",
+        "Compute mean, variance, maximum, and quantiles of r among contacts."
+      ],
+      "inputs": [
+        "Contact maps from P03"
+      ],
+      "outputs": [
+        "data/derived/loop_features_N{N}.parquet",
+        "reports/loop_feature_schema.json"
+      ],
+      "validation_tests": [
+        "Sum_r m_r equals m.",
+        "All nonzero r bins are odd.",
+        "Fixed-bin and scaled-bin totals each sum to m."
+      ],
+      "acceptance_criteria": [
+        "Every conformation has reproducible m_r features.",
+        "Bin definitions are stored with every output dataset."
+      ],
+      "dependencies": [
+        "P03"
+      ]
+    },
+    {
+      "phase_id": "P05",
+      "name": "Classify two-contact motifs",
+      "objective": "Determine whether pairs of contact loops are independent, nested, interleaved, shared, or fused.",
+      "theoretical_requirements": [
+        {
+          "item": "Interval topology",
+          "requirement": "For contacts (i,j) and (k,l), classify the ordering of contour intervals after canonical sorting."
+        },
+        {
+          "item": "Mutual exclusivity",
+          "requirement": "Define a deterministic priority if a contact pair satisfies more than one descriptive property, or store multi-label flags rather than forcing exclusivity."
+        },
+        {
+          "item": "Fused definition",
+          "requirement": "Specify whether fused means shared backbone edge, adjacent contour interval, shared spatial plaquette, shared endpoint, or a separate set of flags."
+        }
+      ],
+      "recommended_taxonomy": {
+        "disjoint": "i<j<k<l or k<l<i<j",
+        "nested": "i<k<l<j or k<i<j<l",
+        "interleaved": "i<k<j<l or k<i<l<j",
+        "shared_endpoint": "The contacts share at least one bead index.",
+        "backbone_overlap": "The intervals share one or more backbone edges.",
+        "spatially_adjacent": "At least one endpoint pair from the two contacts occupies neighboring lattice sites.",
+        "fused": "Composite label derived from shared_endpoint, backbone_overlap, or spatial adjacency according to the frozen project definition."
+      },
+      "code_requirements": [
+        "Implement classify_contact_pair(contact_a, contact_b, coords=None).",
+        "Implement O(m^2) pilot logic and optimized counting for larger m.",
+        "Store raw category counts and optional multi-label counts.",
+        "Add exact small-contact-map tests."
+      ],
+      "inputs": [
+        "Contact maps",
+        "Coordinates when spatially fused definitions are used"
+      ],
+      "outputs": [
+        "data/derived/pair_motif_features_N{N}.parquet",
+        "reports/pair_motif_validation.json"
+      ],
+      "validation_tests": [
+        "Exhaustive tests over all interval orderings.",
+        "Symmetry under swapping the two contacts.",
+        "Counts equal binomial(m,2) for an exhaustive mutually exclusive topology partition.",
+        "No double counting under canonical ordering."
+      ],
+      "acceptance_criteria": [
+        "The taxonomy is mathematically explicit and fully unit-tested.",
+        "Every pair is either assigned exactly once in the exclusive taxonomy or has a documented multi-label representation."
+      ],
+      "dependencies": [
+        "P03",
+        "P04"
+      ]
+    },
+    {
+      "phase_id": "P06",
+      "name": "Build contact graphs and cluster observables",
+      "objective": "Distinguish dispersed isolated contacts from cooperative contact networks.",
+      "theoretical_requirements": [
+        {
+          "item": "Graph definition",
+          "requirement": "Vertices are bead indices participating in at least one nonbonded contact; edges are contact pairs."
+        },
+        {
+          "item": "Backbone exclusion",
+          "requirement": "The contact graph excludes covalent backbone edges unless an augmented graph is explicitly constructed for cycle-rank analysis."
+        },
+        {
+          "item": "Order-parameter caution",
+          "requirement": "S_max/N is a finite-size structural indicator, not automatically a thermodynamic order parameter."
+        }
+      ],
+      "code_requirements": [
+        "Implement contact_graph(contact_pairs).",
+        "Compute connected components, largest component, edge counts, degree distribution, cycle rank, and clustering measures.",
+        "Implement an augmented backbone-plus-contact graph separately.",
+        "Avoid NetworkX in the production hot loop if profiling shows it is too slow; use union-find and compact adjacency arrays."
+      ],
+      "inputs": [
+        "Contact maps"
+      ],
+      "outputs": [
+        "data/derived/contact_graph_features_N{N}.parquet"
+      ],
+      "validation_tests": [
+        "Union-find component sizes match NetworkX on sampled cases.",
+        "Sum of component vertices equals number of contact-participating beads.",
+        "Sum of component edges equals m.",
+        "Augmented graph cycle rank equals m for a connected open backbone with m added contact edges."
+      ],
+      "acceptance_criteria": [
+        "Graph observables reproduce exact hand-calculated examples.",
+        "Production extraction completes within the allocated compute budget."
+      ],
+      "dependencies": [
+        "P03"
+      ]
+    },
+    {
+      "phase_id": "P07",
+      "name": "Assemble the unified per-configuration feature table",
+      "objective": "Create one analysis-ready table containing thermodynamic, geometric, loop, motif, and graph features.",
+      "theoretical_requirements": [
+        {
+          "item": "Feature provenance",
+          "requirement": "Every feature must have an unambiguous mathematical definition and source configuration."
+        },
+        {
+          "item": "No leakage across temperatures",
+          "requirement": "Raw geometric features are temperature-independent properties of a conformation; thermodynamic weights are applied only in later reweighting."
+        }
+      ],
+      "code_requirements": [
+        "Write merge_features.py keyed by run_id and sample_index.",
+        "Validate one-to-one joins.",
+        "Write Parquet and a compact HDF5 mirror.",
+        "Generate a data dictionary automatically."
+      ],
+      "inputs": [
+        "Raw scalar observables",
+        "Loop features",
+        "Pair motif features",
+        "Contact graph features"
+      ],
+      "outputs": [
+        "data/derived/features_N{N}.parquet",
+        "data/derived/features_N{N}.h5",
+        "docs/feature_dictionary.json"
+      ],
+      "validation_tests": [
+        "No duplicate primary keys.",
+        "No missing required features.",
+        "m agrees across all contributing tables.",
+        "R_g^2 agrees with the raw trajectory value."
+      ],
+      "acceptance_criteria": [
+        "All downstream analyses consume this table or an explicitly documented summarized derivative."
+      ],
+      "dependencies": [
+        "P04",
+        "P05",
+        "P06"
+      ]
+    },
+    {
+      "phase_id": "P08",
+      "name": "Thermodynamic reweighting and basic observables",
+      "objective": "Compute temperature-dependent expectations, contact susceptibility, heat capacity, and geometry from one or more sampled ensembles.",
+      "theoretical_requirements": [
+        {
+          "item": "Reweighting formula",
+          "requirement": "For samples drawn at K_0, use weights proportional to exp[(K-K_0)m], with proper multi-histogram treatment when combining temperatures."
+        },
+        {
+          "item": "Observable identity",
+          "requirement": "d<A>/dK = Cov(A,m)."
+        },
+        {
+          "item": "Energy and heat capacity",
+          "requirement": "U=h<m> and C_V=h^2 Var(m)/(k_B T^2) under the fixed h-s model."
+        },
+        {
+          "item": "Overlap limitation",
+          "requirement": "Do not reweight beyond histogram overlap without marking the result extrapolative."
+        }
+      ],
+      "code_requirements": [
+        "Implement single-ensemble and WHAM/MBAR-like multi-ensemble reweighting.",
+        "Use log weights and log-sum-exp.",
+        "Return expectation, variance, covariance, effective sample size, and uncertainty.",
+        "Support arbitrary feature columns.",
+        "Produce a temperature-grid summary table."
+      ],
+      "inputs": [
+        "Unified feature tables",
+        "sampling temperatures",
+        "h and s parameters",
+        "target temperature grid"
+      ],
+      "outputs": [
+        "data/derived/thermo_observables_N{N}.parquet",
+        "reports/reweighting_overlap_N{N}.json"
+      ],
+      "validation_tests": [
+        "At sampled temperatures, reweighted means match direct sample means.",
+        "Normalization of weights.",
+        "Effective sample size warnings trigger correctly.",
+        "Analytic derivative identity matches finite differences.",
+        "Independent implementation cross-check on a small dataset."
+      ],
+      "acceptance_criteria": [
+        "All reported observables include uncertainty and effective sample size.",
+        "Invalid extrapolation regions are excluded or visibly flagged."
+      ],
+      "dependencies": [
+        "P07"
+      ]
+    },
+    {
+      "phase_id": "P09",
+      "name": "Contact-separation susceptibility analysis",
+      "objective": "Determine which contour-separation classes account for contact fluctuations near collapse.",
+      "theoretical_requirements": [
+        {
+          "item": "Susceptibility matrix",
+          "requirement": "chi_rr' = Cov(m_r,m_r')."
+        },
+        {
+          "item": "Total variance decomposition",
+          "requirement": "Var(m)=sum_{r,r'} chi_rr'."
+        },
+        {
+          "item": "Interpretation",
+          "requirement": "Diagonal terms measure fluctuations within a separation class; off-diagonal terms measure cooperation or competition between classes."
+        }
+      ],
+      "code_requirements": [
+        "Create dense or sparse vectors of m_r on a common r grid.",
+        "Compute weighted covariance matrices at each T.",
+        "Aggregate into fixed and N-scaled bins.",
+        "Compute signed contribution matrices and long-range fractions."
+      ],
+      "inputs": [
+        "Loop-length feature data",
+        "Reweighting weights"
+      ],
+      "outputs": [
+        "data/derived/contact_separation_covariance_N{N}.npz",
+        "data/derived/contact_separation_summary_N{N}.parquet",
+        "figures/contact_separation_covariance_N{N}.png"
+      ],
+      "validation_tests": [
+        "Matrix is symmetric within numerical tolerance.",
+        "Sum of all entries matches Var(m).",
+        "Bootstrap confidence intervals reproduce direct variance uncertainty."
+      ],
+      "acceptance_criteria": [
+        "The dominant r or r-r' sectors are identified with uncertainty.",
+        "Results are stable to reasonable changes in bin boundaries."
+      ],
+      "dependencies": [
+        "P08"
+      ]
+    },
+    {
+      "phase_id": "P10",
+      "name": "Motif covariance and dominant-mode analysis",
+      "objective": "Identify the collective combination of motifs with the largest thermodynamic fluctuations.",
+      "theoretical_requirements": [
+        {
+          "item": "Covariance matrix",
+          "requirement": "C_ab = Cov(n_a,n_b)."
+        },
+        {
+          "item": "Mode decomposition",
+          "requirement": "Diagonalize a standardized or physically weighted covariance matrix and document which one is used."
+        },
+        {
+          "item": "Sign ambiguity",
+          "requirement": "Eigenvector signs are arbitrary; orient them consistently using positive correlation with m or another reference feature."
+        },
+        {
+          "item": "Comparability across N",
+          "requirement": "Use intensive, extensive, or standardized features consistently when comparing chain lengths."
+        }
+      ],
+      "code_requirements": [
+        "Compute weighted covariance and correlation matrices.",
+        "Diagonalize with numpy.linalg.eigh.",
+        "Bootstrap eigenvalues, eigenvectors, and subspace overlaps.",
+        "Track mode continuity across T using maximum eigenvector overlap.",
+        "Output loadings and explained fluctuation fractions."
+      ],
+      "inputs": [
+        "Motif feature table",
+        "Reweighting weights"
+      ],
+      "outputs": [
+        "data/derived/motif_modes_N{N}.npz",
+        "data/derived/motif_mode_loadings_N{N}.csv",
+        "figures/motif_mode_spectrum_N{N}.png",
+        "figures/motif_mode_loadings_N{N}.png"
+      ],
+      "validation_tests": [
+        "Covariance matrix is positive semidefinite within numerical tolerance.",
+        "Sum of eigenvalues equals trace.",
+        "Mode tracking is stable under bootstrap resampling.",
+        "Standardized and unstandardized analyses are both reported when scale differences are large."
+      ],
+      "acceptance_criteria": [
+        "A statistically supported statement is possible about whether one mode dominates.",
+        "Dominant loadings are stable across nearby temperatures and independent seeds."
+      ],
+      "dependencies": [
+        "P08"
+      ]
+    },
+    {
+      "phase_id": "P11",
+      "name": "Identify motifs that drive contact growth and true compaction",
+      "objective": "Separate motifs that merely add contacts from motifs that actually reduce polymer size.",
+      "theoretical_requirements": [
+        {
+          "item": "Contact-growth score",
+          "requirement": "D_a^m(T)=Cov(n_a,m)=d<n_a>/dK."
+        },
+        {
+          "item": "Compaction score",
+          "requirement": "D_a^Rg(T)=-Cov(n_a,R_g^2), so positive values correspond to motifs associated with smaller R_g^2."
+        },
+        {
+          "item": "Joint interpretation",
+          "requirement": "A collapse-relevant motif should have positive contact-growth coupling and positive compaction score, with significance assessed by bootstrap."
+        },
+        {
+          "item": "Confounding",
+          "requirement": "Because many motif counts scale with m, compute partial or conditional relationships controlling for total m."
+        }
+      ],
+      "code_requirements": [
+        "Compute weighted Cov(n_a,m), Cov(n_a,R_g^2), and Cov(n_a,shape).",
+        "Compute partial correlations controlling for m.",
+        "Compute conditional means E[R_g^2 | m,n_a].",
+        "Compare predictive models using cross-validation without treating them as proof of causation."
+      ],
+      "inputs": [
+        "Unified feature table",
+        "Reweighting weights"
+      ],
+      "outputs": [
+        "data/derived/motif_dominance_scores_N{N}.parquet",
+        "figures/motif_contact_vs_compaction_N{N}.png"
+      ],
+      "validation_tests": [
+        "Derivative identity checked against finite differences.",
+        "Bootstrap confidence intervals.",
+        "Results compared with and without controlling for m.",
+        "Seed-to-seed consistency."
+      ],
+      "acceptance_criteria": [
+        "Top motifs are ranked by both contact-growth and compaction evidence.",
+        "The report clearly distinguishes raw covariance from m-controlled effects."
+      ],
+      "dependencies": [
+        "P08",
+        "P10"
+      ]
+    },
+    {
+      "phase_id": "P12",
+      "name": "Contact-map and local-contact correlation functions",
+      "objective": "Measure whether contact-rich regions become correlated over increasing contour or spatial distances.",
+      "theoretical_requirements": [
+        {
+          "item": "Local contact count",
+          "requirement": "c_i=sum_j Delta_ij."
+        },
+        {
+          "item": "Contour correlation",
+          "requirement": "G_c(s)=<delta c_i delta c_{i+s}> averaged over valid i."
+        },
+        {
+          "item": "Contact-pair correlation",
+          "requirement": "G_(ij),(kl)=<X_ij X_kl>-<X_ij><X_kl>."
+        },
+        {
+          "item": "Correlation length",
+          "requirement": "Fit exponential decay only where justified; compare exponential, stretched exponential, and finite-size truncated forms."
+        }
+      ],
+      "code_requirements": [
+        "Compute per-bead contact counts c_i.",
+        "Compute contour correlation functions with proper edge normalization.",
+        "Compute correlations binned by loop-center separation and loop lengths.",
+        "Implement bootstrap fits for correlation lengths.",
+        "Optionally compute spatial contact-density structure factors."
+      ],
+      "inputs": [
+        "Contact maps",
+        "Coordinates",
+        "Reweighting weights"
+      ],
+      "outputs": [
+        "data/derived/contact_correlations_N{N}.npz",
+        "data/derived/contact_correlation_lengths_N{N}.parquet",
+        "figures/contact_correlations_N{N}.png"
+      ],
+      "validation_tests": [
+        "G_c(0) matches local-contact variance.",
+        "Large-s correlations approach zero within uncertainty away from criticality.",
+        "Synthetic data with known correlation length is recovered.",
+        "Fit window sensitivity is reported."
+      ],
+      "acceptance_criteria": [
+        "Correlation-length estimates include model and window uncertainty.",
+        "No claim of divergence is made from one finite N."
+      ],
+      "dependencies": [
+        "P08"
+      ]
+    },
+    {
+      "phase_id": "P13",
+      "name": "Conditional free-energy landscapes",
+      "objective": "Test which motif variables provide the clearest low-dimensional description of the finite-size collapse crossover.",
+      "theoretical_requirements": [
+        {
+          "item": "Effective free energy",
+          "requirement": "F_T(x)=-k_B T ln P_T(x)+constant."
+        },
+        {
+          "item": "Candidate coordinates",
+          "requirement": "Evaluate long-range contacts, S_max, largest-component fraction, fused motifs, mean loop length, and the leading covariance-mode coordinate."
+        },
+        {
+          "item": "Curvature",
+          "requirement": "Estimate local curvature near minima cautiously because histogram smoothing and finite sampling can create artificial flattening."
+        }
+      ],
+      "code_requirements": [
+        "Weighted histogram and kernel-density estimators.",
+        "Automatic bin selection with sensitivity analysis.",
+        "Bootstrap free-energy bands.",
+        "One- and two-dimensional free-energy surfaces.",
+        "Curvature estimation by local polynomial fitting."
+      ],
+      "inputs": [
+        "Unified features",
+        "Reweighting weights"
+      ],
+      "outputs": [
+        "data/derived/conditional_free_energies_N{N}.npz",
+        "figures/free_energy_{coordinate}_N{N}.png",
+        "reports/order_parameter_comparison_N{N}.json"
+      ],
+      "validation_tests": [
+        "Probability normalization.",
+        "Free-energy differences invariant to additive constant.",
+        "Stability under bin width and KDE bandwidth changes.",
+        "Bootstrap coverage."
+      ],
+      "acceptance_criteria": [
+        "Candidate coordinates are ranked by sharpness, stability, and added information beyond m.",
+        "No overinterpretation of finite-N double wells."
+      ],
+      "dependencies": [
+        "P08",
+        "P10",
+        "P11"
+      ]
+    },
+    {
+      "phase_id": "P14",
+      "name": "Test information beyond total contact number",
+      "objective": "Quantify whether contact topology explains structural variation that an m-only model cannot.",
+      "theoretical_requirements": [
+        {
+          "item": "Conditional sufficiency",
+          "requirement": "If total m were sufficient for R_g^2, additional motif variables would not materially reduce Var(R_g^2 | m)."
+        },
+        {
+          "item": "Model comparison",
+          "requirement": "Use out-of-sample prediction only as an information diagnostic, not as a replacement for physical interpretation."
+        }
+      ],
+      "code_requirements": [
+        "Fit baseline model R_g^2 ~ f(m).",
+        "Fit extended models adding m_long, S_max, motif counts, and leading mode scores.",
+        "Use nested cross-validation by independent seed or trajectory block.",
+        "Report conditional variance reduction and information criteria.",
+        "Support linear, spline, and low-complexity tree models."
+      ],
+      "inputs": [
+        "Unified feature tables"
+      ],
+      "outputs": [
+        "reports/topology_added_information.json",
+        "figures/conditional_rg_residuals.png"
+      ],
+      "validation_tests": [
+        "Cross-validation splits do not mix correlated frames across train and test.",
+        "Results stable across simple model classes.",
+        "Permutation tests for added feature blocks."
+      ],
+      "acceptance_criteria": [
+        "A quantitative estimate is produced for how much topology improves prediction beyond m.",
+        "The result is reported separately for swollen, theta-region, and collapsed regimes."
+      ],
+      "dependencies": [
+        "P07",
+        "P11"
+      ]
+    },
+    {
+      "phase_id": "P15",
+      "name": "High-temperature marked-contact graph expansion",
+      "objective": "Connect motif counts to coefficients of the contact-activity or true 1/T series.",
+      "theoretical_requirements": [
+        {
+          "item": "Contact-activity expansion",
+          "requirement": "With v=q-1, Z_N(v)=sum_k A_Nk v^k and A_Nk=sum_omega binomial(m(omega),k)."
+        },
+        {
+          "item": "Graph interpretation",
+          "requirement": "Order k counts conformations with k marked contacts; in the augmented backbone-plus-contact graph, k marked contacts create cycle rank k."
+        },
+        {
+          "item": "True high-temperature expansion",
+          "requirement": "For nonzero s, expand in u(T)=exp[-h/(k_B T)]-1 around T=infinity using the entropy-weighted reference ensemble."
+        },
+        {
+          "item": "Linked contributions",
+          "requirement": "Coefficients of ln Z are factorial cumulants and are the appropriate starting point for connected graph analysis."
+        }
+      ],
+      "code_requirements": [
+        "Compute A_Nk from exact or estimated g_N(m).",
+        "Compute factorial cumulants from sampled m distributions.",
+        "Compute motif-resolved order-k counts from stored contact maps for low k.",
+        "Support exact arithmetic for small N.",
+        "Estimate truncation error and radius-of-usefulness empirically."
+      ],
+      "inputs": [
+        "Density of states or weighted samples",
+        "Contact maps",
+        "Motif labels"
+      ],
+      "outputs": [
+        "data/derived/high_T_coefficients_N{N}.json",
+        "data/derived/high_T_motif_coefficients_N{N}.json",
+        "reports/high_T_series_validity_N{N}.json"
+      ],
+      "validation_tests": [
+        "A_N0 equals c_N.",
+        "A_N1 equals sum_m m g_N(m).",
+        "Reconstructed Z_N(v) matches direct polynomial evaluation for finite N.",
+        "Low-order motif totals sum to A_Nk."
+      ],
+      "acceptance_criteria": [
+        "Series coefficients and motif decomposition are reproducible.",
+        "The temperature or coupling interval where truncation is accurate is quantified."
+      ],
+      "dependencies": [
+        "P03",
+        "P05",
+        "P08"
+      ]
+    },
+    {
+      "phase_id": "P16",
+      "name": "Low-temperature compact-state and defect expansion",
+      "objective": "Identify maximally compact states and the lowest contact-deficit excitations.",
+      "theoretical_requirements": [
+        {
+          "item": "Contact deficit",
+          "requirement": "Delta=m_star-m."
+        },
+        {
+          "item": "Expansion",
+          "requirement": "Z_N=q^{m_star} sum_Delta g_N(m_star-Delta) q^{-Delta}."
+        },
+        {
+          "item": "Sampling warning",
+          "requirement": "Athermal sampling is generally unreliable for rare states near m_star unless specifically validated."
+        }
+      ],
+      "code_requirements": [
+        "Estimate or exactly determine m_star for each N.",
+        "Enumerate or enhanced-sample high-contact states.",
+        "Cluster compact conformations by motif and shape.",
+        "Compute g_N(m_star-Delta) for the first several allowed deficits.",
+        "Compare direct low-T observables with truncated defect series."
+      ],
+      "inputs": [
+        "High-contact simulation data",
+        "Exact enumeration for small N where available"
+      ],
+      "outputs": [
+        "data/derived/low_T_defects_N{N}.json",
+        "reports/low_T_series_validity_N{N}.json",
+        "figures/compact_state_motifs_N{N}.png"
+      ],
+      "validation_tests": [
+        "Independent methods agree on m_star for small N.",
+        "No unsampled gap is mistaken for a forbidden deficit.",
+        "Truncated series matches direct low-T estimates in its validated range."
+      ],
+      "acceptance_criteria": [
+        "The first allowed deficits and their motif content are known with uncertainty or exact counts.",
+        "The need for dedicated flat-histogram sampling is explicitly assessed."
+      ],
+      "dependencies": [
+        "P02",
+        "P03",
+        "P06"
+      ]
+    },
+    {
+      "phase_id": "P17",
+      "name": "Finite-size pseudocritical analysis",
+      "objective": "Locate finite-N collapse indicators consistently across thermodynamic and motif observables.",
+      "theoretical_requirements": [
+        {
+          "item": "Analyticity",
+          "requirement": "All finite-N curves are analytic; report pseudocritical locations, not true singular temperatures."
+        },
+        {
+          "item": "Candidate estimators",
+          "requirement": "Use maxima or extrema of C_V, Var(m), d ln<R_g^2>/dT, motif susceptibilities, and correlation lengths."
+        },
+        {
+          "item": "Estimator disagreement",
+          "requirement": "Different finite-size estimators may converge from different directions and need not coincide at small N."
+        }
+      ],
+      "code_requirements": [
+        "Smooth observables with uncertainty-aware splines or local polynomial fits.",
+        "Locate extrema with bootstrap uncertainty.",
+        "Store one pseudocritical estimate per observable and N.",
+        "Compare estimator drift."
+      ],
+      "inputs": [
+        "Temperature-dependent thermodynamic and motif observables"
+      ],
+      "outputs": [
+        "data/derived/pseudocritical_temperatures.parquet",
+        "figures/pseudocritical_estimator_comparison.png"
+      ],
+      "validation_tests": [
+        "Peak location stable to smoothing choices.",
+        "Bootstrap distributions are not pathologically multimodal without being reported.",
+        "Direct-grid and fitted extrema agree within resolution."
+      ],
+      "acceptance_criteria": [
+        "A transparent table of finite-N transition estimators is produced.",
+        "No single estimator is privileged without justification."
+      ],
+      "dependencies": [
+        "P08",
+        "P09",
+        "P10",
+        "P12",
+        "P13"
+      ]
+    },
+    {
+      "phase_id": "P18",
+      "name": "Finite-size scaling and theta-point inference",
+      "objective": "Determine which motif signatures persist and how pseudocritical behavior approaches the 3D theta point.",
+      "theoretical_requirements": [
+        {
+          "item": "Theta scaling",
+          "requirement": "Use Z_N(T) ~ mu_theta^N N^{gamma_theta-1} F(tau N^phi) with possible logarithmic corrections in d=3."
+        },
+        {
+          "item": "Upper critical dimension",
+          "requirement": "Three dimensions is the upper critical dimension for the theta tricritical point, so mean-field powers may be modified by logarithms."
+        },
+        {
+          "item": "Observable scaling",
+          "requirement": "Test both pure power-law and logarithmically corrected forms, and report limited-N identifiability."
+        },
+        {
+          "item": "Extensivity of graph families",
+          "requirement": "For connected motif or graph contributions L_N(G), examine scaling L_N ~ N^{alpha_G}."
+        }
+      ],
+      "code_requirements": [
+        "Implement simultaneous fits across N with bootstrap.",
+        "Compare candidate scaling forms using information criteria and residual diagnostics.",
+        "Support corrections to scaling and logarithmic terms.",
+        "Track dominant covariance-mode eigenvalues and loadings with N.",
+        "Estimate whether motif contributions are subextensive, extensive, or superlinear over the accessible range."
+      ],
+      "inputs": [
+        "Pseudocritical table",
+        "Motif dominance scores",
+        "Correlation lengths",
+        "Graph-expansion coefficients"
+      ],
+      "outputs": [
+        "reports/fss_fit_summary.json",
+        "reports/fss_fit_summary.md",
+        "figures/fss_collapses.png",
+        "figures/motif_scaling_exponents.png"
+      ],
+      "validation_tests": [
+        "Leave-one-N-out fit stability.",
+        "Parameter correlation and identifiability diagnostics.",
+        "Synthetic-data recovery tests.",
+        "Comparison of power-only and log-corrected models."
+      ],
+      "acceptance_criteria": [
+        "Claims are restricted to what the accessible N range supports.",
+        "The report distinguishes robust trends from model-dependent extrapolations."
+      ],
+      "dependencies": [
+        "P17"
+      ]
+    },
+    {
+      "phase_id": "P19",
+      "name": "Robustness, uncertainty, and failure-mode analysis",
+      "objective": "Demonstrate that the motif conclusions are not artifacts of sampling, binning, taxonomy, or reweighting.",
+      "theoretical_requirements": [
+        {
+          "item": "Uncertainty source separation",
+          "requirement": "Separate Monte Carlo error, reweighting overlap error, finite-size drift, model-form uncertainty, and motif-definition sensitivity."
+        }
+      ],
+      "code_requirements": [
+        "Block bootstrap within trajectories and hierarchical bootstrap across seeds.",
+        "Sensitivity analysis for contour bins and fused-motif definitions.",
+        "Repeat analyses with direct sampled-temperature averages and reweighted averages.",
+        "Track missing support and rare-state leverage.",
+        "Generate automated red-flag diagnostics."
+      ],
+      "inputs": [
+        "All derived products"
+      ],
+      "outputs": [
+        "reports/robustness_summary.json",
+        "reports/robustness_summary.md"
+      ],
+      "validation_tests": [
+        "Seed exclusion tests.",
+        "Temperature-grid thinning.",
+        "Feature-definition perturbations.",
+        "Bootstrap convergence.",
+        "Reweighting overlap threshold variation."
+      ],
+      "acceptance_criteria": [
+        "Every headline conclusion has at least one robustness check.",
+        "Negative or inconclusive results are retained in the report."
+      ],
+      "dependencies": [
+        "P09",
+        "P10",
+        "P11",
+        "P12",
+        "P13",
+        "P14",
+        "P15",
+        "P16",
+        "P18"
+      ]
+    },
+    {
+      "phase_id": "P20",
+      "name": "Automated reporting and archival",
+      "objective": "Produce a reproducible research report and preserve all machine-readable outputs.",
+      "theoretical_requirements": [
+        {
+          "item": "Interpretive hierarchy",
+          "requirement": "Present established thermodynamic results first, motif diagnostics second, and speculative mechanisms last."
+        }
+      ],
+      "code_requirements": [
+        "Generate report.md from JSON and Parquet summaries.",
+        "Create publication-quality figures with consistent labels and units.",
+        "Create one master results JSON with provenance.",
+        "Archive configs, manifests, hashes, and software environment.",
+        "Add continuous integration for unit tests and a small end-to-end smoke test."
+      ],
+      "inputs": [
+        "All reports and derived outputs"
+      ],
+      "outputs": [
+        "reports/final_report.md",
+        "reports/final_results.json",
+        "reports/figures/",
+        "archive/environment.yml",
+        "archive/input_hashes.json"
+      ],
+      "validation_tests": [
+        "Fresh-environment reproduction of the smoke test.",
+        "All figures trace back to machine-readable source tables.",
+        "No broken file references in the report.",
+        "Schema validation of final_results.json."
+      ],
+      "acceptance_criteria": [
+        "A new researcher can reproduce the pilot analysis from the repository instructions.",
+        "All conclusions link to explicit data products and uncertainty estimates."
+      ],
+      "dependencies": [
+        "P19"
+      ]
+    }
+  ],
+  "pilot_project": {
+    "goal": "Complete a bounded first implementation before scaling to the full chain-length program.",
+    "recommended_scope": {
+      "chain_lengths": [
+        30,
+        44
+      ],
+      "independent_seeds": 8,
+      "temperature_regimes": [
+        "swollen",
+        "near_pseudocritical",
+        "collapsed"
+      ],
+      "minimum_saved_independent_configurations_per_regime_per_N": 5000,
+      "motif_features": [
+        "m_r",
+        "m_short",
+        "m_long",
+        "pair_disjoint",
+        "pair_nested",
+        "pair_interleaved",
+        "pair_shared_endpoint",
+        "S_max",
+        "largest_component_fraction",
+        "contact_graph_components",
+        "R_g^2"
+      ],
+      "initial_analyses": [
+        "Cov(n_a,m)",
+        "Cov(n_a,R_g^2)",
+        "chi_rr'",
+        "motif covariance eigenmodes",
+        "conditional variance reduction beyond m",
+        "one-dimensional free energies for m_long and S_max"
+      ]
+    },
+    "go_no_go_criteria": [
+      "GO if contact maps can be extracted reliably and independent samples cover all three regimes.",
+      "GO if at least one topology variable adds reproducible information beyond total m.",
+      "REFINE if motif conclusions are strongly taxonomy-dependent.",
+      "RERUN WITH ENHANCED SAMPLING if the collapsed high-contact tail is poorly sampled.",
+      "STOP THE MOTIF EXPANSION DIRECTION if all topology variables become redundant after conditioning on m across both N values."
+    ]
+  },
+  "implementation_order": [
+    "P00",
+    "P01",
+    "P03",
+    "P04",
+    "P05",
+    "P06",
+    "P07",
+    "P08",
+    "P09",
+    "P10",
+    "P11",
+    "P14",
+    "P13",
+    "P12",
+    "P17",
+    "P19",
+    "P20",
+    "P02",
+    "P15",
+    "P16",
+    "P18"
+  ],
+  "implementation_order_note": "The listed order begins by auditing and prototyping feature extraction on any existing coordinate data. Full new production sampling P02 should be moved earlier if the audit shows that existing trajectories do not preserve coordinates or contact maps. High- and low-temperature series and full finite-size scaling should follow only after the pilot motif pipeline is validated.",
+  "immediate_next_actions": [
+    {
+      "priority": 1,
+      "action": "Run P01 on the current 30-mer and 44-mer datasets to determine whether coordinates or contact lists are available."
+    },
+    {
+      "priority": 2,
+      "action": "Freeze the exact motif taxonomy and contour-separation bins in project_definitions.json."
+    },
+    {
+      "priority": 3,
+      "action": "Implement and test build_contact_map(coords)."
+    },
+    {
+      "priority": 4,
+      "action": "Implement the per-configuration feature extractor for m_r, pair motifs, and contact graph statistics."
+    },
+    {
+      "priority": 5,
+      "action": "Create a small exact or hand-verified conformation test suite."
+    },
+    {
+      "priority": 6,
+      "action": "Run the full pilot analysis on a small subset before modifying the production simulation code."
+    }
+  ]
+}
