@@ -289,17 +289,17 @@ def test_pair_counts_equal_binomial():
 
 def test_bins_exhaustive_partition():
     for n in (20, 30, 44, 60):
-        bd = ico.default_bin_definitions(n)
-        chk = ico.validate_bin_definitions(n, bd)
-        # exhaustive partition (no exception) and bins sum back to m_r
+        chk = ico.validate_bin_definitions(n)
+        assert isinstance(chk["warnings"], list)
         chain = _random_saw(n, n)
         if chain is None:
             continue
         cp, _ = ico.build_contact_map(chain)
         m_r = ico.contact_separation_counts(cp, n)
-        binned = ico.bin_contact_separations(m_r, n, bd)
-        assert binned["m_short"] + binned["m_medium"] + binned["m_long"] == cp.shape[0]
-        assert isinstance(chk["warnings"], list)
+        fixed = ico.bin_contact_separations_fixed(m_r, n)
+        scaled = ico.bin_contact_separations_scaled(m_r, n)
+        assert sum(fixed.values()) == cp.shape[0]
+        assert sum(scaled.values()) == cp.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +315,8 @@ def _run(nworkers, n_cycles=30, N=16, structural_stride=1, seed=7):
         N=N, Ts=Ts, steps_per_swap=30, n_cycles=n_cycles,
         model_name=HS["model_name"], params=HS["params"],
         Tref=HS["Tref"], Tscale=HS["Tscale"], seed=seed,
-        n_workers=nworkers, verbose=False, structural_stride=structural_stride,
+        n_workers=nworkers, verbose=False,
+        structural_observables=True, structural_stride=structural_stride,
     )
 
 
@@ -429,9 +430,11 @@ def test_snapshot_refuses_overwrite():
         path = os.path.join(tmp, "cfg.h5")
         w = cio.SnapshotWriter(path, n_beads=8, n_temperatures=2,
                                metadata={"run_id": "x"})
-        w.append(cycle=0, coordinates=np.zeros((2, 8, 3), dtype=np.int64),
+        straight = np.array([(i, 0, 0) for i in range(8)], dtype=np.int64)
+        coords = np.stack([straight, straight])
+        w.append(cycle=0, coordinates=coords,
                  walker_id=np.array([0, 1]), contacts=np.zeros(2),
-                 rg2_lattice=np.zeros(2), ree2_lattice=np.zeros(2))
+                 rg2_lattice=np.full(2, 5.25), ree2_lattice=np.full(2, 49.0))
         w.close()
         with pytest.raises(cio.SnapshotWriterError):
             cio.SnapshotWriter(path, n_beads=8, n_temperatures=2,

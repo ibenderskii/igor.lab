@@ -1,0 +1,17 @@
+{
+  "committed_rows": 24,
+  "n_temperatures": 4,
+  "n_beads": 44,
+  "discrepancy_counts": {
+    "stored_m_vs_recomputed": 0,
+    "mr_sum_vs_m": 0,
+    "separations_odd": 0,
+    "pair_counts_vs_binomial": 0,
+    "graph_edges_vs_m": 0,
+    "rg2_match": 0,
+    "ree2_match": 0,
+    "walker_permutation": 0,
+    "committed_rows_vs_extracted": 0
+  },
+  "all_zero": true
+}

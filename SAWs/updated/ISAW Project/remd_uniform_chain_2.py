@@ -33,7 +33,7 @@ potential rather than a temperature-independent energy:
 Accept if random() < exp(min(0, log_accept)).
 
 Usage:
-    python remd_uniform_chain.py --N 50 --nT 8 --Tmin 280 --Tmax 380 \\
+    python remd_uniform_chain_2_new.py --N 50 --nT 8 --Tmin 280 --Tmax 380 \\
         --steps-per-swap 500 --n-cycles 4000 --seed 42
 
 Output NPZ keys (distributions file)
@@ -116,21 +116,26 @@ not labeled physical heat capacity for effective polynomial b(T) models.
 
 Example commands (PowerShell)
 -----------------------------
+The canonical production script name is ``remd_uniform_chain_2_new.py``
+(``remd_uniform_chain_2.py`` is a byte-identical mirror kept for the existing
+suite/test imports).
+
 Quick test:
-    python .\\remd_uniform_chain_2.py --quick-test
+    python .\\remd_uniform_chain_2_new.py --quick-test
 
 Short structural smoke test:
-    python .\\remd_uniform_chain_2.py `
+    python .\\remd_uniform_chain_2_new.py `
       --N 30 --Tmin 280 --Tmax 360 --nT 8 `
       --steps-per-swap 50 --n-cycles 100 --n-workers 2 `
-      --diagnostics --diagnostic-trajectories --structural-stride 1 `
+      --diagnostics --diagnostic-trajectories `
+      --structural-observables --structural-stride 1 `
       --save-configurations --snapshot-stride 5 `
       --out-prefix .\\test_outputs\\remd_structural_test
 
-Offline feature extraction:
+Offline feature extraction (reads the authoritative saved coordinates):
     python .\\extract_contact_motif_features.py `
       --input .\\test_outputs\\remd_structural_test_configurations.h5 `
-      --output .\\test_outputs\\remd_structural_test_features.parquet --validate
+      --output .\\test_outputs\\remd_structural_test_features.h5 --validate
 """
 from __future__ import annotations
 
@@ -298,7 +303,11 @@ MODEL_API_VERSION = 1
 
 # Output-schema version for the distributions NPZ / run summary / snapshot files.
 # Bump when the set of stored keys or their semantics change.
-SCHEMA_VERSION = 1
+#   v2: independent fixed/scaled contour-bin schemes; move counters gain a
+#       state_changing column (null moves excluded from acceptance);
+#       diagnostics report tau_int_samples/tau_int_cycles; q stored alongside
+#       authoritative K with overflow handled.
+SCHEMA_VERSION = 2
 
 
 def get_model_contract() -> dict:
@@ -445,14 +454,24 @@ def attempt_end_move(chain, occ) -> Tuple[bool, list, set]:
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
 MOVE_NAMES = ["pivot", "crankshaft", "end"]
-# Counter columns per move type (Phase 4 move-resolved acceptance diagnostics).
-MOVE_COUNTER_COLS = ["proposed", "geometrically_valid", "metropolis_accepted"]
+# Counter columns per move type (move-resolved acceptance diagnostics).
+#   proposed            : move type selected
+#   geometrically_valid : proposal preserves lattice connectivity / self-avoidance
+#   state_changing      : proposed chain actually differs from the current chain
+#   metropolis_accepted : a STATE-CHANGING proposal accepted by Metropolis
+# A null proposal (geometrically valid but identical to the current chain) is
+# counted as proposed and geometrically_valid but NOT as state_changing and NOT
+# as a meaningful accepted move.  This prevents null moves from inflating the
+# acceptance rate and weakening move-freezing diagnostics.
+MOVE_COUNTER_COLS = [
+    "proposed", "geometrically_valid", "state_changing", "metropolis_accepted",
+]
 _N_MOVES = len(MOVE_FUNCS)
 _N_MOVE_COLS = len(MOVE_COUNTER_COLS)
 
 
 def new_move_counters() -> np.ndarray:
-    """Zeroed (n_moves, 3) integer counter block: proposed/valid/accepted."""
+    """Zeroed (n_moves, 4) counter block: proposed/valid/state_changing/accepted."""
     return np.zeros((_N_MOVES, _N_MOVE_COLS), dtype=np.int64)
 
 
@@ -462,11 +481,28 @@ def _seed_all(seed: int) -> None:
     np.random.seed(int(seed) % (2 ** 32))
 
 
-# Optional development cross-check: when ISAW_DEBUG_CONTACTS is set in the
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable.
+
+    Values "0", "false", "no", "off", "" (case-insensitive) are False; "1",
+    "true", "yes", "on" are True.  Any other value falls back to ``default``.
+    """
+    raw = _os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("0", "false", "no", "off", ""):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return default
+
+
+# Optional development cross-check: when ISAW_DEBUG_CONTACTS is truthy in the
 # environment, mc_sweep asserts state.m == contact_count(...) after every
 # accepted move.  Off by default so the expensive recount never runs in
-# production.
-_DEBUG_CONTACTS = bool(_os.environ.get("ISAW_DEBUG_CONTACTS"))
+# production.  Values like "0"/"false"/"no" explicitly disable it.
+_DEBUG_CONTACTS = _parse_bool_env("ISAW_DEBUG_CONTACTS", False)
 
 
 @dataclasses.dataclass
@@ -547,13 +583,17 @@ class Replica:
     # Scalar structural observables (every cycle).
     Rg2_traj:  list = dataclasses.field(default_factory=list)
     Ree2_traj: list = dataclasses.field(default_factory=list)
-    # Contact-map-derived structural observables (every structural_stride cycle).
+    # Contact-map-derived structural observables (every structural_stride cycle;
+    # only populated when structural observables are explicitly enabled).
+    # m_long_traj stores m_long_fixed (the fixed-scheme long count).
     m_long_traj: list = dataclasses.field(default_factory=list)
+    m_global_scaled_traj: list = dataclasses.field(default_factory=list)
     Smax_traj:   list = dataclasses.field(default_factory=list)
     largest_component_fraction_traj: list = dataclasses.field(default_factory=list)
+    # Full m_r vectors are retained ONLY when --save-m-r-trajectories is set.
     m_r_traj:    list = dataclasses.field(default_factory=list)
     structural_cycles: list = dataclasses.field(default_factory=list)
-    # Move-resolved acceptance counters: shape (n_moves, 3).
+    # Move-resolved acceptance counters: shape (n_moves, 4).
     move_counters: np.ndarray = dataclasses.field(default_factory=new_move_counters)
 
     @property
@@ -589,6 +629,14 @@ def mc_sweep(
             continue
         counters[move_idx, 1] += 1                       # geometrically valid
 
+        # A geometrically valid proposal that leaves every bead in place (e.g. a
+        # pivot rotation about the tail's own axis) is a NULL move: it is tracked
+        # but does not count as state-changing or as a meaningful accepted move.
+        # The RNG call sequence below is unchanged by this bookkeeping.
+        state_changing = chain_new != state.chain
+        if state_changing:
+            counters[move_idx, 2] += 1                   # state changing
+
         # state.m is the *old* contact count; recompute only the trial config.
         m_old = state.m
         u_old = reduced_potential(m_old, T, model_name, params, Tref, Tscale)
@@ -603,7 +651,8 @@ def mc_sweep(
             state.m     = m_new
             state.E     = energy_from_contacts(m_new, T, model_name, params, Tref, Tscale)
             replica.local_acc += 1
-            counters[move_idx, 2] += 1                   # metropolis accepted
+            if state_changing:
+                counters[move_idx, 3] += 1               # accepted (state-changing)
             if _DEBUG_CONTACTS:
                 assert state.m == int(round(contact_count(state.chain, state.occ))), (
                     "state.m out of sync with contact_count after accepted move"
@@ -700,14 +749,16 @@ def _record_scalar_observables(rep: Replica) -> tuple[float, float]:
 
 
 def _record_structural_sample(
-    rep: Replica, cycle: int, n_beads: int, bin_defs: dict,
+    rep: Replica, cycle: int, n_beads: int, save_m_r: bool = False,
 ) -> None:
     """Append contact-map-derived structural observables for one replica.
 
     Builds the contact map, verifies its count against the cached ``state.m``,
-    and stores m_long, S_max, largest-component fraction, the full m_r vector,
-    and the originating cycle index.  Raises if the recomputed count disagrees
-    with ``state.m`` (a saved contact count must never disagree with coords).
+    and stores m_long_fixed, m_global_scaled, S_max, largest-component fraction,
+    and the originating cycle index.  The full m_r vector is retained in memory
+    ONLY when ``save_m_r`` is True (it is otherwise reconstructable offline from
+    the saved coordinates, the authoritative source).  Raises if the recomputed
+    count disagrees with ``state.m``.
     """
     cp, _seps = ico.build_contact_map(rep.state.chain)
     if cp.shape[0] != int(rep.state.m):
@@ -716,14 +767,17 @@ def _record_structural_sample(
             f"state.m={rep.state.m} (lane T={rep.T}, cycle={cycle})"
         )
     m_r = ico.contact_separation_counts(cp, n_beads)
-    binned = ico.bin_contact_separations(m_r, n_beads, bin_defs)
+    fixed = ico.bin_contact_separations_fixed(m_r, n_beads)
+    scaled = ico.bin_contact_separations_scaled(m_r, n_beads)
     graph = ico.contact_graph_summary(cp, n_beads)
-    rep.m_long_traj.append(int(binned["m_long"]))
+    rep.m_long_traj.append(int(fixed["m_long_fixed"]))
+    rep.m_global_scaled_traj.append(int(scaled["m_global_scaled"]))
     rep.Smax_traj.append(int(graph["largest_component_vertices"]))
     rep.largest_component_fraction_traj.append(
         float(graph["largest_component_fraction_of_N"])
     )
-    rep.m_r_traj.append(m_r.astype(np.int32))
+    if save_m_r:
+        rep.m_r_traj.append(m_r.astype(np.int32))
     rep.structural_cycles.append(int(cycle))
 
 
@@ -753,7 +807,9 @@ def run_remd(
     timing: bool = False,
     diagnostics: bool = False,
     diag_store: dict | None = None,
+    structural_observables: bool = False,
     structural_stride: int = 1,
+    save_m_r: bool = False,
     bin_defs: dict | None = None,
     snapshot_writer: "SnapshotWriter | None" = None,
     snapshot_stride: int = 1,
@@ -783,10 +839,17 @@ def run_remd(
         swap_props — (nT-1,) array: swap proposals per adjacent pair
         swap_accs  — (nT-1,) array: swap acceptances per adjacent pair
     """
-    if seed is not None:
-        _seed_all(seed)
+    # Explicit seed=None behavior (serial and multiprocessing): draw one fresh
+    # nondeterministic base seed, seed all RNGs with it, and use it as the base
+    # for deterministic per-cycle/per-lane worker seeds.  This makes both modes
+    # well-defined; previously seed=None left the global RNG unseeded.
+    if seed is None:
+        seed = random.SystemRandom().randrange(1, 2 ** 31)
+    _seed_all(seed)
 
     structural_stride = _validate_stride("structural_stride", structural_stride)
+    if save_m_r and not structural_observables:
+        raise ValueError("save_m_r requires structural_observables to be enabled")
     save_configurations = snapshot_writer is not None
     if save_configurations:
         snapshot_stride = _validate_stride("snapshot_stride", snapshot_stride)
@@ -884,7 +947,9 @@ def run_remd(
             t_swap_total += t2 - t1
 
             # --- observable recording (main process) ---------------------------
-            do_structural = (cycle % structural_stride) == 0
+            do_structural = (
+                structural_observables and (cycle % structural_stride) == 0
+            )
             do_snapshot = (
                 save_configurations
                 and cycle >= snapshot_start_cycle
@@ -900,7 +965,7 @@ def run_remd(
             for k, rep in enumerate(replicas):
                 rg2, ree2 = _record_scalar_observables(rep)
                 if do_structural:
-                    _record_structural_sample(rep, cycle, n_beads, bin_defs)
+                    _record_structural_sample(rep, cycle, n_beads, save_m_r)
                 if do_snapshot:
                     snap_coords[k] = np.asarray(rep.state.chain, dtype=np.int64)
                     snap_contacts[k] = int(rep.state.m)
@@ -1140,6 +1205,7 @@ DEFAULT_DIAG_THRESHOLDS = {
     "max_drift": 1.0,            # warn if |early-late drift| / std > this
     "min_swap_rate": 0.05,       # warn if any adjacent swap rate < this
     "min_structural_samples": 20,  # warn if post-burn-in structural samples < this
+    "min_state_changing_move_rate": 0.01,  # warn if state-changing accept rate < this
 }
 DEFAULT_DIAG_N_BLOCKS = 5
 
@@ -1359,6 +1425,7 @@ def compute_run_diagnostics(
         ns = len(rep.m_long_traj)
         ss = _post_burnin_slice(ns, burnin_frac)
         m_long = np.asarray(rep.m_long_traj[ss:], dtype=float)
+        m_global = np.asarray(rep.m_global_scaled_traj[ss:], dtype=float)
         Smax = np.asarray(rep.Smax_traj[ss:], dtype=float)
         lcf = np.asarray(rep.largest_component_fraction_traj[ss:], dtype=float)
         struct_cycles = np.asarray(rep.structural_cycles[ss:], dtype=int)
@@ -1366,25 +1433,48 @@ def compute_run_diagnostics(
             int(np.median(np.diff(struct_cycles)))
             if struct_cycles.size >= 2 else 1
         )
+        # structural_burnin_start_index is a sample index into the structural
+        # trajectory; structural_burnin_start_cycle is the originating REMD cycle.
+        struct_start_cycle = (
+            int(rep.structural_cycles[ss])
+            if ns > 0 and ss < ns else None
+        )
         entry = {
             "temperature_index": int(i),
             "temperature": float(Ts[i]) if i < Ts.size else float("nan"),
             "n_post_burnin": int(C.size),
             "n_post_burnin_structural": int(m_long.size),
             "structural_cycle_spacing": struct_spacing,
+            "structural_burnin_start_index": int(ss),
+            "structural_burnin_start_cycle": struct_start_cycle,
         }
-        for name, arr in (
-            ("contacts", C), ("rg", Rg), ("rg2", Rg2), ("ree2", Ree2),
-            ("m_long", m_long), ("smax", Smax),
-            ("largest_component_fraction", lcf), ("energy", E),
+        # spacing: per-cycle observables have cycle-spacing 1; structural
+        # observables (sampled at structural_stride) use struct_spacing so that
+        # tau_int_cycles is expressed in REMD cycles, not in sample steps.
+        for name, arr, spacing in (
+            ("contacts", C, 1), ("rg", Rg, 1), ("rg2", Rg2, 1),
+            ("ree2", Ree2, 1), ("energy", E, 1),
+            ("m_long_fixed", m_long, struct_spacing),
+            ("m_global_scaled", m_global, struct_spacing),
+            ("smax", Smax, struct_spacing),
+            ("largest_component_fraction", lcf, struct_spacing),
         ):
             ac = integrated_autocorr_time(arr)
             dr = early_late_drift(arr)
             bl = block_mean_stability(arr, n_blocks)
+            tau_samples = ac["tau_int"]
+            tau_cycles = (
+                tau_samples * float(spacing)
+                if np.isfinite(tau_samples) else float("nan")
+            )
             entry[name] = {
                 "mean": float(np.nanmean(arr)) if arr.size else float("nan"),
                 "std": float(np.nanstd(arr, ddof=0)) if arr.size else float("nan"),
-                "tau_int": ac["tau_int"],
+                # tau_int kept as a compatibility alias (== tau_int_samples).
+                "tau_int": tau_samples,
+                "tau_int_samples": tau_samples,
+                "tau_int_cycles": tau_cycles,
+                "sample_cycle_spacing": int(spacing),
                 "ess": ac["ess"],
                 "n_samples": ac["n_samples"],
                 "acf_method": ac["method"],
@@ -1396,6 +1486,8 @@ def compute_run_diagnostics(
                 "block_mean_range_over_std": bl["block_mean_range_over_std"],
                 "block_means": bl["block_means"],
             }
+        # Backward-compatible alias: keep "m_long" pointing at m_long_fixed.
+        entry["m_long"] = entry["m_long_fixed"]
         lane_conv.append(entry)
 
     wti = np.asarray(walker_temp_index)
@@ -1437,9 +1529,11 @@ def compute_run_diagnostics(
         vals = _obs_esss(name)
         struct_min_ess[name] = float(min(vals)) if vals else float("nan")
     key_struct = ("contacts", "rg2", "m_long", "smax")
-    key_struct_ess = [
-        v for name in key_struct for v in [min(_obs_esss(name))] if _obs_esss(name)
-    ]
+    key_struct_ess = []
+    for name in key_struct:
+        vals = _obs_esss(name)
+        if vals:
+            key_struct_ess.append(min(vals))
     min_ess_key_structural = float(min(key_struct_ess)) if key_struct_ess else float("nan")
     n_struct_samples = [lane["n_post_burnin_structural"] for lane in lane_conv]
     min_struct_samples = int(min(n_struct_samples)) if n_struct_samples else 0
@@ -1533,8 +1627,12 @@ def compute_run_diagnostics(
               f"minimum post-burn-in structural samples {min_struct_samples} < "
               f"{min_struct_thr}",
               int(min_struct_samples), min_struct_thr)
-    # Move-freezing in collapsed lanes (uses the per-move counters).
-    for w in detect_move_freezing(replicas, Ts):
+    # Local-move freezing (state-changing acceptance, null moves excluded).
+    for w in detect_local_move_freezing(
+        replicas, Ts,
+        float(thr.get("min_state_changing_move_rate",
+                      DEFAULT_DIAG_THRESHOLDS["min_state_changing_move_rate"])),
+    ):
         warnings.append(w)
 
     return {
@@ -1555,6 +1653,7 @@ def compute_run_diagnostics(
 
 def save_results_csv(results: list[dict], out_prefix: str) -> str:
     path = f"{out_prefix}_results.csv"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     keys = [
         # Existing columns (unchanged order for backward compatibility).
         "T", "E_mean", "E_std", "C_mean", "C_std",
@@ -1583,6 +1682,7 @@ def save_swap_csv(
     out_prefix: str,
 ) -> str:
     path = f"{out_prefix}_swap_rates.csv"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["pair", "T_lo", "T_hi", "proposals", "acceptances", "rate"])
@@ -1596,72 +1696,92 @@ def save_swap_csv(
 
 
 MOVE_ACCEPTANCE_CSV_COLUMNS = [
+    # Existing leading columns (kept for backward compatibility), then new ones
+    # appended.  metropolis_accepted now counts STATE-CHANGING accepted moves.
     "temperature_index", "temperature", "move_type",
     "proposed", "geometrically_valid", "metropolis_accepted",
     "a_geometry", "a_metropolis", "a_total",
+    "state_changing", "a_state_changing",
 ]
 
 
 def save_move_acceptance_csv(
     replicas: list[Replica], Ts: np.ndarray, out_prefix: str,
 ) -> str:
-    """Per-lane, per-move-type acceptance breakdown.
+    """Per-lane, per-move-type acceptance breakdown (null moves excluded from
+    state-changing acceptance).
 
-    a_geometry  = valid / proposed
-    a_metropolis = accepted / valid
-    a_total     = accepted / proposed
+    a_geometry        = geometrically_valid / proposed
+    a_state_changing  = state_changing / proposed
+    a_metropolis      = accepted / state_changing   (accepted == state-changing accepted)
+    a_total           = accepted / proposed
     """
     path = f"{out_prefix}_move_acceptance.csv"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(MOVE_ACCEPTANCE_CSV_COLUMNS)
         for i, rep in enumerate(replicas):
             counters = np.asarray(rep.move_counters, dtype=np.int64)
             for mi, mname in enumerate(MOVE_NAMES):
-                prop, valid, acc = (int(counters[mi, 0]), int(counters[mi, 1]),
-                                    int(counters[mi, 2]))
+                prop = int(counters[mi, 0])
+                valid = int(counters[mi, 1])
+                state_changing = int(counters[mi, 2])
+                acc = int(counters[mi, 3])
                 a_geom = (valid / prop) if prop > 0 else float("nan")
-                a_met = (acc / valid) if valid > 0 else float("nan")
+                a_state = (state_changing / prop) if prop > 0 else float("nan")
+                a_met = (acc / state_changing) if state_changing > 0 else float("nan")
                 a_tot = (acc / prop) if prop > 0 else float("nan")
                 w.writerow([
                     i, float(Ts[i]), mname, prop, valid, acc,
                     f"{a_geom:.6f}", f"{a_met:.6f}", f"{a_tot:.6f}",
+                    state_changing, f"{a_state:.6f}",
                 ])
     print(f"Saved {path}")
     return path
 
 
-def detect_move_freezing(
-    replicas: list[Replica], Ts: np.ndarray, min_total_acc_rate: float = 0.01,
+def detect_local_move_freezing(
+    replicas: list[Replica], Ts: np.ndarray,
+    min_state_changing_rate: float = 0.01,
 ) -> list[dict]:
-    """Flag lanes where the local move set is nearly frozen (collapsed lanes).
+    """Flag lanes where state-changing local moves are nearly frozen.
 
-    Returns a list of structured warnings (lowest-T lanes are most at risk).
+    Uses STATE-CHANGING accepted moves / proposed (null acceptances excluded).
+    A frozen lane is not assumed to be in the collapsed phase; it is only a
+    local-move-mixing warning.
     """
     warnings = []
     for i, rep in enumerate(replicas):
         counters = np.asarray(rep.move_counters, dtype=np.int64)
         prop = int(counters[:, 0].sum())
-        acc = int(counters[:, 2].sum())
+        acc = int(counters[:, 3].sum())   # state-changing accepted
         rate = (acc / prop) if prop > 0 else float("nan")
-        if prop > 0 and rate < min_total_acc_rate:
+        if prop > 0 and rate < min_state_changing_rate:
             warnings.append({
-                "type": "move_freezing",
+                "type": "local_move_freezing",
                 "temperature_index": int(i),
                 "temperature": float(Ts[i]),
-                "total_acceptance_rate": float(rate),
-                "threshold": float(min_total_acc_rate),
+                "state_changing_acceptance_rate": float(rate),
+                "threshold": float(min_state_changing_rate),
                 "message": (
-                    f"lane T={float(Ts[i]):.3g} total move acceptance "
-                    f"{rate:.4f} < {min_total_acc_rate}"
+                    f"lane T={float(Ts[i]):.3g} state-changing move acceptance "
+                    f"{rate:.4f} < {min_state_changing_rate} (local move freezing; "
+                    f"not necessarily collapsed phase)"
                 ),
             })
     return warnings
 
 
+# Backward-compatible alias.
+def detect_move_freezing(replicas, Ts, min_total_acc_rate: float = 0.01):
+    return detect_local_move_freezing(replicas, Ts, min_total_acc_rate)
+
+
 def save_distributions(dist: dict, out_prefix: str) -> str:
     """Save distributions NPZ with canonical keys and fitting-script aliases."""
     path = f"{out_prefix}_distributions.npz"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **dist)
     print(f"Saved {path}")
     return path
@@ -1682,7 +1802,8 @@ def save_diagnostics_json(diagnostics: dict, out_prefix: str) -> str:
 
 CONVERGENCE_CSV_COLUMNS = [
     "temperature_index", "temperature", "observable", "n_samples", "mean", "std",
-    "tau_int", "ess", "drift", "drift_in_std", "block_mean_std",
+    "tau_int", "tau_int_samples", "tau_int_cycles", "sample_cycle_spacing",
+    "ess", "drift", "drift_in_std", "block_mean_std",
     "block_mean_range_over_std", "acf_method",
 ]
 
@@ -1693,14 +1814,18 @@ def save_convergence_csv(diagnostics: dict, out_prefix: str) -> str:
         w = csv.writer(fh)
         w.writerow(CONVERGENCE_CSV_COLUMNS)
         for lane in diagnostics["lane_convergence"]:
-            for obs in ("contacts", "rg", "rg2", "ree2", "m_long", "smax",
+            for obs in ("contacts", "rg", "rg2", "ree2", "m_long_fixed",
+                        "m_global_scaled", "smax",
                         "largest_component_fraction", "energy"):
                 if obs not in lane:
                     continue
                 d = lane[obs]
                 w.writerow([
                     lane["temperature_index"], lane["temperature"], obs,
-                    d["n_samples"], d["mean"], d["std"], d["tau_int"], d["ess"],
+                    d["n_samples"], d["mean"], d["std"], d["tau_int"],
+                    d.get("tau_int_samples", d["tau_int"]),
+                    d.get("tau_int_cycles", d["tau_int"]),
+                    d.get("sample_cycle_spacing", 1), d["ess"],
                     d["drift"], d["drift_in_std"], d["block_mean_std"],
                     d["block_mean_range_over_std"], d["acf_method"],
                 ])
@@ -1768,16 +1893,26 @@ def save_diagnostic_trajectories_npz(
         walker_temp_index_post (n_post, n_walkers)
 
     Structural (coarser-stride) trajectories use a separate length n_struct:
-        m_long_post                    (nT, n_struct)
+        m_long_post                    (nT, n_struct)   (== m_long_fixed)
+        m_global_scaled_post           (nT, n_struct)
         smax_post                      (nT, n_struct)
         largest_component_fraction_post (nT, n_struct)
         structural_sample_cycles       (n_struct,)   originating cycle indices
-        structural_burnin_start_cycle  scalar (sample-index burn-in start)
+        structural_burnin_start_index  scalar (sample-index burn-in start)
+        structural_burnin_start_cycle  scalar (originating REMD cycle, -1 if none)
+        structural_stride              scalar
+    When m_r trajectories were retained (--save-m-r-trajectories), the full
+    contour-separation vectors are persisted (not merely kept in memory):
+        m_r_post                       (nT, n_struct, n_beads)  compact int dtype
+        m_r_index_definition           string
+        fixed_bin_definitions          JSON string
+        scaled_bin_definitions         JSON string
 
     The existing arrays are preserved; new arrays are added.  Scalar and
     structural arrays are NOT index-aligned because they use different strides.
     """
     path = f"{out_prefix}_diagnostic_trajectories.npz"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     n_cycles = max((len(r.C_traj) for r in replicas), default=0)
     s = _post_burnin_slice(n_cycles, burnin_frac)
     C = np.array([np.asarray(r.C_traj[s:], dtype=np.float32) for r in replicas])
@@ -1798,6 +1933,8 @@ def save_diagnostic_trajectories_npz(
     ss = _post_burnin_slice(ns, burnin_frac)
     m_long = np.array([np.asarray(r.m_long_traj[ss:], dtype=np.float32)
                        for r in replicas])
+    m_global = np.array([np.asarray(r.m_global_scaled_traj[ss:], dtype=np.float32)
+                         for r in replicas])
     smax = np.array([np.asarray(r.Smax_traj[ss:], dtype=np.float32)
                      for r in replicas])
     lcf = np.array([np.asarray(r.largest_component_fraction_traj[ss:],
@@ -1806,10 +1943,17 @@ def save_diagnostic_trajectories_npz(
         np.asarray(replicas[0].structural_cycles[ss:], dtype=np.int64)
         if replicas else np.empty(0, dtype=np.int64)
     )
+    struct_start_cycle = (
+        int(replicas[0].structural_cycles[ss])
+        if replicas and ss < len(replicas[0].structural_cycles) else -1
+    )
+    struct_spacing = (
+        int(np.median(np.diff(struct_cycles))) if struct_cycles.size >= 2 else 1
+    )
     wti = np.asarray(walker_temp_index)
     wti_post = wti[s:].astype(np.int16) if wti.ndim == 2 else wti
-    np.savez_compressed(
-        path,
+
+    payload = dict(
         Ts=np.asarray(Ts, dtype=float),
         burnin_start_cycle=int(s),
         contacts_post=C,
@@ -1818,12 +1962,38 @@ def save_diagnostic_trajectories_npz(
         rg2_post=Rg2,
         ree2_post=Ree2,
         m_long_post=m_long,
+        m_global_scaled_post=m_global,
         smax_post=smax,
         largest_component_fraction_post=lcf,
         structural_sample_cycles=struct_cycles,
-        structural_burnin_start_cycle=int(ss),
+        structural_burnin_start_index=int(ss),
+        structural_burnin_start_cycle=int(struct_start_cycle),
+        structural_stride=int(struct_spacing),
         walker_temp_index_post=wti_post,
     )
+
+    # Persist full m_r vectors only if they were retained.
+    if replicas and len(replicas[0].m_r_traj) > 0:
+        n_beads = int(len(replicas[0].m_r_traj[0]))
+        mr_max = 0
+        for r in replicas:
+            for v in r.m_r_traj[ss:]:
+                mr_max = max(mr_max, int(np.asarray(v).max(initial=0)))
+        mr_dtype = np.uint8 if mr_max <= 255 else (
+            np.uint16 if mr_max <= 65535 else np.int32)
+        m_r_post = np.array(
+            [np.asarray(r.m_r_traj[ss:], dtype=mr_dtype) for r in replicas]
+        )
+        payload["m_r_post"] = m_r_post
+        payload["m_r_index_definition"] = (
+            "m_r_post[lane, sample, r] = number of contacts with contour "
+            "separation r (0 <= r < n_beads); even r are zero; sum_r == m"
+        )
+        payload["fixed_bin_definitions"] = json.dumps(ico.FIXED_BIN_DEFINITIONS)
+        payload["scaled_bin_definitions"] = json.dumps(ico.SCALED_BIN_DEFINITIONS)
+        payload["n_beads"] = int(n_beads)
+
+    np.savez_compressed(path, **payload)
     print(f"Saved {path}")
     return path
 
@@ -2597,7 +2767,8 @@ def run_structural_quick_test() -> None:
         reps, _sp, _sa = run_remd(
             N=16, Ts=Ts, steps_per_swap=30, n_cycles=24,
             model_name="hs", params=hs_params, Tref=Tref, Tscale=Tscale,
-            seed=9, n_workers=n_workers, verbose=False, structural_stride=2,
+            seed=9, n_workers=n_workers, verbose=False,
+            structural_observables=True, structural_stride=2,
         )
         for rep in reps:
             assert rep.state.m == int(round(contact_count(rep.state.chain,
@@ -2608,7 +2779,9 @@ def run_structural_quick_test() -> None:
             assert all(math.isfinite(v) for v in rep.Rg2_traj)
             assert all(math.isfinite(v) for v in rep.Ree2_traj)
             c = np.asarray(rep.move_counters)
-            assert np.all(c[:, 2] <= c[:, 1]) and np.all(c[:, 1] <= c[:, 0])
+            # accepted <= state_changing <= valid <= proposed
+            assert np.all(c[:, 3] <= c[:, 2]) and np.all(c[:, 2] <= c[:, 1])
+            assert np.all(c[:, 1] <= c[:, 0])
             # contact map count matches state.m for the final config.
             cp, _ = ico.build_contact_map(rep.state.chain)
             assert cp.shape[0] == rep.state.m
@@ -3043,7 +3216,7 @@ def load_fit_summary_json(path: str) -> dict:
             raise ValueError(
                 f"fit_summary.json {path!r} model_api_version "
                 f"{api_version_int} is newer than supported version "
-                f"{MODEL_API_VERSION}. Update remd_uniform_chain_new.py."
+                f"{MODEL_API_VERSION}. Update remd_uniform_chain_2_new.py."
             )
 
     required = ("model", "params", "Tref", "Tscale")
@@ -3348,7 +3521,17 @@ def temperature_bias_arrays(
     b = np.array([reduced_bias(model_name, params, float(T), Tref, Tscale)
                   for T in Ts], dtype=float)
     K = -b
-    q = np.exp(K)
+    # K is authoritative.  q = exp(K) can overflow to +inf for large couplings;
+    # keep the inf as a sentinel (serialized as null in JSON via _json_safe) and
+    # warn rather than silently producing a misleading finite value.
+    with np.errstate(over="ignore"):
+        q = np.exp(K)
+    if not np.all(np.isfinite(q)):
+        n_overflow = int(np.count_nonzero(~np.isfinite(q)))
+        print(
+            f"  [warning] contact weight q=exp(K) overflowed for {n_overflow} "
+            f"temperature(s); K is authoritative, q stored as inf/null."
+        )
     return {
         "reduced_bias_by_temperature": b,
         "coupling_K_by_temperature": K,
@@ -3387,6 +3570,47 @@ def attach_structural_metadata(
     )
     dist["structural_bin_definitions"] = json.dumps(bin_defs)
     return dist
+
+
+def _git_commit() -> str:
+    """Best-effort current git commit hash, or 'unknown'."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_os.path.dirname(_os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or "unknown"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _file_sha256(path: str | None) -> str:
+    """SHA-256 of a file, or 'unknown' when unavailable."""
+    if not path:
+        return "unknown"
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "unknown"
+
+
+def _package_versions() -> dict:
+    versions = {"numpy_version": np.__version__}
+    try:
+        import h5py as _h5
+        versions["h5py_version"] = _h5.__version__
+    except Exception:
+        versions["h5py_version"] = "unknown"
+    return versions
 
 
 def _json_safe(obj):
@@ -3598,23 +3822,51 @@ def main() -> None:
                     default=DEFAULT_DIAG_THRESHOLDS["min_structural_samples"],
                     dest="diag_min_structural_samples",
                     help="warn if post-burn-in structural samples is below this")
+    ap.add_argument("--diag-min-state-changing-move-rate", type=float,
+                    default=DEFAULT_DIAG_THRESHOLDS["min_state_changing_move_rate"],
+                    dest="diag_min_state_changing_move_rate",
+                    help=("warn if a lane's state-changing local-move acceptance "
+                          "rate (null moves excluded) is below this"))
 
-    # --- Structural observables (Phase 3) -----------------------------------
+    # --- Structural observables (opt-in; off by default) --------------------
+    ap.add_argument(
+        "--structural-observables", action="store_true",
+        dest="structural_observables",
+        help=(
+            "Enable online contact-map-derived structural observables "
+            "(m_long_fixed, m_global_scaled, S_max, largest-component fraction) "
+            "recorded every --structural-stride cycles. OFF by default: ordinary "
+            "REMD records only cheap scalars (m, Rg, Rg2, Ree2) every cycle and "
+            "leaves full motif analysis to the offline extractor, which reads "
+            "the authoritative saved coordinates."
+        ),
+    )
     ap.add_argument(
         "--structural-stride", type=int, default=1, dest="structural_stride",
         help=(
-            "Record contact-map-derived structural observables (m_r, m_long, "
-            "S_max, largest-component fraction) every this many cycles. Scalar "
-            "m/Rg/Rg2/Ree2 are always recorded every cycle. Default 1."
+            "Record contact-map-derived structural observables every this many "
+            "cycles (requires --structural-observables). A value of 0 disables "
+            "structural observables. Default 1."
+        ),
+    )
+    ap.add_argument(
+        "--save-m-r-trajectories", action="store_true", dest="save_m_r_trajectories",
+        help=(
+            "Retain and persist the full per-sample m_r contour-separation "
+            "vectors to the diagnostic-trajectories NPZ (requires "
+            "--structural-observables and --diagnostic-trajectories). Off by "
+            "default to avoid retaining large m_r histories in memory; the saved "
+            "coordinates remain the authoritative source for offline motifs."
         ),
     )
     ap.add_argument(
         "--structural-bins-json", type=str, default=None,
         dest="structural_bins_json",
         help=(
-            "Path to a JSON file overriding the contour-separation bin "
-            "definitions (keys: short.r_min, short.r_max, long.r_over_n_min). "
-            "Default: short 3<=r<=9, long r/n_beads>=1/3, medium otherwise."
+            "Path to a JSON file overriding the fixed/scaled contour-separation "
+            "bin definitions (keys: fixed.short_fixed.r_min/r_max, "
+            "fixed.medium_fixed.r_min, fixed.long_threshold_fixed, "
+            "scaled.local_max_ratio, scaled.meso_max_ratio)."
         ),
     )
 
@@ -3668,8 +3920,22 @@ def main() -> None:
         raise ValueError("--diagnostic-trajectories requires --diagnostics")
     if args.diagnostics and args.diag_n_blocks < 1:
         raise ValueError("--diag-n-blocks must be >= 1")
-    if args.structural_stride < 1:
-        raise ValueError("--structural-stride must be >= 1")
+    if args.structural_stride < 0:
+        raise ValueError("--structural-stride must be >= 0 (0 disables)")
+    # --structural-stride 0 disables structural observables entirely.
+    structural_observables = bool(args.structural_observables) and args.structural_stride >= 1
+    structural_stride_eff = max(1, int(args.structural_stride))
+    if args.save_m_r_trajectories:
+        if not structural_observables:
+            raise ValueError(
+                "--save-m-r-trajectories requires --structural-observables and "
+                "--structural-stride >= 1"
+            )
+        if not args.diagnostic_trajectories:
+            raise ValueError(
+                "--save-m-r-trajectories requires --diagnostic-trajectories "
+                "(m_r vectors are persisted into that NPZ)"
+            )
     if args.save_configurations:
         if args.snapshot_stride < 1:
             raise ValueError("--snapshot-stride must be >= 1")
@@ -3677,6 +3943,12 @@ def main() -> None:
             raise ValueError("--snapshot-start-cycle must be >= 0")
         if args.snapshot_flush_interval < 1:
             raise ValueError("--snapshot-flush-interval must be >= 1")
+        if args.snapshot_start_cycle >= args.n_cycles:
+            raise ValueError(
+                f"--snapshot-start-cycle ({args.snapshot_start_cycle}) >= "
+                f"--n-cycles ({args.n_cycles}) would write an empty snapshot "
+                f"file; lower the start cycle or omit --save-configurations."
+            )
         if not cio.h5py_available():
             raise RuntimeError(
                 "--save-configurations requires the 'h5py' package, which is "
@@ -3754,19 +4026,23 @@ def main() -> None:
     elif model_name == "tc_scale":
         print(f"Tc = {model_params[1]:.8g}")
 
-    # Contour-separation bin definitions (default or JSON override).
-    bin_defs = ico.default_bin_definitions(int(args.N))
+    # Contour-separation bin definitions (two independent schemes; optional
+    # JSON override of either).
+    fixed_defs = dict(ico.FIXED_BIN_DEFINITIONS)
+    scaled_defs = dict(ico.SCALED_BIN_DEFINITIONS)
     if args.structural_bins_json is not None:
         with open(args.structural_bins_json, encoding="utf-8") as fh:
             override = json.load(fh)
-        for key in ("short", "long"):
-            if key in override:
-                bin_defs.setdefault(key, {}).update(override[key])
-        if "min_separation" in override:
-            bin_defs["min_separation"] = override["min_separation"]
-    bin_check = ico.validate_bin_definitions(int(args.N), bin_defs)
+        if "fixed" in override:
+            fixed_defs.update(override["fixed"])
+        if "scaled" in override:
+            scaled_defs.update(override["scaled"])
+    bin_check = ico.validate_bin_definitions(int(args.N), fixed_defs, scaled_defs)
     for msg in bin_check["warnings"]:
         print(f"  [bin warning] {msg}")
+    bin_defs = ico.project_bin_definitions(int(args.N))
+    bin_defs["fixed"] = fixed_defs
+    bin_defs["scaled"] = scaled_defs
 
     # Optional streaming coordinate-snapshot writer (opt-in).
     snapshot_writer = None
@@ -3777,7 +4053,9 @@ def main() -> None:
             if args.configuration_path is not None
             else f"{args.out_prefix}_configurations.h5"
         )
+        import socket as _socket
         snap_meta = {
+            "schema_version": int(cio.SNAPSHOT_SCHEMA_VERSION),
             "run_id": Path(args.out_prefix).name,
             "n_beads": int(args.N),
             "n_steps": int(args.N) - 1,
@@ -3788,12 +4066,30 @@ def main() -> None:
             "Tref": float(Tref),
             "Tscale": float(Tscale),
             "temperatures": [float(t) for t in Ts],
+            "temperature_source": temp_source,
             "rg_scale": float(args.rg_scale),
+            "steps_per_swap": int(args.steps_per_swap),
+            "n_cycles": int(args.n_cycles),
+            "burnin_frac": float(args.burnin_frac),
+            "n_workers": int(args.n_workers),
+            "structural_observables_enabled": bool(structural_observables),
+            "structural_stride": int(structural_stride_eff),
+            "snapshot_stride": int(args.snapshot_stride),
+            "snapshot_start_cycle": int(args.snapshot_start_cycle),
+            "snapshot_flush_interval": int(args.snapshot_flush_interval),
+            "fixed_bin_definitions": json.dumps(fixed_defs),
+            "scaled_bin_definitions": json.dumps(scaled_defs),
             "structural_bin_definitions": bin_defs,
             "command_line": " ".join(_sys.argv),
             "python_version": _sys.version.split()[0],
+            "hostname": _socket.gethostname(),
+            "git_commit": _git_commit(),
             "start_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "end_time": "unknown",
+            "input_fit_summary_path": str(fit_summary_json) if fit_summary_json else "unknown",
+            "input_fit_summary_sha256": _file_sha256(fit_summary_json),
         }
+        snap_meta.update(_package_versions())
         snap_meta.update(
             {k: [float(v) for v in arr] for k, arr in
              temperature_bias_arrays(Ts, model_name, model_params,
@@ -3821,12 +4117,20 @@ def main() -> None:
             timing=args.timing,
             diagnostics=args.diagnostics,
             diag_store=diag_store,
-            structural_stride=int(args.structural_stride),
+            structural_observables=structural_observables,
+            structural_stride=structural_stride_eff,
+            save_m_r=bool(args.save_m_r_trajectories),
             bin_defs=bin_defs,
             snapshot_writer=snapshot_writer,
             snapshot_stride=int(args.snapshot_stride),
             snapshot_start_cycle=int(args.snapshot_start_cycle),
         )
+        # Mark the snapshot file complete ONLY after run_remd returns normally.
+        if snapshot_writer is not None:
+            snapshot_writer.update_metadata({
+                "end_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            })
+            snapshot_writer.mark_complete()
     finally:
         if snapshot_writer is not None:
             snapshot_writer.close()
@@ -3873,13 +4177,14 @@ def main() -> None:
         dist,
         Ts=Ts, model_name=model_name, params=model_params,
         Tref=Tref, Tscale=Tscale,
-        structural_stride=int(args.structural_stride),
+        structural_stride=int(structural_stride_eff),
         bin_defs=bin_defs,
         save_configurations=bool(args.save_configurations),
         configuration_path=configuration_path,
         snapshot_stride=int(args.snapshot_stride),
         snapshot_start_cycle=int(args.snapshot_start_cycle),
     )
+    dist["structural_observables_enabled"] = bool(structural_observables)
 
     results_path = save_results_csv(results, args.out_prefix)
     swap_path = save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
@@ -3893,8 +4198,11 @@ def main() -> None:
     }
     if args.save_configurations:
         output_files["configuration_hdf5"] = configuration_path
-    # Warn about move freezing in collapsed lanes (independent of --diagnostics).
-    for w in detect_move_freezing(replicas, Ts):
+    # Warn about local-move freezing (state-changing acceptance; null moves
+    # excluded). A frozen lane is not assumed to be collapsed.
+    for w in detect_local_move_freezing(
+        replicas, Ts, float(args.diag_min_state_changing_move_rate)
+    ):
         print(f"  [move warning] {w['message']}")
 
     # --- Optional diagnostics (computed/saved separately from canonical output) -
@@ -3909,6 +4217,7 @@ def main() -> None:
             "max_drift": args.diag_max_drift,
             "min_swap_rate": args.diag_min_swap_rate,
             "min_structural_samples": args.diag_min_structural_samples,
+            "min_state_changing_move_rate": args.diag_min_state_changing_move_rate,
         }
         walker_temp_index = diag_store.get("walker_temp_index")
         if walker_temp_index is None:
@@ -3988,8 +4297,12 @@ def main() -> None:
         "burnin_frac": float(args.burnin_frac),
         "rg_bins": int(args.rg_bins),
         "rg_scale": float(args.rg_scale),
-        "structural_stride": int(args.structural_stride),
+        "structural_observables_enabled": bool(structural_observables),
+        "structural_stride": int(structural_stride_eff),
+        "save_m_r_trajectories": bool(args.save_m_r_trajectories),
         "structural_bin_definitions": bin_defs,
+        "git_commit": _git_commit(),
+        "diag_min_state_changing_move_rate": float(args.diag_min_state_changing_move_rate),
         "save_configurations": bool(args.save_configurations),
         "configuration_path": configuration_path,
         "snapshot_stride": int(args.snapshot_stride),

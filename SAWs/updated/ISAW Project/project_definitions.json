@@ -1,0 +1,82 @@
+{
+  "definitions_version": "1.0.0",
+  "created_date": "2026-06-29",
+  "description": "Frozen, single-source definitions for the 3D ISAW contact-motif analysis. Code must read fixed/scaled bin and graph definitions from here (or from the matching constants in isaw_contact_observables.py, which mirror this file).",
+
+  "chain_length_convention": {
+    "N": "number of beads (chain length)",
+    "n_beads": "N",
+    "n_steps": "N - 1",
+    "note": "Every output file records both n_beads and n_steps to prevent off-by-one errors."
+  },
+
+  "contact_definition": {
+    "contact_indicator": "Delta_ij = 1 when beads i and j occupy nearest-neighbour lattice sites and j - i > 1; else 0",
+    "total_contact_number": "m = sum_{i<j, j-i>1} Delta_ij",
+    "counting_rule": "each unordered nonbonded nearest-neighbour pair counted exactly once",
+    "minimum_contour_separation": 3,
+    "parity_constraint": "all valid contact contour separations r = j - i are odd on the simple cubic lattice",
+    "manhattan_distance": 1
+  },
+
+  "pair_topology_definitions": {
+    "canonicalization": "each contact sorted to (i, j) with i < j before comparison; result symmetric under swapping the two contacts",
+    "priority": "shared_endpoint takes priority; with four distinct endpoints exactly one of disjoint/nested/interleaved applies",
+    "shared_endpoint": "the two contacts share at least one bead index",
+    "disjoint": "i<j<k<l or k<l<i<j",
+    "nested": "i<k<l<j or k<i<j<l",
+    "interleaved": "i<k<j<l or k<i<l<j",
+    "exhaustiveness": "sum over the four exclusive classes equals C(m,2)"
+  },
+
+  "fixed_bin_definitions": {
+    "scheme": "fixed",
+    "short_fixed": {"r_min": 3, "r_max": 9},
+    "medium_fixed": {"r_min": 11},
+    "long_threshold_fixed": 15,
+    "labels": ["m_short_fixed", "m_medium_fixed", "m_long_fixed"],
+    "rationale": "long threshold is a fixed odd separation (15), not floor(N/3), so no class is empty for N=30 or N=44",
+    "membership_N30": {"short_fixed": [3,5,7,9], "medium_fixed": [11,13], "long_fixed": [15,17,19,21,23,25,27,29]},
+    "membership_N44": {"short_fixed": [3,5,7,9], "medium_fixed": [11,13], "long_fixed": [15,17,19,21,23,25,27,29,31,33,35,37,39,41,43]}
+  },
+
+  "scaled_bin_definitions": {
+    "scheme": "scaled",
+    "local_scaled": "r/N < 0.10",
+    "mesoscopic_scaled": "0.10 <= r/N < 0.33",
+    "global_scaled": "r/N >= 0.33",
+    "local_max_ratio": 0.10,
+    "meso_max_ratio": 0.33,
+    "labels": ["m_local_scaled", "m_mesoscopic_scaled", "m_global_scaled"],
+    "note": "local_scaled is empty for N=30 (min r=3 gives exactly r/N=0.10 -> mesoscopic); this is reported as a warning, never silently produced."
+  },
+
+  "bin_scheme_independence": "The fixed and scaled schemes are INDEPENDENT. Each is exhaustive and non-overlapping over the valid (odd, r>=3) separations within its own definition. The two schemes may and do overlap with each other because they answer different questions. The full m_r vector remains authoritative; binned counts are convenience aggregates.",
+
+  "graph_definitions": {
+    "vertices": "bead indices participating in at least one nonbonded contact",
+    "edges": "the contact pairs (backbone edges excluded)",
+    "S_max": "number of vertices in the largest connected component",
+    "S_max_definition": "largest_component_vertices; a finite-size structural indicator, not automatically a thermodynamic order parameter",
+    "largest_component_tie_break": "ties on vertex count broken by smallest minimum vertex index (deterministic)",
+    "cycle_rank": "edges - vertices + components (computed on the contact graph)",
+    "edge_conservation": "sum over components of component edges equals m"
+  },
+
+  "m_r_authority": "m_r (the dense contour-separation histogram, length n_beads) is the authoritative contour-separation representation. sum_r m_r == m. Even entries are zero.",
+
+  "sign_conventions": {
+    "reduced_bias_b_T": "b(T) is the reduced contact bias; sampling weight P(C|T) ∝ exp[-m(C) b(T)] so favorable (more-contact) configurations have b(T) < 0",
+    "coupling_K_T": "K(T) = -b(T); contact weight w ∝ q^m with q = exp(K)",
+    "contact_weight_q_T": "q(T) = exp(K(T)) = exp(-b(T)); K is authoritative because q can overflow",
+    "reduced_potential": "u(C,T) = m(C) b(T)",
+    "swap_criterion": "log A = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)"
+  },
+
+  "output_schema_versions": {
+    "distributions_schema_version": 2,
+    "snapshot_schema_version": 2,
+    "feature_schema_version": 2,
+    "model_api_version": 1
+  }
+}

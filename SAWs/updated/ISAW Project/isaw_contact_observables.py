@@ -19,10 +19,22 @@ A nonbonded contact is an unordered pair (i, j) with
 Each contact is counted exactly once.  On the simple-cubic lattice every valid
 nonbonded nearest-neighbour contact has *odd* contour separation r = j - i.
 
+    N       = number of beads (chain length)
     m       = total number of contacts
-    m_r     = number of contacts with contour separation r  (sum_r m_r == m)
+    m_r     = number of contacts with contour separation r  (sum_r m_r == m;
+              m_r is the AUTHORITATIVE contour-separation representation)
     R_g^2   = (1/N) sum_i |r_i - r_cm|^2        (primary compaction observable)
     R_ee^2  = |r_{N-1} - r_0|^2
+
+Contour-separation classification (two INDEPENDENT schemes)
+-----------------------------------------------------------
+The *fixed* scheme (short/medium/long_fixed) uses absolute contour separations
+and answers "how local is this contact in monomers".  The *scaled* scheme
+(local/mesoscopic/global_scaled) uses r/N and answers "how global is this
+contact relative to the chain".  Each scheme is independently exhaustive and
+non-overlapping over the valid (odd, r>=3) separations; the two schemes may and
+do overlap with each other because they answer different questions.  ``m_r``
+remains authoritative; the binned counts are convenience aggregates.
 
 Contact graph (backbone edges excluded)
 ---------------------------------------
@@ -34,7 +46,6 @@ connected component.
 """
 from __future__ import annotations
 
-import math
 from typing import Sequence, Tuple
 
 import numpy as np
@@ -48,30 +59,114 @@ _NN6: Tuple[Vec, ...] = (
     (0, 0, 1), (0, 0, -1),
 )
 
+MIN_CONTOUR_SEPARATION = 3
+
 
 class ContactMapError(ValueError):
-    """Raised when a contact map fails validation."""
+    """Raised when coordinates or a contact map fail validation."""
 
 
 # ---------------------------------------------------------------------------
-# Coordinate helpers
+# Phase 1: strict coordinate normalization (single source of truth)
 # ---------------------------------------------------------------------------
 
-def _as_int_tuples(coordinates: Sequence[Vec]) -> list[Vec]:
-    """Return coordinates as a list of integer 3-tuples (no copy of dtype)."""
-    out: list[Vec] = []
-    for r in coordinates:
-        out.append((int(r[0]), int(r[1]), int(r[2])))
-    return out
+def normalize_lattice_coordinates(
+    coordinates,
+    *,
+    require_self_avoiding: bool = True,
+    require_backbone_bonds: bool = True,
+) -> np.ndarray:
+    """Return a validated signed-integer coordinate array of shape (N, 3).
 
+    Rejects (raising :class:`ContactMapError` with a message identifying the
+    failed condition):
 
-def _as_float_array(coordinates: Sequence[Vec]) -> np.ndarray:
-    arr = np.asarray(coordinates, dtype=float)
+    * wrong shape (not exactly ``(N, 3)``) or an empty array;
+    * non-finite values (NaN, +/-inf);
+    * fractional coordinates (values that are not exactly integral) -- they are
+      rejected, never truncated;
+    * duplicate occupied sites          (when ``require_self_avoiding``);
+    * non-unit backbone bonds           (when ``require_backbone_bonds``).
+
+    The lighter geometric callers pass both ``require_*`` flags False; they
+    still get shape/finiteness/integrality checking but skip the lattice
+    self-avoidance and connectivity requirements that are mathematically
+    unnecessary for pure geometry.
+    """
+    try:
+        arr = np.asarray(coordinates)
+    except (TypeError, ValueError) as exc:
+        # Ragged / inhomogeneous input (e.g. rows of differing length).
+        raise ContactMapError(
+            "coordinates must be a homogeneous (N, 3) array; got ragged/"
+            "inhomogeneous input"
+        ) from exc
+
+    # Object / ragged input (e.g. list of mixed-length tuples) -> float coerce.
+    if arr.dtype == object:
+        try:
+            arr = np.asarray(coordinates, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ContactMapError(
+                "coordinates could not be interpreted as a numeric (N, 3) array"
+            ) from exc
+
     if arr.ndim != 2 or arr.shape[1] != 3:
-        raise ValueError(
-            f"coordinates must have shape (N, 3); got {arr.shape}"
+        raise ContactMapError(
+            f"coordinates must have shape (N, 3); got shape {arr.shape}"
         )
-    return arr
+    n = arr.shape[0]
+    if n == 0:
+        raise ContactMapError("coordinates array is empty (N = 0)")
+
+    if arr.dtype.kind in ("i", "u"):
+        ints = arr.astype(np.int64)
+    elif arr.dtype.kind in ("f", "c"):
+        if arr.dtype.kind == "c":
+            raise ContactMapError("coordinates must be real, not complex")
+        if not np.all(np.isfinite(arr)):
+            raise ContactMapError("coordinates contain NaN or infinity")
+        rounded = np.rint(arr)
+        if not np.all(rounded == arr):
+            raise ContactMapError(
+                "coordinates are not exactly integral; fractional lattice "
+                "coordinates are rejected (not truncated)"
+            )
+        ints = rounded.astype(np.int64)
+    elif arr.dtype.kind == "b":
+        ints = arr.astype(np.int64)
+    else:
+        raise ContactMapError(
+            f"coordinates have unsupported dtype {arr.dtype!r}"
+        )
+
+    if require_self_avoiding:
+        uniq = np.unique(ints, axis=0)
+        if uniq.shape[0] != n:
+            raise ContactMapError(
+                f"self-avoidance violated: {n - uniq.shape[0]} duplicate "
+                f"occupied site(s)"
+            )
+
+    if require_backbone_bonds and n >= 2:
+        bond = np.abs(np.diff(ints, axis=0)).sum(axis=1)
+        bad = np.nonzero(bond != 1)[0]
+        if bad.size:
+            i = int(bad[0])
+            raise ContactMapError(
+                f"backbone bond {i}-{i + 1} has Manhattan length "
+                f"{int(bond[i])} != 1 (chain is not a connected lattice walk)"
+            )
+
+    return ints
+
+
+def _geometry_array(coordinates) -> np.ndarray:
+    """Float (N, 3) array for pure-geometry callers (no SAW/bond requirement)."""
+    ints = normalize_lattice_coordinates(
+        coordinates, require_self_avoiding=False, require_backbone_bonds=False
+    )
+    return ints.astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +183,14 @@ def build_contact_map(
     contact_pairs : np.ndarray, shape (m, 2), dtype int64, rows (i, j) with i<j
     separations   : np.ndarray, shape (m,),  dtype int64, r = j - i
 
-    The construction maps each occupied coordinate to its bead index and probes
-    the six nearest-neighbour sites, so it is O(N) rather than O(N^2).
+    Coordinates are validated strictly (self-avoiding, unit backbone bonds,
+    integral) via :func:`normalize_lattice_coordinates`.  The construction maps
+    each occupied coordinate to its bead index and probes the six
+    nearest-neighbour sites, so it is O(N) rather than O(N^2).
     """
-    coords = _as_int_tuples(coordinates)
-    n = len(coords)
+    ints = normalize_lattice_coordinates(coordinates)
+    n = ints.shape[0]
+    coords = [(int(x), int(y), int(z)) for x, y, z in ints]
 
     index_of: dict[Vec, int] = {}
     for i, r in enumerate(coords):
@@ -125,12 +223,13 @@ def build_contact_map_bruteforce(
     coordinates: Sequence[Vec],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reference O(N^2) contact-map construction (for tests/validation)."""
-    arr = _as_float_array(coordinates)
+    ints = normalize_lattice_coordinates(coordinates)
+    arr = ints.astype(np.int64)
     n = arr.shape[0]
     pairs: list[tuple[int, int]] = []
     for i in range(n):
         for j in range(i + 2, n):  # j - i > 1
-            if np.abs(arr[i] - arr[j]).sum() == 1.0:
+            if int(np.abs(arr[i] - arr[j]).sum()) == 1:
                 pairs.append((i, j))
     if not pairs:
         return (np.empty((0, 2), dtype=np.int64),
@@ -139,59 +238,118 @@ def build_contact_map_bruteforce(
     return out, out[:, 1] - out[:, 0]
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: complete contact-map validation
+# ---------------------------------------------------------------------------
+
+def _canonical_pairs(contact_pairs) -> np.ndarray:
+    pairs = np.asarray(contact_pairs)
+    if pairs.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    if pairs.dtype.kind == "f":
+        rounded = np.rint(pairs)
+        if not np.all(np.isfinite(pairs)) or not np.all(rounded == pairs):
+            raise ContactMapError("contact pairs must be exact integers")
+        pairs = rounded
+    pairs = pairs.astype(np.int64).reshape(-1, 2)
+    return pairs
+
+
 def validate_contact_map(
     coordinates: Sequence[Vec],
     contact_pairs: np.ndarray,
     separations: np.ndarray | None = None,
     expected_contact_count: int | None = None,
+    *,
+    strict: bool = True,
 ) -> dict:
-    """Validate a contact map against its coordinates.
+    """Validate that ``contact_pairs`` is the *complete* contact map of ``coordinates``.
 
-    Checks self-avoidance, backbone bond adjacency, i<j, j-i>1, unit Manhattan
-    distance, no duplicate pairs, odd contour separation, and (optionally) the
-    expected contact count.  Returns a dict with ``ok`` and diagnostic fields;
-    raises :class:`ContactMapError` on the first hard violation.
+    In strict mode (default) this:
+
+    1. normalizes coordinates strictly;
+    2. canonicalizes supplied pairs to integer ``(i, j)`` rows;
+    3. requires all pair indices in ``[0, n_beads)``;
+    4. requires ``i < j``; 5. requires ``j - i > 1``;
+    6. requires unit Manhattan distance; 7. rejects duplicate pairs;
+    8. sorts to a canonical (lexicographic) representation;
+    9. computes the complete reference map with
+       :func:`build_contact_map_bruteforce`;
+    10. requires exact set equality of supplied and reference pairs;
+    11. if ``separations`` is supplied, requires shape ``(m,)`` and exact
+        equality to ``pairs[:, 1] - pairs[:, 0]``;
+    12. requires all separations odd;
+    13. if ``expected_contact_count`` is supplied, requires equality.
+
+    The lighter ``strict=False`` mode checks per-pair structural validity
+    (steps 2-7, 12) without proving completeness against the brute-force map --
+    use it only for performance-sensitive internal re-checks where the map was
+    just produced by :func:`build_contact_map`.
+
+    Returns structured validation metadata; raises :class:`ContactMapError` on
+    the first hard violation.
     """
-    arr = _as_float_array(coordinates)
-    n = arr.shape[0]
-    pairs = np.asarray(contact_pairs, dtype=np.int64).reshape(-1, 2)
-
-    # Self-avoidance: all coordinates distinct.
-    uniq = {tuple(int(v) for v in r) for r in arr}
-    if len(uniq) != n:
-        raise ContactMapError(
-            f"self-avoidance violated: {n - len(uniq)} duplicated site(s)"
-        )
-
-    # Backbone bond adjacency: consecutive beads at unit Manhattan distance.
-    if n >= 2:
-        bond = np.abs(np.diff(arr, axis=0)).sum(axis=1)
-        if not np.all(bond == 1.0):
-            bad = int(np.argmax(bond != 1.0))
-            raise ContactMapError(
-                f"backbone bond {bad}-{bad + 1} is not unit length "
-                f"(|step| = {bond[bad]})"
-            )
-
+    ints = normalize_lattice_coordinates(coordinates)
+    n = ints.shape[0]
+    pairs = _canonical_pairs(contact_pairs)
     m = pairs.shape[0]
+
     if m > 0:
         i = pairs[:, 0]
         j = pairs[:, 1]
+        if i.min() < 0 or j.max() >= n:
+            raise ContactMapError(
+                f"contact pair index out of bounds for n_beads={n}"
+            )
         if not np.all(i < j):
             raise ContactMapError("contact pair violates i < j")
         if not np.all((j - i) > 1):
             raise ContactMapError("contact pair violates j - i > 1 (bonded pair)")
-        dist = np.abs(arr[i] - arr[j]).sum(axis=1)
-        if not np.all(dist == 1.0):
+        dist = np.abs(ints[i] - ints[j]).sum(axis=1)
+        if not np.all(dist == 1):
             raise ContactMapError("contact pair Manhattan distance != 1")
-        # No duplicate pairs.
         seen = {(int(a), int(b)) for a, b in pairs}
         if len(seen) != m:
             raise ContactMapError("duplicate contact pair(s) present")
-        # Odd contour separation.
-        seps = (j - i) if separations is None else np.asarray(separations)
-        if not np.all((seps % 2) == 1):
-            raise ContactMapError("non-odd contour separation on cubic lattice")
+
+    # Canonical lexicographic order.
+    if m > 0:
+        order = np.lexsort((pairs[:, 1], pairs[:, 0]))
+        pairs_sorted = pairs[order]
+    else:
+        pairs_sorted = pairs
+
+    seps_self = (pairs_sorted[:, 1] - pairs_sorted[:, 0]) if m else np.empty(0, np.int64)
+    if m > 0 and not np.all((seps_self % 2) == 1):
+        raise ContactMapError("non-odd contour separation on cubic lattice")
+
+    if separations is not None:
+        sep_arr = np.asarray(separations).reshape(-1)
+        if sep_arr.shape[0] != m:
+            raise ContactMapError(
+                f"separations shape {sep_arr.shape} inconsistent with "
+                f"{m} contact pair(s)"
+            )
+        # Compare against the *as-supplied* pair order, not the sorted one.
+        seps_supplied = (pairs[:, 1] - pairs[:, 0]) if m else np.empty(0, np.int64)
+        if not np.array_equal(sep_arr.astype(np.int64), seps_supplied):
+            raise ContactMapError(
+                "supplied separations != pairs[:, 1] - pairs[:, 0]"
+            )
+
+    if strict:
+        ref, _ = build_contact_map_bruteforce(ints)
+        ref_set = {(int(a), int(b)) for a, b in ref}
+        sup_set = {(int(a), int(b)) for a, b in pairs_sorted}
+        if ref_set != sup_set:
+            missing = sorted(ref_set - sup_set)
+            extra = sorted(sup_set - ref_set)
+            raise ContactMapError(
+                "supplied contact map is not the complete map implied by the "
+                f"coordinates: missing {missing[:5]}"
+                f"{'...' if len(missing) > 5 else ''}, "
+                f"extra {extra[:5]}{'...' if len(extra) > 5 else ''}"
+            )
 
     if expected_contact_count is not None and m != int(expected_contact_count):
         raise ContactMapError(
@@ -203,6 +361,7 @@ def validate_contact_map(
         "ok": True,
         "n_beads": int(n),
         "contact_count": int(m),
+        "strict": bool(strict),
         "all_separations_odd": True,
     }
 
@@ -214,19 +373,35 @@ def contact_separation_counts(
     """Dense contour-separation histogram m_r, length ``n_beads``.
 
     ``m_r[r]`` is the number of contacts with separation r = j - i.  Even
-    entries are zero on the cubic lattice.  Satisfies ``m_r.sum() == m``.
+    entries are zero on the cubic lattice.  Validates ``n_beads >= 1``, pair
+    bounds, positive separations, ``r < n_beads``, and ``sum(m_r) == m``.
     """
     n_beads = int(n_beads)
+    if n_beads < 1:
+        raise ContactMapError(f"n_beads must be >= 1, got {n_beads}")
     m_r = np.zeros(n_beads, dtype=np.int64)
-    pairs = np.asarray(contact_pairs, dtype=np.int64).reshape(-1, 2)
-    if pairs.shape[0] == 0:
+    pairs = _canonical_pairs(contact_pairs)
+    m = pairs.shape[0]
+    if m == 0:
         return m_r
-    seps = pairs[:, 1] - pairs[:, 0]
+    i = pairs[:, 0]
+    j = pairs[:, 1]
+    if i.min() < 0 or j.max() >= n_beads:
+        raise ContactMapError(
+            f"contact pair index out of bounds for n_beads={n_beads}"
+        )
+    seps = j - i
+    if seps.min() <= 0:
+        raise ContactMapError("contact separations must be strictly positive")
+    if seps.max() >= n_beads:
+        raise ContactMapError(
+            f"contact separation {int(seps.max())} >= n_beads {n_beads}"
+        )
     counts = np.bincount(seps, minlength=n_beads)
     m_r[: counts.shape[0]] = counts[:n_beads]
-    if int(m_r.sum()) != pairs.shape[0]:
+    if int(m_r.sum()) != m:
         raise ContactMapError(
-            f"m_r sum {int(m_r.sum())} != number of contacts {pairs.shape[0]}"
+            f"m_r sum {int(m_r.sum())} != number of contacts {m}"
         )
     return m_r
 
@@ -237,21 +412,21 @@ def contact_separation_counts(
 
 def radius_of_gyration_squared(coordinates: Sequence[Vec]) -> float:
     """R_g^2 = (1/N) sum_i |r_i - r_cm|^2 (lattice units)."""
-    r = _as_float_array(coordinates)
+    r = _geometry_array(coordinates)
     cm = r.mean(axis=0)
     return float(((r - cm) ** 2).sum(axis=1).mean())
 
 
 def end_to_end_distance_squared(coordinates: Sequence[Vec]) -> float:
     """R_ee^2 = |r_{N-1} - r_0|^2 (lattice units)."""
-    r = _as_float_array(coordinates)
+    r = _geometry_array(coordinates)
     d = r[-1] - r[0]
     return float((d * d).sum())
 
 
 def gyration_tensor(coordinates: Sequence[Vec]) -> np.ndarray:
     """Symmetric 3x3 gyration tensor; trace equals R_g^2."""
-    r = _as_float_array(coordinates)
+    r = _geometry_array(coordinates)
     d = r - r.mean(axis=0)
     return (d.T @ d) / float(d.shape[0])
 
@@ -291,19 +466,19 @@ def contact_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
 
     The contact graph excludes backbone edges.  S_max ==
     ``largest_component_vertices``.  The zero-contact case is handled
-    explicitly (all counts zero, fractions 0.0).
+    explicitly (all counts zero, fractions 0.0).  Largest-component
+    tie-breaking is deterministic: ties on vertex count are broken by the
+    smallest minimum vertex index in the component.
     """
     n_beads = int(n_beads)
-    pairs = np.asarray(contact_pairs, dtype=np.int64).reshape(-1, 2)
+    pairs = _canonical_pairs(contact_pairs)
     m = pairs.shape[0]
     if m == 0:
         return _zero_contact_graph_summary(n_beads)
 
-    # Vertices that participate in at least one contact.
     verts = np.unique(pairs)
     n_vert = int(verts.shape[0])
 
-    # Union-find over participating vertices.
     parent = {int(v): int(v) for v in verts}
 
     def find(x: int) -> int:
@@ -326,20 +501,25 @@ def contact_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
         degree[a] += 1
         degree[b] += 1
 
-    # Aggregate per component.
     comp_vertices: dict[int, int] = {}
     comp_edges: dict[int, int] = {}
+    comp_min_vertex: dict[int, int] = {}
     for v in verts:
         root = find(int(v))
         comp_vertices[root] = comp_vertices.get(root, 0) + 1
+        comp_min_vertex[root] = min(comp_min_vertex.get(root, int(v)), int(v))
     for a, b in pairs:
         root = find(int(a))
         comp_edges[root] = comp_edges.get(root, 0) + 1
 
     n_components = len(comp_vertices)
 
-    # Largest component selected by vertex count (ties -> first encountered).
-    best_root = max(comp_vertices, key=lambda r: comp_vertices[r])
+    # Largest component by vertex count; deterministic tie-break by smallest
+    # minimum vertex index.
+    best_root = min(
+        comp_vertices,
+        key=lambda r: (-comp_vertices[r], comp_min_vertex[r]),
+    )
     s_max = int(comp_vertices[best_root])
     s_max_edges = int(comp_edges.get(best_root, 0))
 
@@ -347,9 +527,7 @@ def contact_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
     mean_degree = float(deg_vals.mean())
     degree_var = float(deg_vals.var())
 
-    # Cycle rank of a forest-or-graph: edges - vertices + components.
     cycle_rank = int(m - n_vert + n_components)
-
     n_multiedge = int(sum(1 for e in comp_edges.values() if e >= 2))
 
     return {
@@ -371,105 +549,219 @@ def contact_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Contour-separation bins
+# Phase 3: two INDEPENDENT contour-separation classification schemes
 # ---------------------------------------------------------------------------
+# Fixed scheme (absolute contour separation, monomers):
+#     short_fixed  : 3  <= r <= 9
+#     medium_fixed : 11 <= r <  long_threshold_fixed
+#     long_fixed   : r  >= long_threshold_fixed
+# The fixed long threshold is a fixed odd separation (default 15) chosen so that
+# every class is non-empty for the pilot lengths N=30 and N=44 (the previous
+# floor(N/3) threshold produced an empty medium class at N=30).
+#
+# Scaled scheme (relative contour separation r/N):
+#     local_scaled       : r/N <  0.10
+#     mesoscopic_scaled  : 0.10 <= r/N < 0.33
+#     global_scaled      : r/N >= 0.33
+#
+# The two schemes are independent and may overlap with each other.  ``m_r``
+# stays authoritative; both schemes are exhaustive and non-overlapping over the
+# valid (odd, r>=3) separations within their own definition.
 
-MIN_CONTOUR_SEPARATION = 3
+FIXED_BIN_DEFINITIONS = {
+    "scheme": "fixed",
+    "short_fixed": {"r_min": 3, "r_max": 9},
+    "medium_fixed": {"r_min": 11},
+    "long_threshold_fixed": 15,
+    "description": (
+        "short_fixed 3<=r<=9; medium_fixed 11<=r<long_threshold_fixed; "
+        "long_fixed r>=long_threshold_fixed"
+    ),
+}
+
+SCALED_BIN_DEFINITIONS = {
+    "scheme": "scaled",
+    "local_max_ratio": 0.10,
+    "meso_max_ratio": 0.33,
+    "description": (
+        "local_scaled r/N<0.10; mesoscopic_scaled 0.10<=r/N<0.33; "
+        "global_scaled r/N>=0.33"
+    ),
+}
+
+FIXED_BIN_LABELS = ("m_short_fixed", "m_medium_fixed", "m_long_fixed")
+SCALED_BIN_LABELS = ("m_local_scaled", "m_mesoscopic_scaled", "m_global_scaled")
 
 
-def default_bin_definitions(n_beads: int) -> dict:
-    """Default short/medium/long contour-separation bins for a pilot run.
-
-    short : 3 <= r <= 9
-    long  : r / n_beads >= 1/3
-    medium: all remaining valid (odd, r >= 3) separations.
-
-    The definitions are returned as plain numbers/strings so they can be
-    serialized to JSON (never pickled).
-    """
-    return {
-        "scheme": "fixed_short_scaled_long",
-        "min_separation": MIN_CONTOUR_SEPARATION,
-        "short": {"r_min": 3, "r_max": 9},
-        "long": {"r_over_n_min": 1.0 / 3.0},
-        "medium": "remaining valid separations not in short or long",
-        "n_beads": int(n_beads),
-    }
+def _fixed_defs(defs: dict | None) -> dict:
+    return FIXED_BIN_DEFINITIONS if defs is None else defs
 
 
-def _long_threshold(n_beads: int, bin_defs: dict) -> float:
-    return float(bin_defs["long"]["r_over_n_min"]) * float(n_beads)
+def _scaled_defs(defs: dict | None) -> dict:
+    return SCALED_BIN_DEFINITIONS if defs is None else defs
 
 
-def assign_bin(r: int, n_beads: int, bin_defs: dict) -> str:
-    """Return 'short', 'medium', or 'long' for separation r (priority: long, short)."""
+def assign_fixed_bin(r: int, defs: dict | None = None) -> str:
+    """Return 'short_fixed' | 'medium_fixed' | 'long_fixed' for separation r."""
+    defs = _fixed_defs(defs)
     r = int(r)
-    long_thr = _long_threshold(n_beads, bin_defs)
-    if r >= long_thr:
-        return "long"
-    if bin_defs["short"]["r_min"] <= r <= bin_defs["short"]["r_max"]:
-        return "short"
-    return "medium"
+    thr = int(defs["long_threshold_fixed"])
+    short = defs["short_fixed"]
+    if r >= thr:
+        return "long_fixed"
+    if int(short["r_min"]) <= r <= int(short["r_max"]):
+        return "short_fixed"
+    return "medium_fixed"
 
 
-def bin_contact_separations(
-    m_r: np.ndarray,
-    n_beads: int,
-    bin_defs: dict,
-) -> dict:
-    """Aggregate a dense m_r vector into short/medium/long counts.
+def assign_scaled_bin(r: int, n_beads: int, defs: dict | None = None) -> str:
+    """Return 'local_scaled' | 'mesoscopic_scaled' | 'global_scaled'."""
+    defs = _scaled_defs(defs)
+    ratio = float(r) / float(n_beads)
+    if ratio < float(defs["local_max_ratio"]):
+        return "local_scaled"
+    if ratio < float(defs["meso_max_ratio"]):
+        return "mesoscopic_scaled"
+    return "global_scaled"
 
-    Returns ``{"m_short", "m_medium", "m_long"}``.  Categories are exhaustive
-    and non-overlapping over valid (odd, r >= 3) separations; the totals sum to
-    ``m_r.sum()``.
-    """
+
+def _valid_separations(n_beads: int) -> list[int]:
+    return [r for r in range(MIN_CONTOUR_SEPARATION, int(n_beads)) if r % 2 == 1]
+
+
+def _check_m_r(m_r: np.ndarray) -> np.ndarray:
     m_r = np.asarray(m_r, dtype=np.int64)
-    counts = {"short": 0, "medium": 0, "long": 0}
+    nz = np.nonzero(m_r)[0]
+    for r in nz:
+        if int(r) < MIN_CONTOUR_SEPARATION:
+            raise ContactMapError(
+                f"m_r has {int(m_r[r])} contact(s) at invalid separation r={int(r)}"
+            )
+    return m_r
+
+
+def bin_contact_separations_fixed(
+    m_r: np.ndarray, n_beads: int | None = None, defs: dict | None = None,
+) -> dict:
+    """Aggregate m_r into the fixed scheme (short/medium/long_fixed)."""
+    m_r = _check_m_r(m_r)
+    counts = {"m_short_fixed": 0, "m_medium_fixed": 0, "m_long_fixed": 0}
     for r in range(len(m_r)):
         c = int(m_r[r])
         if c == 0:
             continue
-        if r < MIN_CONTOUR_SEPARATION:
-            # No valid contact below the minimum separation should appear.
-            raise ContactMapError(
-                f"m_r has {c} contact(s) at invalid separation r={r}"
-            )
-        counts[assign_bin(r, n_beads, bin_defs)] += c
-    total = counts["short"] + counts["medium"] + counts["long"]
+        counts["m_" + assign_fixed_bin(r, defs)] += c
+    total = sum(counts.values())
     if total != int(m_r.sum()):
         raise ContactMapError(
-            f"binned total {total} != m_r sum {int(m_r.sum())}"
+            f"fixed-binned total {total} != m_r sum {int(m_r.sum())}"
         )
+    return {k: int(v) for k, v in counts.items()}
+
+
+def bin_contact_separations_scaled(
+    m_r: np.ndarray, n_beads: int, defs: dict | None = None,
+) -> dict:
+    """Aggregate m_r into the scaled scheme (local/mesoscopic/global_scaled)."""
+    m_r = _check_m_r(m_r)
+    counts = {"m_local_scaled": 0, "m_mesoscopic_scaled": 0, "m_global_scaled": 0}
+    for r in range(len(m_r)):
+        c = int(m_r[r])
+        if c == 0:
+            continue
+        counts["m_" + assign_scaled_bin(r, n_beads, defs)] += c
+    total = sum(counts.values())
+    if total != int(m_r.sum()):
+        raise ContactMapError(
+            f"scaled-binned total {total} != m_r sum {int(m_r.sum())}"
+        )
+    return {k: int(v) for k, v in counts.items()}
+
+
+def validate_bin_definitions(
+    n_beads: int,
+    fixed_defs: dict | None = None,
+    scaled_defs: dict | None = None,
+) -> dict:
+    """Check both schemes are exhaustive, non-overlapping, and non-pathological.
+
+    Each scheme must partition the valid (odd, r>=3) separations exactly once.
+    Empty categories for the selected N are reported as warnings (never
+    silently produced).  Raises on overlap or gaps within a scheme.
+    """
+    valid_r = _valid_separations(n_beads)
+
+    fixed_membership = {"short_fixed": [], "medium_fixed": [], "long_fixed": []}
+    for r in valid_r:
+        fixed_membership[assign_fixed_bin(r, fixed_defs)].append(r)
+    covered = sorted(sum(fixed_membership.values(), []))
+    if covered != valid_r:
+        raise ContactMapError(
+            f"fixed scheme is not an exhaustive non-overlapping partition of "
+            f"{valid_r}; covered {covered}"
+        )
+
+    scaled_membership = {
+        "local_scaled": [], "mesoscopic_scaled": [], "global_scaled": [],
+    }
+    for r in valid_r:
+        scaled_membership[assign_scaled_bin(r, n_beads, scaled_defs)].append(r)
+    covered_s = sorted(sum(scaled_membership.values(), []))
+    if covered_s != valid_r:
+        raise ContactMapError(
+            f"scaled scheme is not an exhaustive non-overlapping partition of "
+            f"{valid_r}; covered {covered_s}"
+        )
+
+    warnings = []
+    for name, members in fixed_membership.items():
+        if not members:
+            warnings.append(
+                f"fixed category {name!r} is empty for n_beads={n_beads}"
+            )
+    for name, members in scaled_membership.items():
+        if not members:
+            warnings.append(
+                f"scaled category {name!r} is empty for n_beads={n_beads}"
+            )
+
     return {
-        "m_short": int(counts["short"]),
-        "m_medium": int(counts["medium"]),
-        "m_long": int(counts["long"]),
+        "valid_separations": valid_r,
+        "fixed_membership": fixed_membership,
+        "scaled_membership": scaled_membership,
+        "warnings": warnings,
     }
 
 
-def validate_bin_definitions(n_beads: int, bin_defs: dict) -> dict:
-    """Check bins are exhaustive, non-overlapping, and non-pathological.
+def project_bin_definitions(n_beads: int) -> dict:
+    """Serializable record of both bin schemes for a given N (for metadata)."""
+    return {
+        "n_beads": int(n_beads),
+        "min_separation": MIN_CONTOUR_SEPARATION,
+        "fixed": dict(FIXED_BIN_DEFINITIONS),
+        "scaled": dict(SCALED_BIN_DEFINITIONS),
+    }
 
-    Returns a dict with per-category valid-separation membership and a list of
-    warnings (e.g. empty categories for small N).  Raises on overlap or gaps.
-    """
-    valid_r = [r for r in range(MIN_CONTOUR_SEPARATION, n_beads) if r % 2 == 1]
-    membership = {"short": [], "medium": [], "long": []}
-    for r in valid_r:
-        membership[assign_bin(r, n_beads, bin_defs)].append(r)
-    covered = sorted(membership["short"] + membership["medium"]
-                     + membership["long"])
-    if covered != valid_r:
-        raise ContactMapError(
-            "bin definitions are not an exhaustive non-overlapping partition "
-            f"of valid separations {valid_r}; covered {covered}"
-        )
-    warnings = [
-        f"bin category {name!r} is empty for n_beads={n_beads}"
-        for name in ("short", "medium", "long") if not membership[name]
-    ]
-    return {"valid_separations": valid_r, "membership": membership,
-            "warnings": warnings}
+
+# ---- Backward-compatibility shims (legacy short/medium/long API) -----------
+# The previous hybrid scheme combined a fixed short class with an N-scaled long
+# class into one exclusive classification (which produced an empty medium class
+# at N=30).  These shims preserve the old call signatures used by older callers
+# and map onto the new FIXED scheme, which is exhaustive for all N.
+
+def default_bin_definitions(n_beads: int) -> dict:
+    """Deprecated: returns the combined fixed+scaled definition record."""
+    return project_bin_definitions(n_beads)
+
+
+def bin_contact_separations(m_r, n_beads, bin_defs: dict | None = None) -> dict:
+    """Deprecated shim: returns m_short/m_medium/m_long from the FIXED scheme."""
+    fixed = bin_contact_separations_fixed(m_r, n_beads)
+    return {
+        "m_short": fixed["m_short_fixed"],
+        "m_medium": fixed["m_medium_fixed"],
+        "m_long": fixed["m_long_fixed"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +788,6 @@ def classify_contact_pair(
     if len({i, j, k, l}) < 4:
         return "shared_endpoint"
 
-    # Four distinct endpoints: compare the two contour intervals [i,j], [k,l].
     if j < k or l < i:
         return "disjoint"          # i<j<k<l or k<l<i<j
     if (i < k and l < j) or (k < i and j < l):
@@ -508,9 +799,10 @@ def count_pair_motifs(contact_pairs: np.ndarray) -> dict:
     """Count exclusive pair-topology classes over all C(m,2) contact pairs.
 
     Returns counts keyed ``pair_shared_endpoint``, ``pair_disjoint``,
-    ``pair_nested``, ``pair_interleaved``.  Their sum equals C(m,2).
+    ``pair_nested``, ``pair_interleaved`` plus ``pair_total``.  Their sum
+    (excluding ``pair_total``) equals C(m,2).
     """
-    pairs = np.asarray(contact_pairs, dtype=np.int64).reshape(-1, 2)
+    pairs = _canonical_pairs(contact_pairs)
     m = pairs.shape[0]
     counts = {label: 0 for label in PAIR_MOTIF_LABELS}
     for a in range(m):
