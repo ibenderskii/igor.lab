@@ -10,7 +10,7 @@ What it does
 ------------
 For each supplied ``fit_summary.json`` it reconstructs the predicted *lattice*
 P(Rg|T) from the joint baseline P0(m,Rg) and the fitted b(T) (the exact same
-physics as the fitter, imported from fit_lattice_contact_model_chat).  Then:
+physics as the cdfitter, imported from fit_lattice_contact_model_chat).  Then:
 
   * finds the per-temperature optimal multiplicative scale s(T) that minimizes
     JS divergence to the observed P(Rg|T) after mass-conserving rebinning onto a
@@ -80,7 +80,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 try:
-    from fit_lattice_contact_model_chat import (
+    from fit_lattice_contact_model_2 import (
         MODEL_REGISTRY,
         build_split_schemes,
         centers_to_edges,
