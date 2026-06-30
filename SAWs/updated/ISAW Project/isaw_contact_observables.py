@@ -46,6 +46,7 @@ connected component.
 """
 from __future__ import annotations
 
+import copy
 from typing import Sequence, Tuple
 
 import numpy as np
@@ -623,6 +624,72 @@ def contact_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
     }
 
 
+def augmented_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
+    """Backbone-plus-contact graph statistics (P06 augmented graph).
+
+    Vertices are ALL ``n_beads`` bead indices.  Edges are the backbone edges
+    ``(i, i+1)`` for i in 0..N-2 plus the nonbonded contact edges.  For a
+    connected open chain with ``m`` nonbonded contacts this gives exactly:
+
+        augmented_graph_edges      = (N - 1) + m
+        augmented_graph_components = 1
+        augmented_graph_cycle_rank = m
+
+    The simple-cubic lattice contact graph is bipartite by contour parity (all
+    contact separations are odd), so triangle-based clustering coefficients are
+    structurally constrained; they are intentionally omitted here rather than
+    reported as a trivially (near-)zero, uninformative statistic.
+    """
+    n = int(n_beads)
+    pairs = _canonical_pairs(contact_pairs)
+    m = int(pairs.shape[0])
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    degree = np.zeros(n, dtype=np.int64)
+    n_backbone = max(0, n - 1)
+    for i in range(n_backbone):
+        union(i, i + 1)
+        degree[i] += 1
+        degree[i + 1] += 1
+    for a, b in pairs:
+        a = int(a); b = int(b)
+        union(a, b)
+        degree[a] += 1
+        degree[b] += 1
+
+    n_edges = n_backbone + m
+    roots = {find(i) for i in range(n)}
+    n_components = len(roots)
+    comp_size: dict[int, int] = {}
+    for i in range(n):
+        r = find(i)
+        comp_size[r] = comp_size.get(r, 0) + 1
+    largest = max(comp_size.values()) if comp_size else 0
+    cycle_rank = n_edges - n + n_components
+
+    return {
+        "augmented_graph_vertices": int(n),
+        "augmented_graph_edges": int(n_edges),
+        "augmented_graph_components": int(n_components),
+        "augmented_graph_cycle_rank": int(cycle_rank),
+        "augmented_mean_degree": float(degree.mean()) if n else 0.0,
+        "augmented_degree_variance": float(degree.var()) if n else 0.0,
+        "augmented_largest_component_vertices": int(largest),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: two INDEPENDENT contour-separation classification schemes
 # ---------------------------------------------------------------------------
@@ -761,8 +828,12 @@ def _check_m_r(m_r: np.ndarray) -> np.ndarray:
 def bin_contact_separations_fixed(
     m_r: np.ndarray, n_beads: int | None = None, defs: dict | None = None,
 ) -> dict:
-    """Aggregate m_r into the fixed scheme (short/medium/long_fixed)."""
-    m_r = _check_m_r(m_r)
+    """Aggregate m_r into the fixed scheme (short/medium/long_fixed).
+
+    When ``n_beads`` is supplied the m_r length is validated against it
+    (``len(m_r) == n_beads``).
+    """
+    m_r = validate_m_r(m_r, n_beads=n_beads)
     counts = {"m_short_fixed": 0, "m_medium_fixed": 0, "m_long_fixed": 0}
     for r in range(len(m_r)):
         c = int(m_r[r])
@@ -780,8 +851,12 @@ def bin_contact_separations_fixed(
 def bin_contact_separations_scaled(
     m_r: np.ndarray, n_beads: int, defs: dict | None = None,
 ) -> dict:
-    """Aggregate m_r into the scaled scheme (local/mesoscopic/global_scaled)."""
-    m_r = _check_m_r(m_r)
+    """Aggregate m_r into the scaled scheme (local/mesoscopic/global_scaled).
+
+    ``n_beads`` is required (the scaled scheme depends on r/N); the m_r length is
+    validated against it.
+    """
+    m_r = validate_m_r(m_r, n_beads=n_beads)
     counts = {"m_local_scaled": 0, "m_mesoscopic_scaled": 0, "m_global_scaled": 0}
     for r in range(len(m_r)):
         c = int(m_r[r])
@@ -796,17 +871,94 @@ def bin_contact_separations_scaled(
     return {k: int(v) for k, v in counts.items()}
 
 
+def _require_int_boundary(value, name):
+    try:
+        f = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ContactMapError(f"{name} must be numeric, got {value!r}") from exc
+    if not np.isfinite(f):
+        raise ContactMapError(f"{name} must be finite, got {value!r}")
+    if f != int(f):
+        raise ContactMapError(f"{name} must be an integer boundary, got {value!r}")
+    return int(f)
+
+
+def validate_fixed_bin_semantics(fixed_defs: dict, n_beads: int) -> None:
+    """Semantic checks on the fixed scheme's integer boundaries.
+
+    Requires 3 <= short_min <= short_max < medium_min < long_threshold < n_beads
+    with all boundaries finite integers and all required keys present.
+    """
+    if not isinstance(fixed_defs, dict):
+        raise ContactMapError("fixed bin definitions must be a dict")
+    for key in ("short_fixed", "medium_fixed", "long_threshold_fixed"):
+        if key not in fixed_defs:
+            raise ContactMapError(f"fixed bin definitions missing key {key!r}")
+    short = fixed_defs["short_fixed"]
+    medium = fixed_defs["medium_fixed"]
+    if not isinstance(short, dict) or "r_min" not in short or "r_max" not in short:
+        raise ContactMapError("short_fixed must have integer r_min and r_max")
+    if not isinstance(medium, dict) or "r_min" not in medium:
+        raise ContactMapError("medium_fixed must have integer r_min")
+    short_min = _require_int_boundary(short["r_min"], "short_fixed.r_min")
+    short_max = _require_int_boundary(short["r_max"], "short_fixed.r_max")
+    medium_min = _require_int_boundary(medium["r_min"], "medium_fixed.r_min")
+    long_thr = _require_int_boundary(
+        fixed_defs["long_threshold_fixed"], "long_threshold_fixed")
+    n = int(n_beads)
+    if not (MIN_CONTOUR_SEPARATION <= short_min <= short_max):
+        raise ContactMapError(
+            f"fixed scheme requires {MIN_CONTOUR_SEPARATION} <= short_min "
+            f"<= short_max; got {short_min}, {short_max}")
+    if not short_max < medium_min:
+        raise ContactMapError(
+            f"fixed scheme requires short_max < medium_min; got "
+            f"{short_max}, {medium_min} (contradictory ranges)")
+    if not medium_min < long_thr:
+        raise ContactMapError(
+            f"fixed scheme requires medium_min < long_threshold; got "
+            f"{medium_min}, {long_thr}")
+    if not long_thr < n:
+        raise ContactMapError(
+            f"fixed scheme requires long_threshold < n_beads; got "
+            f"{long_thr}, {n}")
+
+
+def validate_scaled_bin_semantics(scaled_defs: dict) -> None:
+    """Semantic checks on the scaled scheme: 0 <= local < meso <= 1, finite."""
+    if not isinstance(scaled_defs, dict):
+        raise ContactMapError("scaled bin definitions must be a dict")
+    for key in ("local_max_ratio", "meso_max_ratio"):
+        if key not in scaled_defs:
+            raise ContactMapError(f"scaled bin definitions missing key {key!r}")
+    try:
+        local = float(scaled_defs["local_max_ratio"])
+        meso = float(scaled_defs["meso_max_ratio"])
+    except (TypeError, ValueError) as exc:
+        raise ContactMapError("scaled ratios must be numeric") from exc
+    if not (np.isfinite(local) and np.isfinite(meso)):
+        raise ContactMapError("scaled ratios must be finite")
+    if not (0.0 <= local < meso <= 1.0):
+        raise ContactMapError(
+            f"scaled scheme requires 0 <= local_max_ratio < meso_max_ratio "
+            f"<= 1; got local={local}, meso={meso}")
+
+
 def validate_bin_definitions(
     n_beads: int,
     fixed_defs: dict | None = None,
     scaled_defs: dict | None = None,
 ) -> dict:
-    """Check both schemes are exhaustive, non-overlapping, and non-pathological.
+    """Validate both schemes semantically AND as exhaustive, non-overlapping
+    partitions of the valid (odd, r>=3) separations.
 
-    Each scheme must partition the valid (odd, r>=3) separations exactly once.
-    Empty categories for the selected N are reported as warnings (never
-    silently produced).  Raises on overlap or gaps within a scheme.
+    Semantic boundary checks (integer fixed boundaries, ordered ratios) run
+    first and raise on any incoherent definition.  Empty categories for the
+    selected N are then reported as warnings (never silently produced).  Raises
+    on overlap or gaps within a scheme.
     """
+    validate_fixed_bin_semantics(_fixed_defs(fixed_defs), n_beads)
+    validate_scaled_bin_semantics(_scaled_defs(scaled_defs))
     valid_r = _valid_separations(n_beads)
 
     fixed_membership = {"short_fixed": [], "medium_fixed": [], "long_fixed": []}
@@ -852,13 +1004,50 @@ def validate_bin_definitions(
 
 
 def project_bin_definitions(n_beads: int) -> dict:
-    """Serializable record of both bin schemes for a given N (for metadata)."""
+    """Serializable record of both bin schemes for a given N (for metadata).
+
+    Returns DEEP COPIES of the module constants so a caller mutating a nested
+    dictionary can never corrupt ``FIXED_BIN_DEFINITIONS`` /
+    ``SCALED_BIN_DEFINITIONS``.
+    """
     return {
         "definitions_version": DEFINITIONS_VERSION,
         "n_beads": int(n_beads),
         "min_separation": MIN_CONTOUR_SEPARATION,
-        "fixed": dict(FIXED_BIN_DEFINITIONS),
-        "scaled": dict(SCALED_BIN_DEFINITIONS),
+        "fixed": copy.deepcopy(FIXED_BIN_DEFINITIONS),
+        "scaled": copy.deepcopy(SCALED_BIN_DEFINITIONS),
+        "bin_definition_source": "module_default",
+    }
+
+
+def normalize_bin_definitions(
+    fixed_defs: dict | None = None,
+    scaled_defs: dict | None = None,
+    *,
+    n_beads: int | None = None,
+    source: str = "module_default",
+) -> dict:
+    """Return a validated, DEEP-COPIED canonical bin-definition record.
+
+    Used at API entry points (e.g. ``run_remd``) so supplied definitions are
+    validated once and an immutable-by-convention deep copy is threaded through
+    the run.  When ``n_beads`` is supplied the definitions are validated against
+    it.  The returned nested dicts are deep copies; mutating them never affects
+    the module constants or the caller's input.
+    """
+    fixed = copy.deepcopy(_fixed_defs(fixed_defs))
+    scaled = copy.deepcopy(_scaled_defs(scaled_defs))
+    if n_beads is not None:
+        validate_bin_definitions(int(n_beads), fixed, scaled)
+    else:
+        validate_scaled_bin_semantics(scaled)
+    return {
+        "definitions_version": DEFINITIONS_VERSION,
+        "n_beads": (int(n_beads) if n_beads is not None else None),
+        "min_separation": MIN_CONTOUR_SEPARATION,
+        "fixed": fixed,
+        "scaled": scaled,
+        "bin_definition_source": str(source),
     }
 
 

@@ -105,6 +105,13 @@ SCALAR_COLUMNS = [
     "largest_component_fraction_of_contact_vertices",
     "mean_degree_nonisolated", "degree_variance_nonisolated",
     "contact_graph_cycle_rank", "number_of_multiedge_components",
+    # Augmented backbone+contact graph (C3).
+    "augmented_graph_vertices", "augmented_graph_edges",
+    "augmented_graph_components", "augmented_graph_cycle_rank",
+    "augmented_mean_degree", "augmented_degree_variance",
+    "augmented_largest_component_vertices",
+    # Thermodynamic columns (C2); K is authoritative, q may be inf.
+    "b_T", "K_T", "q_T", "reduced_potential_u", "effective_energy_H",
 ]
 FEATURE_COLUMNS = INDEX_COLUMNS + SCALAR_COLUMNS
 
@@ -116,6 +123,8 @@ _FLOAT_COLS = {
     "largest_component_fraction_of_N",
     "largest_component_fraction_of_contact_vertices",
     "mean_degree_nonisolated", "degree_variance_nonisolated",
+    "augmented_mean_degree", "augmented_degree_variance",
+    "b_T", "K_T", "q_T", "reduced_potential_u", "effective_energy_H",
 }
 
 
@@ -137,6 +146,47 @@ class ExtractionError(RuntimeError):
     pass
 
 
+def _safe_q(K: float) -> float:
+    """q = exp(K); +inf on overflow (K is authoritative and stored separately)."""
+    try:
+        if K > 700:
+            return float("inf")
+        if K < -700:
+            return 0.0
+        return float(math.exp(K))
+    except OverflowError:
+        return float("inf")
+
+
+def _model_bias_evaluator(meta: dict):
+    """Build b(T) from the input file's model metadata, or None if insufficient.
+
+    Reuses the canonical reduced_bias model registry so the thermodynamic
+    columns match the sampler exactly.
+    """
+    name = meta.get("model_name")
+    if isinstance(name, bytes):
+        name = name.decode()
+    if not name:
+        return None, "missing model_name"
+    params = meta.get("model_params")
+    if params is None:
+        return None, "missing model_params"
+    params = [float(v) for v in np.asarray(params).ravel().tolist()]
+    Tref = meta.get("Tref")
+    Tscale = meta.get("Tscale")
+    if Tref is None or Tscale is None:
+        return None, "missing Tref/Tscale"
+    import remd_uniform_chain_2_new as _remd
+    if str(name) not in _remd.MODEL_REGISTRY:
+        return None, f"unknown model {name!r}"
+
+    def b_of_T(T):
+        return float(_remd.reduced_bias(str(name), params, float(T),
+                                        float(Tref), float(Tscale)))
+    return b_of_T, "ok"
+
+
 # ---------------------------------------------------------------------------
 # Per-configuration feature computation + validation
 # ---------------------------------------------------------------------------
@@ -150,6 +200,8 @@ def compute_features_for_config(
     stored_contacts: int | None = None,
     stored_rg2: float | None = None,
     stored_ree2: float | None = None,
+    temperature: float | None = None,
+    b_T: float | None = None,
     validate: bool = False,
     discrepancies: dict | None = None,
     locator: str = "",
@@ -211,12 +263,35 @@ def compute_features_for_config(
     ):
         _fail("graph_edge_total", "graph cycle-rank identity violated")
 
+    aug = ico.augmented_graph_summary(cp, n_beads)
+    # Augmented-graph identity for a connected open chain: edges == N-1+m,
+    # components == 1, cycle_rank == m.
+    if (aug["augmented_graph_edges"] != (int(n_beads) - 1 + m)
+            or aug["augmented_graph_components"] != 1
+            or aug["augmented_graph_cycle_rank"] != m):
+        _fail("graph_edge_total",
+              f"augmented-graph identity violated: edges="
+              f"{aug['augmented_graph_edges']} components="
+              f"{aug['augmented_graph_components']} cyc="
+              f"{aug['augmented_graph_cycle_rank']} (N={n_beads}, m={m})")
+
     if validate:
         ico.validate_contact_map(coordinates, cp, seps,
                                  expected_contact_count=m, strict=True)
 
     lam = ico.gyration_eigenvalues(coordinates)  # ascending
     asph = float(lam[2] - 0.5 * (lam[0] + lam[1]))
+
+    # Thermodynamic columns (C2): K is authoritative; q may overflow to inf.
+    if b_T is None:
+        b_val = K_val = q_val = u_val = H_val = float("nan")
+    else:
+        b_val = float(b_T)
+        K_val = -b_val
+        q_val = _safe_q(K_val)
+        u_val = float(m) * b_val            # u = m b = -m K
+        H_val = (float(temperature) * u_val
+                 if temperature is not None else float("nan"))
 
     feat = {
         "n_beads": int(n_beads),
@@ -241,9 +316,13 @@ def compute_features_for_config(
         "pair_nested": motifs["pair_nested"],
         "pair_interleaved": motifs["pair_interleaved"],
         "pair_total": motifs["pair_total"],
+        "b_T": b_val, "K_T": K_val, "q_T": q_val,
+        "reduced_potential_u": u_val, "effective_energy_H": H_val,
     }
     feat.update(graph)
+    feat.update(aug)
     feat["_m_r"] = m_r
+    feat["_pairs"] = cp        # (m, 2) int64, lexicographically sorted
     return feat
 
 

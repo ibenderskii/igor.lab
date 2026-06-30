@@ -84,7 +84,10 @@ def validate_config_file(cfg_path):
             if not np.array_equal(np.sort(w), np.arange(nT)):
                 disc["walker_permutation"] += 1
             for k in range(nT):
-                c = coords[si, k].astype(np.int64)
+                # Pass the raw HDF5 slice to the strict validator; no pre-cast,
+                # so fractional/NaN/out-of-range coordinates cannot be hidden by
+                # truncation.
+                c = coords[si, k]
                 cp, seps = ico.build_contact_map(c)
                 m = cp.shape[0]
                 if m != int(s["contacts"][si, k]):

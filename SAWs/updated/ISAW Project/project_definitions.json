@@ -1,7 +1,13 @@
 {
-  "definitions_version": "1.0.0",
+  "project_name": "3D_ISAW_PNIPAM_contact_motif_collapse_analysis",
+  "schema_version": 2,
+  "definitions_version": "1.1.0",
   "created_date": "2026-06-29",
-  "description": "Frozen, single-source definitions for the 3D ISAW contact-motif analysis. Code must read fixed/scaled bin and graph definitions from here (or from the matching constants in isaw_contact_observables.py, which mirror this file).",
+  "updated_date": "2026-06-30",
+  "description": "Frozen single-source definitions (P00) for the 3D ISAW contact-motif analysis of PNIPAM. isaw_schema.py loads and validates this file and exposes deep-copied, immutable-by-convention definitions. Code-level constants in isaw_contact_observables.py MUST agree with the bin/graph definitions here (a test enforces this).",
+
+  "polymer_system": "PNIPAM",
+  "transition_type": "LCST",
 
   "chain_length_convention": {
     "N": "number of beads (chain length)",
@@ -19,8 +25,52 @@
     "manhattan_distance": 1
   },
 
-  "pair_topology_definitions": {
-    "canonicalization": "each contact sorted to (i, j) with i < j before comparison; result symmetric under swapping the two contacts",
+  "reduced_bias_definition": "b(T) is the reduced contact bias; sampling weight P(C|T) ∝ exp[-m(C) b(T)].",
+  "K_definition": "K(T) = -b(T); thus P(C|T) ∝ exp[K(T) m(C)] and HIGHER K FAVORS MORE CONTACTS.",
+  "q_definition": "q(T) = exp(K(T)) = exp(-b(T)); K is authoritative because q can overflow.",
+  "reduced_potential_definition": "u(C,T) = m(C) b(T) = -m(C) K(T).",
+  "effective_energy_definition": "H(C,T) = T u(C,T); model-implied, NOT automatically a temperature-independent physical energy for polynomial effective models.",
+
+  "pnipam_lcst_expectations": {
+    "note": "PNIPAM collapses as temperature INCREASES over the fitted LCST range. Do not assume lower T is more collapsed. These trends MUST be checked against the fitted model, not hardcoded.",
+    "over_fitted_range": [
+      "K(T) increases as T increases",
+      "mean contact count m increases as T increases",
+      "Rg^2 decreases as T increases",
+      "long-range/global contacts and connected contact structure increase as collapse develops"
+    ],
+    "primary_contact_favoring_coordinate": "K (not temperature alone)",
+    "expected_signs_high_minus_low_K": {
+      "d<m>/dK": "> 0",
+      "d<Rg2>/dK": "< 0"
+    }
+  },
+
+  "fixed_contour_bins": {
+    "scheme": "fixed",
+    "short_fixed": {"r_min": 3, "r_max": 9},
+    "medium_fixed": {"r_min": 11},
+    "long_threshold_fixed": 15,
+    "labels": ["m_short_fixed", "m_medium_fixed", "m_long_fixed"],
+    "constraints": "3 <= short_min <= short_max < medium_min < long_threshold < n_beads",
+    "membership_N30": {"short_fixed": [3,5,7,9], "medium_fixed": [11,13], "long_fixed": [15,17,19,21,23,25,27,29]},
+    "membership_N44": {"short_fixed": [3,5,7,9], "medium_fixed": [11,13], "long_fixed": [15,17,19,21,23,25,27,29,31,33,35,37,39,41,43]}
+  },
+
+  "scaled_contour_bins": {
+    "scheme": "scaled",
+    "local_max_ratio": 0.10,
+    "meso_max_ratio": 0.33,
+    "local_boundary": "closed",
+    "labels": ["m_local_scaled", "m_mesoscopic_scaled", "m_global_scaled"],
+    "boundary_inclusion": "local_scaled r/N<=0.10; mesoscopic_scaled 0.10<r/N<0.33; global_scaled r/N>=0.33",
+    "constraints": "0 <= local_max_ratio < meso_max_ratio <= 1"
+  },
+
+  "bin_scheme_independence": "The fixed and scaled schemes are INDEPENDENT; each is exhaustive and non-overlapping over the valid (odd, r>=3) separations within its own definition. m_r remains authoritative.",
+
+  "pair_motif_taxonomy": {
+    "canonicalization": "each contact sorted to (i, j) with i < j; result symmetric under swapping the two contacts",
     "priority": "shared_endpoint takes priority; with four distinct endpoints exactly one of disjoint/nested/interleaved applies",
     "shared_endpoint": "the two contacts share at least one bead index",
     "disjoint": "i<j<k<l or k<l<i<j",
@@ -29,54 +79,46 @@
     "exhaustiveness": "sum over the four exclusive classes equals C(m,2)"
   },
 
-  "fixed_bin_definitions": {
-    "scheme": "fixed",
-    "short_fixed": {"r_min": 3, "r_max": 9},
-    "medium_fixed": {"r_min": 11},
-    "long_threshold_fixed": 15,
-    "labels": ["m_short_fixed", "m_medium_fixed", "m_long_fixed"],
-    "rationale": "long threshold is a fixed odd separation (15), not floor(N/3), so no class is empty for N=30 or N=44",
-    "membership_N30": {"short_fixed": [3,5,7,9], "medium_fixed": [11,13], "long_fixed": [15,17,19,21,23,25,27,29]},
-    "membership_N44": {"short_fixed": [3,5,7,9], "medium_fixed": [11,13], "long_fixed": [15,17,19,21,23,25,27,29,31,33,35,37,39,41,43]}
-  },
-
-  "scaled_bin_definitions": {
-    "scheme": "scaled",
-    "local_scaled": "r/N < 0.10",
-    "mesoscopic_scaled": "0.10 <= r/N < 0.33",
-    "global_scaled": "r/N >= 0.33",
-    "local_max_ratio": 0.10,
-    "meso_max_ratio": 0.33,
-    "labels": ["m_local_scaled", "m_mesoscopic_scaled", "m_global_scaled"],
-    "note": "local_scaled is empty for N=30 (min r=3 gives exactly r/N=0.10 -> mesoscopic); this is reported as a warning, never silently produced."
-  },
-
-  "bin_scheme_independence": "The fixed and scaled schemes are INDEPENDENT. Each is exhaustive and non-overlapping over the valid (odd, r>=3) separations within its own definition. The two schemes may and do overlap with each other because they answer different questions. The full m_r vector remains authoritative; binned counts are convenience aggregates.",
-
-  "graph_definitions": {
+  "contact_graph_definition": {
     "vertices": "bead indices participating in at least one nonbonded contact",
     "edges": "the contact pairs (backbone edges excluded)",
-    "S_max": "number of vertices in the largest connected component",
-    "S_max_definition": "largest_component_vertices; a finite-size structural indicator, not automatically a thermodynamic order parameter",
+    "S_max": "largest_component_vertices; a finite-size structural indicator, not automatically a thermodynamic order parameter",
     "largest_component_tie_break": "ties on vertex count broken by smallest minimum vertex index (deterministic)",
-    "cycle_rank": "edges - vertices + components (computed on the contact graph)",
-    "edge_conservation": "sum over components of component edges equals m"
+    "cycle_rank": "edges - vertices + components",
+    "edge_conservation": "contact_graph_edges == m and sum_component_edges == m"
   },
 
-  "m_r_authority": "m_r (the dense contour-separation histogram, length n_beads) is the authoritative contour-separation representation. sum_r m_r == m. Even entries are zero.",
-
-  "sign_conventions": {
-    "reduced_bias_b_T": "b(T) is the reduced contact bias; sampling weight P(C|T) ∝ exp[-m(C) b(T)] so favorable (more-contact) configurations have b(T) < 0",
-    "coupling_K_T": "K(T) = -b(T); contact weight w ∝ q^m with q = exp(K)",
-    "contact_weight_q_T": "q(T) = exp(K(T)) = exp(-b(T)); K is authoritative because q can overflow",
-    "reduced_potential": "u(C,T) = m(C) b(T)",
-    "swap_criterion": "log A = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)"
+  "augmented_graph_definition": {
+    "vertices": "all n_beads bead indices",
+    "edges": "backbone edges (i,i+1) for i in 0..N-2 plus nonbonded contact edges",
+    "identities_connected_chain": "augmented_graph_edges = N-1+m; augmented_graph_components = 1; augmented_graph_cycle_rank = m",
+    "clustering_note": "the simple-cubic contact graph is bipartite by odd-separation parity, so triangle clustering is structurally constrained and is intentionally omitted rather than reported as trivially near-zero"
   },
+
+  "primary_key_definition": ["run_id", "seed", "snapshot_index", "temperature_index"],
+
+  "required_metadata_fields": [
+    "run_id", "seed", "n_beads", "n_steps", "model_name", "param_names",
+    "model_params", "Tref", "Tscale", "temperatures"
+  ],
+
+  "thermodynamic_feature_columns": {
+    "b_T": "reduced contact bias b(T)",
+    "K_T": "K(T) = -b(T) (authoritative)",
+    "q_T": "q(T) = exp(K(T)); inf/null when it overflows",
+    "reduced_potential_u": "u = m b(T) = -m K(T)",
+    "effective_energy_H": "H = T u (model-implied, not necessarily physical)"
+  },
+
+  "m_r_authority": "m_r (dense contour-separation histogram, length n_beads) is authoritative. sum_r m_r == m; even entries zero.",
 
   "output_schema_versions": {
-    "distributions_schema_version": 2,
-    "snapshot_schema_version": 2,
-    "feature_schema_version": 2,
+    "project_schema_version": 2,
+    "distributions_schema_version": 3,
+    "snapshot_schema_version": 3,
+    "feature_schema_version": 4,
+    "diagnostic_trajectory_schema_version": 2,
+    "calibration_report_schema_version": 1,
     "model_api_version": 1
   }
 }

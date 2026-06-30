@@ -117,8 +117,7 @@ not labeled physical heat capacity for effective polynomial b(T) models.
 Example commands (PowerShell)
 -----------------------------
 The canonical production script name is ``remd_uniform_chain_2_new.py``
-(``remd_uniform_chain_2.py`` is a thin compatibility SHIM that re-exports this
-module by object identity -- NOT a byte-identical copy -- kept for the existing
+(``remd_uniform_chain_2.py`` is a byte-identical mirror kept for the existing
 suite/test imports).
 
 Quick test:
@@ -147,7 +146,6 @@ import json
 import math
 import random
 import time
-import multiprocessing as _mp
 from concurrent.futures import ProcessPoolExecutor
 from itertools import permutations, product
 from pathlib import Path
@@ -167,20 +165,14 @@ import isaw_contact_observables as ico  # noqa: E402
 import isaw_config_io as cio  # noqa: E402
 from isaw_config_io import SnapshotWriter  # noqa: E402,F401  (run_remd annotation)
 
-# Matplotlib is imported LAZILY inside the plotting functions only.  Importing
-# it at module import time would initialize a GUI/Agg backend in every spawned
-# worker process (the module is re-imported under the 'spawn' start method) and
-# risks fork-related state on POSIX; keeping the REMD/worker import path free of
-# matplotlib avoids that.  ``_import_matplotlib`` returns (cm, mcolors, plt) or
-# (None, None, None) when matplotlib is unavailable.
-def _import_matplotlib():
-    try:
-        import matplotlib.cm as cm
-        import matplotlib.colors as mcolors
-        import matplotlib.pyplot as plt
-        return cm, mcolors, plt
-    except Exception:  # pragma: no cover - depends on local plotting stack
-        return None, None, None
+try:  # plotting is optional when --no-plots is used
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover - depends on local plotting stack
+    cm = None
+    mcolors = None
+    plt = None
 
 
 # ---------------------------------------------------------------------------
@@ -886,19 +878,13 @@ def run_remd(
 
     nT = len(Ts)
     n_beads = int(N)
-    # Normalize + validate bin definitions ONCE at entry, even for direct
-    # Python-API callers (not only via the CLI).  The result is a deep copy, so
-    # the run never mutates module constants or the caller's dict, and the
-    # definitions are validated semantically + as exhaustive partitions for N.
-    _src = (bin_defs.get("bin_definition_source", "caller_supplied")
-            if isinstance(bin_defs, dict) else "module_default")
-    bin_defs = ico.normalize_bin_definitions(
-        (bin_defs or {}).get("fixed") if isinstance(bin_defs, dict) else None,
-        (bin_defs or {}).get("scaled") if isinstance(bin_defs, dict) else None,
-        n_beads=n_beads, source=_src,
-    )
-    _fixed_defs = bin_defs["fixed"]
-    _scaled_defs = bin_defs["scaled"]
+    if bin_defs is None:
+        bin_defs = ico.default_bin_definitions(n_beads)
+    # Resolve the exact fixed/scaled definitions used for online structural
+    # binning from the (validated) bin_defs, falling back to module defaults
+    # only when a key is genuinely absent.
+    _fixed_defs = bin_defs.get("fixed") if isinstance(bin_defs, dict) else None
+    _scaled_defs = bin_defs.get("scaled") if isinstance(bin_defs, dict) else None
 
     replicas: list[Replica] = [
         Replica(
@@ -931,16 +917,8 @@ def run_remd(
 
     report_every = max(1, n_cycles // 20)
     base_seed = seed if seed is not None else 0
-    # Use an explicit 'spawn' start method so worker startup is deterministic
-    # and identical across platforms (Windows already defaults to spawn), and so
-    # no forked parent state (e.g. an initialized plotting backend) leaks into
-    # workers.  Worker seeds are supplied explicitly per cycle, so sampling is
-    # unchanged by the start method.
     executor = (
-        ProcessPoolExecutor(
-            max_workers=min(n_workers, nT),
-            mp_context=_mp.get_context("spawn"),
-        )
+        ProcessPoolExecutor(max_workers=min(n_workers, nT))
         if n_workers > 1 else None
     )
     t_sweep_total = t_swap_total = t_struct_total = 0.0
@@ -1970,7 +1948,6 @@ def save_diagnostic_trajectories_npz(
     out_prefix: str,
     rg_scale: float = 1.0,
     configured_structural_stride: int | None = None,
-    bin_definitions: dict | None = None,
 ) -> str:
     """Save compressed post-burn-in C/Rg/E and walker temperature-index traces.
 
@@ -2072,26 +2049,6 @@ def save_diagnostic_trajectories_npz(
         walker_temp_index_post=wti_post,
     )
 
-    # Always record the EXACT resolved bin definitions used by this run (not the
-    # current module defaults), because the NPZ carries m_long_post and
-    # m_global_scaled_post which were binned with these definitions.
-    if bin_definitions is not None:
-        rec = bin_definitions
-        fixed_d = rec.get("fixed", ico.FIXED_BIN_DEFINITIONS)
-        scaled_d = rec.get("scaled", ico.SCALED_BIN_DEFINITIONS)
-        defs_ver = rec.get("definitions_version", ico.DEFINITIONS_VERSION)
-        src = rec.get("bin_definition_source", "unknown")
-    else:
-        fixed_d, scaled_d = ico.FIXED_BIN_DEFINITIONS, ico.SCALED_BIN_DEFINITIONS
-        defs_ver, src = ico.DEFINITIONS_VERSION, "module_default"
-    payload["definitions_version"] = str(defs_ver)
-    payload["bin_definition_source"] = str(src)
-    payload["fixed_bin_definitions"] = json.dumps(fixed_d)
-    payload["scaled_bin_definitions"] = json.dumps(scaled_d)
-    payload["structural_bin_definitions"] = json.dumps(
-        bin_definitions if bin_definitions is not None
-        else {"fixed": fixed_d, "scaled": scaled_d})
-
     # Persist full m_r vectors only if they were retained.
     if replicas and len(replicas[0].m_r_traj) > 0:
         n_beads = int(len(replicas[0].m_r_traj[0]))
@@ -2109,6 +2066,8 @@ def save_diagnostic_trajectories_npz(
             "m_r_post[lane, sample, r] = number of contacts with contour "
             "separation r (0 <= r < n_beads); even r are zero; sum_r == m"
         )
+        payload["fixed_bin_definitions"] = json.dumps(ico.FIXED_BIN_DEFINITIONS)
+        payload["scaled_bin_definitions"] = json.dumps(ico.SCALED_BIN_DEFINITIONS)
         payload["n_beads"] = int(n_beads)
 
     np.savez_compressed(path, **payload)
@@ -2121,7 +2080,6 @@ def save_diagnostic_trajectories_npz(
 # ---------------------------------------------------------------------------
 
 def _make_colormap(Ts: np.ndarray):
-    cm, mcolors, _plt = _import_matplotlib()
     cmap = cm.coolwarm
     norm = mcolors.Normalize(vmin=float(np.nanmin(Ts)), vmax=float(np.nanmax(Ts)))
     sm   = cm.ScalarMappable(norm=norm, cmap=cmap)
@@ -2130,7 +2088,6 @@ def _make_colormap(Ts: np.ndarray):
 
 
 def plot_observables(results: list[dict], out_prefix: str) -> None:
-    _cm, _mcolors, plt = _import_matplotlib()
     Ts      = np.array([r["T"]      for r in results])
     E_means = np.array([r["E_mean"] for r in results])
     E_errs  = np.array([r["E_std"]  for r in results])
@@ -2157,7 +2114,6 @@ def plot_observables(results: list[dict], out_prefix: str) -> None:
 
 
 def plot_distributions(dist: dict, out_prefix: str) -> None:
-    _cm, _mcolors, plt = _import_matplotlib()
     Ts         = dist["Ts"]
     c_vals     = dist["c_vals"]
     Pc         = dist["Pc"]
@@ -4167,8 +4123,6 @@ def main() -> None:
     bin_defs = ico.project_bin_definitions(int(args.N))
     bin_defs["fixed"] = fixed_defs
     bin_defs["scaled"] = scaled_defs
-    bin_defs["bin_definition_source"] = (
-        "cli_override" if requested_bin_definitions is not None else "module_default")
 
     # Optional streaming coordinate-snapshot writer (opt-in).
     snapshot_writer = None
@@ -4378,7 +4332,6 @@ def main() -> None:
                 rg_scale=args.rg_scale,
                 configured_structural_stride=(
                     structural_stride_eff if structural_observables else None),
-                bin_definitions=bin_defs,
             )
             output_files["diagnostic_trajectories_npz"] = traj_path
             # The diagnostic-trajectories NPZ also carries the post-burn-in
@@ -4393,8 +4346,7 @@ def main() -> None:
         )
 
     if not args.no_plots:
-        _cm, _mcolors, _plt = _import_matplotlib()
-        if _plt is None or _cm is None or _mcolors is None:
+        if plt is None or cm is None or mcolors is None:
             raise RuntimeError(
                 "matplotlib is required for plots; install it or use --no-plots"
             )
