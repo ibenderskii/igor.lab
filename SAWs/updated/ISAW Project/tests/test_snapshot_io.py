@@ -142,6 +142,20 @@ def test_failed_append_does_not_commit_row():
             assert int(s.attrs["committed_rows"]) == 1
 
 
+def test_commit_marker_survives_reopen():
+    import h5py
+    with tempfile.TemporaryDirectory() as tmp:
+        path, w = _writer(tmp)
+        for c in range(4):
+            _ok_append(w, c)
+            # After every append the committed count is durable on disk: open a
+            # SECOND read-only handle and confirm the marker is already there.
+            with h5py.File(path, "r") as rf:
+                assert cio.committed_rows(rf["snapshots"]) == c + 1
+        w.mark_complete()
+        w.close()
+
+
 def test_refuses_overwrite():
     with tempfile.TemporaryDirectory() as tmp:
         path, w = _writer(tmp)

@@ -61,6 +61,11 @@ _NN6: Tuple[Vec, ...] = (
 
 MIN_CONTOUR_SEPARATION = 3
 
+# Bumped to 1.1.0 when the scaled-bin local boundary became closed (r/N<=0.10),
+# making local_scaled non-empty for N=30.  Stored in every definition record so
+# old files keep their historical definitions/version.
+DEFINITIONS_VERSION = "1.1.0"
+
 
 class ContactMapError(ValueError):
     """Raised when coordinates or a contact map fail validation."""
@@ -120,6 +125,18 @@ def normalize_lattice_coordinates(
         raise ContactMapError("coordinates array is empty (N = 0)")
 
     if arr.dtype.kind in ("i", "u"):
+        # Guard unsigned/over-wide integers that would silently wrap when cast
+        # to int64 (e.g. np.uint64(2**63 + 1) -> negative).
+        if arr.size:
+            int64_max = int(np.iinfo(np.int64).max)
+            int64_min = int(np.iinfo(np.int64).min)
+            amax = int(arr.max())
+            amin = int(arr.min())
+            if amax > int64_max or amin < int64_min:
+                raise ContactMapError(
+                    f"coordinate value out of int64 range "
+                    f"[{amin}, {amax}]; refusing to wrap on cast"
+                )
         ints = arr.astype(np.int64)
     elif arr.dtype.kind in ("f", "c"):
         if arr.dtype.kind == "c":
@@ -242,17 +259,61 @@ def build_contact_map_bruteforce(
 # Phase 2: complete contact-map validation
 # ---------------------------------------------------------------------------
 
+def _exact_int_array(values, *, what: str) -> np.ndarray:
+    """Coerce to int64 only if numeric, finite, and exactly integral.
+
+    Rejects object/ragged arrays, NaN/inf, and fractional values rather than
+    truncating via ``astype``.
+    """
+    try:
+        arr = np.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise ContactMapError(f"{what} could not be interpreted as an array") from exc
+    if arr.dtype == object:
+        raise ContactMapError(f"{what} must be a numeric array, not object/ragged")
+    if arr.dtype.kind == "b":
+        return arr.astype(np.int64)
+    if arr.dtype.kind in ("i", "u"):
+        if arr.dtype.kind == "u" and arr.size and int(arr.max()) > int(np.iinfo(np.int64).max):
+            raise ContactMapError(f"{what} value out of int64 range")
+        return arr.astype(np.int64)
+    if arr.dtype.kind in ("f", "c"):
+        if arr.dtype.kind == "c":
+            raise ContactMapError(f"{what} must be real, not complex")
+        if not np.all(np.isfinite(arr)):
+            raise ContactMapError(f"{what} contains NaN or infinity")
+        rounded = np.rint(arr)
+        if not np.all(rounded == arr):
+            raise ContactMapError(f"{what} has fractional values (not exact integers)")
+        return rounded.astype(np.int64)
+    raise ContactMapError(f"{what} has unsupported dtype {arr.dtype!r}")
+
+
 def _canonical_pairs(contact_pairs) -> np.ndarray:
-    pairs = np.asarray(contact_pairs)
-    if pairs.size == 0:
-        return np.empty((0, 2), dtype=np.int64)
-    if pairs.dtype.kind == "f":
-        rounded = np.rint(pairs)
-        if not np.all(np.isfinite(pairs)) or not np.all(rounded == pairs):
-            raise ContactMapError("contact pairs must be exact integers")
-        pairs = rounded
-    pairs = pairs.astype(np.int64).reshape(-1, 2)
-    return pairs
+    """Validate and return contact pairs as an exact int64 (m, 2) array.
+
+    Requires exactly 2-D input with a trailing dimension of size 2.  An empty
+    array is accepted only if it can represent zero pairs (shape (0, 2) or an
+    empty 1-D array).  No silent reshape of arbitrary arrays.
+    """
+    try:
+        raw = np.asarray(contact_pairs)
+    except (TypeError, ValueError) as exc:
+        raise ContactMapError("contact pairs could not be interpreted as an array") from exc
+    if raw.dtype == object:
+        raise ContactMapError("contact pairs must be numeric, not object/ragged")
+    if raw.size == 0:
+        # Accept empty 1-D or (0, 2); reject other empty shapes like (0, 4).
+        if raw.ndim == 1 or (raw.ndim == 2 and raw.shape[1] == 2):
+            return np.empty((0, 2), dtype=np.int64)
+        raise ContactMapError(
+            f"empty contact-pair array has shape {raw.shape}; expected (0, 2)"
+        )
+    if raw.ndim != 2 or raw.shape[1] != 2:
+        raise ContactMapError(
+            f"contact pairs must have shape (m, 2); got shape {raw.shape}"
+        )
+    return _exact_int_array(raw, what="contact pairs")
 
 
 def validate_contact_map(
@@ -324,15 +385,21 @@ def validate_contact_map(
         raise ContactMapError("non-odd contour separation on cubic lattice")
 
     if separations is not None:
-        sep_arr = np.asarray(separations).reshape(-1)
-        if sep_arr.shape[0] != m:
+        raw_sep = np.asarray(separations)
+        if raw_sep.ndim != 1:
             raise ContactMapError(
-                f"separations shape {sep_arr.shape} inconsistent with "
+                f"separations must be 1-D; got shape {raw_sep.shape}"
+            )
+        if raw_sep.shape[0] != m:
+            raise ContactMapError(
+                f"separations shape {raw_sep.shape} inconsistent with "
                 f"{m} contact pair(s)"
             )
+        # Exact-int validation (rejects 5.9, NaN, inf) -- never truncate.
+        sep_arr = _exact_int_array(raw_sep, what="separations")
         # Compare against the *as-supplied* pair order, not the sorted one.
         seps_supplied = (pairs[:, 1] - pairs[:, 0]) if m else np.empty(0, np.int64)
-        if not np.array_equal(sep_arr.astype(np.int64), seps_supplied):
+        if not np.array_equal(sep_arr, seps_supplied):
             raise ContactMapError(
                 "supplied separations != pairs[:, 1] - pairs[:, 0]"
             )
@@ -450,6 +517,8 @@ def _zero_contact_graph_summary(n_beads: int) -> dict:
     return {
         "contact_vertices": 0,
         "contact_graph_components": 0,
+        "contact_graph_edges": 0,
+        "sum_component_edges": 0,
         "largest_component_vertices": 0,
         "largest_component_edges": 0,
         "largest_component_fraction_of_N": 0.0,
@@ -529,10 +598,16 @@ def contact_graph_summary(contact_pairs: np.ndarray, n_beads: int) -> dict:
 
     cycle_rank = int(m - n_vert + n_components)
     n_multiedge = int(sum(1 for e in comp_edges.values() if e >= 2))
+    # Independent edge totals (not derived from the cycle-rank identity), so the
+    # consumer can cross-check edges == m and sum_component_edges == m without
+    # the check being tautological.
+    sum_comp_edges = int(sum(comp_edges.values()))
 
     return {
         "contact_vertices": n_vert,
         "contact_graph_components": int(n_components),
+        "contact_graph_edges": int(m),
+        "sum_component_edges": sum_comp_edges,
         "largest_component_vertices": s_max,
         "largest_component_edges": s_max_edges,
         "largest_component_fraction_of_N": (
@@ -579,12 +654,19 @@ FIXED_BIN_DEFINITIONS = {
     ),
 }
 
+# Boundary inclusion (canonical, definitions_version 1.1.0):
+#     local_scaled      : r/N <= local_max_ratio          (CLOSED upper bound)
+#     mesoscopic_scaled : local_max_ratio < r/N < meso_max_ratio
+#     global_scaled     : r/N >= meso_max_ratio           (CLOSED lower bound)
+# The local upper bound is closed so that r=3 at N=30 (r/N = 0.10 exactly) falls
+# in local_scaled rather than leaving the local class empty.
 SCALED_BIN_DEFINITIONS = {
     "scheme": "scaled",
     "local_max_ratio": 0.10,
     "meso_max_ratio": 0.33,
+    "local_boundary": "closed",   # r/N == local_max_ratio -> local_scaled
     "description": (
-        "local_scaled r/N<0.10; mesoscopic_scaled 0.10<=r/N<0.33; "
+        "local_scaled r/N<=0.10; mesoscopic_scaled 0.10<r/N<0.33; "
         "global_scaled r/N>=0.33"
     ),
 }
@@ -615,10 +697,15 @@ def assign_fixed_bin(r: int, defs: dict | None = None) -> str:
 
 
 def assign_scaled_bin(r: int, n_beads: int, defs: dict | None = None) -> str:
-    """Return 'local_scaled' | 'mesoscopic_scaled' | 'global_scaled'."""
+    """Return 'local_scaled' | 'mesoscopic_scaled' | 'global_scaled'.
+
+    Boundary inclusion (definitions_version 1.1.0): local upper bound is closed
+    (r/N <= local_max_ratio -> local_scaled); global lower bound is closed
+    (r/N >= meso_max_ratio -> global_scaled).
+    """
     defs = _scaled_defs(defs)
     ratio = float(r) / float(n_beads)
-    if ratio < float(defs["local_max_ratio"]):
+    if ratio <= float(defs["local_max_ratio"]):
         return "local_scaled"
     if ratio < float(defs["meso_max_ratio"]):
         return "mesoscopic_scaled"
@@ -629,15 +716,46 @@ def _valid_separations(n_beads: int) -> list[int]:
     return [r for r in range(MIN_CONTOUR_SEPARATION, int(n_beads)) if r % 2 == 1]
 
 
+def validate_m_r(
+    m_r,
+    *,
+    n_beads: int | None = None,
+    require_cubic_parity: bool = True,
+) -> np.ndarray:
+    """Strictly validate an authoritative contour-separation vector m_r.
+
+    Checks: 1-D, numeric, finite, exact integers, nonnegative; length equals
+    ``n_beads`` when supplied; entries at r < 3 are zero; even-r entries are
+    zero (cubic-lattice parity) when ``require_cubic_parity``.  Never truncates;
+    returns a signed int64 array.
+    """
+    raw = np.asarray(m_r)
+    if raw.dtype == object:
+        raise ContactMapError("m_r must be a numeric array, not object/ragged")
+    if raw.ndim != 1:
+        raise ContactMapError(f"m_r must be 1-D; got shape {raw.shape}")
+    arr = _exact_int_array(raw, what="m_r")
+    if np.any(arr < 0):
+        raise ContactMapError("m_r entries must be nonnegative")
+    if n_beads is not None and arr.shape[0] != int(n_beads):
+        raise ContactMapError(
+            f"m_r length {arr.shape[0]} != n_beads {int(n_beads)}"
+        )
+    below = np.nonzero(arr[:MIN_CONTOUR_SEPARATION])[0]
+    if below.size:
+        raise ContactMapError(
+            f"m_r has nonzero count(s) at invalid separation r<{MIN_CONTOUR_SEPARATION}"
+        )
+    if require_cubic_parity and np.any(arr[0::2] != 0):
+        raise ContactMapError(
+            "m_r has nonzero count(s) at even separation (forbidden on cubic lattice)"
+        )
+    return arr
+
+
 def _check_m_r(m_r: np.ndarray) -> np.ndarray:
-    m_r = np.asarray(m_r, dtype=np.int64)
-    nz = np.nonzero(m_r)[0]
-    for r in nz:
-        if int(r) < MIN_CONTOUR_SEPARATION:
-            raise ContactMapError(
-                f"m_r has {int(m_r[r])} contact(s) at invalid separation r={int(r)}"
-            )
-    return m_r
+    # Backward-compatible internal helper -> strict validator (parity enforced).
+    return validate_m_r(m_r)
 
 
 def bin_contact_separations_fixed(
@@ -736,6 +854,7 @@ def validate_bin_definitions(
 def project_bin_definitions(n_beads: int) -> dict:
     """Serializable record of both bin schemes for a given N (for metadata)."""
     return {
+        "definitions_version": DEFINITIONS_VERSION,
         "n_beads": int(n_beads),
         "min_separation": MIN_CONTOUR_SEPARATION,
         "fixed": dict(FIXED_BIN_DEFINITIONS),

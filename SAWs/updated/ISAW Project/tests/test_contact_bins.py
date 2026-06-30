@@ -36,9 +36,19 @@ def test_no_unintended_empty_fixed(n):
         assert chk["fixed_membership"][name], (n, name)
 
 
-def test_scaled_local_empty_warns_at_n30():
+def test_scaled_local_nonempty_at_n30():
+    # definitions_version 1.1.0: closed local boundary (r/N<=0.10) makes
+    # local_scaled non-empty at N=30 (r=3 -> r/N=0.10 -> local).
     chk = ico.validate_bin_definitions(30)
-    assert any("local_scaled" in w for w in chk["warnings"])
+    assert chk["scaled_membership"]["local_scaled"] == [3]
+    assert not any("local_scaled" in w for w in chk["warnings"])
+
+
+@pytest.mark.parametrize("n", [30, 44])
+def test_all_scaled_categories_nonempty(n):
+    chk = ico.validate_bin_definitions(n)
+    for name in ("local_scaled", "mesoscopic_scaled", "global_scaled"):
+        assert chk["scaled_membership"][name], (n, name)
 
 
 @pytest.mark.parametrize("n", [30, 44])
@@ -61,8 +71,9 @@ def test_boundary_separations_classified_as_documented():
     assert ico.assign_fixed_bin(11) == "medium_fixed"
     assert ico.assign_fixed_bin(13) == "medium_fixed"
     assert ico.assign_fixed_bin(15) == "long_fixed"
-    # Scaled at N=30: r=3 -> r/N=0.10 -> mesoscopic (not local); r=11 -> global.
-    assert ico.assign_scaled_bin(3, 30) == "mesoscopic_scaled"
+    # Scaled at N=30 (closed local boundary): r=3 -> r/N=0.10 -> local;
+    # r=5,7,9 -> mesoscopic; r=11 -> global (r/N>=0.33).
+    assert ico.assign_scaled_bin(3, 30) == "local_scaled"
     assert ico.assign_scaled_bin(9, 30) == "mesoscopic_scaled"
     assert ico.assign_scaled_bin(11, 30) == "global_scaled"
     # Scaled at N=44: r=3 -> local.

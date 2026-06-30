@@ -1,0 +1,496 @@
+{
+  "generated": "2026-06-30T00:49:37.861683+00:00",
+  "any_analysis_enabled": true,
+  "baselines": {
+    "final_joint_baseline_44mer": {
+      "hs": {
+        "model": "hs",
+        "bootstrap": {
+          "enabled": true,
+          "source": "bootstrap_summary.json",
+          "requested_replicates": 200,
+          "successful_replicates": 200,
+          "failed_replicates": 0,
+          "confidence": 0.95,
+          "param_confidence_intervals": {
+            "h": [
+              387.76128521447225,
+              440.01816989401186
+            ],
+            "s": [
+              1.5010964331030787,
+              1.65548379395137
+            ]
+          },
+          "widest_relative_ci": 0.12573997559931777,
+          "strongest_abs_param_correlation": 0.9981583970741942,
+          "n_identifiability_warnings": 1,
+          "identifiability_pairs": [
+            "h~s=0.9982"
+          ],
+          "max_bound_hit_fraction": 0.0,
+          "extra_terms_ci_include_zero": [],
+          "Tc_ci": [
+            258.5857505796235,
+            265.69759975308153
+          ],
+          "status": "warn"
+        },
+        "uncertainty_diagnostics": {
+          "enabled": true,
+          "source": "uncertainty_diagnostics.json",
+          "condition_number": 20088554.7872544,
+          "positive_definite": true,
+          "n_restarts": 8,
+          "n_successful_restarts": 8,
+          "n_distinct_minima": 1,
+          "distinct_minima": false,
+          "max_param_spread": 0.02679710105367319,
+          "restart_objective_spread": 2.000000165480742e-09,
+          "boundary_warnings": null,
+          "identifiability_status": "ok"
+        },
+        "split_sensitivity": {
+          "enabled": true,
+          "source": "split_sensitivity_summary.json",
+          "n_attempted": 16,
+          "n_succeeded": 16,
+          "mean_heldout_combined_loss": 0.05597728700560721,
+          "range_heldout_combined_loss": 0.004275424238193042,
+          "worst_blocked_low": 0.05549025840817314,
+          "worst_blocked_mid": 0.05849263391614075,
+          "worst_blocked_high": 0.055984746001960475,
+          "param_cv": {
+            "h": 0.04729194565722287,
+            "s": 0.03866525118731819,
+            "Tc": 0.009342444094720388
+          },
+          "max_param_cv": 0.04729194565722287,
+          "boundary_hit_warnings": 0,
+          "stability_status": "stable"
+        },
+        "rg_weight_sensitivity": {
+          "enabled": true,
+          "source": "rg_weight_summary.json",
+          "tested_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "production_weight": 0.5,
+          "pareto_efficient_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "knee_weight": 0.5,
+          "contact_loss_range": 0.001613651027780029,
+          "rg_loss_range": 0.0023074502239127034,
+          "production_weight_pareto_efficient": true,
+          "max_param_relative_spread": 0.23411855344751262,
+          "weight_sensitive": false,
+          "status": "stable"
+        }
+      },
+      "hs_quadratic": {
+        "model": "hs_quadratic",
+        "bootstrap": {
+          "enabled": true,
+          "source": "bootstrap_summary.json",
+          "requested_replicates": 200,
+          "successful_replicates": 200,
+          "failed_replicates": 0,
+          "confidence": 0.95,
+          "param_confidence_intervals": {
+            "h": [
+              423.62102288825747,
+              436.57945803995057
+            ],
+            "s": [
+              1.6265333189975915,
+              1.6677452480775328
+            ],
+            "a2": [
+              0.2098598602710141,
+              0.2414336405107513
+            ]
+          },
+          "widest_relative_ci": 0.14074530754440004,
+          "strongest_abs_param_correlation": 0.9955445539128951,
+          "n_identifiability_warnings": 1,
+          "identifiability_pairs": [
+            "h~s=0.9955"
+          ],
+          "max_bound_hit_fraction": 0.0,
+          "extra_terms_ci_include_zero": [],
+          "status": "warn"
+        },
+        "uncertainty_diagnostics": {
+          "enabled": true,
+          "source": "uncertainty_diagnostics.json",
+          "condition_number": 22892339.988838647,
+          "positive_definite": true,
+          "n_restarts": 8,
+          "n_successful_restarts": 8,
+          "n_distinct_minima": 1,
+          "distinct_minima": false,
+          "max_param_spread": 0.022174679653530222,
+          "restart_objective_spread": 1.000000082740371e-09,
+          "boundary_warnings": null,
+          "identifiability_status": "ok"
+        },
+        "split_sensitivity": {
+          "enabled": true,
+          "source": "split_sensitivity_summary.json",
+          "n_attempted": 16,
+          "n_succeeded": 16,
+          "mean_heldout_combined_loss": 0.05464291265973189,
+          "range_heldout_combined_loss": 0.006764150885330729,
+          "worst_blocked_low": 0.050693653381488395,
+          "worst_blocked_mid": 0.05717133423868863,
+          "worst_blocked_high": 0.0509566672737974,
+          "param_cv": {
+            "h": 0.01486125238057914,
+            "s": 0.011988291947705034,
+            "a2": 0.0866906601213199
+          },
+          "max_param_cv": 0.0866906601213199,
+          "boundary_hit_warnings": 0,
+          "stability_status": "stable"
+        },
+        "rg_weight_sensitivity": {
+          "enabled": true,
+          "source": "rg_weight_summary.json",
+          "tested_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "production_weight": 0.5,
+          "pareto_efficient_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "knee_weight": 0.5,
+          "contact_loss_range": 0.0017343840877749456,
+          "rg_loss_range": 0.0024910503601738004,
+          "production_weight_pareto_efficient": true,
+          "max_param_relative_spread": 0.41749453415141924,
+          "weight_sensitive": false,
+          "status": "stable"
+        }
+      },
+      "poly2": {
+        "model": "poly2",
+        "bootstrap": {
+          "enabled": true,
+          "source": "bootstrap_summary.json",
+          "requested_replicates": 200,
+          "successful_replicates": 200,
+          "failed_replicates": 0,
+          "confidence": 0.95,
+          "param_confidence_intervals": {
+            "a0": [
+              -0.3045404360485198,
+              -0.300512078997237
+            ],
+            "a1": [
+              -0.34456271535293104,
+              -0.33354776471125575
+            ],
+            "a2": [
+              0.2910131810181268,
+              0.32670560348048555
+            ]
+          },
+          "widest_relative_ci": 0.11581944643465752,
+          "strongest_abs_param_correlation": 0.6671443322687148,
+          "n_identifiability_warnings": 0,
+          "identifiability_pairs": [],
+          "max_bound_hit_fraction": 0.0,
+          "extra_terms_ci_include_zero": [],
+          "status": "ok"
+        },
+        "uncertainty_diagnostics": {
+          "enabled": true,
+          "source": "uncertainty_diagnostics.json",
+          "condition_number": 186.89004840373653,
+          "positive_definite": true,
+          "n_restarts": 8,
+          "n_successful_restarts": 8,
+          "n_distinct_minima": 2,
+          "distinct_minima": true,
+          "max_param_spread": 22.951946007062265,
+          "restart_objective_spread": 49.532698779,
+          "boundary_warnings": null,
+          "identifiability_status": "warn"
+        },
+        "split_sensitivity": {
+          "enabled": true,
+          "source": "split_sensitivity_summary.json",
+          "n_attempted": 16,
+          "n_succeeded": 16,
+          "mean_heldout_combined_loss": 0.05467119383789092,
+          "range_heldout_combined_loss": 0.006666587527670506,
+          "worst_blocked_low": 0.05079752544652078,
+          "worst_blocked_mid": 0.05717466263604935,
+          "worst_blocked_high": 0.05119173101430832,
+          "param_cv": {
+            "a0": 0.0026205390263877503,
+            "a1": 0.016408990560893937,
+            "a2": 0.0691739842683356
+          },
+          "max_param_cv": 0.0691739842683356,
+          "boundary_hit_warnings": 0,
+          "stability_status": "stable"
+        },
+        "rg_weight_sensitivity": {
+          "enabled": true,
+          "source": "rg_weight_summary.json",
+          "tested_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "production_weight": 0.5,
+          "pareto_efficient_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "knee_weight": 0.5,
+          "contact_loss_range": 0.0017352623654940391,
+          "rg_loss_range": 0.0024926936057836427,
+          "production_weight_pareto_efficient": true,
+          "max_param_relative_spread": 0.3694220755302214,
+          "weight_sensitive": false,
+          "status": "stable"
+        }
+      },
+      "poly3": {
+        "model": "poly3",
+        "bootstrap": {
+          "enabled": true,
+          "source": "bootstrap_summary.json",
+          "requested_replicates": 200,
+          "successful_replicates": 200,
+          "failed_replicates": 0,
+          "confidence": 0.95,
+          "param_confidence_intervals": {
+            "a0": [
+              -0.3053393618967968,
+              -0.30184985054723434
+            ],
+            "a1": [
+              -0.3221026071181272,
+              -0.29837260069660676
+            ],
+            "a2": [
+              0.30632965422267333,
+              0.3340400287784626
+            ],
+            "a3": [
+              -0.28353220748147456,
+              -0.13408679719748517
+            ]
+          },
+          "widest_relative_ci": 0.7584148260401606,
+          "strongest_abs_param_correlation": 0.949525706577243,
+          "n_identifiability_warnings": 1,
+          "identifiability_pairs": [
+            "a1~a3=-0.9495"
+          ],
+          "max_bound_hit_fraction": 0.0,
+          "extra_terms_ci_include_zero": [],
+          "status": "warn"
+        },
+        "uncertainty_diagnostics": {
+          "enabled": true,
+          "source": "uncertainty_diagnostics.json",
+          "condition_number": 2901.09639648801,
+          "positive_definite": true,
+          "n_restarts": 8,
+          "n_successful_restarts": 8,
+          "n_distinct_minima": 2,
+          "distinct_minima": true,
+          "max_param_spread": 23.40054949943156,
+          "restart_objective_spread": 49.534899335,
+          "boundary_warnings": null,
+          "identifiability_status": "warn"
+        },
+        "split_sensitivity": {
+          "enabled": true,
+          "source": "split_sensitivity_summary.json",
+          "n_attempted": 16,
+          "n_succeeded": 16,
+          "mean_heldout_combined_loss": 0.054581967225019054,
+          "range_heldout_combined_loss": 0.007123573815914941,
+          "worst_blocked_low": 0.0503089396491159,
+          "worst_blocked_mid": 0.05716951092755245,
+          "worst_blocked_high": 0.050774162966909925,
+          "param_cv": {
+            "a0": 0.0018876547162221915,
+            "a1": 0.01364427265728257,
+            "a2": 0.038281536941993884,
+            "a3": 0.22976513213634484
+          },
+          "max_param_cv": 0.22976513213634484,
+          "boundary_hit_warnings": 0,
+          "stability_status": "moderate"
+        },
+        "rg_weight_sensitivity": {
+          "enabled": true,
+          "source": "rg_weight_summary.json",
+          "tested_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "production_weight": 0.5,
+          "pareto_efficient_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "knee_weight": 0.5,
+          "contact_loss_range": 0.0017264899464813147,
+          "rg_loss_range": 0.002477138335228668,
+          "production_weight_pareto_efficient": true,
+          "max_param_relative_spread": 0.36290159863069976,
+          "weight_sensitive": false,
+          "status": "stable"
+        }
+      },
+      "heat_capacity": {
+        "model": "heat_capacity",
+        "bootstrap": {
+          "enabled": true,
+          "source": "bootstrap_summary.json",
+          "requested_replicates": 200,
+          "successful_replicates": 200,
+          "failed_replicates": 0,
+          "confidence": 0.95,
+          "param_confidence_intervals": {
+            "dh0": [
+              411.0011481065307,
+              420.8665253878983
+            ],
+            "ds0": [
+              1.587317764588038,
+              1.6168463745561827
+            ],
+            "dCp": [
+              -7.810957748954955,
+              -6.967145168988811
+            ]
+          },
+          "widest_relative_ci": 0.11447763530133949,
+          "strongest_abs_param_correlation": 0.993755704912348,
+          "n_identifiability_warnings": 1,
+          "identifiability_pairs": [
+            "dh0~ds0=0.9938"
+          ],
+          "max_bound_hit_fraction": 0.0,
+          "extra_terms_ci_include_zero": [],
+          "status": "warn"
+        },
+        "uncertainty_diagnostics": {
+          "enabled": true,
+          "source": "uncertainty_diagnostics.json",
+          "condition_number": 21767132.56169735,
+          "positive_definite": true,
+          "n_restarts": 8,
+          "n_successful_restarts": 8,
+          "n_distinct_minima": 4,
+          "distinct_minima": true,
+          "max_param_spread": 8076.11936336938,
+          "restart_objective_spread": 49.534536535,
+          "boundary_warnings": null,
+          "identifiability_status": "warn"
+        },
+        "split_sensitivity": {
+          "enabled": true,
+          "source": "split_sensitivity_summary.json",
+          "n_attempted": 16,
+          "n_succeeded": 16,
+          "mean_heldout_combined_loss": 0.05456409950499245,
+          "range_heldout_combined_loss": 0.007164590949721314,
+          "worst_blocked_low": 0.05042181112861535,
+          "worst_blocked_mid": 0.05716349705348551,
+          "worst_blocked_high": 0.05027538139155302,
+          "param_cv": {
+            "dh0": 0.009988156820324513,
+            "ds0": 0.008017524053571833,
+            "dCp": 0.051751008459716044
+          },
+          "max_param_cv": 0.051751008459716044,
+          "boundary_hit_warnings": 0,
+          "stability_status": "stable"
+        },
+        "rg_weight_sensitivity": {
+          "enabled": true,
+          "source": "rg_weight_summary.json",
+          "tested_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "production_weight": 0.5,
+          "pareto_efficient_weights": [
+            0.0,
+            0.1,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0
+          ],
+          "knee_weight": 0.5,
+          "contact_loss_range": 0.0017315781565084912,
+          "rg_loss_range": 0.0024839521869731707,
+          "production_weight_pareto_efficient": true,
+          "max_param_relative_spread": 0.41373485435872137,
+          "weight_sensitive": false,
+          "status": "stable"
+        }
+      }
+    }
+  }
+}

@@ -18,7 +18,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import isaw_contact_observables as ico
-import remd_uniform_chain_2 as remd
+import remd_uniform_chain_2_new as remd
 
 try:
     import networkx as nx

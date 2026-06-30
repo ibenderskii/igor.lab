@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover - import guard
     h5py = None
     _HAVE_H5PY = False
 
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 
 ALLOWED_COORD_DTYPES = ("auto", "int16", "int32")
 
@@ -323,16 +323,20 @@ class SnapshotWriter:
             ds[row] = value
         self._n_allocated = new
 
-        # 4. Flush row data, then 5./6. update + flush the commit marker.
+        # Row-level durability policy:
+        #   3. flush row data (durable on disk)
+        #   4. update committed_rows / n_snapshots marker
+        #   5. flush the commit marker (durable on disk)
+        # The marker is therefore never flushed ahead of the row data it refers
+        # to, and a crash between any two appends leaves a consistent file whose
+        # committed_rows points only at fully-written rows.
         self._f.flush()
         self._n_written = new
         self._last_cycle = cycle_i
         self._snap.attrs["committed_rows"] = int(self._n_written)
         self._snap.attrs["n_snapshots"] = int(self._n_written)
-        self._since_flush += 1
-        if self._since_flush >= self.flush_interval:
-            self._f.flush()
-            self._since_flush = 0
+        self._f.flush()
+        self._since_flush = 0
 
     # -- lifecycle ----------------------------------------------------------
     @property

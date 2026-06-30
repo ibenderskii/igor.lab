@@ -36,11 +36,20 @@ def test_edge_totals_equal_m():
         if chain is None:
             continue
         cp, _ = ico.build_contact_map(chain)
+        m = cp.shape[0]
         g = ico.contact_graph_summary(cp, len(chain))
-        # cycle_rank identity == sum of component edges == m
+        # Independent edge totals (P14): both equal m, and the cycle-rank
+        # identity is a separate check.
+        assert g["contact_graph_edges"] == m
+        assert g["sum_component_edges"] == m
         assert (g["contact_graph_cycle_rank"]
-                == cp.shape[0] - g["contact_vertices"]
-                + g["contact_graph_components"])
+                == m - g["contact_vertices"] + g["contact_graph_components"])
+
+
+def test_zero_contact_edge_totals():
+    g = ico.contact_graph_summary(np.empty((0, 2), dtype=np.int64), 10)
+    assert g["contact_graph_edges"] == 0
+    assert g["sum_component_edges"] == 0
 
 
 def test_cycle_rank_triangle():

@@ -307,7 +307,11 @@ MODEL_API_VERSION = 1
 #       state_changing column (null moves excluded from acceptance);
 #       diagnostics report tau_int_samples/tau_int_cycles; q stored alongside
 #       authoritative K with overflow handled.
-SCHEMA_VERSION = 2
+#   v3: authoritative resolved bin definitions threaded online->HDF5->extractor;
+#       results CSV gains m_long_fixed_*/m_global_scaled_*/state_changing rate;
+#       diagnostics gate structural warnings + dedup ESS types; configured vs
+#       observed structural stride; definitions_version 1.1.0 (closed local bin).
+SCHEMA_VERSION = 3
 
 
 def get_model_contract() -> dict:
@@ -598,7 +602,22 @@ class Replica:
 
     @property
     def local_acc_rate(self) -> float:
+        # LEGACY metric: all accepted Metropolis outcomes / proposed (includes
+        # accepted null moves).  Kept for backward compatibility.
         return self.local_acc / self.local_prop if self.local_prop else float("nan")
+
+    @property
+    def legacy_local_acceptance_rate(self) -> float:
+        return self.local_acc_rate
+
+    @property
+    def state_changing_acceptance_rate(self) -> float:
+        # State-changing accepted moves (move-counter column 3) / proposed.
+        # Null moves are excluded; this is the freezing-diagnostic metric.
+        if not self.local_prop:
+            return float("nan")
+        accepted_state_changing = int(np.asarray(self.move_counters)[:, 3].sum())
+        return accepted_state_changing / self.local_prop
 
 
 # ---------------------------------------------------------------------------
@@ -750,15 +769,16 @@ def _record_scalar_observables(rep: Replica) -> tuple[float, float]:
 
 def _record_structural_sample(
     rep: Replica, cycle: int, n_beads: int, save_m_r: bool = False,
+    fixed_defs: dict | None = None, scaled_defs: dict | None = None,
 ) -> None:
     """Append contact-map-derived structural observables for one replica.
 
     Builds the contact map, verifies its count against the cached ``state.m``,
     and stores m_long_fixed, m_global_scaled, S_max, largest-component fraction,
-    and the originating cycle index.  The full m_r vector is retained in memory
-    ONLY when ``save_m_r`` is True (it is otherwise reconstructable offline from
-    the saved coordinates, the authoritative source).  Raises if the recomputed
-    count disagrees with ``state.m``.
+    and the originating cycle index, using the EXACT resolved bin definitions
+    (``fixed_defs``/``scaled_defs``) rather than module defaults.  The full m_r
+    vector is retained in memory ONLY when ``save_m_r`` is True.  Raises if the
+    recomputed count disagrees with ``state.m``.
     """
     cp, _seps = ico.build_contact_map(rep.state.chain)
     if cp.shape[0] != int(rep.state.m):
@@ -767,8 +787,8 @@ def _record_structural_sample(
             f"state.m={rep.state.m} (lane T={rep.T}, cycle={cycle})"
         )
     m_r = ico.contact_separation_counts(cp, n_beads)
-    fixed = ico.bin_contact_separations_fixed(m_r, n_beads)
-    scaled = ico.bin_contact_separations_scaled(m_r, n_beads)
+    fixed = ico.bin_contact_separations_fixed(m_r, n_beads, fixed_defs)
+    scaled = ico.bin_contact_separations_scaled(m_r, n_beads, scaled_defs)
     graph = ico.contact_graph_summary(cp, n_beads)
     rep.m_long_traj.append(int(fixed["m_long_fixed"]))
     rep.m_global_scaled_traj.append(int(scaled["m_global_scaled"]))
@@ -860,6 +880,11 @@ def run_remd(
     n_beads = int(N)
     if bin_defs is None:
         bin_defs = ico.default_bin_definitions(n_beads)
+    # Resolve the exact fixed/scaled definitions used for online structural
+    # binning from the (validated) bin_defs, falling back to module defaults
+    # only when a key is genuinely absent.
+    _fixed_defs = bin_defs.get("fixed") if isinstance(bin_defs, dict) else None
+    _scaled_defs = bin_defs.get("scaled") if isinstance(bin_defs, dict) else None
 
     replicas: list[Replica] = [
         Replica(
@@ -965,7 +990,8 @@ def run_remd(
             for k, rep in enumerate(replicas):
                 rg2, ree2 = _record_scalar_observables(rep)
                 if do_structural:
-                    _record_structural_sample(rep, cycle, n_beads, save_m_r)
+                    _record_structural_sample(
+                        rep, cycle, n_beads, save_m_r, _fixed_defs, _scaled_defs)
                 if do_snapshot:
                     snap_coords[k] = np.asarray(rep.state.chain, dtype=np.int64)
                     snap_contacts[k] = int(rep.state.m)
@@ -1059,6 +1085,7 @@ def compute_statistics(
         ns = len(rep.m_long_traj)
         ss = int(math.floor(ns * burnin_frac))
         m_long_mean, m_long_std = _ms(rep.m_long_traj[ss:])
+        m_global_mean, m_global_std = _ms(rep.m_global_scaled_traj[ss:])
         smax_mean, smax_std = _ms(rep.Smax_traj[ss:])
         lcf_mean, lcf_std = _ms(rep.largest_component_fraction_traj[ss:])
 
@@ -1082,14 +1109,21 @@ def compute_statistics(
             "Ree2_mean":  (rg_scale ** 2) * Ree2_mean_lat,
             "Ree2_std":   (rg_scale ** 2) * Ree2_std_lat,
             # Contact/graph observables: never rescaled by rg_scale.
+            # m_long_mean/std are the compatibility aliases for the FIXED scheme.
             "m_long_mean": m_long_mean,
             "m_long_std":  m_long_std,
+            "m_long_fixed_mean": m_long_mean,
+            "m_long_fixed_std":  m_long_std,
+            "m_global_scaled_mean": m_global_mean,
+            "m_global_scaled_std":  m_global_std,
             "Smax_mean":   smax_mean,
             "Smax_std":    smax_std,
             "largest_component_fraction_mean": lcf_mean,
             "largest_component_fraction_std":  lcf_std,
             "n_structural_samples": int(ns),
+            # local_acc_rate is the LEGACY (null-inclusive) acceptance rate.
             "local_acc_rate": rep.local_acc_rate,
+            "state_changing_acceptance_rate": rep.state_changing_acceptance_rate,
         })
     return results
 
@@ -1396,8 +1430,15 @@ def compute_run_diagnostics(
     n_blocks: int,
     thresholds: dict,
     rg_scale: float = 1.0,
+    structural_observables_enabled: bool = False,
 ) -> dict:
     """Assemble per-lane convergence and per-walker mixing diagnostics + warnings.
+
+    When ``structural_observables_enabled`` is False, structural ESS/drift and
+    insufficient-sample warnings are suppressed and the disabled state is
+    recorded; per-cycle observables (contacts, Rg, Rg2, Ree2, energy) are always
+    diagnosed.  Each observable emits at most one canonical ESS warning type
+    (no duplicate ``low_ess`` + ``low_ess_contacts``).
 
     Lane convergence (autocorrelation/ESS/drift/block stability) is computed on
     the post-burn-in segment of each temperature lane (matching the canonical
@@ -1523,12 +1564,19 @@ def compute_run_diagnostics(
     total_round_trips = int(sum(rt_low))
 
     # Structural-observable ESS (separate stride; report per observable).
-    struct_obs = ("rg2", "ree2", "m_long", "smax", "largest_component_fraction")
+    # Canonical observable keys (no aliases): contact-map structural observables
+    # are m_long_fixed / m_global_scaled / smax / largest_component_fraction.
+    struct_obs = ("m_long_fixed", "m_global_scaled", "smax",
+                  "largest_component_fraction")
     struct_min_ess = {}
     for name in struct_obs:
         vals = _obs_esss(name)
         struct_min_ess[name] = float(min(vals)) if vals else float("nan")
-    key_struct = ("contacts", "rg2", "m_long", "smax")
+    # rg2/ree2 are per-cycle scalars (always available) -> reported separately.
+    for name in ("rg2", "ree2"):
+        vals = _obs_esss(name)
+        struct_min_ess[name] = float(min(vals)) if vals else float("nan")
+    key_struct = ("contacts", "rg2", "m_long_fixed", "smax")
     key_struct_ess = []
     for name in key_struct:
         vals = _obs_esss(name)
@@ -1538,8 +1586,8 @@ def compute_run_diagnostics(
     n_struct_samples = [lane["n_post_burnin_structural"] for lane in lane_conv]
     min_struct_samples = int(min(n_struct_samples)) if n_struct_samples else 0
     struct_drift = [
-        abs(lane["m_long"]["drift_in_std"]) for lane in lane_conv
-        if np.isfinite(lane["m_long"]["drift_in_std"])
+        abs(lane["m_long_fixed"]["drift_in_std"]) for lane in lane_conv
+        if np.isfinite(lane["m_long_fixed"]["drift_in_std"])
     ]
 
     summary = {
@@ -1559,14 +1607,16 @@ def compute_run_diagnostics(
         "min_swap_rate": float(finite_swap.min()) if finite_swap.size else float("nan"),
         "median_swap_rate": float(np.median(finite_swap)) if finite_swap.size else float("nan"),
         # Structural-observable summary (separate sampling stride).
+        "structural_observables_enabled": bool(structural_observables_enabled),
         "min_ess_rg2": struct_min_ess["rg2"],
         "min_ess_ree2": struct_min_ess["ree2"],
-        "min_ess_m_long": struct_min_ess["m_long"],
+        "min_ess_m_long_fixed": struct_min_ess["m_long_fixed"],
+        "min_ess_m_global_scaled": struct_min_ess["m_global_scaled"],
         "min_ess_smax": struct_min_ess["smax"],
         "min_ess_largest_component_fraction": struct_min_ess["largest_component_fraction"],
         "min_ess_key_structural": min_ess_key_structural,
         "min_structural_samples": min_struct_samples,
-        "max_drift_m_long": float(max(struct_drift)) if struct_drift else float("nan"),
+        "max_drift_m_long_fixed": float(max(struct_drift)) if struct_drift else float("nan"),
     }
 
     # --- threshold-driven warnings (structured + recorded) ---
@@ -1588,10 +1638,6 @@ def compute_run_diagnostics(
               f"minimum walker temperature coverage {min(coverage):.3f} < "
               f"{thr['min_temp_coverage']}",
               float(min(coverage)), thr["min_temp_coverage"])
-    if ess_contacts and min(ess_contacts) < float(thr["min_ess"]):
-        _warn("low_ess",
-              f"minimum contact ESS {min(ess_contacts):.1f} < {thr['min_ess']}",
-              float(min(ess_contacts)), thr["min_ess"])
     if drift_contacts and max(drift_contacts) > float(thr["max_drift"]):
         _warn("drift",
               f"maximum |contact drift|/std {max(drift_contacts):.3f} > "
@@ -1603,30 +1649,44 @@ def compute_run_diagnostics(
               f"{thr['min_swap_rate']}",
               float(finite_swap.min()), thr["min_swap_rate"])
 
-    # --- structural-observable warnings -------------------------------------
-    for warn_kind, obs_name, label in (
+    # --- per-observable ESS warnings: exactly one canonical type each --------
+    # Always-on per-cycle observables.
+    always_on = (
         ("low_ess_contacts", "contacts", "contact"),
         ("low_ess_rg2", "rg2", "Rg^2"),
-        ("low_ess_m_long", "m_long", "m_long"),
+        ("low_ess_ree2", "ree2", "Ree^2"),
+    )
+    # Structural observables only diagnosed when explicitly enabled.
+    structural_ess = (
+        ("low_ess_m_long_fixed", "m_long_fixed", "m_long_fixed"),
+        ("low_ess_m_global_scaled", "m_global_scaled", "m_global_scaled"),
         ("low_ess_smax", "smax", "S_max"),
-    ):
+        ("low_ess_largest_component_fraction", "largest_component_fraction",
+         "largest-component fraction"),
+    )
+    ess_specs = list(always_on)
+    if structural_observables_enabled:
+        ess_specs += list(structural_ess)
+    for warn_kind, obs_name, label in ess_specs:
         vals = _obs_esss(obs_name)
         if vals and min(vals) < float(thr["min_ess"]):
             _warn(warn_kind,
                   f"minimum {label} ESS {min(vals):.1f} < {thr['min_ess']}",
                   float(min(vals)), thr["min_ess"])
-    if struct_drift and max(struct_drift) > float(thr["max_drift"]):
-        _warn("structural_drift",
-              f"maximum |m_long drift|/std {max(struct_drift):.3f} > "
-              f"{thr['max_drift']}",
-              float(max(struct_drift)), thr["max_drift"])
-    min_struct_thr = int(thr.get("min_structural_samples",
-                                 DEFAULT_DIAG_THRESHOLDS["min_structural_samples"]))
-    if n_struct_samples and min_struct_samples < min_struct_thr:
-        _warn("insufficient_structural_samples",
-              f"minimum post-burn-in structural samples {min_struct_samples} < "
-              f"{min_struct_thr}",
-              int(min_struct_samples), min_struct_thr)
+
+    if structural_observables_enabled:
+        if struct_drift and max(struct_drift) > float(thr["max_drift"]):
+            _warn("structural_drift",
+                  f"maximum |m_long_fixed drift|/std {max(struct_drift):.3f} > "
+                  f"{thr['max_drift']}",
+                  float(max(struct_drift)), thr["max_drift"])
+        min_struct_thr = int(thr.get("min_structural_samples",
+                                     DEFAULT_DIAG_THRESHOLDS["min_structural_samples"]))
+        if n_struct_samples and min_struct_samples < min_struct_thr:
+            _warn("insufficient_structural_samples",
+                  f"minimum post-burn-in structural samples {min_struct_samples} < "
+                  f"{min_struct_thr}",
+                  int(min_struct_samples), min_struct_thr)
     # Local-move freezing (state-changing acceptance, null moves excluded).
     for w in detect_local_move_freezing(
         replicas, Ts,
@@ -1665,6 +1725,12 @@ def save_results_csv(results: list[dict], out_prefix: str) -> str:
         "m_long_mean", "m_long_std", "Smax_mean", "Smax_std",
         "largest_component_fraction_mean", "largest_component_fraction_std",
         "n_structural_samples",
+        # Newest columns appended at the very end (compat: old readers ignore).
+        # m_long_*_fixed are explicit aliases of the m_long_* (fixed-scheme)
+        # columns above; m_global_scaled_* are new.
+        "m_long_fixed_mean", "m_long_fixed_std",
+        "m_global_scaled_mean", "m_global_scaled_std",
+        "state_changing_acceptance_rate",
     ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -1881,6 +1947,7 @@ def save_diagnostic_trajectories_npz(
     burnin_frac: float,
     out_prefix: str,
     rg_scale: float = 1.0,
+    configured_structural_stride: int | None = None,
 ) -> str:
     """Save compressed post-burn-in C/Rg/E and walker temperature-index traces.
 
@@ -1947,9 +2014,15 @@ def save_diagnostic_trajectories_npz(
         int(replicas[0].structural_cycles[ss])
         if replicas and ss < len(replicas[0].structural_cycles) else -1
     )
-    struct_spacing = (
-        int(np.median(np.diff(struct_cycles))) if struct_cycles.size >= 2 else 1
+    # Observed spacing is INFERRED from the saved sample cycles; it is -1 when
+    # there are fewer than two structural samples (cannot be inferred).  The
+    # configured stride is the value the run was launched with and is the
+    # authoritative one; never infer the configured stride from observed gaps.
+    observed_spacing = (
+        int(np.median(np.diff(struct_cycles))) if struct_cycles.size >= 2 else -1
     )
+    cfg_stride = (int(configured_structural_stride)
+                  if configured_structural_stride is not None else -1)
     wti = np.asarray(walker_temp_index)
     wti_post = wti[s:].astype(np.int16) if wti.ndim == 2 else wti
 
@@ -1968,7 +2041,11 @@ def save_diagnostic_trajectories_npz(
         structural_sample_cycles=struct_cycles,
         structural_burnin_start_index=int(ss),
         structural_burnin_start_cycle=int(struct_start_cycle),
-        structural_stride=int(struct_spacing),
+        configured_structural_stride=int(cfg_stride),
+        observed_structural_cycle_spacing=int(observed_spacing),
+        # Compatibility key == the CONFIGURED stride (falls back to observed
+        # only when the configured value was not supplied).
+        structural_stride=int(cfg_stride if cfg_stride > 0 else observed_spacing),
         walker_temp_index_post=wti_post,
     )
 
@@ -4027,12 +4104,15 @@ def main() -> None:
         print(f"Tc = {model_params[1]:.8g}")
 
     # Contour-separation bin definitions (two independent schemes; optional
-    # JSON override of either).
+    # JSON override of either).  Both the requested override and the resolved
+    # definitions are recorded in the run summary for provenance.
+    requested_bin_definitions = None
     fixed_defs = dict(ico.FIXED_BIN_DEFINITIONS)
     scaled_defs = dict(ico.SCALED_BIN_DEFINITIONS)
     if args.structural_bins_json is not None:
         with open(args.structural_bins_json, encoding="utf-8") as fh:
             override = json.load(fh)
+        requested_bin_definitions = override
         if "fixed" in override:
             fixed_defs.update(override["fixed"])
         if "scaled" in override:
@@ -4159,6 +4239,9 @@ def main() -> None:
         replicas, burnin_frac=args.burnin_frac, rg_scale=args.rg_scale
     )
     local_acceptance_rates = [float(r["local_acc_rate"]) for r in results]
+    legacy_local_acceptance_rates = list(local_acceptance_rates)
+    state_changing_acceptance_rates = [
+        float(r["state_changing_acceptance_rate"]) for r in results]
     dist    = build_distributions(
         replicas, rg_bins=args.rg_bins, burnin_frac=args.burnin_frac,
         rg_scale=args.rg_scale,
@@ -4228,6 +4311,7 @@ def main() -> None:
             replicas, swap_props, swap_accs, walker_temp_index, Ts,
             burnin_frac=args.burnin_frac, n_blocks=args.diag_n_blocks,
             thresholds=thresholds, rg_scale=args.rg_scale,
+            structural_observables_enabled=structural_observables,
         )
         output_files["diagnostics_json"] = save_diagnostics_json(
             diagnostics_result, args.out_prefix
@@ -4246,6 +4330,8 @@ def main() -> None:
                 replicas, walker_temp_index, Ts,
                 burnin_frac=args.burnin_frac, out_prefix=args.out_prefix,
                 rg_scale=args.rg_scale,
+                configured_structural_stride=(
+                    structural_stride_eff if structural_observables else None),
             )
             output_files["diagnostic_trajectories_npz"] = traj_path
             # The diagnostic-trajectories NPZ also carries the post-burn-in
@@ -4301,6 +4387,9 @@ def main() -> None:
         "structural_stride": int(structural_stride_eff),
         "save_m_r_trajectories": bool(args.save_m_r_trajectories),
         "structural_bin_definitions": bin_defs,
+        "requested_bin_definitions": requested_bin_definitions,
+        "resolved_bin_definitions": {"fixed": fixed_defs, "scaled": scaled_defs,
+                                     "definitions_version": ico.DEFINITIONS_VERSION},
         "git_commit": _git_commit(),
         "diag_min_state_changing_move_rate": float(args.diag_min_state_changing_move_rate),
         "save_configurations": bool(args.save_configurations),
@@ -4316,6 +4405,8 @@ def main() -> None:
         "swap_rate_mean": float(swap_rates_finite.mean()) if swap_rates_finite.size else None,
         "swap_rate_median": float(np.median(swap_rates_finite)) if swap_rates_finite.size else None,
         "local_acceptance_rates": local_acceptance_rates,
+        "legacy_local_acceptance_rates": legacy_local_acceptance_rates,
+        "state_changing_acceptance_rates": state_changing_acceptance_rates,
         "output_files": output_files,
         "diagnostics_enabled": bool(args.diagnostics),
     }

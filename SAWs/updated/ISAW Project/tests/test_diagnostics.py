@@ -66,6 +66,50 @@ def test_empty_structural_arrays_safe():
     assert lane["n_post_burnin_structural"] == 0
 
 
+def _diag(structural, enabled_flag, n_cycles=40, stride=5):
+    Ts = np.linspace(300, 360, 4)
+    store = {}
+    reps, sp, sa = remd.run_remd(
+        N=16, Ts=Ts, steps_per_swap=30, n_cycles=n_cycles,
+        model_name=HS["model_name"], params=HS["params"],
+        Tref=HS["Tref"], Tscale=HS["Tscale"], seed=4, n_workers=1,
+        verbose=False, diagnostics=True, diag_store=store,
+        structural_observables=structural, structural_stride=stride)
+    # Force ESS warnings with an impossibly high min_ess threshold.
+    thr = dict(remd.DEFAULT_DIAG_THRESHOLDS)
+    thr["min_ess"] = 1e9
+    return remd.compute_run_diagnostics(
+        reps, sp, sa, store["walker_temp_index"], Ts,
+        burnin_frac=0.5, n_blocks=4, thresholds=thr,
+        structural_observables_enabled=enabled_flag)
+
+
+def test_no_structural_warnings_when_disabled():
+    diag = _diag(structural=False, enabled_flag=False)
+    types = [w["type"] for w in diag["warnings"]]
+    for t in ("low_ess_m_long_fixed", "low_ess_m_global_scaled", "low_ess_smax",
+              "low_ess_largest_component_fraction", "structural_drift",
+              "insufficient_structural_samples"):
+        assert t not in types, t
+    assert diag["summary"]["structural_observables_enabled"] is False
+
+
+def test_no_duplicate_ess_warning_types():
+    diag = _diag(structural=True, enabled_flag=True)
+    types = [w["type"] for w in diag["warnings"]]
+    # Each ESS warning type appears at most once; the old generic "low_ess" is gone.
+    assert "low_ess" not in types
+    assert len(types) == len(set(types)), types
+    # The canonical contact ESS warning is present (min_ess forced very high).
+    assert "low_ess_contacts" in types
+
+
+def test_global_scaled_diagnostics_included():
+    diag = _diag(structural=True, enabled_flag=True)
+    assert "min_ess_m_global_scaled" in diag["summary"]
+    assert "m_global_scaled" in diag["lane_convergence"][0]
+
+
 def test_local_move_freezing_uses_state_changing():
     Ts = np.linspace(300, 360, 3)
     reps, _, _ = remd.run_remd(

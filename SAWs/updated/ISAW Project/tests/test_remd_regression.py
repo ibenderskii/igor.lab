@@ -89,6 +89,40 @@ def test_null_moves_not_state_changing():
     assert accepted <= state_changing
 
 
+def test_legacy_and_state_changing_rates_differ_with_null_moves():
+    import random
+    random.seed(0)
+    rep = remd.Replica(T=1000.0, state=remd.ChainState.initial_straight(
+        8, 1000.0, "hs", [0.0, 0.0], 1.0, 1.0))
+    remd.mc_sweep(rep, 400, "hs", [0.0, 0.0], 1.0, 1.0)
+    legacy = rep.legacy_local_acceptance_rate
+    state_changing = rep.state_changing_acceptance_rate
+    # Null moves accepted (du=0) inflate the legacy rate above the
+    # state-changing rate.
+    assert legacy > state_changing
+    assert rep.local_acc_rate == legacy
+
+
+def test_results_csv_has_new_columns(tmp_path):
+    reps, _, _ = _run(1, structural_observables=True)
+    stats = remd.compute_statistics(reps, burnin_frac=0.5)
+    for r in stats:
+        assert "m_global_scaled_mean" in r
+        assert "m_long_fixed_mean" in r
+        assert "state_changing_acceptance_rate" in r
+    path = remd.save_results_csv(stats, str(tmp_path / "run"))
+    import csv
+    with open(path, newline="") as fh:
+        header = next(csv.reader(fh))
+    for col in ("local_acc_rate", "m_global_scaled_mean", "m_global_scaled_std",
+                "m_long_fixed_mean", "state_changing_acceptance_rate"):
+        assert col in header
+    # legacy columns kept in their original leading positions
+    assert header[:10] == ["T", "E_mean", "E_std", "C_mean", "C_std",
+                           "Rg_mean", "Rg_std", "Rg_mean_lattice",
+                           "Rg_std_lattice", "local_acc_rate"]
+
+
 def test_serial_parallel_invariants():
     for nw in (1, 2):
         reps, _, _ = _run(nw, structural_observables=True)

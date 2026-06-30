@@ -123,6 +123,83 @@ def test_deterministic_ordering_and_m_r():
                 assert np.array_equal(m_r[i].astype(np.int64), direct)
 
 
+def _make_float_coord_snapshot(tmp):
+    """Hand-build a status=complete HDF5 with FRACTIONAL float coordinates."""
+    import h5py
+    nb, nT = 6, 1
+    path = os.path.join(tmp, "floatsnap.h5")
+    with h5py.File(path, "w") as f:
+        m = f.create_group("metadata")
+        m.attrs["run_id"] = "fc"
+        m.attrs["seed"] = 0
+        m.attrs["schema_version"] = 3
+        m.create_dataset("temperatures", data=np.array([300.0]))
+        s = f.create_group("snapshots")
+        coords = np.zeros((1, nT, nb, 3), dtype=np.float64)
+        coords[0, 0] = np.array([(i, 0, 0) for i in range(nb)], dtype=np.float64)
+        coords[0, 0, 2, 0] = 2.5    # fractional -> must be rejected
+        s.create_dataset("coordinates", data=coords)
+        s.create_dataset("cycle", data=np.array([0], dtype=np.int64))
+        s.create_dataset("walker_id", data=np.zeros((1, nT), dtype=np.int64))
+        s.create_dataset("contacts", data=np.zeros((1, nT), dtype=np.int64))
+        s.create_dataset("rg2_lattice", data=np.zeros((1, nT)))
+        s.create_dataset("ree2_lattice", data=np.zeros((1, nT)))
+        s.attrs["committed_rows"] = 1
+        s.attrs["status"] = "complete"
+    return path
+
+
+def test_fractional_hdf5_coordinates_rejected():
+    with tempfile.TemporaryDirectory() as tmp:
+        inp = _make_float_coord_snapshot(tmp)
+        with pytest.raises(ico.ContactMapError):
+            # No pre-cast can hide the fractional coordinate: strict validation
+            # fires inside compute_features_for_config -> build_contact_map.
+            ext.extract(inp, os.path.join(tmp, "f.h5"), output_format="hdf5",
+                        validate=True)
+
+
+def test_multi_chunk_streaming_consistent():
+    import h5py
+    with tempfile.TemporaryDirectory() as tmp:
+        inp = _make_snapshot(tmp, n_rows=5)
+        out = os.path.join(tmp, "feat.h5")
+        info = ext.extract(inp, out, output_format="hdf5", chunk_size=2,
+                           validate=True)
+        assert info["row_count"] == 10   # 5 snapshots * 2 lanes
+        with h5py.File(out, "r") as f:
+            assert str(f.attrs["status"]) == "complete"
+            assert int(f["features"].attrs["committed_feature_rows"]) == 10
+            m = f["features/scalars/m"][()]
+            m_r = f["features/m_r"][()]
+            assert m_r.shape == (10, 6)
+            assert np.array_equal(m_r.sum(axis=1).astype(np.int64),
+                                  m.astype(np.int64))
+            snap = f["features/sample_index/snapshot_index"][()]
+            ti = f["features/sample_index/temperature_index"][()]
+            order = list(zip(snap.tolist(), ti.tolist()))
+            assert order == sorted(order)
+            # all datasets share the row count
+            for name in f["features/scalars"]:
+                assert f["features/scalars/" + name].shape[0] == 10
+
+
+def test_parquet_multi_chunk():
+    if not ext._HAVE_PYARROW:
+        pytest.skip("pyarrow not installed")
+    import pyarrow.parquet as pq
+    with tempfile.TemporaryDirectory() as tmp:
+        inp = _make_snapshot(tmp, n_rows=5)
+        out = os.path.join(tmp, "feat.parquet")
+        ext.extract(inp, out, output_format="parquet", chunk_size=2)
+        t = pq.read_table(out)
+        assert t.num_rows == 10
+        mr_cols = [c for c in t.column_names if c.startswith("m_r_")]
+        d = t.to_pydict()
+        for i in range(t.num_rows):
+            assert sum(d[c][i] for c in mr_cols) == d["m"][i]
+
+
 def test_manifest_discrepancies_zero():
     with tempfile.TemporaryDirectory() as tmp:
         inp = _make_snapshot(tmp)

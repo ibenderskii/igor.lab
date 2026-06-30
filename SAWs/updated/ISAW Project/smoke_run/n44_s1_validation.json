@@ -1,0 +1,32 @@
+{
+  "test_kind": "integrity_smoke_test",
+  "regime_spanning": false,
+  "chain_length_N": 44,
+  "seed": 1,
+  "snapshot_count": 24,
+  "n_temperatures": 4,
+  "feature_row_count": 96,
+  "config_discrepancy_counts": {
+    "stored_m_vs_recomputed": 0,
+    "mr_sum_vs_m": 0,
+    "separations_odd": 0,
+    "pair_counts_vs_binomial": 0,
+    "graph_edges_vs_m": 0,
+    "rg2_match": 0,
+    "ree2_match": 0,
+    "walker_permutation": 0
+  },
+  "feature_discrepancy_counts": {
+    "row_count": 0,
+    "scalar_dataset_lengths": 0,
+    "index_dataset_lengths": 0,
+    "m_r_shape": 0,
+    "m_r_sum_vs_m": 0,
+    "row_ordering": 0,
+    "status_complete": 0,
+    "committed_rows_vs_row_count": 0,
+    "manifest_row_count": 0,
+    "manifest_discrepancies_zero": 0
+  },
+  "all_zero": true
+}
