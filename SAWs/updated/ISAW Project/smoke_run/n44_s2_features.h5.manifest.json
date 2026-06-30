@@ -1,12 +1,12 @@
 {
   "input_path": "smoke_run\\n44_s2_configurations.h5",
-  "input_sha256": "5a8971cbe718fa4b8089abe33d57dae421f9edbda721aa27c8a7809a7947f683",
+  "input_sha256": "4bc1060efa358ef334d299b2d26a897246359cc34a63fcc4a251afca6ebab2ce",
   "input_schema_version": 3,
   "input_status": "complete",
   "output_path": "smoke_run\\n44_s2_features.h5",
   "output_format": "hdf5",
   "output_status": "complete",
-  "feature_schema_version": 3,
+  "feature_schema_version": 4,
   "row_count": 96,
   "committed_feature_rows": 96,
   "n_beads": 44,
@@ -55,7 +55,19 @@
     "mean_degree_nonisolated",
     "degree_variance_nonisolated",
     "contact_graph_cycle_rank",
-    "number_of_multiedge_components"
+    "number_of_multiedge_components",
+    "augmented_graph_vertices",
+    "augmented_graph_edges",
+    "augmented_graph_components",
+    "augmented_graph_cycle_rank",
+    "augmented_mean_degree",
+    "augmented_degree_variance",
+    "augmented_largest_component_vertices",
+    "b_T",
+    "K_T",
+    "q_T",
+    "reduced_potential_u",
+    "effective_energy_H"
   ],
   "m_r_dtype": "uint16",
   "m_r_max_observed": 9,
@@ -81,6 +93,32 @@
     "local_boundary": "closed",
     "description": "local_scaled r/N<=0.10; mesoscopic_scaled 0.10<r/N<0.33; global_scaled r/N>=0.33"
   },
+  "primary_key": [
+    "run_id",
+    "seed",
+    "snapshot_index",
+    "temperature_index"
+  ],
+  "contact_pairs_representation": "HDF5 /features/contact_pairs/pairs (total_contacts,2) + offsets (n_rows+1,); row i pairs = pairs[offsets[i]:offsets[i+1]]",
+  "thermodynamic_columns": [
+    "b_T",
+    "K_T",
+    "q_T",
+    "reduced_potential_u",
+    "effective_energy_H"
+  ],
+  "thermodynamic_status": "ok",
+  "thermodynamic_note": "K_T is authoritative; q_T may be inf on overflow; effective_energy_H is model-implied, not necessarily physical for polynomial effective models",
+  "augmented_graph_columns": [
+    "augmented_graph_vertices",
+    "augmented_graph_edges",
+    "augmented_graph_components",
+    "augmented_graph_cycle_rank",
+    "augmented_mean_degree",
+    "augmented_degree_variance",
+    "augmented_largest_component_vertices"
+  ],
+  "parquet_experimental": false,
   "validation_enabled": true,
   "validation_discrepancy_counts": {
     "contact_count": 0,
@@ -92,9 +130,9 @@
     "graph_edge_total": 0,
     "walker_permutation": 0
   },
-  "creation_time": "2026-06-30T12:22:21",
+  "creation_time": "2026-06-30T13:22:10",
   "hostname": "igor",
-  "git_commit": "38541752740c40b2d97f153eaa35573bb12fd190",
+  "git_commit": "3c2d3c28c2c76e4b7e51775d114216a65d802543",
   "software_versions": {
     "python": "3.13.0",
     "numpy": "2.1.2",

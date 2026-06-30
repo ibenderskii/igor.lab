@@ -26,7 +26,8 @@
     "status_complete": 0,
     "committed_rows_vs_row_count": 0,
     "manifest_row_count": 0,
-    "manifest_discrepancies_zero": 0
+    "manifest_discrepancies_zero": 0,
+    "schema_validator": 0
   },
   "all_zero": true
 }

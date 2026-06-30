@@ -26,7 +26,11 @@ def _make_snapshot(tmp, *, contacts=None, rg2=None, ree2=None, complete=True,
     path = os.path.join(tmp, "snap.h5")
     w = cio.SnapshotWriter(path, n_beads=nb, n_temperatures=nT,
                            metadata={"run_id": "qt", "seed": 1,
-                                     "temperatures": [300.0, 320.0]})
+                                     "temperatures": [300.0, 320.0],
+                                     "model_name": "hs",
+                                     "param_names": ["h", "s"],
+                                     "model_params": [647.7, 1.874],
+                                     "Tref": 320.0, "Tscale": 80.0})
     for c in range(n_rows):
         coords = np.stack([np.asarray(HAIRPIN6, dtype=np.int64)] * nT)
         w.append(cycle=c, coordinates=coords,
@@ -133,7 +137,11 @@ def _make_float_coord_snapshot(tmp):
         m.attrs["run_id"] = "fc"
         m.attrs["seed"] = 0
         m.attrs["schema_version"] = 3
+        m.attrs["model_name"] = "hs"
         m.create_dataset("temperatures", data=np.array([300.0]))
+        m.create_dataset("model_params", data=np.array([647.7, 1.874]))
+        m.attrs["Tref"] = 320.0
+        m.attrs["Tscale"] = 80.0
         s = f.create_group("snapshots")
         coords = np.zeros((1, nT, nb, 3), dtype=np.float64)
         coords[0, 0] = np.array([(i, 0, 0) for i in range(nb)], dtype=np.float64)

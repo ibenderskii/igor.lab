@@ -1,0 +1,549 @@
+{
+  "calibration_report_schema_version": 1,
+  "model": "hs",
+  "params": [
+    647.7084692814295,
+    1.8744782766410941
+  ],
+  "N": 44,
+  "seeds": [
+    1,
+    2
+  ],
+  "fitted_temperature_interval": [
+    280.0,
+    360.0
+  ],
+  "branch_note": "full_interval",
+  "K_analysis": {
+    "K_increases_with_T": true,
+    "monotonic": true,
+    "zero_crossing_T": 345.5406764137588,
+    "T_grid_endpoints": [
+      280.0,
+      360.0
+    ],
+    "K_grid_endpoints": [
+      -0.4387662565068686,
+      0.07528808419267885
+    ]
+  },
+  "temperature_ladder": [
+    280.0,
+    280.2005012531328,
+    302.4000268005017,
+    328.6956660458083,
+    360.0
+  ],
+  "K_ladder": [
+    -0.4387662565068686,
+    -0.43711098313788965,
+    -0.2674146197796248,
+    -0.09606327954468874,
+    0.07528808419267885
+  ],
+  "trends": {
+    "per_seed": [
+      {
+        "temperatures": [
+          280.0,
+          280.2005,
+          302.4,
+          328.6957,
+          360.0
+        ],
+        "K": [
+          -0.4387662565068686,
+          -0.4371109934759454,
+          -0.26741480960701947,
+          -0.09606307598819042,
+          0.07528808419267885
+        ],
+        "C_mean": {
+          "values": [
+            4.2,
+            4.08,
+            5.126666666666667,
+            6.386666666666667,
+            9.24
+          ],
+          "spearman_vs_K": 0.9,
+          "slope_vs_K": 9.268893372887721,
+          "endpoint_high_minus_low": 5.04
+        },
+        "Rg2_mean": {
+          "values": [
+            17.93032369146006,
+            18.417706611570246,
+            18.511859504132232,
+            16.940179063360883,
+            14.409201101928375
+          ],
+          "spearman_vs_K": -0.6,
+          "slope_vs_K": -6.734188459235719,
+          "endpoint_high_minus_low": -3.5211225895316858
+        },
+        "Ree2_mean": {
+          "values": [
+            115.8,
+            117.93333333333334,
+            122.10666666666667,
+            105.96,
+            90.68
+          ],
+          "spearman_vs_K": -0.6,
+          "slope_vs_K": -48.94592247408525,
+          "endpoint_high_minus_low": -25.11999999999999
+        },
+        "m_long_mean": {
+          "values": [
+            0.26666666666666666,
+            0.13333333333333333,
+            0.36666666666666664,
+            0.26666666666666666,
+            0.6333333333333333
+          ],
+          "spearman_vs_K": 0.8,
+          "slope_vs_K": 0.6872605468482093,
+          "endpoint_high_minus_low": 0.36666666666666664
+        },
+        "m_global_scaled_mean": {
+          "values": [
+            0.26666666666666666,
+            0.13333333333333333,
+            0.36666666666666664,
+            0.26666666666666666,
+            0.6333333333333333
+          ],
+          "spearman_vs_K": 0.8,
+          "slope_vs_K": 0.6872605468482093,
+          "endpoint_high_minus_low": 0.36666666666666664
+        },
+        "Smax_mean": {
+          "values": [
+            2.8333333333333335,
+            2.3666666666666667,
+            2.966666666666667,
+            3.2666666666666666,
+            4.233333333333333
+          ],
+          "spearman_vs_K": 0.9,
+          "slope_vs_K": 2.921551158056539,
+          "endpoint_high_minus_low": 1.4
+        },
+        "largest_component_fraction_mean": {
+          "values": [
+            0.06439393939393939,
+            0.05378787878787878,
+            0.06742424242424241,
+            0.07424242424242423,
+            0.09621212121212122
+          ],
+          "spearman_vs_K": 0.9,
+          "slope_vs_K": 0.06639888995583046,
+          "endpoint_high_minus_low": 0.03181818181818183
+        }
+      },
+      {
+        "temperatures": [
+          280.0,
+          280.2005,
+          302.4,
+          328.6957,
+          360.0
+        ],
+        "K": [
+          -0.4387662565068686,
+          -0.4371109934759454,
+          -0.26741480960701947,
+          -0.09606307598819042,
+          0.07528808419267885
+        ],
+        "C_mean": {
+          "values": [
+            3.7466666666666666,
+            3.8,
+            5.1,
+            6.253333333333333,
+            8.68
+          ],
+          "spearman_vs_K": 1.0,
+          "slope_vs_K": 9.071490671172935,
+          "endpoint_high_minus_low": 4.933333333333334
+        },
+        "Rg2_mean": {
+          "values": [
+            19.541494490358126,
+            18.848657024793393,
+            17.875048209366394,
+            16.772679063360883,
+            14.393574380165289
+          ],
+          "spearman_vs_K": -1.0,
+          "slope_vs_K": -8.87287698293062,
+          "endpoint_high_minus_low": -5.147920110192837
+        },
+        "Ree2_mean": {
+          "values": [
+            130.97333333333333,
+            118.77333333333333,
+            118.05333333333333,
+            106.37333333333333,
+            85.37333333333333
+          ],
+          "spearman_vs_K": -1.0,
+          "slope_vs_K": -72.74154942739945,
+          "endpoint_high_minus_low": -45.599999999999994
+        },
+        "m_long_mean": {
+          "values": [
+            0.13333333333333333,
+            0.06666666666666667,
+            0.4666666666666667,
+            0.36666666666666664,
+            0.7666666666666667
+          ],
+          "spearman_vs_K": 0.8,
+          "slope_vs_K": 1.1515082032606772,
+          "endpoint_high_minus_low": 0.6333333333333334
+        },
+        "m_global_scaled_mean": {
+          "values": [
+            0.13333333333333333,
+            0.06666666666666667,
+            0.4666666666666667,
+            0.36666666666666664,
+            0.7666666666666667
+          ],
+          "spearman_vs_K": 0.8,
+          "slope_vs_K": 1.1515082032606772,
+          "endpoint_high_minus_low": 0.6333333333333334
+        },
+        "Smax_mean": {
+          "values": [
+            2.5,
+            2.566666666666667,
+            2.966666666666667,
+            3.1333333333333333,
+            3.966666666666667
+          ],
+          "spearman_vs_K": 1.0,
+          "slope_vs_K": 2.556675870607638,
+          "endpoint_high_minus_low": 1.4666666666666668
+        },
+        "largest_component_fraction_mean": {
+          "values": [
+            0.05681818181818181,
+            0.05833333333333332,
+            0.06742424242424241,
+            0.07121212121212121,
+            0.09015151515151516
+          ],
+          "spearman_vs_K": 1.0,
+          "slope_vs_K": 0.05810626978653721,
+          "endpoint_high_minus_low": 0.033333333333333354
+        }
+      }
+    ],
+    "endpoint_delta_m_highK_minus_lowK": {
+      "mean": 4.986666666666666,
+      "ci95": [
+        4.933333333333334,
+        5.04
+      ]
+    },
+    "endpoint_delta_Rg2_highK_minus_lowK": {
+      "mean": -4.3345213498622615,
+      "ci95": [
+        -5.147920110192837,
+        -3.5211225895316858
+      ]
+    },
+    "pnipam_signs_consistent": true,
+    "note": "expected (LCST): \u0394<m> > 0 and \u0394<Rg2> < 0 from low-K to high-K; sign conflict => NOT consistent."
+  },
+  "mixing": {
+    "seeds": [
+      {
+        "lanes": [
+          {
+            "temperature": 280.0,
+            "tau_int_cycles_contacts": 1.525213032581454,
+            "ess_contacts": 98.34691731300117,
+            "tau_int_cycles_rg2": 1.1401263082792874,
+            "ess_rg2": 131.56437046557102,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 5.0,
+            "ess_smax": 30.0,
+            "contact_support_bins": 12,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 280.2005,
+            "tau_int_cycles_contacts": 1.9971758337976597,
+            "ess_contacts": 75.1060559924625,
+            "tau_int_cycles_rg2": 2.659533283035949,
+            "ess_rg2": 56.40087340015155,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 11.72036673215455,
+            "ess_smax": 12.798234340950998,
+            "contact_support_bins": 13,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 302.4,
+            "tau_int_cycles_contacts": 2.054525693955792,
+            "ess_contacts": 73.00955176237753,
+            "tau_int_cycles_rg2": 1.6291480664371711,
+            "ess_rg2": 92.07266244868653,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 5.0,
+            "ess_smax": 30.0,
+            "contact_support_bins": 14,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 328.6957,
+            "tau_int_cycles_contacts": 1.2555321314179815,
+            "ess_contacts": 119.47125545133757,
+            "tau_int_cycles_rg2": 1.0232943657978484,
+            "ess_rg2": 146.58538638883942,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 11.813648293963254,
+            "ess_smax": 12.697178404798933,
+            "contact_support_bins": 17,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 360.0,
+            "tau_int_cycles_contacts": 1.6154893214382264,
+            "ess_contacts": 92.85112442987804,
+            "tau_int_cycles_rg2": 1.3322770427545092,
+            "ess_rg2": 112.5891951796092,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 7.571685124214307,
+            "ess_smax": 19.810649484128554,
+            "contact_support_bins": 19,
+            "high_contact_tail_prob": 0.006666666666666667
+          }
+        ],
+        "swap_rates": [
+          0.9933333333333333,
+          0.78,
+          0.7066666666666667,
+          0.6066666666666667
+        ],
+        "min_temp_coverage": 1.0,
+        "total_round_trips_low": 51,
+        "adjacent_overlap_bhattacharyya": [
+          0.9721840183222662,
+          0.9522328381065265,
+          0.9461713262927713,
+          0.8696844553792312
+        ],
+        "overlap_matrix": [
+          [
+            1.0,
+            0.9721840183222662,
+            0.9647096718948719,
+            0.887493679698231,
+            0.664431632111625
+          ],
+          [
+            0.9721840183222662,
+            1.0,
+            0.9522328381065265,
+            0.8965876215616555,
+            0.6619176714159118
+          ],
+          [
+            0.9647096718948719,
+            0.9522328381065265,
+            1.0,
+            0.9461713262927713,
+            0.7874067723984858
+          ],
+          [
+            0.887493679698231,
+            0.8965876215616555,
+            0.9461713262927713,
+            1.0000000000000002,
+            0.8696844553792312
+          ],
+          [
+            0.664431632111625,
+            0.6619176714159118,
+            0.7874067723984858,
+            0.8696844553792312,
+            1.0
+          ]
+        ],
+        "state_changing_acceptance_rates": [
+          0.5749444444444445,
+          0.5773333333333334,
+          0.591,
+          0.6035555555555555,
+          0.5726666666666667
+        ]
+      },
+      {
+        "lanes": [
+          {
+            "temperature": 280.0,
+            "tau_int_cycles_contacts": 1.3552707879898684,
+            "ess_contacts": 110.67898853075651,
+            "tau_int_cycles_rg2": 1.7996133983355689,
+            "ess_rg2": 83.35123540352188,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 5.0,
+            "ess_smax": 30.0,
+            "contact_support_bins": 11,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 280.2005,
+            "tau_int_cycles_contacts": 1.0,
+            "ess_contacts": 150.0,
+            "tau_int_cycles_rg2": 1.0,
+            "ess_rg2": 150.0,
+            "tau_int_cycles_m_global_scaled": 9.61904761904762,
+            "ess_m_global_scaled": 15.594059405940591,
+            "tau_int_cycles_smax": 5.863694593902126,
+            "ess_smax": 25.581141309097262,
+            "contact_support_bins": 11,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 302.4,
+            "tau_int_cycles_contacts": 2.1967395626242543,
+            "ess_contacts": 68.28301476976543,
+            "tau_int_cycles_rg2": 1.54886272150527,
+            "ess_rg2": 96.84525162709176,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 5.0,
+            "ess_smax": 30.0,
+            "contact_support_bins": 15,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 328.6957,
+            "tau_int_cycles_contacts": 1.560660381812745,
+            "ess_contacts": 96.11315937024771,
+            "tau_int_cycles_rg2": 1.2444797204773708,
+            "ess_rg2": 120.53229757931403,
+            "tau_int_cycles_m_global_scaled": 5.049209138840071,
+            "ess_m_global_scaled": 29.707622694048027,
+            "tau_int_cycles_smax": 5.0,
+            "ess_smax": 30.0,
+            "contact_support_bins": 16,
+            "high_contact_tail_prob": 0.0
+          },
+          {
+            "temperature": 360.0,
+            "tau_int_cycles_contacts": 1.451088733216579,
+            "ess_contacts": 103.37065995095979,
+            "tau_int_cycles_rg2": 2.6449157768898486,
+            "ess_rg2": 56.712580911133855,
+            "tau_int_cycles_m_global_scaled": 5.0,
+            "ess_m_global_scaled": 30.0,
+            "tau_int_cycles_smax": 5.0,
+            "ess_smax": 30.0,
+            "contact_support_bins": 18,
+            "high_contact_tail_prob": 0.006666666666666667
+          }
+        ],
+        "swap_rates": [
+          1.0,
+          0.8,
+          0.7466666666666667,
+          0.68
+        ],
+        "min_temp_coverage": 1.0,
+        "total_round_trips_low": 67,
+        "adjacent_overlap_bhattacharyya": [
+          0.9945742739590647,
+          0.9494711746829856,
+          0.9470869774532262,
+          0.9131036393323473
+        ],
+        "overlap_matrix": [
+          [
+            1.0,
+            0.9945742739590647,
+            0.9497728074376581,
+            0.8782638249756831,
+            0.6636156805421773
+          ],
+          [
+            0.9945742739590647,
+            1.0,
+            0.9494711746829856,
+            0.8827654698805574,
+            0.6708967981895546
+          ],
+          [
+            0.9497728074376581,
+            0.9494711746829856,
+            1.0,
+            0.9470869774532262,
+            0.8157327197950357
+          ],
+          [
+            0.8782638249756831,
+            0.8827654698805574,
+            0.9470869774532262,
+            1.0,
+            0.9131036393323473
+          ],
+          [
+            0.6636156805421773,
+            0.6708967981895546,
+            0.8157327197950357,
+            0.9131036393323473,
+            1.0
+          ]
+        ],
+        "state_changing_acceptance_rates": [
+          0.5768888888888889,
+          0.5809444444444445,
+          0.5798333333333333,
+          0.5975,
+          0.5781666666666667
+        ]
+      }
+    ],
+    "slowest_tau_int_cycles": 11.813648293963254,
+    "min_ess_observed": 12.697178404798933
+  },
+  "recommended_production": {
+    "rationale": "independent structural samples are estimated from 2*tau_int_cycles (NOT raw snapshot counts)",
+    "slowest_tau_int_cycles": 11.813648293963254,
+    "cycles_per_independent_sample": 23.62729658792651,
+    "target_effective_per_regime": 5000,
+    "recommended_steps_per_swap": 60,
+    "recommended_n_temperatures": 16,
+    "recommended_structural_stride": 5,
+    "recommended_snapshot_stride": 5,
+    "recommended_burnin_cycles": 119,
+    "recommended_production_cycles": 35441,
+    "expected_raw_snapshots_per_seed": 7089,
+    "expected_effective_independent_per_seed": 7500,
+    "storage_estimate_note": "coords int16 gzip ~ n_temperatures*n_beads*3*2 bytes/snapshot",
+    "target_feasible_estimate": true
+  },
+  "pnipam_lcst_assessment": {
+    "K_increases_with_T": true,
+    "m_increases_with_K": true,
+    "Rg2_decreases_with_K": true,
+    "consistent_with_PNIPAM_LCST": true,
+    "ladder_spans_distinct_states": true,
+    "sampling_mixing_adequate": false
+  }
+}

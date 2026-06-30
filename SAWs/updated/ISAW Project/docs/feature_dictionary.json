@@ -1,0 +1,562 @@
+{
+  "feature_schema_version": 4,
+  "definitions_version": "1.1.0",
+  "primary_key": [
+    "run_id",
+    "seed",
+    "snapshot_index",
+    "temperature_index"
+  ],
+  "fields": [
+    {
+      "name": "run_id",
+      "dtype": "string",
+      "units": "none",
+      "definition": "run identifier",
+      "source": "metadata",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "seed",
+      "dtype": "int64",
+      "units": "none",
+      "definition": "RNG seed",
+      "source": "metadata",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "snapshot_index",
+      "dtype": "int64",
+      "units": "none",
+      "definition": "committed snapshot row index",
+      "source": "index",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "cycle",
+      "dtype": "int64",
+      "units": "cycles",
+      "definition": "originating REMD cycle",
+      "source": "index",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "temperature_index",
+      "dtype": "int64",
+      "units": "none",
+      "definition": "lane index",
+      "source": "index",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "temperature",
+      "dtype": "float64",
+      "units": "K",
+      "definition": "lane temperature",
+      "source": "metadata",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "walker_id",
+      "dtype": "int64",
+      "units": "none",
+      "definition": "walker occupying the lane",
+      "source": "index",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "n_beads",
+      "dtype": "int64",
+      "units": "beads",
+      "definition": "chain length N",
+      "source": "config",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "n_steps",
+      "dtype": "int64",
+      "units": "bonds",
+      "definition": "N-1",
+      "source": "config",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m",
+      "dtype": "int64",
+      "units": "contacts",
+      "definition": "total nonbonded contacts",
+      "source": "contact_map",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "Rg2_lattice",
+      "dtype": "float64",
+      "units": "lattice^2",
+      "definition": "radius of gyration squared",
+      "source": "geometry",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "Ree2_lattice",
+      "dtype": "float64",
+      "units": "lattice^2",
+      "definition": "end-to-end distance squared",
+      "source": "geometry",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "asphericity",
+      "dtype": "float64",
+      "units": "lattice^2",
+      "definition": "lam3-0.5(lam1+lam2)",
+      "source": "geometry",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "gyration_lambda_1",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "gyration lambda 1",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "gyration_lambda_2",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "gyration lambda 2",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "gyration_lambda_3",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "gyration lambda 3",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "mean_contact_separation",
+      "dtype": "float64",
+      "units": "beads",
+      "definition": "mean r among contacts",
+      "source": "contact_map",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "max_contact_separation",
+      "dtype": "float64",
+      "units": "beads",
+      "definition": "max r among contacts",
+      "source": "contact_map",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m_short_fixed",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "m short fixed",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m_medium_fixed",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "m medium fixed",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m_long_fixed",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "m long fixed",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m_local_scaled",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "m local scaled",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m_mesoscopic_scaled",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "m mesoscopic scaled",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "m_global_scaled",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "m global scaled",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "pair_shared_endpoint",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "pair shared endpoint",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "pair_disjoint",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "pair disjoint",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "pair_nested",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "pair nested",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "pair_interleaved",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "pair interleaved",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "pair_total",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "pair total",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "contact_vertices",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "contact vertices",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "contact_graph_components",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "contact graph components",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "contact_graph_edges",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "contact graph edges",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "sum_component_edges",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "sum component edges",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "largest_component_vertices",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "largest component vertices",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "largest_component_edges",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "largest component edges",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "largest_component_fraction_of_N",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "largest component fraction of N",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "largest_component_fraction_of_contact_vertices",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "largest component fraction of contact vertices",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "mean_degree_nonisolated",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "mean degree nonisolated",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "degree_variance_nonisolated",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "degree variance nonisolated",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "contact_graph_cycle_rank",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "contact graph cycle rank",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "number_of_multiedge_components",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "number of multiedge components",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_graph_vertices",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "augmented graph vertices",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_graph_edges",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "augmented graph edges",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_graph_components",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "augmented graph components",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_graph_cycle_rank",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "augmented graph cycle rank",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_mean_degree",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "augmented mean degree",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_degree_variance",
+      "dtype": "float64",
+      "units": "float64",
+      "definition": "augmented degree variance",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "augmented_largest_component_vertices",
+      "dtype": "int64",
+      "units": "int64",
+      "definition": "augmented largest component vertices",
+      "source": "contact_map/graph",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "b_T",
+      "dtype": "float64",
+      "units": "kT",
+      "definition": "reduced contact bias b(T)",
+      "source": "thermo",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 4
+    },
+    {
+      "name": "K_T",
+      "dtype": "float64",
+      "units": "kT",
+      "definition": "K(T)=-b(T) (authoritative)",
+      "source": "thermo",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 4
+    },
+    {
+      "name": "q_T",
+      "dtype": "float64",
+      "units": "none",
+      "definition": "exp(K); inf on overflow",
+      "source": "thermo",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 4
+    },
+    {
+      "name": "reduced_potential_u",
+      "dtype": "float64",
+      "units": "kT",
+      "definition": "u=-m K",
+      "source": "thermo",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 4
+    },
+    {
+      "name": "effective_energy_H",
+      "dtype": "float64",
+      "units": "energy",
+      "definition": "H=T u (model-implied)",
+      "source": "thermo",
+      "cadence": "per (snapshot, lane) configuration",
+      "nullable": true,
+      "schema_version_introduced": 4
+    },
+    {
+      "name": "m_r",
+      "dtype": "uint16",
+      "units": "contacts",
+      "definition": "dense contour-separation histogram length n_beads; m_r[r]=#contacts with separation r; sum_r==m",
+      "source": "contact_map",
+      "cadence": "per configuration",
+      "nullable": false,
+      "schema_version_introduced": 1
+    },
+    {
+      "name": "contact_pairs",
+      "dtype": "ragged int64 (pairs+offsets)",
+      "units": "bead-index pairs",
+      "definition": "row i pairs = pairs[offsets[i]:offsets[i+1]]; lexicographically sorted; row pair count == m",
+      "source": "contact_map",
+      "cadence": "per configuration",
+      "nullable": false,
+      "schema_version_introduced": 4
+    }
+  ]
+}

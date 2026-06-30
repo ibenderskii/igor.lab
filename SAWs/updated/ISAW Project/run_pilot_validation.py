@@ -153,6 +153,14 @@ def validate_feature_file(feat_path, *, committed_rows, n_temperatures, n_beads)
             disc["manifest_row_count"] += 1
         if not all(v == 0 for v in man.get("validation_discrepancy_counts", {1: 1}).values()):
             disc["manifest_discrepancies_zero"] += 1
+    # Run the comprehensive schema validator (C4) -- contact-pair offsets,
+    # graph/thermo identities, primary-key uniqueness, definition versions.
+    try:
+        ext.validate_feature_file_hdf5(feat_path)
+        disc["schema_validator"] = 0
+    except ext.ExtractionError as e:
+        disc["schema_validator"] = 1
+        print(f"  [schema-validator FAIL] {e}")
     return disc, expected
 
 

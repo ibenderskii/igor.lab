@@ -1,0 +1,6 @@
+walker,fraction_visited,n_visited,first_passage_low_to_high,first_passage_high_to_low,n_round_trips_low,n_round_trips_high,n_round_trips,mean_round_trip_duration
+0,1.0,5,5,5,13,13,26,21.923076923076923
+1,1.0,5,5,5,14,14,28,19.285714285714285
+2,1.0,5,7,5,14,15,29,19.586206896551722
+3,1.0,5,5,9,14,13,27,19.62962962962963
+4,1.0,5,9,8,12,12,24,23.958333333333332

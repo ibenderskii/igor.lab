@@ -1,0 +1,16 @@
+{
+  "rationale": "independent structural samples are estimated from 2*tau_int_cycles (NOT raw snapshot counts)",
+  "slowest_tau_int_cycles": 16.704545454545464,
+  "cycles_per_independent_sample": 33.40909090909093,
+  "target_effective_per_regime": 5000,
+  "recommended_steps_per_swap": 60,
+  "recommended_n_temperatures": 16,
+  "recommended_structural_stride": 5,
+  "recommended_snapshot_stride": 5,
+  "recommended_burnin_cycles": 168,
+  "recommended_production_cycles": 50114,
+  "expected_raw_snapshots_per_seed": 10023,
+  "expected_effective_independent_per_seed": 7500,
+  "storage_estimate_note": "coords int16 gzip ~ n_temperatures*n_beads*3*2 bytes/snapshot",
+  "target_feasible_estimate": true
+}

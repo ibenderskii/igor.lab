@@ -60,6 +60,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isaw_contact_observables as ico  # noqa: E402
 import isaw_config_io as cio  # noqa: E402
+from isaw_schema import PRIMARY_KEY  # noqa: E402
 
 try:
     import h5py
@@ -75,7 +76,7 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_PYARROW = False
 
-FEATURE_SCHEMA_VERSION = 3
+FEATURE_SCHEMA_VERSION = 4   # +contact_pairs, thermodynamic columns, augmented graph
 
 # Fixed, documented m_r dtype: counts per separation are bounded by N (< 2^16),
 # so uint16 is always safe and the dataset dtype never needs widening.
@@ -430,6 +431,16 @@ class _StreamHDF5Writer:
             "m_r", shape=(0, self.n_beads), maxshape=(None, self.n_beads),
             dtype=_M_R_DTYPE, chunks=(chunk, self.n_beads),
             compression="gzip", compression_opts=4)
+        # Ragged contact-pair storage (C1): pairs + offsets (no Python objects).
+        cpg = self.feats.create_group("contact_pairs")
+        self.cp_pairs = cpg.create_dataset(
+            "pairs", shape=(0, 2), maxshape=(None, 2), dtype="int64",
+            chunks=(chunk, 2), compression="gzip", compression_opts=4)
+        self.cp_offsets = cpg.create_dataset(
+            "offsets", shape=(1,), maxshape=(None,), dtype="int64",
+            chunks=(chunk + 1,))
+        self.cp_offsets[0] = 0
+        self._n_pairs = 0
         self.feats.attrs["committed_feature_rows"] = 0
         self.f.flush()
 
@@ -444,7 +455,7 @@ class _StreamHDF5Writer:
         return group.create_dataset(name, shape=(0,), maxshape=(None,),
                                     dtype=dt, chunks=(chunk,))
 
-    def append_batch(self, rows, m_r_block):
+    def append_batch(self, rows, m_r_block, pairs_block):
         k = len(rows)
         if k == 0:
             return
@@ -466,6 +477,21 @@ class _StreamHDF5Writer:
             ds[self.committed:new] = vals
         self.mr.resize((new, self.n_beads))
         self.mr[self.committed:new] = np.asarray(m_r_block, dtype=_M_R_DTYPE)
+        # Append contact pairs + monotone offsets (one offset per appended row).
+        flat = (np.concatenate([np.asarray(p, dtype=np.int64).reshape(-1, 2)
+                                for p in pairs_block], axis=0)
+                if pairs_block else np.zeros((0, 2), dtype=np.int64))
+        if flat.shape[0]:
+            self.cp_pairs.resize((self._n_pairs + flat.shape[0], 2))
+            self.cp_pairs[self._n_pairs:self._n_pairs + flat.shape[0]] = flat
+        running = self._n_pairs
+        new_offsets = np.empty(k, dtype=np.int64)
+        for i, p in enumerate(pairs_block):
+            running += int(np.asarray(p).reshape(-1, 2).shape[0])
+            new_offsets[i] = running
+        self.cp_offsets.resize((new + 1,))
+        self.cp_offsets[self.committed + 1:new + 1] = new_offsets
+        self._n_pairs = running
         # 1. flush row data, 2. update commit marker, 3. flush marker.
         self.f.flush()
         self.committed = new
@@ -475,20 +501,32 @@ class _StreamHDF5Writer:
     def finalize(self, *, status, manifest):
         self.f.attrs["status"] = status
         self.feats.attrs["committed_feature_rows"] = int(self.committed)
+        self.feats["contact_pairs"].attrs["total_contacts"] = int(self._n_pairs)
         meta = self.f.create_group("metadata")
         meta.attrs["manifest"] = json.dumps(manifest, default=str)
         meta.attrs["columns"] = json.dumps(FEATURE_COLUMNS)
+        meta.attrs["primary_key"] = json.dumps(list(PRIMARY_KEY))
         self.f.flush()
         self.f.close()
 
 
 class _StreamParquetWriter:
-    """One Parquet record batch per chunk (no full in-memory table)."""
+    """One Parquet record batch per chunk (no full in-memory table).
 
-    def __init__(self, path, *, n_beads, run_id):
+    EXPERIMENTAL format.  Parquet cannot offer the append-safe committed-row
+    semantics of HDF5, so the file is written to a temporary path and atomically
+    renamed onto the final path ONLY on success; on failure the temp file is
+    removed (no partial file at the final path).  Schema key/value metadata
+    embeds provenance; the companion ``.manifest.json`` is authoritative.
+    Contact-pair ragged arrays are NOT written to Parquet (HDF5 is authoritative
+    for those); m_r is exported as m_r_<r> columns.
+    """
+
+    def __init__(self, path, *, n_beads, run_id, definitions):
         import pyarrow as pa
         self.pa = pa
         self.path = path
+        self.tmp_path = str(path) + ".tmp"
         self.run_id = run_id
         self.committed = 0
         self.mr_cols = [r for r in range(int(n_beads))
@@ -501,12 +539,26 @@ class _StreamParquetWriter:
             fields.append(pa.field(name, t))
         for r in self.mr_cols:
             fields.append(pa.field(f"m_r_{r}", pa.int64()))
-        self.schema = pa.schema(fields)
+        kv = {
+            b"feature_schema_version": str(FEATURE_SCHEMA_VERSION).encode(),
+            b"run_id": str(run_id).encode(),
+            b"n_beads": str(int(n_beads)).encode(),
+            b"definitions_version": str(ico.DEFINITIONS_VERSION).encode(),
+            b"fixed_bin_definitions": json.dumps(definitions[0]).encode(),
+            b"scaled_bin_definitions": json.dumps(definitions[1]).encode(),
+            b"primary_key": json.dumps(list(PRIMARY_KEY)).encode(),
+            b"format": b"parquet",
+            b"experimental": b"true",
+            b"status_semantics": (
+                b"file present at final path => complete; committed_feature_rows"
+                b" == parquet num_rows; manifest is authoritative"),
+        }
+        self.schema = pa.schema(fields, metadata=kv)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         import pyarrow.parquet as pq
-        self.writer = pq.ParquetWriter(path, self.schema)
+        self.writer = pq.ParquetWriter(self.tmp_path, self.schema)
 
-    def append_batch(self, rows, m_r_block):
+    def append_batch(self, rows, m_r_block, pairs_block):
         if not rows:
             return
         pa = self.pa
@@ -532,8 +584,14 @@ class _StreamParquetWriter:
         self.committed += len(rows)
 
     def finalize(self, *, status, manifest):
-        # Embed the manifest (incl. status) in the parquet key/value metadata.
         self.writer.close()
+        if status == "complete":
+            os.replace(self.tmp_path, self.path)   # atomic on same filesystem
+        else:
+            try:
+                os.remove(self.tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +665,20 @@ def extract(
         temps = np.asarray(meta.get("temperatures", np.full(nT, np.nan)), dtype=float)
         schema_version = int(meta.get("schema_version", 0))
         fixed_defs, scaled_defs, defs_source = _resolve_input_bin_defs(meta, n_beads)
+        b_of_T, thermo_status = _model_bias_evaluator(meta)
+        if validate and thermo_status != "ok":
+            raise ExtractionError(
+                f"input lacks sufficient model metadata for thermodynamic "
+                f"columns ({thermo_status}); cannot run a validated extraction. "
+                f"Re-run the sampler so model_name/model_params/Tref/Tscale are "
+                f"saved, or extract without --validate.")
 
         if fmt == "hdf5":
             writer = _StreamHDF5Writer(output_path, n_beads=int(n_beads), run_id=run_id)
         else:
-            writer = _StreamParquetWriter(output_path, n_beads=int(n_beads), run_id=run_id)
+            writer = _StreamParquetWriter(output_path, n_beads=int(n_beads),
+                                          run_id=run_id,
+                                          definitions=(fixed_defs, scaled_defs))
 
         mr_max = 0
         sample_index = 0
@@ -626,6 +693,7 @@ def extract(
 
             rows_chunk = []
             m_r_chunk = []
+            pairs_chunk = []
             for si in range(s1 - s0):
                 snap_idx = s0 + si
                 cyc = int(cyc_block[si])
@@ -638,6 +706,9 @@ def extract(
                     )
                 for k in range(nT):
                     locator = f"[snapshot {snap_idx} cycle {cyc} lane {k}] "
+                    T_k = float(temps[k]) if k < temps.size else math.nan
+                    b_k = (b_of_T(T_k) if (b_of_T is not None
+                                           and math.isfinite(T_k)) else None)
                     # Pass the raw HDF5 slice straight to the strict validator --
                     # NO pre-cast to int64.
                     feat = compute_features_for_config(
@@ -647,25 +718,31 @@ def extract(
                         stored_contacts=int(cont_block[si, k]),
                         stored_rg2=float(rg2_block[si, k]),
                         stored_ree2=float(ree2_block[si, k]),
+                        temperature=T_k, b_T=b_k,
                         validate=validate,
                         discrepancies=discrepancies,
                         locator=locator,
                     )
                     m_r = feat.pop("_m_r")
+                    pairs = feat.pop("_pairs")
                     mr_max = max(mr_max, int(m_r.max(initial=0)))
                     row = {
                         "run_id": run_id, "seed": seed,
                         "snapshot_index": snap_idx, "cycle": cyc,
                         "temperature_index": int(k),
-                        "temperature": float(temps[k]) if k < temps.size else math.nan,
+                        "temperature": T_k,
                         "walker_id": int(w[k]),
                     }
                     row.update(feat)
                     rows_chunk.append(row)
                     m_r_chunk.append(np.asarray(m_r, dtype=_M_R_DTYPE))
+                    pairs_chunk.append(np.asarray(pairs, dtype=np.int64).reshape(-1, 2))
                     sample_index += 1
-            writer.append_batch(rows_chunk, np.asarray(m_r_chunk, dtype=_M_R_DTYPE)
-                                if m_r_chunk else np.zeros((0, int(n_beads)), _M_R_DTYPE))
+            writer.append_batch(
+                rows_chunk,
+                (np.asarray(m_r_chunk, dtype=_M_R_DTYPE) if m_r_chunk
+                 else np.zeros((0, int(n_beads)), _M_R_DTYPE)),
+                pairs_chunk)
 
         n_rows = writer.committed
         manifest = {
@@ -695,6 +772,24 @@ def extract(
             "bin_definitions_source": defs_source,
             "fixed_bin_definitions": fixed_defs,
             "scaled_bin_definitions": scaled_defs,
+            "primary_key": list(PRIMARY_KEY),
+            "contact_pairs_representation": (
+                "HDF5 /features/contact_pairs/pairs (total_contacts,2) + "
+                "offsets (n_rows+1,); row i pairs = pairs[offsets[i]:offsets[i+1]]"
+            ),
+            "thermodynamic_columns": ["b_T", "K_T", "q_T",
+                                      "reduced_potential_u", "effective_energy_H"],
+            "thermodynamic_status": thermo_status,
+            "thermodynamic_note": (
+                "K_T is authoritative; q_T may be inf on overflow; "
+                "effective_energy_H is model-implied, not necessarily physical "
+                "for polynomial effective models"),
+            "augmented_graph_columns": [
+                "augmented_graph_vertices", "augmented_graph_edges",
+                "augmented_graph_components", "augmented_graph_cycle_rank",
+                "augmented_mean_degree", "augmented_degree_variance",
+                "augmented_largest_component_vertices"],
+            "parquet_experimental": bool(fmt == "parquet"),
             "validation_enabled": bool(validate),
             "validation_discrepancy_counts": discrepancies,
             "creation_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
@@ -730,6 +825,161 @@ def extract(
 
 
 # ---------------------------------------------------------------------------
+# Feature dictionary + comprehensive schema validation (C4)
+# ---------------------------------------------------------------------------
+
+_FEATURE_META = {
+    "run_id": ("string", "none", "run identifier", "metadata", False, 1),
+    "seed": ("int", "none", "RNG seed", "metadata", False, 1),
+    "snapshot_index": ("int", "none", "committed snapshot row index", "index", False, 1),
+    "cycle": ("int", "cycles", "originating REMD cycle", "index", False, 1),
+    "temperature_index": ("int", "none", "lane index", "index", False, 1),
+    "temperature": ("float", "K", "lane temperature", "metadata", False, 1),
+    "walker_id": ("int", "none", "walker occupying the lane", "index", False, 1),
+    "n_beads": ("int", "beads", "chain length N", "config", False, 1),
+    "n_steps": ("int", "bonds", "N-1", "config", False, 1),
+    "m": ("int", "contacts", "total nonbonded contacts", "contact_map", False, 1),
+    "Rg2_lattice": ("float", "lattice^2", "radius of gyration squared", "geometry", False, 1),
+    "Ree2_lattice": ("float", "lattice^2", "end-to-end distance squared", "geometry", False, 1),
+    "asphericity": ("float", "lattice^2", "lam3-0.5(lam1+lam2)", "geometry", False, 1),
+    "mean_contact_separation": ("float", "beads", "mean r among contacts", "contact_map", True, 1),
+    "max_contact_separation": ("float", "beads", "max r among contacts", "contact_map", True, 1),
+    "b_T": ("float", "kT", "reduced contact bias b(T)", "thermo", True, 4),
+    "K_T": ("float", "kT", "K(T)=-b(T) (authoritative)", "thermo", True, 4),
+    "q_T": ("float", "none", "exp(K); inf on overflow", "thermo", True, 4),
+    "reduced_potential_u": ("float", "kT", "u=-m K", "thermo", True, 4),
+    "effective_energy_H": ("float", "energy", "H=T u (model-implied)", "thermo", True, 4),
+}
+
+
+def build_feature_dictionary() -> dict:
+    """Machine-readable feature dictionary for every column."""
+    fields = []
+    for name in FEATURE_COLUMNS:
+        kind = _col_dtype(name)
+        dtype = {"str": "string", "float": "float64", "int": "int64"}[kind]
+        units, _u2, definition, source, nullable, ver = _FEATURE_META.get(
+            name, (dtype, "various", name.replace("_", " "),
+                   "contact_map/graph", False, 1))
+        if name in _FEATURE_META:
+            units = _FEATURE_META[name][1]
+        fields.append({
+            "name": name, "dtype": dtype, "units": units,
+            "definition": definition, "source": source,
+            "cadence": "per (snapshot, lane) configuration",
+            "nullable": bool(nullable),
+            "schema_version_introduced": int(ver),
+        })
+    fields.append({
+        "name": "m_r", "dtype": str(np.dtype(_M_R_DTYPE)), "units": "contacts",
+        "definition": "dense contour-separation histogram length n_beads; "
+                      "m_r[r]=#contacts with separation r; sum_r==m",
+        "source": "contact_map", "cadence": "per configuration",
+        "nullable": False, "schema_version_introduced": 1})
+    fields.append({
+        "name": "contact_pairs", "dtype": "ragged int64 (pairs+offsets)",
+        "units": "bead-index pairs",
+        "definition": "row i pairs = pairs[offsets[i]:offsets[i+1]]; "
+                      "lexicographically sorted; row pair count == m",
+        "source": "contact_map", "cadence": "per configuration",
+        "nullable": False, "schema_version_introduced": 4})
+    return {
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "definitions_version": ico.DEFINITIONS_VERSION,
+        "primary_key": list(PRIMARY_KEY),
+        "fields": fields,
+    }
+
+
+def write_feature_dictionary(path=None) -> str:
+    p = Path(path) if path is not None else (
+        Path(__file__).resolve().parent / "docs" / "feature_dictionary.json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(build_feature_dictionary(), fh, indent=2)
+    return str(p)
+
+
+def validate_feature_file_hdf5(path: str) -> dict:
+    """Comprehensive structural/identity validation of a feature HDF5 file.
+
+    Raises :class:`ExtractionError` on any failure; returns a summary dict.
+    """
+    import isaw_schema as sch
+    with h5py.File(path, "r") as f:
+        if str(f.attrs.get("status")) != "complete":
+            raise ExtractionError("feature file status != complete")
+        feats = f["features"]
+        scalars = feats["scalars"]
+        idxg = feats["sample_index"]
+        m = scalars["m"][()]
+        n_rows = int(m.shape[0])
+        committed = int(feats.attrs.get("committed_feature_rows", -1))
+        if committed != n_rows:
+            raise ExtractionError(
+                f"committed_feature_rows {committed} != row count {n_rows}")
+        for grp, label in ((scalars, "scalar"), (idxg, "index")):
+            for name in grp:
+                if grp[name].shape[0] != n_rows:
+                    raise ExtractionError(f"{label} dataset {name} length mismatch")
+        n_beads = int(f.attrs["n_beads"])
+        m_r = feats["m_r"][()]
+        if m_r.shape != (n_rows, n_beads):
+            raise ExtractionError(f"m_r shape {m_r.shape} != {(n_rows, n_beads)}")
+        if not np.array_equal(m_r.sum(axis=1).astype(np.int64), m.astype(np.int64)):
+            raise ExtractionError("sum_r m_r != m for some row")
+        # contact-pair offsets / counts
+        pairs = feats["contact_pairs/pairs"][()]
+        offsets = feats["contact_pairs/offsets"][()]
+        if offsets.shape[0] != n_rows + 1:
+            raise ExtractionError("offsets length != n_rows+1")
+        if int(offsets[0]) != 0:
+            raise ExtractionError("offsets[0] != 0")
+        if not np.all(np.diff(offsets) >= 0):
+            raise ExtractionError("offsets not nondecreasing")
+        if int(offsets[-1]) != pairs.shape[0]:
+            raise ExtractionError("offsets[-1] != len(pairs)")
+        row_pair_counts = np.diff(offsets)
+        if not np.array_equal(row_pair_counts.astype(np.int64), m.astype(np.int64)):
+            raise ExtractionError("row pair count != m")
+        if pairs.shape[0]:
+            if int(pairs.min()) < 0 or int(pairs.max()) >= n_beads:
+                raise ExtractionError("contact pair index out of bounds")
+            if not np.all(pairs[:, 0] < pairs[:, 1]):
+                raise ExtractionError("contact pair violates i<j")
+        # graph identities
+        cge = scalars["contact_graph_edges"][()]
+        sce = scalars["sum_component_edges"][()]
+        if not (np.array_equal(cge.astype(np.int64), m.astype(np.int64))
+                and np.array_equal(sce.astype(np.int64), m.astype(np.int64))):
+            raise ExtractionError("contact graph edge totals != m")
+        aug_e = scalars["augmented_graph_edges"][()]
+        aug_cyc = scalars["augmented_graph_cycle_rank"][()]
+        if not np.array_equal(aug_e.astype(np.int64),
+                              (n_beads - 1 + m).astype(np.int64)):
+            raise ExtractionError("augmented edges != N-1+m")
+        if not np.array_equal(aug_cyc.astype(np.int64), m.astype(np.int64)):
+            raise ExtractionError("augmented cycle rank != m")
+        # thermodynamic identity: u == -m K (where finite)
+        K = scalars["K_T"][()]
+        u = scalars["reduced_potential_u"][()]
+        finite = np.isfinite(K) & np.isfinite(u)
+        if finite.any():
+            if not np.allclose(u[finite], -(m.astype(float)[finite]) * K[finite],
+                               atol=1e-6, rtol=1e-9):
+                raise ExtractionError("reduced_potential_u != -m K")
+        # primary key uniqueness
+        cols = {k: idxg[k][()] for k in PRIMARY_KEY}
+        sch.validate_feature_primary_keys(cols)
+        man = json.loads(f["metadata"].attrs["manifest"])
+        if int(man.get("row_count", -1)) != n_rows:
+            raise ExtractionError("manifest row_count mismatch")
+        if str(man.get("definitions_version")) != str(ico.DEFINITIONS_VERSION):
+            raise ExtractionError("definitions_version mismatch")
+    return {"row_count": n_rows, "n_beads": n_beads, "ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Quick test
 # ---------------------------------------------------------------------------
 
@@ -750,7 +1000,11 @@ def run_quick_test() -> None:
         nT = 2
         w = cio.SnapshotWriter(inp, n_beads=n_beads, n_temperatures=nT,
                                metadata={"run_id": "qt", "seed": 1,
-                                         "temperatures": [300.0, 320.0]})
+                                         "temperatures": [300.0, 320.0],
+                                         "model_name": "hs",
+                                         "param_names": ["h", "s"],
+                                         "model_params": [378.96, 1.39686],
+                                         "Tref": 320.0, "Tscale": 80.0})
         for c in range(5):
             coords = np.stack([np.asarray(chain, dtype=np.int64)] * nT)
             w.append(cycle=c, coordinates=coords,

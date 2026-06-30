@@ -1,0 +1,228 @@
+{
+  "timestamp": "2026-06-30T13:24:07",
+  "model_api_version": 1,
+  "model": "hs",
+  "param_names": [
+    "h",
+    "s"
+  ],
+  "params": [
+    647.7084692814295,
+    1.8744782766410941
+  ],
+  "Tref": 320.0,
+  "Tscale": 80.0,
+  "parameter_source": "fit_summary_json",
+  "fit_summary_json": "fits_30mer_contact_only/hs/fit_summary.json",
+  "temperatures": [
+    280.0,
+    280.2005,
+    302.4,
+    328.6957,
+    360.0
+  ],
+  "temperature_count": 5,
+  "temperature_min": 280.0,
+  "temperature_max": 360.0,
+  "temperature_uniform": false,
+  "temperature_source": "cli:--temps",
+  "N": 30,
+  "n_beads": 30,
+  "n_steps": 29,
+  "schema_version": 3,
+  "steps_per_swap": 60,
+  "n_cycles": 300,
+  "total_steps_per_replica": 18000,
+  "seed": 1,
+  "n_workers": 1,
+  "burnin_frac": 0.5,
+  "rg_bins": 64,
+  "rg_scale": 1.0,
+  "structural_observables_enabled": true,
+  "structural_stride": 5,
+  "save_m_r_trajectories": false,
+  "structural_bin_definitions": {
+    "definitions_version": "1.1.0",
+    "n_beads": 30,
+    "min_separation": 3,
+    "fixed": {
+      "scheme": "fixed",
+      "short_fixed": {
+        "r_min": 3,
+        "r_max": 9
+      },
+      "medium_fixed": {
+        "r_min": 11
+      },
+      "long_threshold_fixed": 15,
+      "description": "short_fixed 3<=r<=9; medium_fixed 11<=r<long_threshold_fixed; long_fixed r>=long_threshold_fixed"
+    },
+    "scaled": {
+      "scheme": "scaled",
+      "local_max_ratio": 0.1,
+      "meso_max_ratio": 0.33,
+      "local_boundary": "closed",
+      "description": "local_scaled r/N<=0.10; mesoscopic_scaled 0.10<r/N<0.33; global_scaled r/N>=0.33"
+    },
+    "bin_definition_source": "module_default"
+  },
+  "requested_bin_definitions": null,
+  "resolved_bin_definitions": {
+    "fixed": {
+      "scheme": "fixed",
+      "short_fixed": {
+        "r_min": 3,
+        "r_max": 9
+      },
+      "medium_fixed": {
+        "r_min": 11
+      },
+      "long_threshold_fixed": 15,
+      "description": "short_fixed 3<=r<=9; medium_fixed 11<=r<long_threshold_fixed; long_fixed r>=long_threshold_fixed"
+    },
+    "scaled": {
+      "scheme": "scaled",
+      "local_max_ratio": 0.1,
+      "meso_max_ratio": 0.33,
+      "local_boundary": "closed",
+      "description": "local_scaled r/N<=0.10; mesoscopic_scaled 0.10<r/N<0.33; global_scaled r/N>=0.33"
+    },
+    "definitions_version": "1.1.0"
+  },
+  "git_commit": "3c2d3c28c2c76e4b7e51775d114216a65d802543",
+  "diag_min_state_changing_move_rate": 0.01,
+  "save_configurations": true,
+  "configuration_path": "calibration_N30\\calib_N30_s1_configurations.h5",
+  "snapshot_stride": 5,
+  "snapshot_start_cycle": 0,
+  "reduced_bias_by_temperature": [
+    0.4387662565068686,
+    0.4371109934759454,
+    0.26741480960701947,
+    0.09606307598819042,
+    -0.07528808419267885
+  ],
+  "coupling_K_by_temperature": [
+    -0.4387662565068686,
+    -0.4371109934759454,
+    -0.26741480960701947,
+    -0.09606307598819042,
+    0.07528808419267885
+  ],
+  "contact_weight_q_by_temperature": [
+    0.6448314871799551,
+    0.6458997367749828,
+    0.7653555287839247,
+    0.9084067156103177,
+    1.0781947170024873
+  ],
+  "wall_time_seconds": 2.472491000080481,
+  "swap_rates": [
+    1.0,
+    0.7733333333333333,
+    0.82,
+    0.72
+  ],
+  "swap_rate_min": 0.72,
+  "swap_rate_mean": 0.8283333333333334,
+  "swap_rate_median": 0.7966666666666666,
+  "local_acceptance_rates": [
+    0.5896666666666667,
+    0.5927777777777777,
+    0.5986111111111111,
+    0.6062222222222222,
+    0.5862777777777778
+  ],
+  "legacy_local_acceptance_rates": [
+    0.5896666666666667,
+    0.5927777777777777,
+    0.5986111111111111,
+    0.6062222222222222,
+    0.5862777777777778
+  ],
+  "state_changing_acceptance_rates": [
+    0.5877777777777777,
+    0.5907222222222223,
+    0.597,
+    0.6047222222222223,
+    0.5841666666666666
+  ],
+  "output_files": {
+    "results_csv": "calibration_N30\\calib_N30_s1_results.csv",
+    "swap_rates_csv": "calibration_N30\\calib_N30_s1_swap_rates.csv",
+    "move_acceptance_csv": "calibration_N30\\calib_N30_s1_move_acceptance.csv",
+    "distributions_npz": "calibration_N30\\calib_N30_s1_distributions.npz",
+    "configuration_hdf5": "calibration_N30\\calib_N30_s1_configurations.h5",
+    "diagnostics_json": "calibration_N30\\calib_N30_s1_diagnostics.json",
+    "convergence_csv": "calibration_N30\\calib_N30_s1_convergence.csv",
+    "round_trips_csv": "calibration_N30\\calib_N30_s1_round_trips.csv",
+    "walker_occupancy_csv": "calibration_N30\\calib_N30_s1_walker_occupancy.csv",
+    "diagnostic_trajectories_npz": "calibration_N30\\calib_N30_s1_diagnostic_trajectories.npz",
+    "structural_trajectories_npz": "calibration_N30\\calib_N30_s1_diagnostic_trajectories.npz",
+    "run_summary_json": "calibration_N30\\calib_N30_s1_run_summary.json"
+  },
+  "diagnostics_enabled": true,
+  "diagnostics_overhead_seconds": 0.02353700005915016,
+  "diagnostics_summary": {
+    "n_temperatures": 5,
+    "n_walkers": 5,
+    "total_round_trips_low": 73,
+    "min_round_trips_per_walker": 10,
+    "median_round_trips_per_walker": 15.0,
+    "min_temp_coverage": 1.0,
+    "median_temp_coverage": 1.0,
+    "min_ess_contacts": 118.94793967299516,
+    "median_ess_contacts": 136.53606741659854,
+    "total_ess_contacts": 685.2612012117714,
+    "max_autocorr_contacts": 1.261055890605347,
+    "max_autocorr_rg": 1.4059401340365376,
+    "max_drift_contacts": 0.13770787872849424,
+    "min_swap_rate": 0.72,
+    "median_swap_rate": 0.7966666666666666,
+    "structural_observables_enabled": true,
+    "min_ess_rg2": 105.18395003095479,
+    "min_ess_ree2": 119.11404205214376,
+    "min_ess_m_long_fixed": 30.0,
+    "min_ess_m_global_scaled": 16.34078212290503,
+    "min_ess_smax": 22.784810126582283,
+    "min_ess_largest_component_fraction": 22.784810126582283,
+    "min_ess_key_structural": 22.784810126582283,
+    "min_structural_samples": 30,
+    "max_drift_m_long_fixed": 0.5052911526399114
+  },
+  "diagnostics_thresholds": {
+    "min_round_trips": 1,
+    "min_temp_coverage": 0.5,
+    "min_ess": 50.0,
+    "max_drift": 1.0,
+    "min_swap_rate": 0.05,
+    "min_structural_samples": 20,
+    "min_state_changing_move_rate": 0.01
+  },
+  "diagnostics_warnings": [
+    {
+      "type": "low_ess_m_long_fixed",
+      "message": "minimum m_long_fixed ESS 30.0 < 50.0",
+      "value": 30.0,
+      "threshold": 50.0
+    },
+    {
+      "type": "low_ess_m_global_scaled",
+      "message": "minimum m_global_scaled ESS 16.3 < 50.0",
+      "value": 16.34078212290503,
+      "threshold": 50.0
+    },
+    {
+      "type": "low_ess_smax",
+      "message": "minimum S_max ESS 22.8 < 50.0",
+      "value": 22.784810126582283,
+      "threshold": 50.0
+    },
+    {
+      "type": "low_ess_largest_component_fraction",
+      "message": "minimum largest-component fraction ESS 22.8 < 50.0",
+      "value": 22.784810126582283,
+      "threshold": 50.0
+    }
+  ]
+}

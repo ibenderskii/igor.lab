@@ -1,0 +1,6 @@
+walker,fraction_visited,occupancy_T0,occupancy_T1,occupancy_T2,occupancy_T3,occupancy_T4
+0,1.0,62,65,63,66,44
+1,1.0,62,60,54,58,66
+2,1.0,62,62,62,62,52
+3,1.0,64,62,60,53,61
+4,1.0,50,51,61,61,77

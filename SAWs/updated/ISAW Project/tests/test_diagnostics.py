@@ -110,6 +110,54 @@ def test_global_scaled_diagnostics_included():
     assert "m_global_scaled" in diag["lane_convergence"][0]
 
 
+def test_diagnostic_npz_bin_provenance(tmp_path):
+    import json
+    import isaw_contact_observables as ico
+    Ts = np.linspace(300, 360, 4)
+    store = {}
+    custom = ico.project_bin_definitions(16)
+    custom["scaled"] = {**ico.SCALED_BIN_DEFINITIONS, "meso_max_ratio": 0.25}
+    custom["bin_definition_source"] = "cli_override"
+    reps, _, _ = remd.run_remd(
+        N=16, Ts=Ts, steps_per_swap=30, n_cycles=20,
+        model_name=HS["model_name"], params=HS["params"],
+        Tref=HS["Tref"], Tscale=HS["Tscale"], seed=1, n_workers=1,
+        verbose=False, diagnostics=True, diag_store=store,
+        structural_observables=True, structural_stride=5, bin_defs=custom)
+    path = remd.save_diagnostic_trajectories_npz(
+        reps, store["walker_temp_index"], Ts, burnin_frac=0.5,
+        out_prefix=str(tmp_path / "run"), configured_structural_stride=5,
+        bin_definitions=custom)
+    d = np.load(path)
+    # bin provenance saved even though m_r_post was NOT requested
+    assert "m_r_post" not in d
+    assert str(d["bin_definition_source"]) == "cli_override"
+    scaled = json.loads(str(d["scaled_bin_definitions"]))
+    assert scaled["meso_max_ratio"] == 0.25      # the EXACT run definitions
+    assert str(d["definitions_version"]) == ico.DEFINITIONS_VERSION
+
+
+def test_one_sample_structural_stride(tmp_path):
+    # A burn-in leaving a single structural sample -> observed spacing sentinel
+    # -1, but the configured stride is preserved.
+    Ts = np.linspace(300, 360, 3)
+    store = {}
+    reps, _, _ = remd.run_remd(
+        N=16, Ts=Ts, steps_per_swap=20, n_cycles=12,
+        model_name=HS["model_name"], params=HS["params"],
+        Tref=HS["Tref"], Tscale=HS["Tscale"], seed=1, n_workers=1,
+        verbose=False, diagnostics=True, diag_store=store,
+        structural_observables=True, structural_stride=5)
+    # burnin_frac high so only ~1 structural sample remains post-burn-in
+    path = remd.save_diagnostic_trajectories_npz(
+        reps, store["walker_temp_index"], Ts, burnin_frac=0.6,
+        out_prefix=str(tmp_path / "one"), configured_structural_stride=5)
+    d = np.load(path)
+    assert int(d["configured_structural_stride"]) == 5
+    assert int(d["observed_structural_cycle_spacing"]) in (-1, 5)
+    assert int(d["structural_stride"]) == 5      # compat == configured
+
+
 def test_local_move_freezing_uses_state_changing():
     Ts = np.linspace(300, 360, 3)
     reps, _, _ = remd.run_remd(
