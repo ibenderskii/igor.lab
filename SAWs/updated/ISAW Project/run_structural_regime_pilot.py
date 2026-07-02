@@ -50,6 +50,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import remd_uniform_chain_2_new as remd
 import isaw_schema as sch
+import isaw_config_io as cio
+import extract_contact_motif_features as ext
 
 PY = sys.executable
 REMD = str(HERE / "remd_uniform_chain_2_new.py")
@@ -72,6 +74,15 @@ DEFAULT_GATE_THRESHOLDS = {
     "min_tail_probability": 1e-3,
     "max_seed_relative_spread": 0.5,
     "min_regime_effect_size": 2.0,
+    # Phase 9 tail gate (pooled + per-seed support, not just a probability).
+    "min_raw_pooled_tail_count": 20.0,
+    "min_effective_pooled_tail_count": 5.0,
+    "min_seed_tail_fraction": 0.5,
+    "min_per_seed_tail_count": 1.0,
+    # Phase 10 worst-seed adjacent overlap (isolated poor connectivity).
+    "min_worst_seed_adjacent_overlap": 0.10,
+    # Phase 8 seed-label agreement for regime stability.
+    "min_regime_label_agreement": 1.0,
 }
 
 
@@ -422,7 +433,8 @@ def _block_resample_mean(x, block_len, rng):
     return float(sample.mean())
 
 
-def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701):
+def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701,
+                           n_requested_seeds=None):
     """True two-level (seed x block) bootstrap of endpoint deltas and K-slopes (Part 4).
 
     ``seed_data`` is a list (one entry per independent seed) of dicts with keys
@@ -439,7 +451,10 @@ def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701):
     K = np.asarray(seed_data[0]["K"], float)
     order = np.argsort(K)
     lo, hi = int(order[0]), int(order[-1])
-    keys = ("contacts", "rg2", "m_global", "smax")
+    # Only bootstrap observables actually present (synthetic callers may omit
+    # the largest-component fraction; real seed data carries it).
+    keys = tuple(k for k in ("contacts", "rg2", "m_global", "smax", "lcf")
+                 if k in seed_data[0])
 
     def lane_means(sd, key, rng=None):
         arr = np.asarray(sd[key], float)
@@ -464,11 +479,9 @@ def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701):
     est = {
         "delta_contacts": float(a0["contacts"][hi] - a0["contacts"][lo]),
         "delta_rg2": float(a0["rg2"][hi] - a0["rg2"][lo]),
-        "slope_contacts": _slope(K, a0["contacts"]),
-        "slope_rg2": _slope(K, a0["rg2"]),
-        "slope_m_global": _slope(K, a0["m_global"]),
-        "slope_smax": _slope(K, a0["smax"]),
     }
+    for k in keys:
+        est[f"slope_{k}"] = _slope(K, a0[k])
     rng = np.random.RandomState(int(seed))
     draws = {q: np.empty(n_boot) for q in est}
     for b in range(n_boot):
@@ -476,10 +489,9 @@ def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701):
         a = agg(sel, rng)
         draws["delta_contacts"][b] = a["contacts"][hi] - a["contacts"][lo]
         draws["delta_rg2"][b] = a["rg2"][hi] - a["rg2"][lo]
-        draws["slope_contacts"][b] = _slope(K, a["contacts"])
-        draws["slope_rg2"][b] = _slope(K, a["rg2"])
-        draws["slope_m_global"][b] = _slope(K, a["m_global"])
-        draws["slope_smax"][b] = _slope(K, a["smax"])
+        for k in keys:
+            draws[f"slope_{k}"][b] = _slope(K, a[k])
+    n_req = int(n_requested_seeds) if n_requested_seeds is not None else int(S)
     out = {}
     for q, arr in draws.items():
         arr = arr[np.isfinite(arr)]
@@ -489,8 +501,11 @@ def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701):
         else:
             ci, bm = [float("nan"), float("nan")], float("nan")
         out[q] = {"estimate": est[q], "bootstrap_mean": bm, "ci95": ci,
-                  "n_seeds": int(S), "block_length": int(block_len),
-                  "n_bootstrap_replicates": int(n_boot)}
+                  "n_seeds": int(S), "n_complete_seeds": int(S),
+                  "n_requested_seeds": n_req,
+                  "block_length": int(block_len),
+                  "n_bootstrap_replicates": int(n_boot),
+                  "bootstrap_seed": int(seed)}
     out["endpoint_lanes"] = {"low_K_lane": lo, "high_K_lane": hi}
     return out
 
@@ -673,13 +688,129 @@ def high_contact_tail(Pc, c_vals, ess_by_lane, n_by_lane, tau_by_lane,
     }
 
 
+def common_tail_statistics(per_seed_Pc, per_seed_counts, per_seed_ess, c_vals,
+                           threshold=None, threshold_source=None, percentile=90.0,
+                           support_maximum=None, support_source=None):
+    """ONE common high-contact tail threshold applied to every seed (Phase 9).
+
+    Every seed's normalized histogram is converted back to RAW counts using the
+    actual post-burn-in sample counts, the counts are pooled across all seeds and
+    lanes, and a single tail threshold is chosen (user-supplied, or the pooled
+    sampled ``percentile``).  Every seed's and the pool's tail statistics use that
+    same threshold, so ``raw_tail_count_pooled == sum(raw_tail_count_per_seed)``
+    exactly.
+    """
+    S = len(per_seed_Pc)
+    Pc = np.nan_to_num(np.asarray(per_seed_Pc, float))          # (S, nT, W)
+    counts = np.asarray(per_seed_counts, float)                 # (S, nT)
+    ess = np.asarray(per_seed_ess, float)                       # (S, nT)
+    c_vals = np.asarray(c_vals, float)
+    raw = Pc * counts[:, :, None]                               # (S, nT, W)
+    pooled_counts = raw.sum(axis=(0, 1))                        # (W,)
+    if threshold is None:
+        tot = float(pooled_counts.sum())
+        if tot > 0:
+            cdf = np.cumsum(pooled_counts) / tot
+            k = int(np.searchsorted(cdf, percentile / 100.0))
+            threshold = float(c_vals[min(k, c_vals.size - 1)])
+            src = threshold_source or "pooled_sampled_percentile"
+        else:
+            threshold = float(c_vals[-1]) if c_vals.size else 0.0
+            src = threshold_source or "empty_distribution"
+    else:
+        threshold = float(threshold)
+        src = threshold_source or "user_supplied"
+    mask = c_vals >= threshold
+    nT = counts.shape[1] if counts.ndim == 2 else 0
+    raw_per_seed, eff_per_seed, prob_per_seed, max_per_seed = [], [], [], []
+    for s in range(S):
+        raw_per_seed.append(float(raw[s][:, mask].sum()))
+        tp_lane = np.zeros(nT)
+        for lane in range(nT):
+            n = counts[s, lane]
+            tp_lane[lane] = (raw[s, lane][mask].sum() / n) if n > 0 else 0.0
+        eff_per_seed.append(float((tp_lane * ess[s]).sum()))
+        w = counts[s]
+        prob_per_seed.append(
+            float(np.average(tp_lane, weights=w)) if w.sum() > 0 else 0.0)
+        nz = np.nonzero(np.nan_to_num(Pc[s]).sum(axis=0) > 0)[0]
+        max_per_seed.append(float(c_vals[nz[-1]]) if nz.size else 0.0)
+    raw_pooled = float(pooled_counts[mask].sum())
+    eff_pooled = float(np.sum(eff_per_seed))
+    seeds_with_tail = int(sum(1 for r in raw_per_seed if r > 0))
+    # Support-boundary truncation only against a genuine external reference.
+    if support_maximum is not None and np.isfinite(support_maximum):
+        boundary_value = float(support_maximum)
+        boundary_src = support_source or "external"
+        max_pooled = max(max_per_seed) if max_per_seed else 0.0
+        boundary_limited = bool(max_pooled >= boundary_value)
+    else:
+        boundary_value = None
+        boundary_src = "unavailable"
+        boundary_limited = None
+    return {
+        "tail_threshold": float(threshold),
+        "threshold_source": src,
+        "threshold_percentile": (float(percentile)
+                                 if src == "pooled_sampled_percentile" else None),
+        "raw_tail_count_per_seed": raw_per_seed,
+        "effective_tail_count_per_seed": eff_per_seed,
+        "tail_probability_per_seed": prob_per_seed,
+        "raw_tail_count_pooled": raw_pooled,
+        "effective_tail_count_pooled": eff_pooled,
+        "tail_probability_pooled": (raw_pooled / float(pooled_counts.sum())
+                                    if pooled_counts.sum() > 0 else 0.0),
+        "seed_coverage": seeds_with_tail,
+        "n_seeds": int(S),
+        "maximum_observed_m_per_seed": max_per_seed,
+        "maximum_observed_m_pooled": (max(max_per_seed) if max_per_seed
+                                      else float("nan")),
+        "support_boundary_source": boundary_src,
+        "support_boundary_value": boundary_value,
+        "maximum_is_boundary_limited": boundary_limited,
+        "pooled_raw_equals_seed_sum": bool(
+            abs(raw_pooled - float(np.sum(raw_per_seed))) <= 1e-6),
+    }
+
+
+def evaluate_tail_gate(tail, thresholds=None):
+    """Strengthened high-contact-tail gate (Phase 9): pooled raw + effective
+    counts, seed coverage, and per-seed support -- not just a probability."""
+    t = dict(DEFAULT_GATE_THRESHOLDS)
+    if thresholds:
+        t.update(thresholds)
+    raw_pooled = float(tail.get("raw_tail_count_pooled", 0.0))
+    eff_pooled = float(tail.get("effective_tail_count_pooled", 0.0))
+    per_seed = list(tail.get("raw_tail_count_per_seed", []))
+    n_seeds = max(1, int(tail.get("n_seeds", len(per_seed) or 1)))
+    seed_cov = int(tail.get("seed_coverage", 0))
+    min_per_seed = float(min(per_seed)) if per_seed else 0.0
+    passed = (raw_pooled >= t["min_raw_pooled_tail_count"]
+              and eff_pooled >= t["min_effective_pooled_tail_count"]
+              and (seed_cov / n_seeds) >= t["min_seed_tail_fraction"]
+              and min_per_seed >= t["min_per_seed_tail_count"])
+    return {
+        "passed": bool(passed),
+        "raw_tail_count_pooled": raw_pooled,
+        "min_raw_pooled_tail_count": t["min_raw_pooled_tail_count"],
+        "effective_tail_count_pooled": eff_pooled,
+        "min_effective_pooled_tail_count": t["min_effective_pooled_tail_count"],
+        "seed_tail_fraction": seed_cov / n_seeds,
+        "min_seed_tail_fraction": t["min_seed_tail_fraction"],
+        "min_per_seed_tail_count": min_per_seed,
+        "min_per_seed_tail_count_threshold": t["min_per_seed_tail_count"],
+        "explanation": "high-contact tail has adequate pooled + per-seed support",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-regime production estimator (Phase 10)
 # ---------------------------------------------------------------------------
 
 def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
                            snapshot_stride, n_seeds, target_ess=TARGET_EFF_PER_REGIME,
-                           limiting_observable_by_lane=None):
+                           limiting_observable_by_lane=None,
+                           regime_labels_stable=True):
     """Snapshot-stride-aware required production cycles per structural regime (Part 8).
 
     The effective sample spacing in CYCLES accounts for BOTH autocorrelation and
@@ -746,15 +877,26 @@ def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
             eff = L * n_seeds * (f * P_rec) / delta_eff
             rr["expected_effective_configs_pooled"] = float(eff)
             rr["expected_raw_saved_configs_per_seed"] = int(np.floor(f * P_rec / stride))
+            rr["expected_raw_saved_configs_per_regime"] = int(
+                np.floor(f * P_rec / stride) * L)
             rr["reaches_target"] = bool(eff >= target_ess)
         else:
             rr["expected_effective_configs_pooled"] = 0.0
             rr["expected_raw_saved_configs_per_seed"] = 0
+            rr["expected_raw_saved_configs_per_regime"] = 0
             rr["reaches_target"] = False
+        # Phase 8/12: a regime is DEFINITIVE only when it reaches target AND the
+        # regime labels are stable across seeds; otherwise it is provisional.
+        rr["status"] = ("definitive" if (rr["reaches_target"]
+                        and regime_labels_stable) else "provisional")
         all_reach = all_reach and rr["reaches_target"]
     limiting = max(required_P, key=lambda r: required_P[r]) if required_P else None
+    overall_status = ("definitive" if (all_reach and regime_labels_stable)
+                      else "provisional")
     return {
         "per_regime": per_regime,
+        "status": overall_status,
+        "regime_labels_stable": bool(regime_labels_stable),
         "recommended_production_cycles_per_seed": int(P_rec),
         "target_effective_per_regime": int(target_ess),
         "limiting_regime": limiting,
@@ -814,7 +956,15 @@ def evaluate_sampling_gates(metrics, thresholds=None):
     g["min_adjacent_overlap"] = _gate(
         metrics.get("min_adjacent_overlap", 0) >= t["min_adjacent_overlap"],
         metrics.get("min_adjacent_overlap", 0), t["min_adjacent_overlap"],
-        "minimum adjacent contact-histogram Bhattacharyya overlap")
+        "minimum POOLED adjacent contact-histogram Bhattacharyya overlap")
+    # Phase 10: a separate worst-SEED gate so a single seed with poor ladder
+    # connectivity cannot be hidden by a healthy pooled overlap.
+    g["worst_seed_adjacent_overlap"] = _gate(
+        metrics.get("min_worst_seed_adjacent_overlap", 0)
+        >= t["min_worst_seed_adjacent_overlap"],
+        metrics.get("min_worst_seed_adjacent_overlap", 0),
+        t["min_worst_seed_adjacent_overlap"],
+        "minimum worst-SEED adjacent overlap (per-seed ladder connectivity)")
     g["swap_rate"] = _band_gate(
         metrics.get("min_swap_rate", 0), t["min_swap_rate"],
         metrics.get("max_swap_rate", 1), t["max_swap_rate"],
@@ -829,9 +979,11 @@ def evaluate_sampling_gates(metrics, thresholds=None):
         t["min_state_changing_acceptance"],
         "minimum state-changing local-move acceptance")
     g["high_contact_tail_support"] = _gate(
-        metrics.get("tail_probability", 0) >= t["min_tail_probability"],
-        metrics.get("tail_probability", 0), t["min_tail_probability"],
-        "high-contact tail has sampled support")
+        (metrics.get("tail_probability", 0) >= t["min_tail_probability"])
+        and (metrics.get("raw_tail_count_pooled", 0)
+             >= t["min_raw_pooled_tail_count"]),
+        metrics.get("raw_tail_count_pooled", 0), t["min_raw_pooled_tail_count"],
+        "high-contact tail has pooled sampled support (probability + raw count)")
     g["seed_agreement"] = _gate(
         metrics.get("seed_relative_spread", 1.0) <= t["max_seed_relative_spread"],
         metrics.get("seed_relative_spread", 1.0), t["max_seed_relative_spread"],
@@ -855,21 +1007,100 @@ def _sha256(path):
     return h.hexdigest()
 
 
+# Bump when the resume-validation SEMANTICS change (a certificate written by an
+# older revision must not be trusted for reuse).
+VALIDATOR_REVISION = 3
+
+
 def _certificate_path(feat_path):
     return Path(str(feat_path) + ".validation.json")
 
 
-def _deep_validate_and_certify(feat_path):
-    """Deep-validate a completed feature file and write a SHA-256 certificate.
+def _canonical_json(obj):
+    """Deterministic, key-sorted JSON for fingerprinting (JSON-safe first)."""
+    return json.dumps(sch.json_safe(obj), sort_keys=True, separators=(",", ":"))
+
+
+def _stage_fingerprint(fields):
+    """SHA-256 of the canonical calibration-stage fingerprint fields (Phase 4)."""
+    return hashlib.sha256(_canonical_json(fields).encode("utf-8")).hexdigest()
+
+
+def build_stage_fingerprint_fields(*, N, seed, ladder, K_ladder, info,
+                                   fit_summary_path, n_cycles, steps_per_swap,
+                                   n_workers, structural_stride, snapshot_stride,
+                                   burnin_frac):
+    """Canonical fields that uniquely identify a requested calibration stage.
+
+    Any change to N, seed, the ladders, the fitted model (path/hash/params), the
+    sampler control parameters, the definitions, or the schema/validator
+    revisions produces a different fingerprint, so a resumed stage can be reused
+    only when it was produced for exactly the requested configuration.
+    """
+    return {
+        "N": int(N),
+        "seed": int(seed),
+        "temperature_ladder": [round(float(t), 6) for t in ladder],
+        "K_ladder": [round(float(k), 8) for k in K_ladder],
+        "fit_summary_path": str(fit_summary_path),
+        "fit_summary_sha256": _sha256(fit_summary_path),
+        "model_name": str(info["model_name"]),
+        "param_names": [str(x) for x in info.get("param_names", [])],
+        "model_params": [float(x) for x in info["params"]],
+        "Tref": float(info["Tref"]),
+        "Tscale": float(info["Tscale"]),
+        "n_cycles": int(n_cycles),
+        "steps_per_swap": int(steps_per_swap),
+        "n_workers": int(n_workers),
+        "structural_stride": int(structural_stride),
+        "snapshot_stride": int(snapshot_stride),
+        "burnin_frac": float(burnin_frac),
+        "definitions_path": str(sch.RESOLVED_DEFINITIONS_PATH),
+        "definitions_sha256": _sha256(str(sch.RESOLVED_DEFINITIONS_PATH)),
+        "definitions_version": str(sch.DEFINITIONS_VERSION),
+        "sampler_schema_version": int(remd.SCHEMA_VERSION),
+        "snapshot_schema_version": int(cio.SNAPSHOT_SCHEMA_VERSION),
+        "feature_schema_version": int(ext.FEATURE_SCHEMA_VERSION),
+        "diagnostic_trajectory_schema_version": int(
+            sch.DIAGNOSTIC_TRAJECTORY_SCHEMA_VERSION),
+        "validator_revision": int(VALIDATOR_REVISION),
+    }
+
+
+def _companion_paths(prefix, cfg, feat):
+    """The full set of per-seed companion artifacts a stage must produce."""
+    return {
+        "distributions_npz": f"{prefix}_distributions.npz",
+        "diagnostics_json": f"{prefix}_diagnostics.json",
+        "diagnostic_trajectories_npz": f"{prefix}_diagnostic_trajectories.npz",
+        "results_csv": f"{prefix}_results.csv",
+        "swap_rates_csv": f"{prefix}_swap_rates.csv",
+        "move_acceptance_csv": f"{prefix}_move_acceptance.csv",
+        "configuration_h5": str(cfg),
+        "feature_h5": str(feat),
+    }
+
+
+def _deep_validate_and_certify(feat_path, *, stage_fingerprint=None,
+                               source_config=None):
+    """Deep-validate a completed feature file and write a full certificate.
 
     Raises ``ExtractionError`` on any structural/identity failure (the caller
-    treats that as "the stage must rerun or fail clearly").
+    treats that as "the stage must rerun or fail clearly").  The certificate
+    records the stage fingerprint and source-configuration hash so a later
+    ``--resume`` can prove the file belongs to the exact requested stage.
     """
-    import extract_contact_motif_features as ext
     info = ext.validate_feature_file_hdf5(str(feat_path), deep=True)
+    src_sha = (_sha256(source_config)
+               if source_config and Path(source_config).exists() else None)
     cert = {
         "feature_path": str(feat_path),
         "feature_sha256": _sha256(feat_path),
+        "source_configuration_path": (str(source_config)
+                                      if source_config else None),
+        "source_configuration_sha256": src_sha,
+        "stage_fingerprint": stage_fingerprint,
+        "validator_revision": int(VALIDATOR_REVISION),
         "validation_timestamp": _dt.datetime.now().isoformat(),
         "validator_schema_version": int(ext.FEATURE_SCHEMA_VERSION),
         "definitions_version": info.get("definitions_version"),
@@ -878,6 +1109,41 @@ def _deep_validate_and_certify(feat_path):
     _certificate_path(feat_path).write_text(
         json.dumps(cert, indent=2), encoding="utf-8")
     return cert
+
+
+def stage_reusable(feat, cfg, stage_fingerprint, companions):
+    """(reusable, reason) — a resumed stage may be reused only if EVERYTHING
+    matches the requested stage (Phase 4).
+
+    Requires: feature + source config exist; the certificate exists, passed, and
+    matches the current feature hash, validator revision, stage fingerprint, and
+    source-configuration hash; and every companion artifact is present.
+    """
+    if not Path(feat).exists():
+        return False, "feature file missing"
+    if not Path(cfg).exists():
+        return False, "source configuration missing"
+    cert_p = _certificate_path(feat)
+    if not cert_p.exists():
+        return False, "no validation certificate"
+    try:
+        cert = json.loads(cert_p.read_text(encoding="utf-8"))
+    except Exception:
+        return False, "unreadable certificate"
+    if cert.get("validation_result") != "passed":
+        return False, "certificate validation_result != passed"
+    if cert.get("feature_sha256") != _sha256(feat):
+        return False, "feature file hash changed since certification"
+    if int(cert.get("validator_revision", -1)) != int(VALIDATOR_REVISION):
+        return False, "certificate validator revision differs from current"
+    if cert.get("stage_fingerprint") != stage_fingerprint:
+        return False, "stage fingerprint differs from the requested stage"
+    if cert.get("source_configuration_sha256") != _sha256(cfg):
+        return False, "source configuration hash changed"
+    for name, path in companions.items():
+        if not Path(path).exists():
+            return False, f"missing companion artifact: {name}"
+    return True, "reusable"
 
 
 def _feature_certified(feat_path):
@@ -907,19 +1173,147 @@ def _feature_certified(feat_path):
         return False
 
 
+# ---------------------------------------------------------------------------
+# Seed-artifact audit (Phase 5) + cross-seed alignment (Phase 6)
+# ---------------------------------------------------------------------------
+
+# The artifacts every requested seed must produce before it can contribute to a
+# multi-seed statistical analysis.
+REQUIRED_SEED_ARTIFACTS = (
+    "results_csv", "diagnostics_json", "diagnostic_trajectories_npz",
+    "distributions_npz", "feature_h5")
+
+ALIGN_TOL = 1e-6
+
+
+class SeedAlignmentError(RuntimeError):
+    """Raised when seeds disagree on the physics-defining run configuration."""
+
+
+def audit_seed_artifacts(seed_companions, *, feature_validator=None):
+    """Classify each requested seed as complete / missing / invalid (Phase 5).
+
+    ``seed_companions`` maps each requested seed to its companion-artifact path
+    dict (as returned by :func:`_companion_paths`).  A seed is COMPLETE only when
+    every required artifact exists AND (when ``feature_validator`` is given) its
+    feature file deep-validates.  Missing artifacts never silently drop a seed;
+    they are reported so scientific inference can be marked not assessable.
+    """
+    validator = feature_validator or _feature_certified
+    complete, missing, invalid = [], [], []
+    failures = {}
+    for seed in sorted(seed_companions):
+        comp = seed_companions[seed]
+        miss = [n for n in REQUIRED_SEED_ARTIFACTS
+                if not Path(comp[n]).exists()]
+        if miss:
+            missing.append(seed)
+            failures[seed] = {"missing_artifacts": miss}
+            continue
+        if not validator(comp["feature_h5"]):
+            invalid.append(seed)
+            failures[seed] = {"feature_validation": "failed"}
+            continue
+        complete.append(seed)
+    requested = sorted(seed_companions)
+    return {
+        "requested_seeds": requested,
+        "complete_seeds": complete,
+        "missing_seeds": missing,
+        "invalid_seeds": invalid,
+        "artifact_failures_by_seed": failures,
+        "all_requested_complete": bool(len(complete) == len(requested)),
+        "assessable": bool(len(complete) == len(requested) and len(complete) >= 2),
+    }
+
+
+def require_seed_alignment(records, tol=ALIGN_TOL):
+    """Raise :class:`SeedAlignmentError` unless every seed agrees EXACTLY (within
+    a serialized-float tolerance) on the physics-defining quantities (Phase 6).
+
+    Each record is a dict with keys ``N``, ``temperatures`` (per-lane order),
+    ``K`` (per-lane order), ``model_name``, ``model_params``, ``Tref``,
+    ``Tscale``, ``definitions_version``, ``trajectory_obs`` (iterable of names),
+    ``trajectory_shapes`` (name -> shape).  Comparison is against the first
+    record but flags ANY deviating seed, so the pass/fail outcome is invariant to
+    seed ordering.  Temperatures/K are compared in per-lane order, so a reversed
+    or shifted lane assignment fails even though the SORTED ladders would match.
+    """
+    if not records:
+        raise SeedAlignmentError("no seed records to align")
+    ref = records[0]
+
+    def _arr(r, k):
+        return np.asarray(r[k], float).ravel()
+
+    for i, r in enumerate(records):
+        if i == 0:
+            continue
+        if int(r["N"]) != int(ref["N"]):
+            raise SeedAlignmentError(f"seed index {i}: N {r['N']} != {ref['N']}")
+        t0, t1 = _arr(ref, "temperatures"), _arr(r, "temperatures")
+        if t1.size != t0.size:
+            raise SeedAlignmentError(
+                f"seed index {i}: temperature count {t1.size} != {t0.size} "
+                f"(a seed is missing a lane)")
+        if not np.allclose(t1, t0, atol=tol, rtol=0.0):
+            if np.allclose(np.sort(t1), np.sort(t0), atol=tol, rtol=0.0):
+                raise SeedAlignmentError(
+                    f"seed index {i}: temperature lanes are reordered relative "
+                    f"to the reference (same sorted ladder, different order)")
+            raise SeedAlignmentError(
+                f"seed index {i}: temperature ladder differs across seeds")
+        k0, k1 = _arr(ref, "K"), _arr(r, "K")
+        if k1.size != k0.size or not np.allclose(k1, k0, atol=tol, rtol=0.0):
+            raise SeedAlignmentError(f"seed index {i}: K ladder differs")
+        if str(r.get("model_name")) != str(ref.get("model_name")):
+            raise SeedAlignmentError(f"seed index {i}: model_name differs")
+        p0 = [float(x) for x in ref.get("model_params", [])]
+        p1 = [float(x) for x in r.get("model_params", [])]
+        if len(p1) != len(p0) or any(abs(a - b) > tol for a, b in zip(p0, p1)):
+            raise SeedAlignmentError(f"seed index {i}: model parameters differ")
+        for key in ("Tref", "Tscale"):
+            if ref.get(key) is not None and r.get(key) is not None:
+                if abs(float(r[key]) - float(ref[key])) > tol:
+                    raise SeedAlignmentError(f"seed index {i}: {key} differs")
+        if str(r.get("definitions_version")) != str(ref.get("definitions_version")):
+            raise SeedAlignmentError(
+                f"seed index {i}: definitions_version differs")
+        if set(r.get("trajectory_obs", [])) != set(ref.get("trajectory_obs", [])):
+            raise SeedAlignmentError(
+                f"seed index {i}: trajectory observable names differ")
+        for name, shp in ref.get("trajectory_shapes", {}).items():
+            if tuple(r.get("trajectory_shapes", {}).get(name, ())) != tuple(shp):
+                raise SeedAlignmentError(
+                    f"seed index {i}: trajectory array {name!r} shape differs")
+    return {
+        "n_seeds": len(records),
+        "N": int(ref["N"]),
+        "n_temperatures": int(_arr(ref, "temperatures").size),
+        "aligned": True,
+    }
+
+
 def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
-             structural_stride, snapshot_stride, resume=False, commands=None):
+             structural_stride, snapshot_stride, resume=False, commands=None,
+             stage_fingerprint=None, burnin_frac=0.5, n_workers=1):
     prefix = out_dir / f"calib_N{N}_s{seed}"
     cfg = f"{prefix}_configurations.h5"
     feat = out_dir / f"calib_N{N}_s{seed}_features.h5"
-    if resume and Path(cfg).exists() and Path(feat).exists() and _feature_certified(feat):
-        print(f"RESUME: seed {seed} deep-validated ({feat})")
-        return str(prefix)
+    companions = _companion_paths(prefix, cfg, feat)
+    if resume:
+        ok, reason = stage_reusable(feat, cfg, stage_fingerprint, companions)
+        if ok:
+            print(f"RESUME: seed {seed} reused (stage fingerprint + companions "
+                  f"match; {feat})")
+            return str(prefix)
+        print(f"RESUME: seed {seed} NOT reusable ({reason}); rerunning.")
     temps = ",".join(f"{t:.4f}" for t in ladder)
     cmd = [PY, REMD, "--N", str(N), "--temps", temps,
            "--fit-summary-json", summary_path,
            "--steps-per-swap", str(steps_per_swap), "--n-cycles", str(n_cycles),
-           "--n-workers", "1", "--seed", str(seed), "--burnin-frac", "0.5",
+           "--n-workers", str(int(n_workers)), "--seed", str(seed),
+           "--burnin-frac", str(float(burnin_frac)),
            "--structural-observables", "--structural-stride", str(structural_stride),
            "--diagnostics", "--diagnostic-trajectories",
            "--save-configurations", "--snapshot-stride", str(snapshot_stride),
@@ -934,9 +1328,11 @@ def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
     if commands is not None:
         commands.append(" ".join(ecmd))
     subprocess.run(ecmd, check=True, cwd=str(HERE))
-    # Deep-validate the freshly extracted features and write a certificate so a
-    # later --resume can trust this stage without rerunning the full validator.
-    _deep_validate_and_certify(feat)
+    # Deep-validate the freshly extracted features and write a full certificate
+    # (stage fingerprint + source-config hash) so a later --resume can prove the
+    # stage belongs to exactly this requested configuration.
+    _deep_validate_and_certify(feat, stage_fingerprint=stage_fingerprint,
+                               source_config=cfg)
     return str(prefix)
 
 
@@ -975,12 +1371,50 @@ def _load_seed_trajectories(prefix, info):
     t = np.load(traj)
     Ts = np.asarray(t["Ts"], float)
     K = np.array([_K_of(info, float(x)) for x in Ts])
-    return {
+    out = {
         "K": K,
         "contacts": np.asarray(t["contacts_post"], float),
         "rg2": np.asarray(t["rg2_post"], float),
         "m_global": np.asarray(t["m_global_scaled_post"], float),
         "smax": np.asarray(t["smax_post"], float),
+    }
+    if "largest_component_fraction_post" in t:
+        out["lcf"] = np.asarray(t["largest_component_fraction_post"], float)
+    return out
+
+
+def _seed_alignment_record(prefix, feat_path, info, N):
+    """Build a cross-seed alignment record from a completed seed's artifacts."""
+    rows = _read_results(prefix)
+    temps = [float(r["T"]) for r in rows]        # per-lane (run) order
+    K = [_K_of(info, t) for t in temps]
+    traj = Path(f"{prefix}_diagnostic_trajectories.npz")
+    obs, shapes = [], {}
+    if traj.exists():
+        t = np.load(traj)
+        for k in ("contacts_post", "rg2_post", "m_global_scaled_post",
+                  "smax_post", "largest_component_fraction_post"):
+            if k in t:
+                obs.append(k)
+                shapes[k] = tuple(int(x) for x in np.asarray(t[k]).shape)
+    defs_ver = None
+    mparams = [float(x) for x in info["params"]]
+    man_path = Path(str(feat_path) + ".manifest.json")
+    if man_path.exists():
+        try:
+            man = json.loads(man_path.read_text(encoding="utf-8"))
+            defs_ver = man.get("definitions_version")
+            mr = man.get("model_record") or {}
+            if mr.get("model_params") is not None:
+                mparams = [float(x) for x in mr["model_params"]]
+        except Exception:
+            pass
+    return {
+        "N": int(N), "temperatures": temps, "K": K,
+        "model_name": str(info["model_name"]), "model_params": mparams,
+        "Tref": float(info["Tref"]), "Tscale": float(info["Tscale"]),
+        "definitions_version": defs_ver,
+        "trajectory_obs": obs, "trajectory_shapes": shapes,
     }
 
 
@@ -1013,7 +1447,8 @@ def analyze_trends(prefixes, info, block_len=20, n_boot=2000):
     # -- genuine hierarchical (seed x block) bootstrap (Part 4) --------------
     seed_data = [d for d in (_load_seed_trajectories(p, info) for p in prefixes)
                  if d is not None]
-    hb = (hierarchical_bootstrap(seed_data, n_boot=n_boot, block_len=block_len)
+    hb = (hierarchical_bootstrap(seed_data, n_boot=n_boot, block_len=block_len,
+                                 n_requested_seeds=len(prefixes))
           if seed_data else None)
 
     # Point estimates / directional signs from the aggregate endpoint deltas.
@@ -1079,6 +1514,10 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
     min_swap = float("inf"); max_swap = 0.0; max_drift = 0.0
     min_state_changing = float("inf")
     tau_by_lane = None
+    # Phase 11: worst finite drift across seeds, lanes, AND key observables.
+    drift_limit = {"value": 0.0, "seed": None, "lane": None, "observable": None}
+    total_round_trips = 0
+    median_round_trips = []
 
     # First pass: find the common (widest) integer contact grid across seeds.
     dists = []
@@ -1092,7 +1531,6 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
 
     seed_reports = []
     per_seed_Pc = []; per_seed_counts = []; per_seed_ess = []; per_seed_tau = []
-    per_seed_tail_raw = []
     for si, prefix in enumerate(prefixes):
         diag = _read_diag(prefix)
         lanes = diag["lane_convergence"]
@@ -1119,8 +1557,17 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
                 ess_lane[i] = float(c["ess"])
             if c.get("n_samples"):
                 n_lane[i] = float(c["n_samples"])
-            if "drift_in_std" in c and np.isfinite(c["drift_in_std"]):
-                max_drift = max(max_drift, abs(float(c["drift_in_std"])))
+            # Worst finite drift across every key observable (not only contacts).
+            for o in key_obs:
+                lo = lane.get(o, {})
+                d = lo.get("drift_in_std")
+                if d is not None and np.isfinite(d):
+                    ad = abs(float(d))
+                    if ad > max_drift:
+                        max_drift = ad
+                    if ad > drift_limit["value"]:
+                        drift_limit = {"value": ad, "seed": Path(prefix).name,
+                                       "lane": i, "observable": o}
             per_lane.append(row)
         tau_by_lane = lane_tau if tau_by_lane is None else np.fmax(tau_by_lane, lane_tau)
         adj = [float(_bhattacharyya(Pc[a], Pc[a + 1])) for a in range(nT - 1)]
@@ -1128,16 +1575,19 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
         if srates:
             min_swap = min(min_swap, min(srates)); max_swap = max(max_swap, max(srates))
         min_cov = min(min_cov, diag["summary"].get("min_temp_coverage", 0) or 0)
-        min_rt = min(min_rt, diag["summary"].get("total_round_trips_low", 0) or 0)
+        # Phase 11: gate on the MINIMUM round trips PER WALKER, not the total.
+        rt_pw = diag["summary"].get("min_round_trips_per_walker")
+        if rt_pw is None:
+            rt_pw = diag["summary"].get("total_round_trips_low", 0) or 0
+        min_rt = min(min_rt, float(rt_pw))
+        total_round_trips += int(diag["summary"].get("total_round_trips_low", 0) or 0)
+        med = diag["summary"].get("median_round_trips_per_walker")
+        if med is not None:
+            median_round_trips.append(float(med))
         summ = json.load(open(f"{prefix}_run_summary.json"))
         scr = [float(x) for x in summ.get("state_changing_acceptance_rates", [])]
         if scr:
             min_state_changing = min(min_state_changing, min(scr))
-        # Per-seed tail (support boundary genuinely unavailable unless supplied).
-        tinfo = high_contact_tail(Pc, c_vals_common, ess_lane, n_lane, lane_tau,
-                                  support_maximum=support_maximum,
-                                  support_source=support_source)
-        per_seed_tail_raw.append(float(tinfo["raw_tail_count"]))
         per_seed_Pc.append(Pc); per_seed_counts.append(n_lane)
         per_seed_ess.append(ess_lane); per_seed_tau.append(lane_tau)
         seed_reports.append({
@@ -1146,9 +1596,12 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
             "swap_rates": srates,
             "min_temp_coverage": diag["summary"].get("min_temp_coverage"),
             "total_round_trips_low": diag["summary"].get("total_round_trips_low"),
+            "min_round_trips_per_walker": diag["summary"].get(
+                "min_round_trips_per_walker"),
+            "median_round_trips_per_walker": diag["summary"].get(
+                "median_round_trips_per_walker"),
             "adjacent_overlap_bhattacharyya": adj,
             "state_changing_acceptance_rates": scr,
-            "high_contact_tail": tinfo,
         })
 
     # -- seed-aggregated adjacent overlap (median/min/pooled-count) ----------
@@ -1173,45 +1626,48 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
     worst_seed_adjacent = [d["minimum_overlap"] for d in adjacent_aggregate]
     min_adj_overlap = (min(pooled_adjacent) if pooled_adjacent else float("inf"))
 
-    # -- pooled high-contact tail (actual counts across seeds and lanes) ------
-    pooled_prob = pooled_count / np.maximum(
-        pooled_count.sum(axis=1, keepdims=True), 1e-30)
-    pooled_ess = np.array(per_seed_ess).sum(axis=0)
-    pooled_n = counts.sum(axis=0)
-    pooled_tau = np.nanmax(np.array(per_seed_tau), axis=0)
-    tail_pooled = high_contact_tail(pooled_prob, c_vals_common, pooled_ess,
-                                    pooled_n, pooled_tau,
-                                    support_maximum=support_maximum,
-                                    support_source=support_source)
-    tail_pooled["raw_tail_count_per_seed"] = per_seed_tail_raw
-    tail_pooled["raw_tail_count_pooled"] = float(np.sum(per_seed_tail_raw))
-    tail_pooled["per_seed_tail_count"] = per_seed_tail_raw
-    tail_pooled["maximum_observed_m_per_seed"] = [
-        float(r["high_contact_tail"]["maximum_observed_m"]) for r in seed_reports]
-    tail_pooled["maximum_observed_m_pooled"] = (
-        float(max(tail_pooled["maximum_observed_m_per_seed"]))
-        if tail_pooled["maximum_observed_m_per_seed"] else float("nan"))
+    # -- ONE common tail threshold across every seed (Phase 9) --------------
+    tail_pooled = common_tail_statistics(
+        per_seed_Pc, per_seed_counts, per_seed_ess, c_vals_common,
+        support_maximum=support_maximum, support_source=support_source)
+    min_worst_seed_overlap = (min(worst_seed_adjacent)
+                              if worst_seed_adjacent else float("inf"))
 
     metrics = {
         "min_ess": (None if min_ess == float("inf") else min_ess),
         "min_round_trips": (None if min_rt == float("inf") else min_rt),
         "min_temp_coverage": (None if min_cov == float("inf") else min_cov),
         "min_adjacent_overlap": (None if min_adj_overlap == float("inf") else min_adj_overlap),
+        "min_worst_seed_adjacent_overlap": (
+            None if min_worst_seed_overlap == float("inf")
+            else min_worst_seed_overlap),
         "min_swap_rate": (None if min_swap == float("inf") else min_swap),
         "max_swap_rate": max_swap,
         "max_drift_in_std": max_drift,
         "min_state_changing_acceptance": (
             None if min_state_changing == float("inf") else min_state_changing),
-        "tail_probability": float(tail_pooled["tail_probability"]),
+        "tail_probability": float(tail_pooled["tail_probability_pooled"]),
+        "raw_tail_count_pooled": float(tail_pooled["raw_tail_count_pooled"]),
+        "effective_tail_count_pooled": float(
+            tail_pooled["effective_tail_count_pooled"]),
     }
     return {"seeds": seed_reports,
             "slowest_tau_int_cycles": slowest_tau_cycles,
             "tau_by_lane": [None if not np.isfinite(x) else float(x)
                             for x in (tau_by_lane if tau_by_lane is not None else [])],
+            "round_trips": {
+                "total_round_trips_low": int(total_round_trips),
+                "min_round_trips_per_walker": (
+                    None if min_rt == float("inf") else float(min_rt)),
+                "median_round_trips_per_walker": (
+                    float(np.median(median_round_trips))
+                    if median_round_trips else None)},
+            "drift_limiting": drift_limit,
             "adjacent_overlap_aggregate": adjacent_aggregate,
             "pooled_adjacent_overlap": pooled_adjacent,
             "worst_seed_adjacent_overlap": worst_seed_adjacent,
             "high_contact_tail_pooled": tail_pooled,
+            "tail_gate": evaluate_tail_gate(tail_pooled),
             "metrics": metrics}
 
 
@@ -1248,6 +1704,16 @@ def main():
                     help="DIAGNOSTIC override: permit a scientific run on a branch "
                          "where K decreases with T (recorded in the manifest)")
     ap.add_argument("--allow-failed-calibration", action="store_true")
+    # Phase 12: production planning is decoupled from the calibration run; the
+    # future production seed count is NOT inferred from the calibration seeds.
+    ap.add_argument("--production-seeds", type=int, default=8,
+                    help="planned number of INDEPENDENT production seeds "
+                         "(default 8; not inferred from calibration seeds)")
+    ap.add_argument("--production-burnin-frac", type=float, default=0.5)
+    ap.add_argument("--production-snapshot-stride", type=int, default=None,
+                    help="production snapshot stride (defaults to --snapshot-stride)")
+    ap.add_argument("--target-effective-per-regime", type=int,
+                    default=TARGET_EFF_PER_REGIME)
     ap.add_argument("--smoke-test", action="store_true",
                     help="tiny software check; never scientifically validated")
     ap.add_argument("--run-id", default=None)
@@ -1312,6 +1778,21 @@ def main():
                 f"{ladder_info['recommendation']} (reduce --n-temperatures or "
                 f"relax --min-dT/--min-dK).")
 
+    # -- per-seed stage fingerprints (Phase 4) ------------------------------
+    BURNIN_FRAC = 0.5
+    N_WORKERS = 1
+    stage_fingerprint_fields = {}
+    stage_fingerprints = {}
+    for s in seeds:
+        ff = build_stage_fingerprint_fields(
+            N=args.N, seed=s, ladder=ladder, K_ladder=K_ladder, info=info,
+            fit_summary_path=args.fit_summary_json, n_cycles=args.n_cycles,
+            steps_per_swap=args.steps_per_swap, n_workers=N_WORKERS,
+            structural_stride=args.structural_stride,
+            snapshot_stride=args.snapshot_stride, burnin_frac=BURNIN_FRAC)
+        stage_fingerprint_fields[s] = ff
+        stage_fingerprints[s] = _stage_fingerprint(ff)
+
     commands = []
     manifest = {
         "calibration_report_schema_version": CALIBRATION_REPORT_SCHEMA_VERSION,
@@ -1327,6 +1808,10 @@ def main():
         "ladder": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                    for k, v in ladder_info.items()},
         "K_ladder": K_ladder,
+        "stage_fingerprints": {str(s): stage_fingerprints[s] for s in seeds},
+        "stage_fingerprint_fields": {str(s): stage_fingerprint_fields[s]
+                                     for s in seeds},
+        "validator_revision": int(VALIDATOR_REVISION),
         "input_fit_summary_sha256": _sha256(args.fit_summary_json),
         "project_definitions_sha256": _sha256(str(sch.RESOLVED_DEFINITIONS_PATH)),
         "project_definitions_path": str(sch.RESOLVED_DEFINITIONS_PATH),
@@ -1348,13 +1833,41 @@ def main():
         prefixes = [run_seed(out_dir, args.N, s, ladder, args.fit_summary_json,
                              args.n_cycles, args.steps_per_swap,
                              args.structural_stride, args.snapshot_stride,
-                             resume=args.resume, commands=commands)
+                             resume=args.resume, commands=commands,
+                             stage_fingerprint=stage_fingerprints[s],
+                             burnin_frac=BURNIN_FRAC, n_workers=N_WORKERS)
                     for s in seeds]
     except Exception:
         manifest["status"] = "failed"
         (out_dir / "run_manifest.json").write_text(
             json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
         raise
+
+    # -- seed-artifact audit (Phase 5) + cross-seed alignment (Phase 6) ------
+    companions_by_seed = {}
+    align_records = []
+    for s, prefix in zip(seeds, prefixes):
+        feat = Path(f"{prefix}_features.h5")
+        cfg = f"{prefix}_configurations.h5"
+        companions_by_seed[s] = _companion_paths(prefix, cfg, feat)
+        align_records.append(_seed_alignment_record(prefix, feat, info, args.N))
+    seed_audit = audit_seed_artifacts(companions_by_seed)
+    alignment_ok, alignment_reason = True, None
+    seed_alignment = {"aligned": True, "n_seeds": len(align_records)}
+    if len(align_records) >= 2:
+        try:
+            seed_alignment = require_seed_alignment(align_records)
+        except SeedAlignmentError as exc:
+            alignment_ok, alignment_reason = False, str(exc)
+            seed_alignment = {"aligned": False, "reason": alignment_reason}
+    seeds_assessable = bool(seed_audit["assessable"] and alignment_ok)
+    # Misaligned seeds must NEVER be combined; this is a data-integrity failure,
+    # not a soft gate, so it aborts a scientific run outright.
+    if not args.smoke_test and not alignment_ok:
+        manifest["status"] = "failed"
+        (out_dir / "run_manifest.json").write_text(
+            json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
+        raise SystemExit(f"cross-seed alignment failed: {alignment_reason}")
 
     trends = analyze_trends(prefixes, info)
     mixing = analyze_mixing(prefixes, info)
@@ -1374,6 +1887,10 @@ def main():
             ps["smax"][s] / max(1, args.N), agg["within_lane_std"],
             DEFAULT_GATE_THRESHOLDS["min_regime_effect_size"])["labels"]
         per_seed_labels.append(lab)
+    # Phase 8: a lane is UNSTABLE when its per-seed agreement with the aggregate
+    # label is below the configurable threshold; stable labels are required
+    # before regimes may be called resolved or production called definitive.
+    min_agreement = DEFAULT_GATE_THRESHOLDS["min_regime_label_agreement"]
     agree = []
     unstable_lanes = []
     for k in range(agg["n_temperatures"]):
@@ -1381,20 +1898,32 @@ def main():
         frac = (sum(1 for v in votes if v == regimes["labels"][k]) / len(votes)
                 if votes else 0.0)
         agree.append(frac)
-        if frac < 1.0:
+        if frac < min_agreement:
             unstable_lanes.append(k)
+    regime_labels_stable = bool(len(unstable_lanes) == 0)
     regimes["seed_stability"] = {
         "per_seed_labels": per_seed_labels,
         "fraction_agreeing_with_aggregate": agree,
         "unstable_lanes": unstable_lanes,
+        "min_regime_label_agreement": float(min_agreement),
+        "regime_labels_stable": regime_labels_stable,
         "between_seed_std": {k: [float(x) for x in v]
                              for k, v in agg["between_seed_std"].items()},
     }
+    # Resolved regimes additionally require STABLE labels across seeds.
+    regimes["distinct_regimes_resolved"] = bool(
+        regimes["distinct_regimes_resolved"] and regime_labels_stable)
     regime_map = _regime_lane_map(regimes["labels"])
 
+    prod_stride = (args.production_snapshot_stride
+                   if args.production_snapshot_stride is not None
+                   else args.snapshot_stride)
     production = production_requirement(
-        regime_map, mixing["tau_by_lane"], post_burnin_frac=0.5,
-        snapshot_stride=args.snapshot_stride, n_seeds=len(seeds))
+        regime_map, mixing["tau_by_lane"],
+        post_burnin_frac=args.production_burnin_frac,
+        snapshot_stride=prod_stride, n_seeds=int(args.production_seeds),
+        target_ess=int(args.target_effective_per_regime),
+        regime_labels_stable=regime_labels_stable)
 
     metrics = dict(mixing["metrics"])
     metrics["seed_relative_spread"] = trends["seed_relative_spread_delta_m"]
@@ -1405,6 +1934,12 @@ def main():
     sampled_ok = trends["sampled_direction_is_LCST_compatible"]
     stat_ok = trends["structural_change_is_statistically_supported"]
     stat_status = trends["statistical_support_status"]
+    # Phases 5-7: inference is assessable ONLY when every requested seed is
+    # complete/valid AND aligned.  An incomplete/misaligned set is not
+    # assessable regardless of any degenerate bootstrap interval.
+    if not seeds_assessable:
+        stat_ok = False
+        stat_status = "not_assessable"
     distinct_ok = regimes["distinct_regimes_resolved"]
     sampling_ok = gates["_all_passed"]
     enough_seeds = len(seeds) >= 2
@@ -1412,7 +1947,8 @@ def main():
 
     calibration_gate_passed = bool(
         model_K_ok and sampled_ok and stat_ok and distinct_ok
-        and sampling_ok and enough_seeds and not args.smoke_test)
+        and sampling_ok and enough_seeds and seeds_assessable
+        and not args.smoke_test)
 
     # Part 3: scientifically_validated is the gate result, NOT merely "not smoke".
     report = {
@@ -1437,6 +1973,10 @@ def main():
         "ladder": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                    for k, v in ladder_info.items()},
         "K_ladder": K_ladder,
+        "stage_fingerprints": {str(s): stage_fingerprints[s] for s in seeds},
+        "validator_revision": int(VALIDATOR_REVISION),
+        "seed_audit": seed_audit,
+        "seed_alignment": seed_alignment,
         "trends": trends,
         "regimes": regimes,
         "mixing": mixing,
@@ -1450,6 +1990,9 @@ def main():
             "distinct_regimes_are_resolved": distinct_ok,
             "sampling_is_adequate": sampling_ok,
             "enough_seeds_for_calibration": enough_seeds,
+            "all_requested_seeds_complete": seed_audit["all_requested_complete"],
+            "seeds_are_aligned": alignment_ok,
+            "seeds_assessable": seeds_assessable,
             "calibration_gate_passed": calibration_gate_passed,
         },
     }

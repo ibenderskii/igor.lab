@@ -281,9 +281,11 @@ def test_production_snapshot_stride_changes_recommendation():
 
 def test_gates_pass_and_fail():
     good = {"min_ess": 500, "min_round_trips": 10, "min_temp_coverage": 0.9,
-            "min_adjacent_overlap": 0.5, "min_swap_rate": 0.4, "max_swap_rate": 0.6,
+            "min_adjacent_overlap": 0.5, "min_worst_seed_adjacent_overlap": 0.3,
+            "min_swap_rate": 0.4, "max_swap_rate": 0.6,
             "max_drift_in_std": 0.2, "min_state_changing_acceptance": 0.1,
-            "tail_probability": 0.05, "seed_relative_spread": 0.1}
+            "tail_probability": 0.05, "raw_tail_count_pooled": 100.0,
+            "seed_relative_spread": 0.1}
     g = cal.evaluate_sampling_gates(good)
     assert g["_all_passed"] is True
     bad = dict(good, min_ess=5)

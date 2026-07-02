@@ -890,12 +890,24 @@ def run_remd(
     # Python-API callers (not only via the CLI).  The result is a deep copy, so
     # the run never mutates module constants or the caller's dict, and the
     # definitions are validated semantically + as exhaustive partitions for N.
-    _src = (bin_defs.get("bin_definition_source", "caller_supplied")
-            if isinstance(bin_defs, dict) else "module_default")
+    # Phase 13: a direct API caller with bin_defs=None uses the RESOLVED schema
+    # context (the JSON project definitions), NOT the isaw_contact_observables
+    # compatibility constants -- so the online run and the CLI agree on one
+    # authoritative definitions source.
+    if bin_defs is None:
+        import isaw_schema as _sch
+        _ctx = _sch.active_definitions_context()
+        _fixed_in, _scaled_in = _ctx.fixed_bins, _ctx.scaled_bins
+        _src = _sch.PROV_JSON
+    elif isinstance(bin_defs, dict):
+        _fixed_in = bin_defs.get("fixed")
+        _scaled_in = bin_defs.get("scaled")
+        _src = bin_defs.get("bin_definition_source", "explicit_caller_definitions")
+    else:
+        _fixed_in = _scaled_in = None
+        _src = "compatibility_fallback"
     bin_defs = ico.normalize_bin_definitions(
-        (bin_defs or {}).get("fixed") if isinstance(bin_defs, dict) else None,
-        (bin_defs or {}).get("scaled") if isinstance(bin_defs, dict) else None,
-        n_beads=n_beads, source=_src,
+        _fixed_in, _scaled_in, n_beads=n_beads, source=_src,
     )
     _fixed_defs = bin_defs["fixed"]
     _scaled_defs = bin_defs["scaled"]
@@ -4177,8 +4189,12 @@ def main() -> None:
     bin_defs = ico.project_bin_definitions(int(args.N))
     bin_defs["fixed"] = fixed_defs
     bin_defs["scaled"] = scaled_defs
+    # Phase 13: the default bins are JSON-sourced (via isaw_schema), so label
+    # them accordingly -- NOT "module_default" (which would misattribute the
+    # authoritative JSON definitions to the compatibility constants).
     bin_defs["bin_definition_source"] = (
-        "cli_override" if requested_bin_definitions is not None else "module_default")
+        "cli_override" if requested_bin_definitions is not None
+        else _sch.PROV_JSON)
 
     # Optional streaming coordinate-snapshot writer (opt-in).
     snapshot_writer = None

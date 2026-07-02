@@ -1,0 +1,733 @@
+{
+  "project_title": "PNIPAM Aggregation with a Multi-Chain Lattice Polymer Model",
+  "project_goal": {
+    "primary": "Extend the existing single-chain PNIPAM lattice model into a multi-chain model capable of studying collapse, aggregation, phase separation, and mesoglobule formation.",
+    "core_questions": [
+      "Does single-chain collapse promote or suppress interchain aggregation?",
+      "Can the contact free energy fitted from single-chain REMD predict aggregation without additional fitting?",
+      "What additional physics is required to reproduce stable finite PNIPAM aggregates or mesoglobules?"
+    ],
+    "central_hypothesis": "The fitted single-chain effective contact free energy can be transferred, as a first null model, to interchain contacts. Deviations from experiment will identify missing intermolecular physics."
+  },
+  "existing_model_context": {
+    "polymer": "PNIPAM",
+    "current_chain_lengths": [
+      30,
+      44
+    ],
+    "current_single_chain_model": {
+      "description": "Self-avoiding lattice polymer with a temperature-dependent effective contact free energy.",
+      "contact_free_energy": "g(T) = h - T s",
+      "single_chain_hamiltonian": "H(X;T) = g(T) m_intra(X)"
+    },
+    "important_caution": "The current molecular-to-lattice contact offset was fitted for single-chain intrachain contacts and must not be applied directly to interchain contacts."
+  },
+  "minimal_multichain_model": {
+    "system": {
+      "number_of_chains": "M",
+      "chain_length": "N",
+      "box": "Periodic cubic lattice with side length L",
+      "volume_fraction": "phi = M N / L^3",
+      "excluded_volume": "At most one bead per lattice site",
+      "bead_metadata": [
+        "wrapped lattice coordinates",
+        "unwrapped chain coordinates",
+        "chain identity",
+        "monomer index",
+        "bonded neighbors",
+        "optional bead type for later extensions"
+      ]
+    },
+    "contacts": {
+      "m_intra": "Nonbonded nearest-neighbor contacts between beads on the same chain",
+      "m_inter": "Nearest-neighbor contacts between beads on different chains",
+      "m_total": "m_intra + m_inter",
+      "bonded_neighbor_rule": "Covalently bonded neighbors are excluded from contact counts"
+    },
+    "baseline_hamiltonian": {
+      "equation": "H(X;T) = g_intra(T) m_intra(X) + g_inter(T) m_inter(X)",
+      "null_model": "g_intra(T) = g_inter(T) = h - T s",
+      "scientific_meaning": "A monomer-monomer contact has the same effective free energy whether it is intrachain or interchain."
+    },
+    "later_parameterizations": [
+      "g_inter(T) = a g_intra(T) + b",
+      "g_intra(T) = h_intra - T s_intra",
+      "g_inter(T) = h_inter - T s_inter"
+    ]
+  },
+  "periodic_boundary_requirements": {
+    "wrapped_coordinates": "Used for occupancy, neighbor lookup, and contact counting.",
+    "unwrapped_coordinates": "Used for per-chain radius of gyration and polymer geometry.",
+    "minimum_image_use": [
+      "interchain distances",
+      "chain center-of-mass distances",
+      "cluster geometry",
+      "pair correlations"
+    ],
+    "critical_validation": "Chains crossing a periodic boundary must retain the correct Rg after unwrapping."
+  },
+  "monte_carlo_moves": {
+    "required_local_moves": [
+      "end moves",
+      "corner flips",
+      "crankshaft moves",
+      "pull moves"
+    ],
+    "required_collective_moves": [
+      {
+        "move": "whole-chain translation",
+        "purpose": "Allow translational diffusion and interchain encounters"
+      },
+      {
+        "move": "whole-chain lattice rotation",
+        "purpose": "Improve orientational sampling in dilute systems and near aggregate surfaces"
+      },
+      {
+        "move": "reptation",
+        "purpose": "Allow chains to rearrange inside dense clusters"
+      },
+      {
+        "move": "pivot",
+        "purpose": "Accelerate conformational equilibration in dilute or weakly collapsed regimes"
+      }
+    ],
+    "advanced_if_needed": [
+      "configurational-bias regrowth",
+      "double-pivot moves",
+      "partial-chain regrowth",
+      "cluster translation",
+      "cluster rotation"
+    ],
+    "equilibrium_vs_kinetics_rule": {
+      "equilibrium": "Nonlocal and replica-exchange moves are allowed.",
+      "kinetics": "Use only local or approximately diffusive moves. Do not interpret REMD, large pivots, or artificial cluster moves as physical kinetics."
+    }
+  },
+  "replica_exchange": {
+    "reason_for_general_rule": "The Hamiltonian depends explicitly on temperature through g(T).",
+    "swap_probability": "p = min[1, exp(-beta_i H(X_j;T_i) - beta_j H(X_i;T_j) + beta_i H(X_i;T_i) + beta_j H(X_j;T_j))]",
+    "do_not_use_without_proof": "The simplified temperature-independent-energy swap formula.",
+    "diagnostics": [
+      "neighboring-replica acceptance",
+      "replica round trips",
+      "energy histogram overlap",
+      "cluster-state mixing",
+      "time spent in dispersed and aggregated states"
+    ]
+  },
+  "core_observables": {
+    "chain_level": [
+      "per-chain radius of gyration Rg_alpha",
+      "mean and distribution of per-chain Rg",
+      "end-to-end distance",
+      "asphericity",
+      "intrachain contacts per chain",
+      "interchain contacts per chain"
+    ],
+    "contact_level": [
+      "m_intra",
+      "m_inter",
+      "m_total",
+      "f_inter = m_inter / (m_intra + m_inter)",
+      "Cov(m_intra, m_inter)"
+    ],
+    "cluster_level": {
+      "definition": "Each chain is a graph node. Two chains are connected when they share at least q_min interchain contacts.",
+      "thresholds_to_test": [
+        1,
+        2,
+        3
+      ],
+      "observables": [
+        "largest cluster size s_max",
+        "largest cluster fraction f_max = s_max / M",
+        "cluster-size distribution P(s)",
+        "number of clusters",
+        "number-average aggregation number",
+        "weight-average aggregation number",
+        "fraction of isolated chains",
+        "cluster lifetimes in kinetic runs"
+      ]
+    },
+    "aggregate_geometry": [
+      "aggregate radius of gyration",
+      "aggregate asphericity",
+      "aggregate monomer density",
+      "surface-to-volume ratio",
+      "number of constituent chains",
+      "number of interchain contacts",
+      "number of exposed beads"
+    ],
+    "scattering": {
+      "total_structure_factor": "S(q) = (1/MN) <|sum_j exp(i q.r_j)|^2>",
+      "intrachain_form_factor": "P_intra(q) = (1/MN) sum_alpha <|sum_i_in_alpha exp(i q.r_i)|^2>",
+      "scientific_use": "Separate single-chain contraction from collective concentration fluctuations and aggregation."
+    },
+    "primary_order_parameters": [
+      "Q1 = f_max",
+      "Q2 = m_inter / (M N)",
+      "Q3 = S(q_min)"
+    ],
+    "thermodynamics": [
+      "heat capacity or energy fluctuation analog",
+      "susceptibility of Rg",
+      "susceptibility of m_inter",
+      "susceptibility of f_max",
+      "Binder cumulants",
+      "order-parameter bimodality"
+    ]
+  },
+  "free_energy_analysis": {
+    "general_equation": "F(x,y) = -k_B T ln P(x,y) + C",
+    "recommended_surfaces": [
+      "F(mean_Rg, f_max)",
+      "F(m_intra, m_inter)",
+      "F(m_inter, f_max)"
+    ],
+    "expected_regimes": {
+      "dispersed_coils": {
+        "Rg": "large",
+        "f_max": "small"
+      },
+      "dispersed_globules": {
+        "Rg": "small",
+        "f_max": "small"
+      },
+      "loose_aggregates": {
+        "Rg": "moderate or large",
+        "f_max": "large"
+      },
+      "compact_aggregates": {
+        "Rg": "small",
+        "f_max": "large"
+      }
+    }
+  },
+  "initial_simulation_design": {
+    "chain_lengths": [
+      30,
+      44
+    ],
+    "numbers_of_chains": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "later_numbers_of_chains": [
+      32,
+      64
+    ],
+    "concentration_measure": "phi / phi_star",
+    "full_concentration_set": [
+      0.05,
+      0.2,
+      0.5,
+      1.0,
+      2.0
+    ],
+    "pilot_concentration_set": [
+      0.2,
+      0.5,
+      1.0
+    ],
+    "temperature_strategy": "Start with the current REMD ladder, then add resolution near collapse and aggregation features.",
+    "pilot_seeds": "At least 4",
+    "production_seeds": "At least 8"
+  },
+  "pilot_experiment": {
+    "main_question": "Does the existing single-chain interaction produce a distinct aggregation transition in a multi-chain system?",
+    "default_condition": {
+      "N": 44,
+      "M": 8,
+      "concentration": "phi / phi_star approximately 0.5"
+    },
+    "control_models": {
+      "A_full_equal_contact": {
+        "g_intra": "g(T)",
+        "g_inter": "g(T)"
+      },
+      "B_independent_collapse": {
+        "g_intra": "g(T)",
+        "g_inter": "0"
+      },
+      "C_pure_aggregation": {
+        "g_intra": "0",
+        "g_inter": "g(T)"
+      }
+    },
+    "comparison_outputs": [
+      "mean Rg versus T",
+      "m_intra versus T",
+      "m_inter versus T",
+      "f_max versus T",
+      "cluster-size distribution",
+      "F(mean_Rg, f_max)"
+    ],
+    "success_criterion": "The three controls clearly distinguish collapse-driven, aggregation-driven, and coupled behavior."
+  },
+  "implementation_validation": {
+    "geometry_tests": [
+      "bond length remains one lattice unit",
+      "no double occupancy",
+      "periodic wrapping is correct",
+      "unwrapped coordinates give correct Rg",
+      "whole-chain translation preserves geometry",
+      "rotations preserve connectivity"
+    ],
+    "contact_tests": [
+      "hand-constructed configurations with known m_intra",
+      "hand-constructed configurations with known m_inter",
+      "known total energies",
+      "known cluster assignments"
+    ],
+    "detailed_balance_tests": [
+      "forward and reverse proposal probabilities",
+      "Metropolis-Hastings factors",
+      "incremental energy changes compared with full recomputation"
+    ],
+    "replica_exchange_tests": [
+      "manual swap-probability checks",
+      "temperature-specific Hamiltonian evaluation",
+      "coordinate-swap and temperature-label-swap equivalence"
+    ],
+    "limiting_cases": {
+      "zero_interactions": "Self-avoiding chains with only transient contacts",
+      "g_inter_zero": "Independent single-chain collapse without stable aggregation",
+      "g_intra_zero": "Interchain aggregation without intrinsic single-chain collapse",
+      "strong_attraction": "Dense aggregate formation with largest cluster approaching M"
+    }
+  },
+  "finite_size_scaling": {
+    "procedure": "Increase M and L together while holding N and phi fixed.",
+    "example_chain_counts": [
+      8,
+      16,
+      32
+    ],
+    "measurements": [
+      "transition-temperature shift",
+      "largest-cluster fraction",
+      "cluster-size distribution convergence",
+      "susceptibility peak sharpening",
+      "free-energy barrier growth",
+      "system-spanning aggregate formation"
+    ],
+    "mesoglobule_test": "A characteristic finite aggregate size should become independent of total M and L at fixed concentration.",
+    "phase_separation_signature": "Aggregate size grows proportionally with total chain number."
+  },
+  "collapse_aggregation_analysis": {
+    "transition_estimators": {
+      "T_collapse": "temperature of maximum |d<Rg>/dT|",
+      "T_contact": "temperature of maximum |d<m_inter>/dT|",
+      "T_cluster": "temperature of maximum |d<f_max>/dT|"
+    },
+    "possible_scenarios": {
+      "collapse_before_aggregation": "Chains compactify before associating.",
+      "aggregation_before_collapse": "Expanded chains first form interchain bridges or loose clusters.",
+      "simultaneous": "Collapse and aggregation are strongly coupled."
+    },
+    "required_sweeps": [
+      "temperature",
+      "concentration",
+      "chain length",
+      "system size"
+    ]
+  },
+  "contact_motif_extension": {
+    "contact_labels": [
+      "chain identities",
+      "sequence separation",
+      "local coordination",
+      "number of chains in motif",
+      "intrachain/interchain/mixed classification"
+    ],
+    "motif_classes": [
+      "intrachain loops",
+      "two-chain bridges",
+      "three-chain junctions",
+      "compact multichain cores",
+      "surface contacts",
+      "end-group contacts"
+    ],
+    "research_question": "Do specific bridge or junction motifs appear before conventional aggregation observables change?"
+  },
+  "model_extensions_and_triggers": {
+    "separate_interchain_parameters": {
+      "add_when": [
+        "single-chain collapse is reproduced but aggregation temperature is wrong",
+        "concentration dependence is wrong",
+        "interchain contacts are systematically too strong or weak"
+      ]
+    },
+    "chain_end_interactions": {
+      "add_when": [
+        "short chains behave incorrectly",
+        "aggregation is unusually sensitive to N",
+        "experimental end groups are charged or strongly hydrophilic"
+      ],
+      "possible_term": "H_end = epsilon_end m_end-end + epsilon_end-body m_end-body"
+    },
+    "bending_stiffness": {
+      "add_when": [
+        "low-temperature Rg is wrong",
+        "chains are too flexible",
+        "contact motifs disagree with molecular REMD"
+      ],
+      "possible_term": "H_bend = kappa n_turns"
+    },
+    "longer_range_repulsion": {
+      "add_when": [
+        "all systems collapse into one macroscopic aggregate",
+        "stable finite mesoglobules are the experimental target"
+      ]
+    },
+    "hydration_states": {
+      "add_when": [
+        "temperature-dependent pair attraction cannot reproduce both collapse and aggregation",
+        "a more mechanistic PNIPAM LCST model is needed"
+      ],
+      "possible_states": [
+        "hydrated",
+        "dehydrated"
+      ]
+    }
+  },
+  "code_architecture": {
+    "multichain_state.py": [
+      "coordinates",
+      "occupancy grid",
+      "chain identities",
+      "box dimensions",
+      "restart and serialization"
+    ],
+    "multichain_energy.py": [
+      "intrachain contact counting",
+      "interchain contact counting",
+      "temperature-dependent Hamiltonian",
+      "incremental energy updates",
+      "full-recount validation"
+    ],
+    "multichain_moves.py": [
+      "local moves",
+      "reptation",
+      "pivot",
+      "whole-chain translation",
+      "whole-chain rotation"
+    ],
+    "multichain_clusters.py": [
+      "chain-contact graph",
+      "connected components",
+      "cluster-size distributions",
+      "aggregate geometry"
+    ],
+    "multichain_observables.py": [
+      "per-chain Rg",
+      "aggregate Rg",
+      "contact observables",
+      "structure factors",
+      "shape metrics",
+      "motif counts"
+    ],
+    "remd_multichain.py": [
+      "temperature ladder",
+      "replica propagation",
+      "general swap criterion",
+      "checkpoint and resume",
+      "replica diagnostics"
+    ],
+    "run_aggregation_pilot.py": [
+      "configuration parsing",
+      "pilot matrix construction",
+      "seed management",
+      "result collection"
+    ],
+    "analyze_aggregation.py": [
+      "temperature curves",
+      "cluster distributions",
+      "free-energy surfaces",
+      "finite-size scaling",
+      "transition estimates",
+      "uncertainty analysis"
+    ]
+  },
+  "output_schema": {
+    "metadata": [
+      "N",
+      "M",
+      "L",
+      "phi",
+      "phi_over_phi_star",
+      "temperature ladder",
+      "interaction model",
+      "contact parameters",
+      "move probabilities",
+      "seed",
+      "number of sweeps",
+      "equilibration length",
+      "sampling interval"
+    ],
+    "per_sample": [
+      "temperature index",
+      "energy",
+      "m_intra",
+      "m_inter",
+      "per-chain Rg",
+      "mean Rg",
+      "largest cluster size",
+      "number of clusters",
+      "cluster-size histogram",
+      "structure-factor values",
+      "motif counts"
+    ],
+    "diagnostics": [
+      "acceptance by move type",
+      "swap acceptance",
+      "replica round trips",
+      "energy histogram overlap",
+      "cluster-state mixing",
+      "energy-validation failures",
+      "occupancy violations",
+      "connectivity violations"
+    ]
+  },
+  "research_roadmap": [
+    {
+      "phase": 1,
+      "name": "Specification and invariants",
+      "objective": "Define the exact statistical-mechanical model and the data structures needed for a multi-chain periodic system.",
+      "tasks": [
+        "formalize contact definitions",
+        "formalize periodic coordinate handling",
+        "define Hamiltonian and units",
+        "define output schema",
+        "write hand-verifiable test configurations"
+      ],
+      "exit_criteria": [
+        "model equations are fixed",
+        "all invariants are documented",
+        "expected energies and contact counts are known for unit tests"
+      ],
+      "deliverables": [
+        "model specification",
+        "test configuration library",
+        "JSON configuration schema"
+      ]
+    },
+    {
+      "phase": 2,
+      "name": "Multi-chain geometry and moves",
+      "objective": "Create a correct multi-chain state representation and reversible Monte Carlo moves.",
+      "tasks": [
+        "implement occupancy grid",
+        "implement wrapped and unwrapped coordinates",
+        "implement whole-chain translations",
+        "implement reptation and rotations",
+        "validate detailed balance"
+      ],
+      "exit_criteria": [
+        "no occupancy or connectivity failures",
+        "all move energy changes match full recomputation",
+        "chains diffuse in the zero-interaction limit"
+      ],
+      "deliverables": [
+        "multichain_state.py",
+        "multichain_moves.py",
+        "geometry and detailed-balance tests"
+      ]
+    },
+    {
+      "phase": 3,
+      "name": "Energy, REMD, and sampling validation",
+      "objective": "Implement temperature-dependent intra/interchain energies and correct replica exchange.",
+      "tasks": [
+        "implement m_intra and m_inter",
+        "implement general swap rule",
+        "add checkpoints and resume",
+        "test high-temperature and strong-attraction limits"
+      ],
+      "exit_criteria": [
+        "manual swap tests pass",
+        "replicas make temperature round trips",
+        "energy histograms overlap sufficiently",
+        "known limiting behavior is reproduced"
+      ],
+      "deliverables": [
+        "multichain_energy.py",
+        "remd_multichain.py",
+        "sampling validation report"
+      ]
+    },
+    {
+      "phase": 4,
+      "name": "Observables and cluster analysis",
+      "objective": "Measure single-chain collapse, interchain association, aggregate connectivity, and scattering.",
+      "tasks": [
+        "implement per-chain Rg",
+        "implement chain-contact graph",
+        "implement cluster statistics",
+        "implement S(q) and P_intra(q)",
+        "implement free-energy surfaces"
+      ],
+      "exit_criteria": [
+        "observables reproduce hand-designed examples",
+        "cluster definitions are robust to q_min",
+        "scattering code passes simple structure tests"
+      ],
+      "deliverables": [
+        "multichain_clusters.py",
+        "multichain_observables.py",
+        "analysis plots and validation notebook"
+      ]
+    },
+    {
+      "phase": 5,
+      "name": "Three-control pilot",
+      "objective": "Determine how intrachain collapse and interchain attraction combine to produce aggregation.",
+      "tasks": [
+        "run full equal-contact model",
+        "run independent-collapse control",
+        "run pure-aggregation control",
+        "compare order parameters and free-energy surfaces"
+      ],
+      "exit_criteria": [
+        "all controls equilibrate",
+        "collapse and aggregation signatures can be separated",
+        "the baseline model behavior is scientifically interpretable"
+      ],
+      "deliverables": [
+        "pilot report",
+        "transition estimates",
+        "recommendation on whether separate interchain parameters are needed"
+      ]
+    },
+    {
+      "phase": 6,
+      "name": "Concentration and chain-length mapping",
+      "objective": "Map how collapse and aggregation depend on N and phi/phi_star.",
+      "tasks": [
+        "run N = 30 and 44",
+        "run dilute to semidilute concentrations",
+        "locate T_collapse, T_contact, and T_cluster",
+        "classify transition ordering"
+      ],
+      "exit_criteria": [
+        "transition lines are reproducible across seeds",
+        "concentration trends are statistically resolved",
+        "chain-length effects are quantified"
+      ],
+      "deliverables": [
+        "collapse-aggregation phase map",
+        "uncertainty estimates",
+        "chain-length comparison"
+      ]
+    },
+    {
+      "phase": 7,
+      "name": "Finite-size and thermodynamic analysis",
+      "objective": "Distinguish finite-box condensation, macroscopic phase separation, and finite mesoglobules.",
+      "tasks": [
+        "increase M and L at fixed N and phi",
+        "analyze Binder cumulants",
+        "analyze free-energy barriers",
+        "test cluster-size convergence"
+      ],
+      "exit_criteria": [
+        "finite-size trends are established",
+        "claims about phase transitions or mesoglobules are supported",
+        "finite-size artifacts are ruled out or explicitly identified"
+      ],
+      "deliverables": [
+        "finite-size scaling report",
+        "thermodynamic classification",
+        "recommended production system size"
+      ]
+    },
+    {
+      "phase": 8,
+      "name": "PNIPAM-specific refinement",
+      "objective": "Add only the minimum additional physics required by discrepancies with experiment.",
+      "tasks": [
+        "test separate interchain contact free energy",
+        "test chain-end interactions",
+        "test bending stiffness",
+        "test competing repulsion",
+        "optionally test hydration states"
+      ],
+      "exit_criteria": [
+        "each added parameter addresses a documented failure",
+        "model selection penalizes unnecessary complexity",
+        "new terms improve multiple observables rather than one curve"
+      ],
+      "deliverables": [
+        "model comparison table",
+        "parameter sensitivity analysis",
+        "final recommended PNIPAM aggregation model"
+      ]
+    },
+    {
+      "phase": 9,
+      "name": "Kinetic aggregation study",
+      "objective": "Study the structural sequence after a temperature quench without using unphysical equilibrium acceleration moves.",
+      "tasks": [
+        "prepare equilibrated high-temperature states",
+        "quench to selected temperatures",
+        "track Rg, m_inter, f_max, P(s), and motifs",
+        "compare collapse-first, aggregation-first, and simultaneous pathways"
+      ],
+      "exit_criteria": [
+        "multiple seeds show reproducible pathway classes",
+        "results are robust to local move probabilities",
+        "Monte Carlo time is not overinterpreted as physical time"
+      ],
+      "deliverables": [
+        "kinetic pathway diagrams",
+        "cluster-growth curves",
+        "motif sequence analysis"
+      ]
+    }
+  ],
+  "decision_tree": {
+    "no_aggregation": [
+      "check concentration",
+      "check chain diffusion",
+      "check simulation length",
+      "check interchain energy implementation",
+      "increase sampling before changing the Hamiltonian"
+    ],
+    "aggregation_at_all_temperatures": [
+      "check energy sign",
+      "check contact double counting",
+      "check accidental application of contact offset",
+      "check high-temperature coverage"
+    ],
+    "one_aggregate_always_forms": [
+      "perform finite-size scaling",
+      "classify as phase separation unless finite aggregate size converges"
+    ],
+    "finite_clusters_observed": [
+      "test longer runs",
+      "test different initial states",
+      "increase system size",
+      "distinguish equilibrium from kinetic trapping"
+    ],
+    "collapse_and_aggregation_simultaneous": [
+      "increase temperature resolution",
+      "inspect joint free-energy surfaces"
+    ],
+    "collapse_and_aggregation_separate": [
+      "map both transitions versus concentration and chain length"
+    ]
+  },
+  "expected_major_results": [
+    "A tested transferability criterion for single-chain contact energetics.",
+    "A collapse-aggregation phase map as a function of temperature, concentration, and chain length.",
+    "A thermodynamic distinction between finite clusters and macroscopic phase separation.",
+    "Identification of early multichain contact motifs that precede visible aggregation.",
+    "A justified hierarchy of PNIPAM-specific model extensions."
+  ],
+  "reference_files": {
+    "latex_source": "PNIPAM_aggregation_lattice_model_research_plan.tex",
+    "compiled_pdf": "PNIPAM_aggregation_lattice_model_research_plan.pdf"
+  }
+}

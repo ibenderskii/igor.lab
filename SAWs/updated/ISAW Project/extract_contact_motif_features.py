@@ -147,6 +147,64 @@ class ExtractionError(RuntimeError):
     pass
 
 
+_INT64_MAX = int(np.iinfo(np.int64).max)
+_INT64_MIN = int(np.iinfo(np.int64).min)
+
+
+def require_exact_integer_array(values, *, field_name, row=None):
+    """Return an int64 array ONLY after every value is verified exactly integral.
+
+    A stored integer dataset that was recreated as floating point (a corruption
+    or a lossy round-trip) must never be silently truncated by ``astype(int)``.
+    This helper rejects, raising :class:`ExtractionError` naming the field (and
+    row when given):
+
+    * object / ragged arrays;
+    * complex values;
+    * NaN and +/- infinity;
+    * fractional values (values that are not exactly integral);
+    * values outside the signed int64 range.
+
+    The int64 array is returned only when all checks pass.
+    """
+    loc = f"[row {row}] " if row is not None else ""
+    try:
+        arr = np.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise ExtractionError(
+            f"{loc}{field_name} could not be interpreted as an array") from exc
+    if arr.dtype == object:
+        raise ExtractionError(
+            f"{loc}{field_name} must be a numeric array, not object/ragged")
+    kind = arr.dtype.kind
+    if kind == "b":
+        return arr.astype(np.int64)
+    if kind == "c":
+        raise ExtractionError(f"{loc}{field_name} must be real, not complex")
+    if kind in ("i", "u"):
+        if kind == "u" and arr.size and int(arr.max()) > _INT64_MAX:
+            raise ExtractionError(
+                f"{loc}{field_name} value exceeds the signed int64 range")
+        return arr.astype(np.int64)
+    if kind == "f":
+        if not np.all(np.isfinite(arr)):
+            raise ExtractionError(
+                f"{loc}{field_name} contains NaN or infinity (not an exact integer)")
+        rounded = np.rint(arr)
+        if not np.all(rounded == arr):
+            raise ExtractionError(
+                f"{loc}{field_name} has fractional values (not exact integers)")
+        if arr.size:
+            # Compare on true integers (float64 cannot represent int64 edges).
+            if int(round(float(arr.max()))) > _INT64_MAX \
+                    or int(round(float(arr.min()))) < _INT64_MIN:
+                raise ExtractionError(
+                    f"{loc}{field_name} is outside the signed int64 range")
+        return rounded.astype(np.int64)
+    raise ExtractionError(
+        f"{loc}{field_name} has unsupported dtype {arr.dtype!r}")
+
+
 def _project_definitions_path() -> str:
     """Resolved project-definitions path (for manifest provenance)."""
     try:
@@ -711,6 +769,26 @@ def extract(
         seed = int(meta.get("seed", -1))
         temps = np.asarray(meta.get("temperatures", np.full(nT, np.nan)), dtype=float)
         schema_version = int(meta.get("schema_version", 0))
+        # Phase 2: copy the authoritative model record from the source snapshot
+        # metadata so the feature file carries an independent provenance copy.
+        _model_name = meta.get("model_name")
+        if isinstance(_model_name, bytes):
+            _model_name = _model_name.decode()
+        _param_names = meta.get("param_names")
+        if _param_names is not None:
+            _param_names = [str(v) for v in np.asarray(_param_names).ravel().tolist()]
+        _model_params = meta.get("model_params")
+        if _model_params is not None:
+            _model_params = [float(v) for v in np.asarray(_model_params).ravel().tolist()]
+        _Tref = meta.get("Tref")
+        _Tscale = meta.get("Tscale")
+        model_record = {
+            "model_name": (None if _model_name is None else str(_model_name)),
+            "param_names": _param_names,
+            "model_params": _model_params,
+            "Tref": (None if _Tref is None else float(_Tref)),
+            "Tscale": (None if _Tscale is None else float(_Tscale)),
+        }
         (fixed_defs, scaled_defs, defs_source,
          stored_defs_version) = _resolve_input_bin_defs(meta, n_beads)
         uses_current_definitions = (
@@ -815,6 +893,14 @@ def extract(
             "committed_feature_rows": int(n_rows),
             "n_beads": int(n_beads),
             "temperature_count": int(nT),
+            # Phase 2: authoritative temperature ladder + model record + source
+            # provenance, copied from the source snapshot metadata (unambiguous
+            # JSON, not lossy string formatting).
+            "temperatures": [float(t) for t in temps.tolist()],
+            "model_record": model_record,
+            "source_configuration_path": str(input_path),
+            "source_configuration_sha256": input_sha,
+            "source_snapshot_schema_version": int(schema_version),
             "committed_rows": int(n_committed),
             "allocated_rows": int(n_alloc),
             "extracted_snapshot_rows": int(n_committed),
@@ -1090,6 +1176,48 @@ def build_feature_dictionary() -> dict:
             "primary-key column tuple",
             "json", "metadata.primary_key",
             "unique across all rows"),
+        # Phase 2/15: authoritative temperature ladder + model record + source
+        # provenance copied from the source snapshot metadata.
+        "temperatures": (
+            "authoritative temperature ladder (per lane index)",
+            "json", "manifest.temperatures",
+            "len == temperature_count; each row temperature matches its index"),
+        "temperature_count": (
+            "number of temperature lanes",
+            "int", "manifest.temperature_count",
+            "== len(temperatures); each snapshot has exactly this many rows"),
+        "model_record": (
+            "fitted-model metadata (model_name/param_names/model_params/Tref/Tscale)",
+            "json", "manifest.model_record",
+            "matches the source configuration model record when available"),
+        "source_configuration_path": (
+            "path of the source coordinate snapshot file",
+            "string", "manifest.source_configuration_path",
+            "hashed and re-verified by the validator when present"),
+        "source_configuration_sha256": (
+            "SHA-256 of the source coordinate snapshot file",
+            "string", "manifest.source_configuration_sha256",
+            "matches the actual source file hash when available"),
+        "source_snapshot_schema_version": (
+            "snapshot schema version of the source file",
+            "int", "manifest.source_snapshot_schema_version",
+            ">= 1"),
+        # Phase 4/15: calibration-stage fingerprint + validation certificate.
+        "stage_fingerprint": (
+            "SHA-256 of the canonical calibration-stage fingerprint fields",
+            "string", "validation certificate.stage_fingerprint",
+            "resume reuses a stage only on an exact fingerprint match"),
+        "validation_certificate": (
+            "companion <feature>.validation.json (feature_path, feature_sha256, "
+            "source_configuration_path/sha256, stage_fingerprint, "
+            "validator_revision, validation_timestamp, definitions_version, "
+            "validation_result)",
+            "json", "sidecar validation certificate",
+            "feature_sha256 matches the file; validation_result == passed"),
+        "feature_schema_version_attr": (
+            "feature schema version file attribute",
+            "int", "file attribute feature_schema_version",
+            "1..current; equals the manifest feature_schema_version"),
     }
     for name, (mdef, dt, srep, ident) in prov.items():
         fields.append({
@@ -1140,6 +1268,16 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
         idxg = feats["sample_index"]
         S = {name: scalars[name][()] for name in scalars}
         I = {name: idxg[name][()] for name in idxg}
+        # -- Phase 1: EXACT integer validation before any int cast ----------
+        # Every stored integer dataset must be exactly integral and in int64
+        # range; a dataset silently recreated as float with a fractional / NaN /
+        # inf / out-of-range value is rejected here, never truncated.
+        for name in scalars:
+            if _col_dtype(name) == "int":
+                S[name] = require_exact_integer_array(S[name], field_name=name)
+        for name in idxg:
+            if _col_dtype(name) == "int":
+                I[name] = require_exact_integer_array(I[name], field_name=name)
         m = S["m"].astype(np.int64)
         n_rows = int(m.shape[0])
         committed = int(feats.attrs.get("committed_feature_rows", -1))
@@ -1150,7 +1288,8 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
             for name, arr in grp.items():
                 if arr.shape[0] != n_rows:
                     raise ExtractionError(f"{label} dataset {name} length mismatch")
-        n_beads = int(f.attrs["n_beads"])
+        n_beads = int(require_exact_integer_array(
+            np.asarray(f.attrs["n_beads"]).reshape(1), field_name="n_beads")[0])
 
         # -- n_steps / chain-length convention ------------------------------
         if not np.array_equal(S["n_beads"].astype(np.int64),
@@ -1160,16 +1299,18 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
                               np.full(n_rows, n_beads - 1, np.int64)):
             raise ExtractionError("n_steps != n_beads - 1 for some row")
 
-        # -- m_r block ------------------------------------------------------
-        m_r = feats["m_r"][()]
+        # -- m_r block (exact integer; never truncate a float recreation) ---
+        m_r = require_exact_integer_array(feats["m_r"][()], field_name="m_r")
         if m_r.shape != (n_rows, n_beads):
             raise ExtractionError(f"m_r shape {m_r.shape} != {(n_rows, n_beads)}")
         if not np.array_equal(m_r.sum(axis=1).astype(np.int64), m):
             raise ExtractionError("sum_r m_r != m for some row")
 
         # -- contact-pair offsets (aggregate) -------------------------------
-        pairs = feats["contact_pairs/pairs"][()]
-        offsets = feats["contact_pairs/offsets"][()].astype(np.int64)
+        pairs = require_exact_integer_array(
+            feats["contact_pairs/pairs"][()], field_name="contact_pairs/pairs")
+        offsets = require_exact_integer_array(
+            feats["contact_pairs/offsets"][()], field_name="contact_pairs/offsets")
         if offsets.shape[0] != n_rows + 1:
             raise ExtractionError("offsets length != n_rows+1")
         if int(offsets[0]) != 0:
@@ -1202,30 +1343,156 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
         stored_ver = str(man.get("definitions_version", ico.DEFINITIONS_VERSION))
         uses_current = (stored_ver == str(ico.DEFINITIONS_VERSION))
 
-        # -- temperature-index <-> temperature ladder -----------------------
+        # -- feature-schema version support + file/manifest agreement (Phase 3)
+        file_ver = int(f.attrs.get("feature_schema_version", -1))
+        if not (1 <= file_ver <= FEATURE_SCHEMA_VERSION):
+            raise ExtractionError(
+                f"unsupported feature_schema_version {file_ver} "
+                f"(supported 1..{FEATURE_SCHEMA_VERSION})")
+        man_ver = int(man.get("feature_schema_version", file_ver))
+        if man_ver != file_ver:
+            raise ExtractionError(
+                f"manifest/file feature_schema_version mismatch "
+                f"({man_ver} != {file_ver})")
+
+        # -- per-file constant run_id / seed --------------------------------
+        def _as_str(v):
+            return v.decode() if isinstance(v, bytes) else str(v)
+        run_ids = np.asarray([_as_str(v) for v in I["run_id"].tolist()])
+        file_run_id = _as_str(f.attrs.get("run_id", run_ids[0] if run_ids.size else ""))
+        if run_ids.size and not np.all(run_ids == file_run_id):
+            raise ExtractionError("run_id is not constant across all feature rows")
+        seed_col = I["seed"].astype(np.int64)
+        if seed_col.size and int(seed_col.min()) != int(seed_col.max()):
+            raise ExtractionError("seed is not constant across all feature rows")
+
+        # -- authoritative temperature ladder (Phase 2) ---------------------
         ti = I["temperature_index"].astype(np.int64)
         tv = I["temperature"].astype(float)
         if ti.size and (int(ti.min()) < 0):
             raise ExtractionError("negative temperature_index")
+        auth_temps = man.get("temperatures")
+        nT_man = int(man.get("temperature_count",
+                             len(np.unique(ti)) if ti.size else 0))
+        if auth_temps is not None:
+            auth = np.asarray(auth_temps, dtype=float).ravel()
+            if int(auth.size) != nT_man:
+                raise ExtractionError(
+                    f"temperature_count {nT_man} != len(authoritative "
+                    f"temperatures) {auth.size}")
+            if not np.all(np.isfinite(auth)):
+                raise ExtractionError("authoritative temperature ladder has a "
+                                      "nonfinite entry")
+        else:
+            auth = None
+        # Every stored feature-row temperature must be finite; each temperature
+        # index must sit in [0, temperature_count); each index maps to ONE
+        # consistent temperature that matches the authoritative ladder entry.
+        if tv.size and not np.all(np.isfinite(tv)):
+            bad = int(np.nonzero(~np.isfinite(tv))[0][0])
+            raise ExtractionError(f"[row {bad}] nonfinite feature-row temperature")
         ladder = {}
         for r in range(n_rows):
             k = int(ti[r])
+            if k < 0 or k >= nT_man:
+                raise ExtractionError(
+                    f"[row {r}] temperature_index {k} outside [0,{nT_man})")
             if k in ladder:
-                if not (math.isnan(ladder[k]) and math.isnan(float(tv[r]))) \
-                        and abs(ladder[k] - float(tv[r])) > 1e-9:
+                if abs(ladder[k] - float(tv[r])) > 1e-9:
                     raise ExtractionError(
                         f"[row {r}] temperature {tv[r]} != ladder[{k}]={ladder[k]}")
             else:
                 ladder[k] = float(tv[r])
-        nT_man = int(man.get("temperature_count", len(ladder)))
-        if len(ladder) and (max(ladder) >= nT_man):
-            raise ExtractionError("temperature_index out of ladder bounds")
+            if auth is not None and abs(float(tv[r]) - float(auth[k])) > 1e-6:
+                raise ExtractionError(
+                    f"[row {r}] temperature {float(tv[r])} != authoritative "
+                    f"ladder[{k}]={float(auth[k])}")
 
-        # -- deterministic (snapshot_index, temperature_index) ordering -----
-        order = list(zip(I["snapshot_index"].astype(np.int64).tolist(),
-                         ti.tolist()))
+        # -- per-snapshot invariants (Phase 3) ------------------------------
+        # Each snapshot must contain every temperature index and every walker id
+        # exactly once, share one cycle/run_id/seed, and have exactly
+        # temperature_count rows.  Cycles must strictly increase across snapshots.
+        snap_idx = I["snapshot_index"].astype(np.int64)
+        cyc = I["cycle"].astype(np.int64)
+        walker = I["walker_id"].astype(np.int64)
+        order = list(zip(snap_idx.tolist(), ti.tolist()))
         if order != sorted(order):
-            raise ExtractionError("rows not in (snapshot_index, temperature_index) order")
+            raise ExtractionError(
+                "rows not in (snapshot_index, temperature_index) order")
+        uniq_snap = np.unique(snap_idx)
+        if uniq_snap.size and not np.array_equal(
+                uniq_snap, np.arange(int(uniq_snap[0]),
+                                     int(uniq_snap[0]) + uniq_snap.size)):
+            raise ExtractionError("snapshot_index values are not contiguous")
+        expected_lane = np.arange(nT_man, dtype=np.int64)
+        last_cycle = None
+        for s in uniq_snap.tolist():
+            rows_s = np.nonzero(snap_idx == s)[0]
+            if rows_s.size != nT_man:
+                raise ExtractionError(
+                    f"[snapshot {s}] has {rows_s.size} rows != temperature_count "
+                    f"{nT_man}")
+            lane_s = np.sort(ti[rows_s])
+            if not np.array_equal(lane_s, expected_lane):
+                raise ExtractionError(
+                    f"[snapshot {s}] temperature_index not a permutation of "
+                    f"0..{nT_man - 1}")
+            walk_s = np.sort(walker[rows_s])
+            if not np.array_equal(walk_s, expected_lane):
+                raise ExtractionError(
+                    f"[snapshot {s}] walker_id not a permutation of "
+                    f"0..{nT_man - 1}")
+            cyc_s = cyc[rows_s]
+            if int(cyc_s.min()) != int(cyc_s.max()):
+                raise ExtractionError(
+                    f"[snapshot {s}] cycle not constant across lanes")
+            if run_ids.size and not np.all(run_ids[rows_s] == file_run_id):
+                raise ExtractionError(f"[snapshot {s}] run_id not constant")
+            if not np.all(seed_col[rows_s] == seed_col[rows_s][0]):
+                raise ExtractionError(f"[snapshot {s}] seed not constant")
+            this_cycle = int(cyc_s[0])
+            if last_cycle is not None and this_cycle <= last_cycle:
+                raise ExtractionError(
+                    f"[snapshot {s}] cycle {this_cycle} not strictly greater "
+                    f"than previous snapshot cycle {last_cycle}")
+            last_cycle = this_cycle
+
+        # -- source-configuration + model-record provenance (Phase 2) -------
+        src_path = man.get("source_configuration_path")
+        src_sha = man.get("source_configuration_sha256")
+        if src_path and src_sha and Path(src_path).exists():
+            if _file_sha256(src_path) != str(src_sha):
+                raise ExtractionError(
+                    "source_configuration_sha256 does not match the actual "
+                    "source configuration file")
+            try:
+                with h5py.File(src_path, "r") as _sf:
+                    src_meta = _read_metadata(_sf)
+                for key, fv in (man.get("model_record") or {}).items():
+                    sv = src_meta.get(key)
+                    if isinstance(sv, bytes):
+                        sv = sv.decode()
+                    if key in ("param_names",) and sv is not None:
+                        sv = [str(x) for x in np.asarray(sv).ravel().tolist()]
+                    if key in ("model_params",) and sv is not None:
+                        sv = [float(x) for x in np.asarray(sv).ravel().tolist()]
+                        if fv is not None and (len(sv) != len(fv) or any(
+                                abs(a - b) > 1e-9 for a, b in zip(sv, fv))):
+                            raise ExtractionError(
+                                "feature-file model_params disagree with the "
+                                "source configuration")
+                        continue
+                    if key in ("Tref", "Tscale") and sv is not None and fv is not None:
+                        if abs(float(sv) - float(fv)) > 1e-9:
+                            raise ExtractionError(
+                                f"feature-file {key} disagrees with source config")
+                        continue
+                    if sv is not None and fv is not None and str(sv) != str(fv):
+                        raise ExtractionError(
+                            f"feature-file model record {key} disagrees with "
+                            f"source configuration")
+            except OSError:
+                pass  # unreadable source is treated as "unavailable", not a fail
 
         # -- primary-key uniqueness -----------------------------------------
         try:

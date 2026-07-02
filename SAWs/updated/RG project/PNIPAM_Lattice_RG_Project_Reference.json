@@ -1,0 +1,388 @@
+{
+  "project": {
+    "title": "PNIPAM Lattice Model: Experiment-to-Simulation Validation and Aggregation Roadmap",
+    "purpose": "Develop and validate a transferable lattice model of PNIPAM that connects atomistic REMD simulations, experimental radius-of-gyration measurements, thermal transition curves, polymer scaling, and multi-chain aggregation.",
+    "central_question": "Can a local temperature-dependent lattice contact free energy fitted to short PNIPAM chains predict longer-chain conformational and collective behavior without chain-length-specific refitting?",
+    "created": "2026-07-02"
+  },
+  "current_reference_state": {
+    "chain_lengths_available": [
+      30,
+      44
+    ],
+    "rg_scale_current": 0.46320503312590167,
+    "contact_offset_current_44mer": 43.0,
+    "core_model_form": "P_N(m,Rg|T) proportional to P0_N(m,Rg) * exp[-b(T)m]",
+    "hs_model": "b(T) = h/T - s",
+    "main_known_issue": "Athermal support mismatch, especially at high temperature and increasingly with chain length.",
+    "current_rg_interpretation": "The lattice model is not uniformly smaller than the molecular model. It is slightly lower at some temperatures and slightly higher at others. The remaining mean-Rg bias is small, but the fitted rg_scale is not yet an independent prediction."
+  },
+  "transferability_principles": {
+    "potentially_transferable": [
+      "Temperature-dependent local contact free energy b(T)",
+      "Lattice geometry, if coarse-graining remains physically appropriate",
+      "One physical lattice spacing, if validated across chain length",
+      "Local stiffness parameter, if calibrated independently from low-temperature molecular data"
+    ],
+    "not_directly_transferable": [
+      "The 44-mer athermal density of states",
+      "The 44-mer joint baseline P0_N(m,Rg)",
+      "The contact offset as a universal physical contact count",
+      "The fitted rg_scale unless shown to be chain-length independent"
+    ],
+    "key_rule": "Transfer the interaction law, not the sampled 44-mer ensemble."
+  },
+  "execution_plan": {
+    "phase_1_short_chain_transferability": {
+      "objective": "Test whether the fitted contact free energy and Rg scale transfer between N=30 and N=44.",
+      "tasks": [
+        "Freeze the current model parameters, contact definitions, and rg_scale.",
+        "Fit on N=44 and predict N=30 without refitting.",
+        "Fit on N=30 and predict N=44 without refitting.",
+        "Fit one shared b(T) to both chains.",
+        "Fit chain-specific rg scales only as diagnostics.",
+        "Compare mean Rg, full P(Rg|T), mean contacts, P(m|T), JS divergence, RMSE, transition midpoint, and transition width."
+      ],
+      "deliverables": [
+        "analyze_rg_transferability.py",
+        "run_cross_chain_prediction.py",
+        "transition_curve_metrics.py",
+        "transferability_summary.csv",
+        "transferability_summary.json",
+        "transferability_report.txt"
+      ],
+      "validation_gate": [
+        "One b(T) predicts both chains with acceptable error, or",
+        "Any failure is localized to Rg mapping, stiffness, end effects, or contact mapping."
+      ]
+    },
+    "phase_2_chain_length_generalization": {
+      "objective": "Make the codebase work for arbitrary chain length without hard-coded assumptions.",
+      "tasks": [
+        "Create a general project configuration schema.",
+        "Refactor baseline generation and REMD scripts for arbitrary N.",
+        "Standardize outputs, metadata, checkpoints, and resume behavior.",
+        "Add unit tests for contacts, Rg, self-avoidance, replica exchange, and periodic unwrapping."
+      ],
+      "deliverables": [
+        "lattice_project_config.schema.json",
+        "validate_project_config.py",
+        "generate_athermal_baseline.py",
+        "run_single_chain_remd.py",
+        "analyze_single_chain_run.py",
+        "estimate_effective_sample_size.py",
+        "diagnose_support_overlap.py",
+        "merge_independent_runs.py",
+        "common_observables.py"
+      ]
+    },
+    "phase_3_n_series": {
+      "objective": "Test chain-length scaling and transition behavior.",
+      "chain_lengths": [
+        30,
+        44,
+        60,
+        90,
+        120,
+        200,
+        400,
+        800,
+        1200
+      ],
+      "sampling_strategy": {
+        "N_le_120": "Use high-statistics athermal baselines when support diagnostics pass.",
+        "N_ge_200": "Prefer direct REMD or density-of-states methods such as multicanonical or Wang-Landau sampling."
+      },
+      "observables": [
+        "Mean Rg(T)",
+        "P(Rg|T)",
+        "Mean contact number",
+        "P(m|T)",
+        "Joint P(m,Rg|T)",
+        "End-to-end distance",
+        "Asphericity",
+        "Tangent correlations",
+        "Heat capacity",
+        "Synthetic form factor P(q,T)"
+      ]
+    },
+    "phase_4_polymer_scaling": {
+      "objective": "Determine whether one interaction law reproduces PNIPAM size scaling.",
+      "primary_model": "Rg(N,T) = A(T) * N^nu(T)",
+      "reference_exponents": {
+        "good_solvent": 0.588,
+        "PNIPAM_experiment_near_20C": 0.54,
+        "theta_like": 0.5,
+        "compact_globule": 0.3333333333
+      },
+      "analysis": [
+        "Fit A(T) and nu(T) at every temperature.",
+        "Repeat fits using N_min = 30, 60, 120, and 200.",
+        "Bootstrap across independent seeds.",
+        "Fit T_1/2(N) = T_infinity + c*N^(-phi).",
+        "Analyze transition width, peak susceptibility, and heat-capacity scaling."
+      ],
+      "deliverables": [
+        "fit_rg_scaling.py",
+        "fit_finite_size_transition.py",
+        "bootstrap_scaling_analysis.py",
+        "scaling_fit_summary.csv",
+        "scaling_fit_summary.json"
+      ]
+    },
+    "phase_5_direct_experiment_connection": {
+      "objective": "Compare experiment, molecular REMD, and lattice simulations using one fixed physical mapping.",
+      "experimental_metadata_required": [
+        "Citation",
+        "Measurement method",
+        "Molecular weight",
+        "Dispersity",
+        "Approximate degree of polymerization",
+        "Solvent and isotope",
+        "Concentration",
+        "Temperature range",
+        "Tacticity",
+        "End-group chemistry",
+        "Reported Rg or Rh",
+        "Measurement uncertainty",
+        "Raw scattering availability",
+        "Whether the reported size is single-chain or collective"
+      ],
+      "length_scale_strategy": "Determine one lattice spacing from low-temperature multi-N data, then freeze it for all other temperatures.",
+      "comparison_levels": [
+        "Experimental Rg(Mw) versus lattice Rg(N)",
+        "Normalized experimental Rg(T) versus normalized lattice Rg(T)",
+        "Collapse fraction comparison",
+        "Direct experimental versus simulated scattering"
+      ],
+      "synthetic_scattering": {
+        "lattice_form_factor": "P(q) = (1/N^2) * sum_ij sin(q*r_ij)/(q*r_ij)",
+        "molecular": "Compute atom-weighted and monomer-center scattering with experimental contrast where possible.",
+        "analysis_rule": "Use the same q-range and fit model as the experiment."
+      },
+      "deliverables": [
+        "experimental_dataset_registry.json",
+        "import_experimental_rg.py",
+        "digitized_experimental_rg.csv",
+        "fit_global_length_scale.py",
+        "compute_lattice_form_factor.py",
+        "compute_molecular_form_factor.py",
+        "fit_guinier_rg.py",
+        "compare_scattering_curves.py",
+        "compare_experiment_molecular_lattice.py"
+      ]
+    },
+    "phase_6_thermal_transition_curves": {
+      "objective": "Compare structural collapse and calorimetric transition behavior.",
+      "structural_metrics": [
+        "Rg(T)",
+        "Normalized collapse fraction",
+        "dRg/dT",
+        "Mean contacts",
+        "d<m>/dT",
+        "Transition midpoint T_1/2",
+        "10-90 percent transition width",
+        "Peak variance",
+        "Bimodality",
+        "Free energy F(Rg,m)"
+      ],
+      "thermodynamic_relations": {
+        "hs_model": {
+          "b(T)": "h/T - s",
+          "U(T)": "h * <m>",
+          "C(T)": "h^2 * Var(m) / T^2"
+        },
+        "general_bT": {
+          "U(T)": "-T^2 * b'(T) * <m>",
+          "C(T)": "[-2T b'(T) - T^2 b''(T)]<m> + T^2[b'(T)]^2 Var(m)"
+        }
+      },
+      "model_roles": {
+        "hs": "Thermodynamically interpretable reference model.",
+        "hs_quadratic": "More flexible descriptive model that may absorb missing physics."
+      },
+      "deliverables": [
+        "compute_transition_curves.py",
+        "compute_generalized_heat_capacity.py",
+        "analyze_free_energy_surfaces.py",
+        "compare_hs_and_hs_quadratic.py",
+        "thermal_transition_summary.csv"
+      ]
+    },
+    "phase_7_missing_physics_diagnostics": {
+      "decision_tree": {
+        "correct_transition_wrong_RgN": "Add or calibrate chain stiffness and revisit lattice length mapping.",
+        "long_chains_agree_short_chains_fail": "Add terminal-bead or end-group corrections.",
+        "Rg_agrees_heat_capacity_fails": "Improve thermodynamics or introduce explicit hydration states.",
+        "single_chain_agrees_cloud_point_fails": "Proceed to a multi-chain model rather than refitting the single-chain model.",
+        "sampling_support_fails": "Use direct REMD or density-of-states methods."
+      },
+      "possible_extensions": [
+        "Bending penalty calibrated from molecular tangent correlations",
+        "Distinct terminal bead types",
+        "Explicit hydrated/dehydrated bead states",
+        "State-dependent contact energies",
+        "State-dependent stiffness"
+      ],
+      "model_selection_rule": "Accept added complexity only if it improves held-out chain lengths or temperatures, not only the training fit."
+    },
+    "phase_8_multichain_aggregation": {
+      "objective": "Test whether the single-chain interaction predicts aggregation without refitting.",
+      "minimal_model": {
+        "system": "M connected self-avoiding chains of length N in a periodic box",
+        "observables": {
+          "m_intra": "Nonbonded contacts within the same chain",
+          "m_inter": "Contacts between different chains"
+        },
+        "initial_hypothesis": "g_inter(T) = g_intra(T)"
+      },
+      "required_moves_equilibrium": [
+        "Local bead moves",
+        "End moves",
+        "Crankshaft moves",
+        "Pivot moves",
+        "Reptation",
+        "Whole-chain translation",
+        "Whole-chain lattice rotation",
+        "Configurational-bias regrowth",
+        "Replica exchange"
+      ],
+      "system_matrix": {
+        "chain_lengths": [
+          30,
+          44,
+          90,
+          200
+        ],
+        "number_of_chains": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ],
+        "phi_over_phi_star": [
+          0.05,
+          0.2,
+          0.5,
+          1.0,
+          2.0
+        ]
+      },
+      "observables": [
+        "Per-chain Rg",
+        "Intrachain and interchain contacts",
+        "Largest-cluster fraction",
+        "Cluster-size distribution",
+        "Aggregation number",
+        "Aggregate Rg and density",
+        "Pair-correlation functions",
+        "Structure factor",
+        "Cluster lifetimes",
+        "Percolation probability",
+        "Contact-motif populations"
+      ],
+      "deliverables": [
+        "multi_chain_lattice.py",
+        "multi_chain_moves.py",
+        "multi_chain_observables.py",
+        "run_multi_chain_remd.py",
+        "run_aggregation_quench.py",
+        "cluster_analysis.py",
+        "multi_chain_schema.py",
+        "multi_chain_validation_tests.py"
+      ]
+    },
+    "phase_9_finite_size_and_phase_behavior": {
+      "objective": "Distinguish equilibrium mesoglobules, metastable clusters, and finite-size representations of macroscopic phase separation.",
+      "protocol": "Increase M and box size L together at fixed chain length, concentration, and interaction parameters.",
+      "diagnostics": [
+        "Largest cluster fraction",
+        "Cluster-size distribution",
+        "Binder cumulants",
+        "Low-q structure factor",
+        "Susceptibility",
+        "Free-energy barriers",
+        "Percolation probability",
+        "Coarsening kinetics"
+      ],
+      "interpretation": {
+        "macroscopic_phase_separation": "Largest cluster grows with system size and coarsening continues.",
+        "equilibrium_mesoglobules": "Finite aggregate size converges with increasing total system size.",
+        "metastable_clusters": "Apparent size depends strongly on time or initialization and continues to evolve."
+      }
+    }
+  },
+  "immediate_next_sprint": {
+    "goal": "Determine whether the current interaction law and Rg scale transfer between N=30 and N=44.",
+    "tasks": [
+      "Create frozen reference manifests for N=30 and N=44.",
+      "Reproduce all current metrics.",
+      "Implement analyze_rg_transferability.py.",
+      "Implement run_cross_chain_prediction.py.",
+      "Implement transition_curve_metrics.py.",
+      "Run 44-to-30 and 30-to-44 no-refit predictions.",
+      "Run one joint fit.",
+      "Compare fixed and diagnostic Rg scales.",
+      "Generate residual, distribution, and transition plots.",
+      "Write a go/no-go report for the N-series."
+    ],
+    "acceptance_criteria": [
+      "Existing results are reproducible.",
+      "Cross-chain predictions run without manual code changes.",
+      "Fixed and diagnostic Rg scales are reported.",
+      "Transition metrics are consistent.",
+      "Any failure is localized to a specific part of the mapping.",
+      "The next scientific decision is supported quantitatively."
+    ]
+  },
+  "priority_order": {
+    "immediate": [
+      "Freeze 30-mer and 44-mer reference results.",
+      "Quantify temperature-dependent Rg residuals.",
+      "Perform reciprocal transferability tests.",
+      "Test one shared Rg scale.",
+      "Generalize configuration and output schemas."
+    ],
+    "near_term": [
+      "Generate N=60, 90, 120, and 200 simulations.",
+      "Fit Rg(N,T) scaling.",
+      "Build the experimental dataset registry.",
+      "Calibrate one global lattice spacing.",
+      "Compare normalized thermal collapse curves."
+    ],
+    "medium_term": [
+      "Simulate N=400, 800, and 1200.",
+      "Compute synthetic scattering.",
+      "Construct heat-capacity curves.",
+      "Diagnose stiffness and end-group effects."
+    ],
+    "long_term": [
+      "Build the multi-chain model.",
+      "Test g_inter(T)=g_intra(T).",
+      "Map aggregation versus temperature and concentration.",
+      "Perform finite-size scaling.",
+      "Test mesoglobule-stabilizing interactions."
+    ]
+  },
+  "success_definitions": {
+    "minimum": [
+      "Reproducible short-chain model",
+      "Quantified Rg bias",
+      "Tested 30-to-44-mer transferability",
+      "Chain-length scaling through at least N=200",
+      "Direct comparison to experimental Rg"
+    ],
+    "strong": [
+      "One b(T) and one lattice spacing describe molecular and experimental size data",
+      "Transition curves agree without chain-specific refitting",
+      "Synthetic scattering agrees with experiment",
+      "Long-chain predictions are stable"
+    ],
+    "complete": [
+      "The same local interaction predicts single-chain collapse and multi-chain aggregation",
+      "Any added terms are physically interpretable and improve held-out predictions",
+      "Finite-size scaling distinguishes phase separation from stable finite aggregates"
+    ]
+  }
+}

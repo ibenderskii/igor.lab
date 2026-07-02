@@ -24,9 +24,11 @@ Key conventions (also frozen in the JSON)
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +187,84 @@ def get_scaled_bin_definitions() -> dict:
 def active_definitions_path() -> Path:
     """The definitions file currently in effect (honors runtime overrides)."""
     return resolve_definitions_path()
+
+
+# ---------------------------------------------------------------------------
+# One resolved definitions context (Phase 13)
+# ---------------------------------------------------------------------------
+# Provenance labels for bin definitions used across the pipeline.  JSON-sourced
+# definitions are NEVER labeled "module_default".
+PROV_JSON = "json_project_definitions"
+PROV_INPUT_HISTORICAL = "input_file_historical_definitions"
+PROV_EXPLICIT_CALLER = "explicit_caller_definitions"
+PROV_COMPAT_FALLBACK = "compatibility_fallback"
+
+
+@dataclass(frozen=True)
+class DefinitionsContext:
+    """Immutable bundle of everything derived from ONE resolved definitions file.
+
+    Resolving a context once (at process startup, or explicitly for a CLI) avoids
+    a split-brain process in which some values are re-read from an alternate JSON
+    while version/path globals stay frozen: a context always carries a mutually
+    consistent record, path, hash, version, bins, and schema versions.
+    """
+    record: dict
+    resolved_path: Path
+    sha256: str
+    definitions_version: str
+    fixed_bins: dict
+    scaled_bins: dict
+    schema_versions: dict
+    provenance: str = PROV_JSON
+
+    def bin_defs(self, n_beads: int) -> dict:
+        """Normalized (validated, deep-copied) bin-definition record for N."""
+        rec = ico.normalize_bin_definitions(
+            copy.deepcopy(self.fixed_bins), copy.deepcopy(self.scaled_bins),
+            n_beads=int(n_beads), source=self.provenance)
+        return rec
+
+
+def _sha256_file(path: str | os.PathLike) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def resolve_definitions_context(path: str | os.PathLike | None = None
+                                ) -> DefinitionsContext:
+    """Resolve a complete, immutable definitions context from ONE JSON file.
+
+    Honors the documented resolution precedence (explicit path, then the
+    ``ISAW_PROJECT_DEFINITIONS`` env var, then the packaged/root locations).
+    """
+    rec = load_project_definitions(path)
+    resolved = Path(rec["_resolved_path"])
+    return DefinitionsContext(
+        record=rec,
+        resolved_path=resolved,
+        sha256=_sha256_file(resolved),
+        definitions_version=str(rec["definitions_version"]),
+        fixed_bins=_fixed_from_json(rec["fixed_contour_bins"]),
+        scaled_bins=_scaled_from_json(rec["scaled_contour_bins"]),
+        schema_versions=copy.deepcopy(rec.get("output_schema_versions", {})),
+        provenance=PROV_JSON,
+    )
+
+
+# Resolved once at import (process startup).  CLI entry points that must honor a
+# runtime override call ``resolve_definitions_context()`` again to get a fresh,
+# internally consistent bundle rather than mixing frozen globals with re-read
+# values.
+CONTEXT = resolve_definitions_context()
+
+
+def active_definitions_context() -> DefinitionsContext:
+    """Fresh context honoring any runtime ``ISAW_PROJECT_DEFINITIONS`` override."""
+    return resolve_definitions_context()
 
 
 def project_definitions() -> dict:

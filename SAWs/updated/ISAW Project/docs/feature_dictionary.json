@@ -11,7 +11,16 @@
     "definitions_version",
     "code_definitions_version",
     "project_definitions_path",
-    "primary_key"
+    "primary_key",
+    "temperatures",
+    "temperature_count",
+    "model_record",
+    "source_configuration_path",
+    "source_configuration_sha256",
+    "source_snapshot_schema_version",
+    "stage_fingerprint",
+    "validation_certificate",
+    "feature_schema_version_attr"
   ],
   "fields": [
     {
@@ -673,6 +682,105 @@
       "nullable": false,
       "schema_version_introduced": 1,
       "validation_identity": "unique across all rows"
+    },
+    {
+      "name": "temperatures",
+      "dtype": "json",
+      "units": "none",
+      "mathematical_definition": "authoritative temperature ladder (per lane index)",
+      "source_representation": "manifest.temperatures",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "len == temperature_count; each row temperature matches its index"
+    },
+    {
+      "name": "temperature_count",
+      "dtype": "int",
+      "units": "none",
+      "mathematical_definition": "number of temperature lanes",
+      "source_representation": "manifest.temperature_count",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "== len(temperatures); each snapshot has exactly this many rows"
+    },
+    {
+      "name": "model_record",
+      "dtype": "json",
+      "units": "none",
+      "mathematical_definition": "fitted-model metadata (model_name/param_names/model_params/Tref/Tscale)",
+      "source_representation": "manifest.model_record",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "matches the source configuration model record when available"
+    },
+    {
+      "name": "source_configuration_path",
+      "dtype": "string",
+      "units": "none",
+      "mathematical_definition": "path of the source coordinate snapshot file",
+      "source_representation": "manifest.source_configuration_path",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "hashed and re-verified by the validator when present"
+    },
+    {
+      "name": "source_configuration_sha256",
+      "dtype": "string",
+      "units": "none",
+      "mathematical_definition": "SHA-256 of the source coordinate snapshot file",
+      "source_representation": "manifest.source_configuration_sha256",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "matches the actual source file hash when available"
+    },
+    {
+      "name": "source_snapshot_schema_version",
+      "dtype": "int",
+      "units": "none",
+      "mathematical_definition": "snapshot schema version of the source file",
+      "source_representation": "manifest.source_snapshot_schema_version",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": ">= 1"
+    },
+    {
+      "name": "stage_fingerprint",
+      "dtype": "string",
+      "units": "none",
+      "mathematical_definition": "SHA-256 of the canonical calibration-stage fingerprint fields",
+      "source_representation": "validation certificate.stage_fingerprint",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "resume reuses a stage only on an exact fingerprint match"
+    },
+    {
+      "name": "validation_certificate",
+      "dtype": "json",
+      "units": "none",
+      "mathematical_definition": "companion <feature>.validation.json (feature_path, feature_sha256, source_configuration_path/sha256, stage_fingerprint, validator_revision, validation_timestamp, definitions_version, validation_result)",
+      "source_representation": "sidecar validation certificate",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "feature_sha256 matches the file; validation_result == passed"
+    },
+    {
+      "name": "feature_schema_version_attr",
+      "dtype": "int",
+      "units": "none",
+      "mathematical_definition": "feature schema version file attribute",
+      "source_representation": "file attribute feature_schema_version",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "1..current; equals the manifest feature_schema_version"
     }
   ]
 }
