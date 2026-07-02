@@ -175,7 +175,8 @@ def test_feature_dictionary_covers_all_columns():
     names = {x["name"] for x in fd["fields"]}
     for col in ext.FEATURE_COLUMNS:
         assert col in names, col
-    assert "m_r" in names and "contact_pairs" in names
+    assert "m_r" in names
+    assert "contact_pairs/pairs" in names and "contact_pairs/offsets" in names
     assert fd["feature_schema_version"] == ext.FEATURE_SCHEMA_VERSION
 
 

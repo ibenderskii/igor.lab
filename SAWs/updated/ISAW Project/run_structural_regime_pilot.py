@@ -2,12 +2,13 @@
 """PNIPAM-aware structural CALIBRATION pilot (LCST-correct; K-based).
 
 Builds a temperature ladder from a FITTED contact model, evaluates K(T) = -b(T)
-densely over the fitted interval, verifies whether the model is consistent with
-PNIPAM LCST behavior (collapse as T INCREASES because K increases with T), runs
-short structural REMD with full saving, extracts validated features, and assesses
-collapse trends against BOTH T and K using endpoint effect sizes, rank
-correlation, slopes, and seed bootstrap.  It then recommends production settings
-from the slowest autocorrelation time WITHOUT launching production.
+densely over the fitted interval, selects a monotonic K branch, verifies whether
+the model is consistent with PNIPAM LCST behavior (collapse as T INCREASES
+because K increases with T), runs short structural REMD with full saving,
+extracts validated features, and assesses collapse trends against K using
+endpoint effect sizes, tie-corrected rank correlation, slopes, and block + seed
+bootstrap.  It then evaluates structured sampling/mixing gates and recommends
+production settings per structural regime WITHOUT launching production.
 
 PNIPAM convention
 -----------------
@@ -16,20 +17,29 @@ the fitted LCST branch we EXPECT, from low-K to high-K: <m> up, <Rg^2> down,
 global/long contacts up, connected structure up.  These are verified, never
 hardcoded.
 
-PowerShell example:
-    python .\\run_structural_regime_pilot.py `
-        --fit-summary-json .\\fits_30mer_contact_only\\hs\\fit_summary.json `
-        --N 30 --seeds 1 2 --n-temperatures 8 --n-cycles 600 `
-        --output-dir .\\calibration_N30
+Scientific vs smoke mode
+------------------------
+* ``--smoke-test`` runs a tiny, fast software check; it is NEVER labeled
+  scientifically validated and always exits 0.
+* A scientific run requires >= 2 independent seeds and PASSES only when every
+  gate passes.  It exits NONZERO on a failed scientific gate unless
+  ``--allow-failed-calibration`` is given.
 
-Run explicitly (longer than the smoke test); not part of the unit-test suite.
 This script does NOT launch the eight-seed production campaign.
+
+Pure analysis helpers (``evaluate_K_grid``, ``monotonic_branches``,
+``select_branch``, ``build_k_ladder``, ``spearman``, ``block_bootstrap_mean``,
+``classify_regimes``, ``high_contact_tail``, ``production_requirement``,
+``evaluate_sampling_gates``) are unit-tested in ``tests/test_calibration.py``.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import datetime as _dt
+import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -46,18 +56,54 @@ REMD = str(HERE / "remd_uniform_chain_2_new.py")
 EXTRACT = str(HERE / "extract_contact_motif_features.py")
 
 CALIBRATION_REPORT_SCHEMA_VERSION = sch.CALIBRATION_REPORT_SCHEMA_VERSION
-TARGET_EFF_PER_REGIME = 5000   # computational-plan target
+TARGET_EFF_PER_REGIME = 5000   # computational-plan target (per regime, per N)
+REGIME_NAMES = ("swollen", "crossover", "collapsed")
+
+# Default scientific gate thresholds (documented; overridable).
+DEFAULT_GATE_THRESHOLDS = {
+    "min_ess": 200.0,
+    "min_round_trips": 5.0,
+    "min_temp_coverage": 0.5,
+    "min_adjacent_overlap": 0.20,
+    "min_swap_rate": 0.10,
+    "max_swap_rate": 0.90,
+    "max_drift_in_std": 1.0,
+    "min_state_changing_acceptance": 0.01,
+    "min_tail_probability": 1e-3,
+    "max_seed_relative_spread": 0.5,
+    "min_regime_effect_size": 2.0,
+}
 
 
 # ---------------------------------------------------------------------------
-# Fitted model + K(T) analysis (D1, D2)
+# Fitted model + K(T) analysis (Phase 6.1, 6.2)
 # ---------------------------------------------------------------------------
 
-def load_fitted_model(summary_path, cli_tmin, cli_tmax):
+def infer_fit_chain_length(raw: dict):
+    """Infer N from a fit summary (contact_offset == N-1) or return None."""
+    if "n_beads" in raw:
+        return int(raw["n_beads"])
+    if "N" in raw:
+        return int(raw["N"])
+    if "contact_offset" in raw and raw["contact_offset"] is not None:
+        return int(round(float(raw["contact_offset"]))) + 1
+    return None
+
+
+def load_fitted_model(summary_path, cli_tmin, cli_tmax, requested_N,
+                      allow_n_mismatch=False):
     info = remd.load_fit_summary_json(summary_path)
     with open(summary_path) as fh:
         raw = json.load(fh)
-    # Fitted temperature interval: explicit field, else temps_all, else require CLI.
+    fit_N = infer_fit_chain_length(raw)
+    n_note = None
+    if fit_N is not None and int(fit_N) != int(requested_N):
+        n_note = (f"requested N={requested_N} != fit-summary N={fit_N}")
+        if not allow_n_mismatch:
+            raise SystemExit(
+                n_note + "; pass --allow-n-mismatch to override (recorded).")
+    elif fit_N is not None:
+        n_note = f"fit-summary N={fit_N} matches requested N"
     rng = None
     if cli_tmin is not None and cli_tmax is not None:
         rng = (float(cli_tmin), float(cli_tmax))
@@ -71,20 +117,18 @@ def load_fitted_model(summary_path, cli_tmin, cli_tmax):
         raise SystemExit(
             "fit summary has no explicit temperature interval; supply "
             "--t-min and --t-max (no silent fallback).")
-    return info, rng
+    return info, rng, {"fit_N": fit_N, "n_note": n_note}
 
 
-def analyze_K(info, T_lo, T_hi, n_dense=400):
+def evaluate_K_grid(info, T_lo, T_hi, n_dense=400):
     Ts = np.linspace(T_lo, T_hi, n_dense)
     b = np.array([remd.reduced_bias(info["model_name"], info["params"],
                                     float(T), info["Tref"], info["Tscale"])
                   for T in Ts])
     K = -b
     dKdT = np.gradient(K, Ts)
-    inc = np.all(np.diff(K) > 0)
-    dec = np.all(np.diff(K) < 0)
-    monotonic = bool(inc or dec)
-    # b(T)=0 crossing (K=0), if any.
+    inc = bool(np.all(np.diff(K) > 0))
+    dec = bool(np.all(np.diff(K) < 0))
     zero_cross = None
     sgn = np.sign(b)
     idx = np.where(np.diff(sgn) != 0)[0]
@@ -93,88 +137,811 @@ def analyze_K(info, T_lo, T_hi, n_dense=400):
         zero_cross = float(np.interp(0.0, [b[i + 1], b[i]], [Ts[i + 1], Ts[i]])
                            if b[i + 1] != b[i] else Ts[i])
     return {"T": Ts, "b": b, "K": K, "dKdT": dKdT,
-            "K_increases_with_T": bool(inc), "monotonic": monotonic,
+            "K_increases_with_T": inc, "monotonic": bool(inc or dec),
             "zero_crossing_T": zero_cross}
 
 
-def build_K_ladder(kinfo, n_points, branch="auto"):
-    """Choose temperatures ~uniform in K, with extra points where |dK/dT| is
-    largest; returns sorted temperatures and the chosen-branch note."""
-    Ts, K, dKdT = kinfo["T"], kinfo["K"], kinfo["dKdT"]
-    note = "full_interval"
-    if not kinfo["monotonic"]:
-        # Identify the longest monotonic branch; require the user to confirm via
-        # --branch low|high if ambiguous.
-        dk = np.diff(K)
-        sign = np.sign(dk)
-        # longest run of equal sign
-        best_s, best_e, s = 0, 0, 0
-        for e in range(1, len(sign)):
-            if sign[e] != sign[s]:
-                if (e - s) > (best_e - best_s):
-                    best_s, best_e = s, e
-                s = e
-        if (len(sign) - s) > (best_e - best_s):
-            best_s, best_e = s, len(sign)
-        Ts = Ts[best_s:best_e + 1]
-        K = K[best_s:best_e + 1]
-        note = f"nonmonotonic_K; using_longest_monotonic_branch[{branch}]"
-    # uniform-in-K target levels
-    K_lo, K_hi = float(K.min()), float(K.max())
-    base = np.linspace(K_lo, K_hi, max(3, n_points - 2))
-    # extra points where |dK/dT| largest (most structural sensitivity)
-    extra_T = Ts[np.argsort(-np.abs(np.gradient(K, Ts)))[:2]]
-    # invert K->T by interpolation (K monotone on this branch)
+# Backwards-compatible alias used by older callers/tests.
+analyze_K = evaluate_K_grid
+
+
+def monotonic_branches(T, K):
+    """Return index ranges (i0, i1) of maximal monotonic runs of K over T.
+
+    Flat segments (dK == 0) are absorbed into the neighbouring run.
+    """
+    K = np.asarray(K, float)
+    n = K.shape[0]
+    if n < 2:
+        return [(0, max(0, n - 1))]
+    sign = np.sign(np.diff(K))
+    branches = []
+    start = 0
+    cur = 0.0
+    for i, sg in enumerate(sign):
+        if sg == 0:
+            continue
+        if cur == 0.0:
+            cur = sg
+        elif sg != cur:
+            branches.append((start, i))
+            start = i
+            cur = sg
+    branches.append((start, n - 1))
+    return branches
+
+
+def select_branch(kinfo, branch="auto", physical_branch=None):
+    """Select a monotonic K branch and report its bounds and direction.
+
+    ``branch`` is 'low' (lowest-T branch), 'high' (highest-T branch), or 'auto'
+    (the full interval if monotonic, else fail unless ``physical_branch`` picks
+    one explicitly).
+    """
+    T = np.asarray(kinfo["T"], float)
+    K = np.asarray(kinfo["K"], float)
+    brs = monotonic_branches(T, K)
+    if branch == "auto":
+        if len(brs) == 1:
+            idx = 0
+        elif physical_branch is not None:
+            idx = int(physical_branch)
+        else:
+            raise SystemExit(
+                "K(T) is non-monotonic over the interval and no physical branch "
+                "is marked; rerun with --branch low or --branch high.")
+    elif branch == "low":
+        idx = 0
+    elif branch == "high":
+        idx = len(brs) - 1
+    else:
+        raise SystemExit(f"unknown branch {branch!r}")
+    i0, i1 = brs[idx]
+    Tb, Kb = T[i0:i1 + 1], K[i0:i1 + 1]
+    direction = ("increasing" if Kb[-1] > Kb[0]
+                 else "decreasing" if Kb[-1] < Kb[0] else "flat")
+    return {
+        "branch_index": int(idx),
+        "n_branches": int(len(brs)),
+        "branch_temperature_bounds": [float(Tb[0]), float(Tb[-1])],
+        "branch_K_bounds": [float(Kb[0]), float(Kb[-1])],
+        "K_direction": direction,
+        "K_increases_with_T": bool(direction == "increasing"),
+        "Ts": Tb, "K": Kb,
+    }
+
+
+# ---------------------------------------------------------------------------
+# K ladder (Phase 6.3) + overlap refinement (Phase 6.4)
+# ---------------------------------------------------------------------------
+
+def build_k_ladder(Ts, K, n_points, min_dT=0.25, min_dK=1e-4, round_to=4,
+                   k_of_T=None):
+    """Ladder approximately uniform in K, mapped to T (Part 9).
+
+    Works for BOTH increasing and decreasing K(T): all interpolation is done on
+    a strictly T-ascending coordinate, so a descending x-array is never passed
+    to ``np.interp``.  After selecting temperatures the K values are recomputed
+    by calling the actual fitted model (``k_of_T``) when supplied, rather than
+    re-interpolating a possibly misordered array.  Spacing constraints are
+    reported (``spacing_ok``, ``exact_count``, ``endpoints_included``) with a
+    recommendation when they cannot be met.
+    """
+    Ts = np.asarray(Ts, float)
+    K = np.asarray(K, float)
+    n_points = int(n_points)
+    if n_points < 2:
+        raise ValueError("n_points must be >= 2")
+    # Strictly T-ascending working arrays (drop duplicate temperatures).
+    to = np.argsort(Ts)
+    Tt, Kt = Ts[to], K[to]
+    keep = np.concatenate([[True], np.diff(Tt) > 0])
+    Tt, Kt = Tt[keep], Kt[keep]
+    K0, K1 = float(Kt[0]), float(Kt[-1])
+    K_levels = np.linspace(K0, K1, n_points)
+    # Invert K -> T.  np.interp needs an ASCENDING xp, so flip when K decreases.
+    if K1 >= K0:
+        temps = np.interp(K_levels, Kt, Tt)
+    else:
+        temps = np.interp(K_levels[::-1], Kt[::-1], Tt[::-1])[::-1]
+    temps[0], temps[-1] = float(Tt[0]), float(Tt[-1])
+    temps = np.sort(temps)
+    temps = np.round(temps, round_to)
+    step = 10.0 ** (-round_to)
+    for i in range(1, temps.size):
+        if temps[i] <= temps[i - 1]:
+            temps[i] = round(temps[i - 1] + step, round_to)
+    # Recompute K at the chosen temperatures via the ACTUAL model when given;
+    # else interpolate on the strictly T-ascending arrays (never K-ordered).
+    if k_of_T is not None:
+        K_at = np.array([float(k_of_T(float(t))) for t in temps])
+    else:
+        K_at = np.interp(temps, Tt, Kt)
+    dK = np.abs(np.diff(K_at))
+    dT = np.abs(np.diff(temps))
+    unique_count = int(np.unique(temps).size)
+    min_dT_ok = bool(dT.size and dT.min() >= min_dT)
+    min_dK_ok = bool(dK.size and dK.min() >= min_dK)
+    exact_count = bool(unique_count == n_points)
+    endpoints_included = bool(abs(temps[0] - Tt[0]) <= step
+                              and abs(temps[-1] - Tt[-1]) <= step)
+    spacing_ok = bool(min_dT_ok and min_dK_ok and exact_count and endpoints_included)
+    recommendation = None
+    if not spacing_ok:
+        recs = []
+        if not exact_count:
+            recs.append(f"cannot place {n_points} unique temperatures in the "
+                        f"branch interval; reduce --n-temperatures")
+        if not min_dT_ok:
+            recs.append(f"minimum dT {float(dT.min()) if dT.size else float('nan'):.4g}"
+                        f" < min_dT {min_dT}; reduce --n-temperatures or relax min_dT")
+        if not min_dK_ok:
+            recs.append(f"minimum dK {float(dK.min()) if dK.size else float('nan'):.4g}"
+                        f" < min_dK {min_dK}; reduce --n-temperatures or relax min_dK")
+        recommendation = "; ".join(recs)
+    return {
+        "temperatures": temps,
+        "K_values": [float(x) for x in K_at],
+        "achieved_dK": [float(x) for x in dK],
+        "achieved_dT": [float(x) for x in dT],
+        "min_dK": float(dK.min()) if dK.size else float("nan"),
+        "min_dT": float(dT.min()) if dT.size else float("nan"),
+        "min_dK_ok": min_dK_ok,
+        "min_dT_ok": min_dT_ok,
+        "unique_count": unique_count,
+        "requested_count": n_points,
+        "exact_count": exact_count,
+        "endpoints_included": endpoints_included,
+        "spacing_ok": spacing_ok,
+        "K_direction": ("increasing" if K1 > K0 else
+                        "decreasing" if K1 < K0 else "flat"),
+        "recommendation": recommendation,
+    }
+
+
+def refine_ladder(temps, adjacent_overlap, low_overlap=0.15, high_overlap=0.90):
+    """Recommend ladder edits from adjacent contact-histogram overlap.
+
+    Returns per-gap recommendations (delete a redundant lane / insert a lane in
+    a poorly overlapping gap) plus a refined temperature recommendation.  Does
+    NOT rerun anything.
+    """
+    temps = [float(t) for t in temps]
+    ov = [float(x) for x in adjacent_overlap]
+    recs = []
+    refined = list(temps)
+    for a, o in enumerate(ov):
+        lo, hi = temps[a], temps[a + 1]
+        if o >= high_overlap:
+            recs.append({"gap": [lo, hi], "overlap": o,
+                         "action": "delete_redundant_lane",
+                         "detail": f"lanes at {lo} and {hi} overlap {o:.3f} "
+                                   f">= {high_overlap}"})
+        elif o <= low_overlap:
+            recs.append({"gap": [lo, hi], "overlap": o,
+                         "action": "insert_lane",
+                         "insert_temperature": round(0.5 * (lo + hi), 4),
+                         "detail": f"overlap {o:.3f} <= {low_overlap}"})
+    # Build a refined ladder: drop the higher lane of each redundant pair, insert
+    # midpoints for sparse gaps.
+    drop = {r["gap"][1] for r in recs if r["action"] == "delete_redundant_lane"}
+    inserts = [r["insert_temperature"] for r in recs if r["action"] == "insert_lane"]
+    refined = sorted(set([t for t in refined if t not in drop] + inserts))
+    return {"recommendations": recs, "refined_temperatures": refined,
+            "overlap_metric": "Bhattacharyya coefficient"}
+
+
+# ---------------------------------------------------------------------------
+# Statistics (Phase 7)
+# ---------------------------------------------------------------------------
+
+def spearman(x, y):
+    """Tie-corrected Spearman rank correlation (SciPy if available)."""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    if x.size < 3:
+        return float("nan")
+    try:
+        from scipy.stats import spearmanr
+        r = spearmanr(x, y).correlation
+        return float(r)
+    except Exception:
+        def _avg_rank(a):
+            order = np.argsort(a, kind="mergesort")
+            ranks = np.empty(a.size, float)
+            ranks[order] = np.arange(a.size, dtype=float)
+            # average ties
+            sa = a[order]
+            i = 0
+            while i < a.size:
+                j = i
+                while j + 1 < a.size and sa[j + 1] == sa[i]:
+                    j += 1
+                if j > i:
+                    ranks[order[i:j + 1]] = (i + j) / 2.0
+                i = j + 1
+            return ranks
+        rx, ry = _avg_rank(x), _avg_rank(y)
+        rx -= rx.mean(); ry -= ry.mean()
+        denom = np.sqrt((rx * rx).sum() * (ry * ry).sum())
+        return float((rx * ry).sum() / denom) if denom > 0 else float("nan")
+
+
+def seed_bootstrap(vals, n=4000, seed=0):
+    """Hierarchical (across-seed) bootstrap CI of the mean."""
+    vals = np.asarray(vals, float)
+    if vals.size == 0:
+        return (float("nan"), float("nan"), float("nan"))
+    if vals.size == 1:
+        return (float(vals[0]), float(vals[0]), float(vals[0]))
+    rng = np.random.RandomState(seed)
+    bs = vals[rng.randint(0, vals.size, size=(n, vals.size))].mean(axis=1)
+    return (float(vals.mean()), float(np.percentile(bs, 2.5)),
+            float(np.percentile(bs, 97.5)))
+
+
+def block_bootstrap_mean(x, n_blocks=10, n=2000, seed=0):
+    """Moving-block bootstrap CI of the mean of a correlated series."""
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return (float("nan"), float("nan"), float("nan"))
+    if x.size < n_blocks or n_blocks < 2:
+        m = float(x.mean())
+        return (m, m, m)
+    L = max(1, x.size // n_blocks)
+    starts_max = x.size - L
+    rng = np.random.RandomState(seed)
+    n_needed = int(np.ceil(x.size / L))
+    means = np.empty(n)
+    for b in range(n):
+        s = rng.randint(0, starts_max + 1, size=n_needed)
+        sample = np.concatenate([x[i:i + L] for i in s])[:x.size]
+        means[b] = sample.mean()
+    return (float(x.mean()), float(np.percentile(means, 2.5)),
+            float(np.percentile(means, 97.5)))
+
+
+def ci_excludes_zero(lo, hi):
+    return bool((lo > 0 and hi > 0) or (lo < 0 and hi < 0))
+
+
+def _block_resample_mean(x, block_len, rng):
+    """Mean of one moving-block bootstrap resample of a correlated 1-D series."""
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = x.size
+    if n == 0:
+        return float("nan")
+    L = max(1, min(int(block_len), n))
+    n_blocks = int(np.ceil(n / L))
+    if n > L:
+        starts = rng.randint(0, n - L + 1, size=n_blocks)
+    else:
+        starts = np.zeros(n_blocks, dtype=int)
+    sample = np.concatenate([x[s:s + L] for s in starts])[:n]
+    return float(sample.mean())
+
+
+def hierarchical_bootstrap(seed_data, n_boot=2000, block_len=20, seed=20260701):
+    """True two-level (seed x block) bootstrap of endpoint deltas and K-slopes (Part 4).
+
+    ``seed_data`` is a list (one entry per independent seed) of dicts with keys
+    ``K`` (nT,), and per-lane trajectory matrices ``contacts``/``rg2``
+    (nT, n_post) and ``m_global``/``smax`` (nT, n_struct).  Each replicate: (1)
+    resamples SEEDS with replacement; (2) within each selected seed resamples
+    trajectory BLOCKS per lane; (3) recomputes lane means; (4) recomputes the
+    high-K-minus-low-K endpoint deltas and the slopes vs K.  Point estimates use
+    the full data.  Deterministic ``seed`` makes the CIs reproducible.
+    """
+    S = len(seed_data)
+    if S == 0:
+        return None
+    K = np.asarray(seed_data[0]["K"], float)
     order = np.argsort(K)
-    Ks, Tsorted = K[order], Ts[order]
-    chosen_T = np.interp(base, Ks, Tsorted)
-    chosen_T = np.unique(np.concatenate([chosen_T, extra_T]))
-    chosen_T.sort()
-    if chosen_T.size > n_points:
-        # thin to n_points keeping endpoints
-        idx = np.linspace(0, chosen_T.size - 1, n_points).round().astype(int)
-        chosen_T = np.unique(chosen_T[idx])
-    return chosen_T, note
+    lo, hi = int(order[0]), int(order[-1])
+    keys = ("contacts", "rg2", "m_global", "smax")
+
+    def lane_means(sd, key, rng=None):
+        arr = np.asarray(sd[key], float)
+        nT = arr.shape[0]
+        if rng is None:
+            return np.array([float(np.nanmean(arr[k])) for k in range(nT)])
+        return np.array([_block_resample_mean(arr[k], block_len, rng)
+                         for k in range(nT)])
+
+    def agg(selected, rng=None):
+        out = {}
+        idx = selected if selected is not None else range(S)
+        for key in keys:
+            lm = np.mean([lane_means(seed_data[i], key, rng) for i in idx], axis=0)
+            out[key] = lm
+        return out
+
+    def _slope(K_, y):
+        return float(np.polyfit(K_, y, 1)[0]) if y.size >= 2 else float("nan")
+
+    a0 = agg(None)
+    est = {
+        "delta_contacts": float(a0["contacts"][hi] - a0["contacts"][lo]),
+        "delta_rg2": float(a0["rg2"][hi] - a0["rg2"][lo]),
+        "slope_contacts": _slope(K, a0["contacts"]),
+        "slope_rg2": _slope(K, a0["rg2"]),
+        "slope_m_global": _slope(K, a0["m_global"]),
+        "slope_smax": _slope(K, a0["smax"]),
+    }
+    rng = np.random.RandomState(int(seed))
+    draws = {q: np.empty(n_boot) for q in est}
+    for b in range(n_boot):
+        sel = rng.randint(0, S, size=S)
+        a = agg(sel, rng)
+        draws["delta_contacts"][b] = a["contacts"][hi] - a["contacts"][lo]
+        draws["delta_rg2"][b] = a["rg2"][hi] - a["rg2"][lo]
+        draws["slope_contacts"][b] = _slope(K, a["contacts"])
+        draws["slope_rg2"][b] = _slope(K, a["rg2"])
+        draws["slope_m_global"][b] = _slope(K, a["m_global"])
+        draws["slope_smax"][b] = _slope(K, a["smax"])
+    out = {}
+    for q, arr in draws.items():
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            ci = [float(np.percentile(arr, 2.5)), float(np.percentile(arr, 97.5))]
+            bm = float(arr.mean())
+        else:
+            ci, bm = [float("nan"), float("nan")], float("nan")
+        out[q] = {"estimate": est[q], "bootstrap_mean": bm, "ci95": ci,
+                  "n_seeds": int(S), "block_length": int(block_len),
+                  "n_bootstrap_replicates": int(n_boot)}
+    out["endpoint_lanes"] = {"low_K_lane": lo, "high_K_lane": hi}
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Run + analysis (D3, D4, D5)
+# Regime classification (Phase 7.4)
 # ---------------------------------------------------------------------------
 
-def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap):
+def _norm(a, invert=False):
+    a = np.asarray(a, float)
+    lo, hi = np.nanmin(a), np.nanmax(a)
+    if not np.isfinite(lo) or hi <= lo:
+        return np.zeros_like(a)
+    z = (a - lo) / (hi - lo)
+    return 1.0 - z if invert else z
+
+
+def classify_regimes(K, m_mean, rg2_mean, global_frac=None, smax_frac=None,
+                     within_lane_std=None, min_effect_size=2.0):
+    """Classify each lane as swollen/crossover/collapsed from multiple signals.
+
+    Rule (documented in the report): build a per-lane collapse coordinate in
+    [0,1] as the mean of available normalized signals -- normalized mean
+    contacts, inverted normalized Rg^2, normalized global-contact fraction,
+    normalized S_max/N -- where higher means more collapsed.  Terciles of the
+    coordinate label swollen (<1/3), crossover (<2/3), collapsed (>=2/3).
+    ``distinct_regimes_resolved`` additionally requires the endpoint contact
+    effect size (|Δ<m>|/pooled within-lane std) to exceed ``min_effect_size``
+    and at least one lane in each of the swollen and collapsed classes.
+    """
+    signals = [_norm(m_mean), _norm(rg2_mean, invert=True)]
+    if global_frac is not None:
+        signals.append(_norm(global_frac))
+    if smax_frac is not None:
+        signals.append(_norm(smax_frac))
+    coord = np.mean(np.vstack(signals), axis=0)
+    labels = np.where(coord < 1 / 3, "swollen",
+                      np.where(coord < 2 / 3, "crossover", "collapsed"))
+    m = np.asarray(m_mean, float)
+    order = np.argsort(K)
+    dm = float(m[order][-1] - m[order][0])
+    pooled = (float(np.nanmean(within_lane_std))
+              if within_lane_std is not None
+              and np.any(np.isfinite(within_lane_std)) else float("nan"))
+    effect = abs(dm) / pooled if (pooled and np.isfinite(pooled) and pooled > 0) \
+        else float("inf") if dm != 0 else 0.0
+    has_both = ("swollen" in labels) and ("collapsed" in labels)
+    resolved = bool(has_both and effect >= min_effect_size)
+    return {
+        "labels": [str(x) for x in labels],
+        "collapse_coordinate": [float(x) for x in coord],
+        "endpoint_effect_size_contacts": float(effect),
+        "distinct_regimes_resolved": resolved,
+        "rule": ("mean of normalized [m, 1-Rg2, global_frac, Smax/N]; terciles "
+                 "label regimes; resolved requires effect size >= "
+                 f"{min_effect_size} and >=1 swollen and >=1 collapsed lane"),
+    }
+
+
+def aggregate_lane_observables(prefixes, info, n_beads):
+    """Seed-aligned per-lane aggregation of the regime observables (Part 5).
+
+    Lanes are aligned by ascending temperature (deterministic, seed-order
+    invariant).  Returns per-lane mean across seeds, between-seed std, pooled
+    within-seed std (from C_std), and the per-seed matrices for each of: mean
+    contacts, Rg^2, global-contact fraction, S_max/N, largest-component
+    fraction.  ``K`` is recomputed from the aligned temperatures.
+    """
+    cols = {
+        "m": "C_mean", "rg2": "Rg2_mean",
+        "global_frac": "m_global_scaled_mean",
+        "smax": "Smax_mean",
+        "largest_component_fraction": "largest_component_fraction_mean",
+    }
+    per_seed_rows = [sorted(_read_results(p), key=lambda r: float(r["T"]))
+                     for p in prefixes]
+    nT = min(len(r) for r in per_seed_rows)
+    per_seed_rows = [rows[:nT] for rows in per_seed_rows]
+    T = np.array([float(per_seed_rows[0][k]["T"]) for k in range(nT)])
+    K = np.array([_K_of(info, t) for t in T])
+    S = len(per_seed_rows)
+    aggregate, between_std, per_seed = {}, {}, {}
+    for name, col in cols.items():
+        M = np.array([[float(rows[k][col]) for k in range(nT)]
+                      for rows in per_seed_rows])          # (S, nT)
+        aggregate[name] = M.mean(axis=0)
+        between_std[name] = (M.std(axis=0, ddof=1) if S > 1 else np.zeros(nT))
+        per_seed[name] = M
+    cstd = np.array([[float(rows[k].get("C_std", 0.0)) for k in range(nT)]
+                     for rows in per_seed_rows])
+    aggregate["smax_over_N"] = aggregate["smax"] / max(1, int(n_beads))
+    return {
+        "n_temperatures": nT, "n_seeds": S,
+        "temperatures": T, "K": K,
+        "aggregate": aggregate, "between_seed_std": between_std,
+        "per_seed": per_seed, "within_lane_std": cstd.mean(axis=0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# High-contact tail (Phase 9)
+# ---------------------------------------------------------------------------
+
+def high_contact_tail(Pc, c_vals, ess_by_lane, n_by_lane, tau_by_lane,
+                      threshold=None, percentile=90.0,
+                      support_maximum=None, support_source=None):
+    """High-contact-tail diagnostics from the sampled distribution.
+
+    The tail threshold is the pooled-sampled ``percentile`` (default 90th) of
+    the contact count, NOT a percentile of the integer support grid.  Effective
+    tail counts use per-lane ESS.
+
+    Support-boundary truncation (Part 7) is decided ONLY against a genuine
+    external reference (an exact known maximum contact count for N, an externally
+    supplied maximum, a baseline maximum, or a fixed pre-sampling histogram
+    bound).  When none is available, ``support_boundary_source`` is
+    ``"unavailable"`` and ``maximum_is_boundary_limited`` is ``None`` -- it is
+    NEVER inferred from the observed maximum against a dynamically generated
+    histogram edge (which would make it nearly always True).
+    """
+    Pc = np.asarray(Pc, float)
+    c_vals = np.asarray(c_vals, float)
+    nT = Pc.shape[0]
+    weights = np.nan_to_num(Pc).sum(axis=1)
+    pooled = np.nan_to_num(Pc).sum(axis=0)
+    ps = pooled.sum()
+    pooled = pooled / ps if ps > 0 else pooled
+    if threshold is None:
+        cdf = np.cumsum(pooled)
+        k = int(np.searchsorted(cdf, percentile / 100.0))
+        threshold = float(c_vals[min(k, c_vals.size - 1)])
+    tail_mask = c_vals >= threshold
+    per_lane = []
+    raw_total = 0.0
+    eff_total = 0.0
+    max_obs = 0.0
+    for i in range(nT):
+        p = np.nan_to_num(Pc[i])
+        tp = float(p[tail_mask].sum())
+        n_i = float(n_by_lane[i]) if i < len(n_by_lane) else 0.0
+        e_i = float(ess_by_lane[i]) if i < len(ess_by_lane) else 0.0
+        raw = tp * n_i
+        eff = tp * e_i
+        raw_total += raw
+        eff_total += eff
+        nz = np.nonzero(p > 0)[0]
+        if nz.size:
+            max_obs = max(max_obs, float(c_vals[nz[-1]]))
+        per_lane.append({"temperature_index": i, "tail_probability": tp,
+                         "raw_tail_count": raw, "effective_tail_count": eff})
+    # Genuine support reference (Part 7): use an externally supplied maximum;
+    # otherwise the boundary is UNAVAILABLE and truncation is NOT inferred from
+    # the observed maximum against a dynamic histogram edge.
+    if support_maximum is not None and np.isfinite(support_maximum):
+        boundary_value = float(support_maximum)
+        boundary_src = support_source or "external"
+        boundary_limited = bool(max_obs >= boundary_value)
+        distance = float(boundary_value - max_obs)
+    else:
+        boundary_value = None
+        boundary_src = "unavailable"
+        boundary_limited = None
+        distance = None
+    return {
+        "tail_threshold": float(threshold),
+        "tail_threshold_rule": f"pooled sampled {percentile:.0f}th percentile",
+        "raw_tail_count": float(raw_total),
+        "tail_probability": float(np.average(
+            [pl["tail_probability"] for pl in per_lane],
+            weights=weights) if weights.sum() > 0 else 0.0),
+        "effective_tail_count": float(eff_total),
+        "per_seed_tail_count": None,   # filled by caller across seeds
+        "per_lane": per_lane,
+        "maximum_observed_m": float(max_obs),
+        "highest_histogram_edge": (float(c_vals[-1]) if c_vals.size else None),
+        "support_boundary_source": boundary_src,
+        "support_boundary_value": boundary_value,
+        "distance_to_boundary": distance,
+        "maximum_is_boundary_limited": boundary_limited,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-regime production estimator (Phase 10)
+# ---------------------------------------------------------------------------
+
+def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
+                           snapshot_stride, n_seeds, target_ess=TARGET_EFF_PER_REGIME,
+                           limiting_observable_by_lane=None):
+    """Snapshot-stride-aware required production cycles per structural regime (Part 8).
+
+    The effective sample spacing in CYCLES accounts for BOTH autocorrelation and
+    the snapshot stride::
+
+        Delta_eff = max(snapshot_stride, 2 * tau_int_cycles)
+
+    so coarsely strided saving (stride > 2*tau) is autocorrelation-independent
+    and finely strided saving is autocorrelation-limited.  Effective independent
+    saved configurations per lane per seed ~ post_burnin_cycles / Delta_eff, and
+    the raw saved snapshots per lane per seed ~ post_burnin_cycles /
+    snapshot_stride.  Required cycles solve
+    ``L*n_seeds*(f*P/Delta_eff) >= target_ess``; the recommended length is the
+    MAXIMUM required length over all regimes (and, via tau being the max over key
+    observables, over key observables).  Changing the snapshot stride changes
+    both the expected raw and effective saved-configuration counts.
+    """
+    f = float(post_burnin_frac)
+    stride = max(1, int(snapshot_stride))
+    per_regime = {}
+    required_P = {}
+    for regime, lanes in regime_to_lanes.items():
+        taus = [float(tau_by_lane[i]) for i in lanes
+                if i < len(tau_by_lane) and np.isfinite(tau_by_lane[i])
+                and tau_by_lane[i] > 0]
+        L = len(lanes)
+        limiting_obs = None
+        if limiting_observable_by_lane is not None and taus:
+            islow = max((i for i in lanes if i < len(tau_by_lane)
+                         and np.isfinite(tau_by_lane[i]) and tau_by_lane[i] > 0),
+                        key=lambda i: tau_by_lane[i], default=None)
+            if islow is not None and islow < len(limiting_observable_by_lane):
+                limiting_obs = limiting_observable_by_lane[islow]
+        if not taus or L == 0 or f <= 0:
+            per_regime[regime] = {
+                "lane_indices": list(lanes), "number_of_lanes": L,
+                "number_of_seeds": int(n_seeds), "snapshot_stride": stride,
+                "post_burnin_frac": f, "limiting_observable": limiting_obs,
+                "slowest_tau_int_cycles": None, "effective_sample_spacing_cycles": None,
+                "required_production_cycles": None, "reaches_target": False,
+                "limiting_reason": "no valid tau / lanes"}
+            required_P[regime] = float("inf")
+            continue
+        tau = max(taus)
+        delta_eff = max(float(stride), 2.0 * tau)
+        P = int(np.ceil(target_ess * delta_eff / max(1e-9, (L * n_seeds * f))))
+        required_P[regime] = P
+        per_regime[regime] = {
+            "lane_indices": list(lanes), "number_of_lanes": L,
+            "number_of_seeds": int(n_seeds), "snapshot_stride": stride,
+            "post_burnin_frac": f, "limiting_observable": limiting_obs,
+            "slowest_tau_int_cycles": float(tau),
+            "effective_sample_spacing_cycles": float(delta_eff),
+            "required_production_cycles": int(P),
+        }
+    P_rec = int(max([v for v in required_P.values() if np.isfinite(v)] or [0]))
+    all_reach = True
+    for regime, lanes in regime_to_lanes.items():
+        rr = per_regime[regime]
+        tau = rr.get("slowest_tau_int_cycles")
+        L = rr["number_of_lanes"]
+        if tau and L:
+            delta_eff = rr["effective_sample_spacing_cycles"]
+            eff = L * n_seeds * (f * P_rec) / delta_eff
+            rr["expected_effective_configs_pooled"] = float(eff)
+            rr["expected_raw_saved_configs_per_seed"] = int(np.floor(f * P_rec / stride))
+            rr["reaches_target"] = bool(eff >= target_ess)
+        else:
+            rr["expected_effective_configs_pooled"] = 0.0
+            rr["expected_raw_saved_configs_per_seed"] = 0
+            rr["reaches_target"] = False
+        all_reach = all_reach and rr["reaches_target"]
+    limiting = max(required_P, key=lambda r: required_P[r]) if required_P else None
+    return {
+        "per_regime": per_regime,
+        "recommended_production_cycles_per_seed": int(P_rec),
+        "target_effective_per_regime": int(target_ess),
+        "limiting_regime": limiting,
+        "post_burnin_frac": f,
+        "snapshot_stride": stride,
+        "n_seeds": int(n_seeds),
+        "every_regime_reaches_target": bool(all_reach),
+        "rationale": ("effective spacing Delta_eff = max(snapshot_stride, "
+                      "2*tau_int_cycles); effective saved ~ post_burnin_cycles/"
+                      "Delta_eff summed over retained lanes and seeds; raw saved ~ "
+                      "post_burnin_cycles/snapshot_stride; recommended length is "
+                      "the max required length over regimes and key observables."),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sampling / mixing gates (Phase 8)
+# ---------------------------------------------------------------------------
+
+def _gate(passed, value, threshold, explanation):
+    return {"passed": bool(passed), "value": (None if value is None else float(value)),
+            "threshold": float(threshold), "explanation": explanation}
+
+
+def _band_gate(min_value, min_threshold, max_value, max_threshold, explanation):
+    """Explicit two-sided (band) gate that records BOTH bounds (Part 10)."""
+    passed = ((min_value is not None and min_value >= min_threshold)
+              and (max_value is not None and max_value <= max_threshold))
+    return {
+        "passed": bool(passed),
+        "minimum_value": (None if min_value is None else float(min_value)),
+        "minimum_threshold": float(min_threshold),
+        "maximum_value": (None if max_value is None else float(max_value)),
+        "maximum_threshold": float(max_threshold),
+        "explanation": explanation,
+    }
+
+
+def evaluate_sampling_gates(metrics, thresholds=None):
+    """Structured gate results from aggregated mixing metrics."""
+    t = dict(DEFAULT_GATE_THRESHOLDS)
+    if thresholds:
+        t.update(thresholds)
+    g = {}
+    g["min_ess"] = _gate(metrics.get("min_ess", 0) >= t["min_ess"],
+                         metrics.get("min_ess", 0), t["min_ess"],
+                         "min ESS over key observables (m, Rg2, m_global_scaled, "
+                         "Smax, largest_component_fraction)")
+    g["min_round_trips"] = _gate(
+        metrics.get("min_round_trips", 0) >= t["min_round_trips"],
+        metrics.get("min_round_trips", 0), t["min_round_trips"],
+        "minimum walker round trips low<->high")
+    g["min_temp_coverage"] = _gate(
+        metrics.get("min_temp_coverage", 0) >= t["min_temp_coverage"],
+        metrics.get("min_temp_coverage", 0), t["min_temp_coverage"],
+        "minimum fraction of temperatures visited by a walker")
+    g["min_adjacent_overlap"] = _gate(
+        metrics.get("min_adjacent_overlap", 0) >= t["min_adjacent_overlap"],
+        metrics.get("min_adjacent_overlap", 0), t["min_adjacent_overlap"],
+        "minimum adjacent contact-histogram Bhattacharyya overlap")
+    g["swap_rate"] = _band_gate(
+        metrics.get("min_swap_rate", 0), t["min_swap_rate"],
+        metrics.get("max_swap_rate", 1), t["max_swap_rate"],
+        "swap acceptance rates within the [min_swap_rate, max_swap_rate] band")
+    g["drift"] = _gate(metrics.get("max_drift_in_std", 0) <= t["max_drift_in_std"],
+                       metrics.get("max_drift_in_std", 0), t["max_drift_in_std"],
+                       "absence of severe early/late drift (in std units)")
+    g["state_changing_acceptance"] = _gate(
+        metrics.get("min_state_changing_acceptance", 0)
+        >= t["min_state_changing_acceptance"],
+        metrics.get("min_state_changing_acceptance", 0),
+        t["min_state_changing_acceptance"],
+        "minimum state-changing local-move acceptance")
+    g["high_contact_tail_support"] = _gate(
+        metrics.get("tail_probability", 0) >= t["min_tail_probability"],
+        metrics.get("tail_probability", 0), t["min_tail_probability"],
+        "high-contact tail has sampled support")
+    g["seed_agreement"] = _gate(
+        metrics.get("seed_relative_spread", 1.0) <= t["max_seed_relative_spread"],
+        metrics.get("seed_relative_spread", 1.0), t["max_seed_relative_spread"],
+        "endpoint Δ<m> agrees across seeds (relative spread)")
+    all_pass = all(v["passed"] for v in g.values())
+    g["_all_passed"] = bool(all_pass)
+    return g
+
+
+# ---------------------------------------------------------------------------
+# Run + provenance (Phase 11)
+# ---------------------------------------------------------------------------
+
+def _sha256(path):
+    if path is None or not Path(path).exists():
+        return "unknown"
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _certificate_path(feat_path):
+    return Path(str(feat_path) + ".validation.json")
+
+
+def _deep_validate_and_certify(feat_path):
+    """Deep-validate a completed feature file and write a SHA-256 certificate.
+
+    Raises ``ExtractionError`` on any structural/identity failure (the caller
+    treats that as "the stage must rerun or fail clearly").
+    """
+    import extract_contact_motif_features as ext
+    info = ext.validate_feature_file_hdf5(str(feat_path), deep=True)
+    cert = {
+        "feature_path": str(feat_path),
+        "feature_sha256": _sha256(feat_path),
+        "validation_timestamp": _dt.datetime.now().isoformat(),
+        "validator_schema_version": int(ext.FEATURE_SCHEMA_VERSION),
+        "definitions_version": info.get("definitions_version"),
+        "validation_result": "passed",
+    }
+    _certificate_path(feat_path).write_text(
+        json.dumps(cert, indent=2), encoding="utf-8")
+    return cert
+
+
+def _feature_certified(feat_path):
+    """True only when ``feat_path`` DEEP-validates (never a shallow check).
+
+    A validation certificate is reused only when its recorded SHA-256 matches
+    the current file; otherwise deep validation is rerun (and a fresh
+    certificate written).  A missing/failed certificate or a failed validation
+    returns False so the seed stage reruns or fails clearly.
+    """
+    feat_path = Path(feat_path)
+    if not feat_path.exists():
+        return False
+    cert_p = _certificate_path(feat_path)
+    if cert_p.exists():
+        try:
+            cert = json.loads(cert_p.read_text(encoding="utf-8"))
+            if (cert.get("validation_result") == "passed"
+                    and cert.get("feature_sha256") == _sha256(feat_path)):
+                return True
+        except Exception:
+            pass
+    try:
+        _deep_validate_and_certify(feat_path)
+        return True
+    except Exception:
+        return False
+
+
+def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
+             structural_stride, snapshot_stride, resume=False, commands=None):
     prefix = out_dir / f"calib_N{N}_s{seed}"
+    cfg = f"{prefix}_configurations.h5"
+    feat = out_dir / f"calib_N{N}_s{seed}_features.h5"
+    if resume and Path(cfg).exists() and Path(feat).exists() and _feature_certified(feat):
+        print(f"RESUME: seed {seed} deep-validated ({feat})")
+        return str(prefix)
     temps = ",".join(f"{t:.4f}" for t in ladder)
     cmd = [PY, REMD, "--N", str(N), "--temps", temps,
            "--fit-summary-json", summary_path,
            "--steps-per-swap", str(steps_per_swap), "--n-cycles", str(n_cycles),
            "--n-workers", "1", "--seed", str(seed), "--burnin-frac", "0.5",
-           "--structural-observables", "--structural-stride", "5",
+           "--structural-observables", "--structural-stride", str(structural_stride),
            "--diagnostics", "--diagnostic-trajectories",
-           "--save-configurations", "--snapshot-stride", "5",
+           "--save-configurations", "--snapshot-stride", str(snapshot_stride),
            "--overwrite-configurations", "--no-plots",
            "--out-prefix", str(prefix)]
+    if commands is not None:
+        commands.append(" ".join(cmd))
     print("RUN:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(HERE))
-    cfg = f"{prefix}_configurations.h5"
-    feat = out_dir / f"calib_N{N}_s{seed}_features.h5"
-    subprocess.run([PY, EXTRACT, "--input", cfg, "--output", str(feat),
-                    "--validate", "--overwrite"], check=True, cwd=str(HERE))
-    return prefix
-
-
-def _spearman(x, y):
-    x = np.asarray(x, float); y = np.asarray(y, float)
-    if x.size < 3:
-        return float("nan")
-    rx = np.argsort(np.argsort(x)); ry = np.argsort(np.argsort(y))
-    rx = rx - rx.mean(); ry = ry - ry.mean()
-    denom = np.sqrt((rx * rx).sum() * (ry * ry).sum())
-    return float((rx * ry).sum() / denom) if denom > 0 else float("nan")
+    ecmd = [PY, EXTRACT, "--input", cfg, "--output", str(feat),
+            "--validate", "--overwrite"]
+    if commands is not None:
+        commands.append(" ".join(ecmd))
+    subprocess.run(ecmd, check=True, cwd=str(HERE))
+    # Deep-validate the freshly extracted features and write a certificate so a
+    # later --resume can trust this stage without rerunning the full validator.
+    _deep_validate_and_certify(feat)
+    return str(prefix)
 
 
 def _read_results(prefix):
-    rows = list(csv.DictReader(open(f"{prefix}_results.csv", newline="")))
-    return rows
+    return list(csv.DictReader(open(f"{prefix}_results.csv", newline="")))
 
 
 def _read_diag(prefix):
@@ -187,15 +954,42 @@ def _K_of(info, T):
                               info["Tref"], info["Tscale"])
 
 
-def analyze_trends(prefixes, info):
-    """Per-seed trend analysis vs T and K with endpoint effect sizes, Spearman,
-    slope vs K, and across-seed bootstrap of endpoint differences."""
+def _bhattacharyya(p, q):
+    p = np.asarray(p, float); q = np.asarray(q, float)
+    p = np.where(np.isfinite(p), p, 0.0); q = np.where(np.isfinite(q), q, 0.0)
+    sp, sq = p.sum(), q.sum()
+    if sp <= 0 or sq <= 0:
+        return 0.0
+    return float(np.sqrt((p / sp) * (q / sq)).sum())
+
+
+# ---------------------------------------------------------------------------
+# Trend + mixing analysis
+# ---------------------------------------------------------------------------
+
+def _load_seed_trajectories(prefix, info):
+    """Per-lane post-burn-in trajectories for the hierarchical bootstrap."""
+    traj = Path(f"{prefix}_diagnostic_trajectories.npz")
+    if not traj.exists():
+        return None
+    t = np.load(traj)
+    Ts = np.asarray(t["Ts"], float)
+    K = np.array([_K_of(info, float(x)) for x in Ts])
+    return {
+        "K": K,
+        "contacts": np.asarray(t["contacts_post"], float),
+        "rg2": np.asarray(t["rg2_post"], float),
+        "m_global": np.asarray(t["m_global_scaled_post"], float),
+        "smax": np.asarray(t["smax_post"], float),
+    }
+
+
+def analyze_trends(prefixes, info, block_len=20, n_boot=2000):
     obs = ["C_mean", "Rg2_mean", "Ree2_mean", "m_long_mean",
            "m_global_scaled_mean", "Smax_mean",
            "largest_component_fraction_mean"]
     per_seed = []
-    endpoint_dm = []   # high-K minus low-K, mean contacts
-    endpoint_drg2 = []
+    endpoint_dm, endpoint_drg2 = [], []
     for prefix in prefixes:
         rows = _read_results(prefix)
         T = np.array([float(r["T"]) for r in rows])
@@ -206,145 +1000,231 @@ def analyze_trends(prefixes, info):
             y = np.array([float(r[o]) for r in rows])[order]
             rec[o] = {
                 "values": y.tolist(),
-                "spearman_vs_K": _spearman(K[order], y),
-                "slope_vs_K": float(np.polyfit(K[order], y, 1)[0]) if y.size >= 2 else float("nan"),
+                "spearman_vs_K": spearman(K[order], y),
+                "slope_vs_K": (float(np.polyfit(K[order], y, 1)[0])
+                               if y.size >= 2 else float("nan")),
                 "endpoint_high_minus_low": float(y[-1] - y[0]),
             }
         per_seed.append(rec)
         endpoint_dm.append(rec["C_mean"]["endpoint_high_minus_low"])
         endpoint_drg2.append(rec["Rg2_mean"]["endpoint_high_minus_low"])
 
-    def _boot(vals, n=2000, seed=0):
-        vals = np.asarray(vals, float)
-        if vals.size == 0:
-            return (float("nan"), float("nan"), float("nan"))
-        rng = np.random.RandomState(seed)
-        bs = vals[rng.randint(0, vals.size, size=(n, vals.size))].mean(axis=1)
-        return (float(vals.mean()), float(np.percentile(bs, 2.5)),
-                float(np.percentile(bs, 97.5)))
+    n_seeds = len(prefixes)
+    # -- genuine hierarchical (seed x block) bootstrap (Part 4) --------------
+    seed_data = [d for d in (_load_seed_trajectories(p, info) for p in prefixes)
+                 if d is not None]
+    hb = (hierarchical_bootstrap(seed_data, n_boot=n_boot, block_len=block_len)
+          if seed_data else None)
 
-    dm_mean, dm_lo, dm_hi = _boot(endpoint_dm)
-    drg2_mean, drg2_lo, drg2_hi = _boot(endpoint_drg2)
-    # PNIPAM expected signs: Δ<m> > 0 and Δ<Rg2> < 0 (high-K minus low-K).
-    signs_ok = (dm_mean > 0) and (drg2_mean < 0)
+    # Point estimates / directional signs from the aggregate endpoint deltas.
+    dm_point = float(np.mean(endpoint_dm)) if endpoint_dm else float("nan")
+    drg2_point = float(np.mean(endpoint_drg2)) if endpoint_drg2 else float("nan")
+    signs_ok = (dm_point > 0) and (drg2_point < 0)
+
+    # -- statistical support: NOT ASSESSABLE with < 2 independent seeds ------
+    if n_seeds < 2 or hb is None:
+        stat_supported = False
+        stat_status = "not_assessable"
+    else:
+        dm_ci = hb["delta_contacts"]["ci95"]
+        drg2_ci = hb["delta_rg2"]["ci95"]
+        support = (ci_excludes_zero(*dm_ci) and dm_ci[0] > 0
+                   and ci_excludes_zero(*drg2_ci) and drg2_ci[1] < 0)
+        stat_supported = bool(support)
+        stat_status = "supported" if support else "not_supported"
+
+    dm_arr = np.asarray(endpoint_dm, float)
+    spread = (float(np.std(dm_arr) / abs(np.mean(dm_arr)))
+              if dm_arr.size > 1 and abs(np.mean(dm_arr)) > 0 else 0.0)
     return {
         "per_seed": per_seed,
-        "endpoint_delta_m_highK_minus_lowK": {
-            "mean": dm_mean, "ci95": [dm_lo, dm_hi]},
-        "endpoint_delta_Rg2_highK_minus_lowK": {
-            "mean": drg2_mean, "ci95": [drg2_lo, drg2_hi]},
-        "pnipam_signs_consistent": bool(signs_ok),
-        "note": ("expected (LCST): Δ<m> > 0 and Δ<Rg2> < 0 from low-K to "
-                 "high-K; sign conflict => NOT consistent."),
+        "endpoint_delta_m_point": dm_point,
+        "endpoint_delta_Rg2_point": drg2_point,
+        "hierarchical_bootstrap": hb,
+        "seed_relative_spread_delta_m": spread,
+        "sampled_direction_is_LCST_compatible": bool(signs_ok),
+        "structural_change_is_statistically_supported": bool(stat_supported),
+        "statistical_support_status": stat_status,
+        "n_seeds": n_seeds,
+        "note": ("expected (LCST): Δ<m> > 0 and Δ<Rg2> < 0 from low-K to high-K; "
+                 "statistical support requires the HIERARCHICAL (seed x block) "
+                 "bootstrap CI95 to exclude 0 with the correct sign; with < 2 "
+                 "independent seeds support is 'not_assessable'."),
     }
 
 
-def _bhattacharyya(p, q):
-    p = np.asarray(p, float); q = np.asarray(q, float)
-    p = np.where(np.isfinite(p), p, 0.0); q = np.where(np.isfinite(q), q, 0.0)
-    sp, sq = p.sum(), q.sum()
-    if sp <= 0 or sq <= 0:
-        return 0.0
-    return float(np.sqrt((p / sp) * (q / sq)).sum())
+def _pad_pc(Pc, width):
+    """Pad a per-lane P(m) block (0-based integer contact grid) to ``width``."""
+    Pc = np.asarray(Pc, float)
+    if Pc.shape[1] >= width:
+        return Pc[:, :width]
+    out = np.zeros((Pc.shape[0], width), dtype=float)
+    out[:, :Pc.shape[1]] = Pc
+    return out
 
 
-def analyze_mixing(prefixes, info):
-    """tau_int_cycles / ESS / swap / coverage / round-trips / state-changing
-    acceptance / contact support / high-contact tail / adjacent overlap."""
-    seed_reports = []
+def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
+    """Mixing diagnostics with SEED-AGGREGATED overlap and tail support (Part 6).
+
+    Adjacent contact-histogram overlap is reported per seed and aggregated
+    (median, minimum, and pooled-COUNT overlap using actual sample counts);
+    ladder refinement and the overlap gate use the pooled/worst-seed values, so
+    they are invariant to seed ordering.  The high-contact tail pools raw contact
+    counts across all seeds and lanes with actual counts.
+    """
+    key_obs = ("contacts", "rg2", "m_global_scaled", "smax",
+               "largest_component_fraction")
     slowest_tau_cycles = 0.0
-    min_ess = float("inf")
+    min_ess = float("inf"); min_rt = float("inf"); min_cov = float("inf")
+    min_swap = float("inf"); max_swap = 0.0; max_drift = 0.0
+    min_state_changing = float("inf")
+    tau_by_lane = None
+
+    # First pass: find the common (widest) integer contact grid across seeds.
+    dists = []
+    c_width = 0
     for prefix in prefixes:
+        npz = np.load(f"{prefix}_distributions.npz")
+        Pc_raw = np.asarray(npz["Pc"], float)
+        dists.append(Pc_raw)
+        c_width = max(c_width, Pc_raw.shape[1])
+    c_vals_common = np.arange(c_width, dtype=float)
+
+    seed_reports = []
+    per_seed_Pc = []; per_seed_counts = []; per_seed_ess = []; per_seed_tau = []
+    per_seed_tail_raw = []
+    for si, prefix in enumerate(prefixes):
         diag = _read_diag(prefix)
         lanes = diag["lane_convergence"]
-        npz = np.load(f"{prefix}_distributions.npz")
-        Pc = npz["Pc"]; c_vals = npz["c_vals"]
+        Pc = _pad_pc(dists[si], c_width)
+        nT = Pc.shape[0]
+        lane_tau = np.full(nT, np.nan)
+        ess_lane = np.zeros(nT); n_lane = np.zeros(nT)
         per_lane = []
         for i, lane in enumerate(lanes):
             row = {"temperature": lane["temperature"]}
-            for o in ("contacts", "rg2", "m_global_scaled", "smax"):
+            for o in key_obs:
                 if o in lane:
-                    row[f"tau_int_cycles_{o}"] = lane[o].get("tau_int_cycles")
-                    row[f"ess_{o}"] = lane[o].get("ess")
                     tc = lane[o].get("tau_int_cycles")
+                    e = lane[o].get("ess")
+                    row[f"tau_int_cycles_{o}"] = tc
+                    row[f"ess_{o}"] = e
                     if tc and np.isfinite(tc):
                         slowest_tau_cycles = max(slowest_tau_cycles, float(tc))
-                    e = lane[o].get("ess")
+                        lane_tau[i] = np.nanmax([lane_tau[i], float(tc)])
                     if e and np.isfinite(e):
                         min_ess = min(min_ess, float(e))
-            # contact support + high-contact tail
-            pc = Pc[i] if i < Pc.shape[0] else np.array([])
-            support = int(np.count_nonzero(np.nan_to_num(pc) > 0))
-            tail = float(np.nan_to_num(pc)[c_vals >= np.nanpercentile(
-                c_vals, 90)].sum()) if pc.size else 0.0
-            row["contact_support_bins"] = support
-            row["high_contact_tail_prob"] = tail
+            c = lane.get("contacts", {})
+            if c.get("ess"):
+                ess_lane[i] = float(c["ess"])
+            if c.get("n_samples"):
+                n_lane[i] = float(c["n_samples"])
+            if "drift_in_std" in c and np.isfinite(c["drift_in_std"]):
+                max_drift = max(max_drift, abs(float(c["drift_in_std"])))
             per_lane.append(row)
-        # adjacent-lane histogram overlap (Bhattacharyya) matrix
-        nT = Pc.shape[0]
-        overlap = np.zeros((nT, nT))
-        for a in range(nT):
-            for b in range(nT):
-                overlap[a, b] = _bhattacharyya(Pc[a], Pc[b])
-        adj = [float(overlap[a, a + 1]) for a in range(nT - 1)]
+        tau_by_lane = lane_tau if tau_by_lane is None else np.fmax(tau_by_lane, lane_tau)
+        adj = [float(_bhattacharyya(Pc[a], Pc[a + 1])) for a in range(nT - 1)]
+        srates = diag["swap_rates"]
+        if srates:
+            min_swap = min(min_swap, min(srates)); max_swap = max(max_swap, max(srates))
+        min_cov = min(min_cov, diag["summary"].get("min_temp_coverage", 0) or 0)
+        min_rt = min(min_rt, diag["summary"].get("total_round_trips_low", 0) or 0)
+        summ = json.load(open(f"{prefix}_run_summary.json"))
+        scr = [float(x) for x in summ.get("state_changing_acceptance_rates", [])]
+        if scr:
+            min_state_changing = min(min_state_changing, min(scr))
+        # Per-seed tail (support boundary genuinely unavailable unless supplied).
+        tinfo = high_contact_tail(Pc, c_vals_common, ess_lane, n_lane, lane_tau,
+                                  support_maximum=support_maximum,
+                                  support_source=support_source)
+        per_seed_tail_raw.append(float(tinfo["raw_tail_count"]))
+        per_seed_Pc.append(Pc); per_seed_counts.append(n_lane)
+        per_seed_ess.append(ess_lane); per_seed_tau.append(lane_tau)
         seed_reports.append({
+            "seed_prefix": Path(prefix).name,
             "lanes": per_lane,
-            "swap_rates": diag["swap_rates"],
+            "swap_rates": srates,
             "min_temp_coverage": diag["summary"].get("min_temp_coverage"),
             "total_round_trips_low": diag["summary"].get("total_round_trips_low"),
             "adjacent_overlap_bhattacharyya": adj,
-            "overlap_matrix": overlap.tolist(),
-            "state_changing_acceptance_rates": [
-                float(x) for x in json.load(open(f"{prefix}_run_summary.json"))
-                .get("state_changing_acceptance_rates", [])],
+            "state_changing_acceptance_rates": scr,
+            "high_contact_tail": tinfo,
         })
+
+    # -- seed-aggregated adjacent overlap (median/min/pooled-count) ----------
+    S = len(prefixes)
+    counts = np.array(per_seed_counts)            # (S, nT)
+    Pc_stack = np.nan_to_num(np.array(per_seed_Pc))   # (S, nT, width)
+    pooled_count = (Pc_stack * counts[:, :, None]).sum(axis=0)   # (nT, width)
+    nT = pooled_count.shape[0]
+    adjacent_aggregate = []
+    for a in range(nT - 1):
+        ov = [float(_bhattacharyya(per_seed_Pc[s][a], per_seed_Pc[s][a + 1]))
+              for s in range(S)]
+        adjacent_aggregate.append({
+            "gap_index": a,
+            "overlap_per_seed": ov,
+            "median_overlap": float(np.median(ov)) if ov else float("nan"),
+            "minimum_overlap": float(np.min(ov)) if ov else float("nan"),
+            "pooled_count_overlap": float(_bhattacharyya(
+                pooled_count[a], pooled_count[a + 1])),
+        })
+    pooled_adjacent = [d["pooled_count_overlap"] for d in adjacent_aggregate]
+    worst_seed_adjacent = [d["minimum_overlap"] for d in adjacent_aggregate]
+    min_adj_overlap = (min(pooled_adjacent) if pooled_adjacent else float("inf"))
+
+    # -- pooled high-contact tail (actual counts across seeds and lanes) ------
+    pooled_prob = pooled_count / np.maximum(
+        pooled_count.sum(axis=1, keepdims=True), 1e-30)
+    pooled_ess = np.array(per_seed_ess).sum(axis=0)
+    pooled_n = counts.sum(axis=0)
+    pooled_tau = np.nanmax(np.array(per_seed_tau), axis=0)
+    tail_pooled = high_contact_tail(pooled_prob, c_vals_common, pooled_ess,
+                                    pooled_n, pooled_tau,
+                                    support_maximum=support_maximum,
+                                    support_source=support_source)
+    tail_pooled["raw_tail_count_per_seed"] = per_seed_tail_raw
+    tail_pooled["raw_tail_count_pooled"] = float(np.sum(per_seed_tail_raw))
+    tail_pooled["per_seed_tail_count"] = per_seed_tail_raw
+    tail_pooled["maximum_observed_m_per_seed"] = [
+        float(r["high_contact_tail"]["maximum_observed_m"]) for r in seed_reports]
+    tail_pooled["maximum_observed_m_pooled"] = (
+        float(max(tail_pooled["maximum_observed_m_per_seed"]))
+        if tail_pooled["maximum_observed_m_per_seed"] else float("nan"))
+
+    metrics = {
+        "min_ess": (None if min_ess == float("inf") else min_ess),
+        "min_round_trips": (None if min_rt == float("inf") else min_rt),
+        "min_temp_coverage": (None if min_cov == float("inf") else min_cov),
+        "min_adjacent_overlap": (None if min_adj_overlap == float("inf") else min_adj_overlap),
+        "min_swap_rate": (None if min_swap == float("inf") else min_swap),
+        "max_swap_rate": max_swap,
+        "max_drift_in_std": max_drift,
+        "min_state_changing_acceptance": (
+            None if min_state_changing == float("inf") else min_state_changing),
+        "tail_probability": float(tail_pooled["tail_probability"]),
+    }
     return {"seeds": seed_reports,
             "slowest_tau_int_cycles": slowest_tau_cycles,
-            "min_ess_observed": (None if min_ess == float("inf") else min_ess)}
+            "tau_by_lane": [None if not np.isfinite(x) else float(x)
+                            for x in (tau_by_lane if tau_by_lane is not None else [])],
+            "adjacent_overlap_aggregate": adjacent_aggregate,
+            "pooled_adjacent_overlap": pooled_adjacent,
+            "worst_seed_adjacent_overlap": worst_seed_adjacent,
+            "high_contact_tail_pooled": tail_pooled,
+            "metrics": metrics}
 
 
 # ---------------------------------------------------------------------------
-# Production recommendation (D6)
+# Driver (Phase 11 immutability + gate exit)
 # ---------------------------------------------------------------------------
 
-def recommend_production(mixing, n_temperatures, n_seeds, structural_stride,
-                         snapshot_stride):
-    tau = mixing["slowest_tau_int_cycles"] or 1.0
-    # cycles between effectively independent structural samples ~ 2*tau.
-    cycles_per_indep = max(1.0, 2.0 * tau)
-    # We need TARGET per regime (~3 regimes) per N; spread across seeds.
-    target_total = TARGET_EFF_PER_REGIME * 3
-    indep_per_seed = target_total / max(1, n_seeds)
-    production_cycles = int(np.ceil(indep_per_seed * cycles_per_indep
-                                    / max(1, n_temperatures)))
-    burnin_cycles = int(np.ceil(10 * tau))
-    snapshots = int(np.ceil(production_cycles / max(1, snapshot_stride)))
-    return {
-        "rationale": ("independent structural samples are estimated from "
-                      "2*tau_int_cycles (NOT raw snapshot counts)"),
-        "slowest_tau_int_cycles": float(tau),
-        "cycles_per_independent_sample": float(cycles_per_indep),
-        "target_effective_per_regime": TARGET_EFF_PER_REGIME,
-        "recommended_steps_per_swap": 60,
-        "recommended_n_temperatures": int(max(n_temperatures, 16)),
-        "recommended_structural_stride": int(structural_stride),
-        "recommended_snapshot_stride": int(snapshot_stride),
-        "recommended_burnin_cycles": burnin_cycles,
-        "recommended_production_cycles": production_cycles,
-        "expected_raw_snapshots_per_seed": snapshots,
-        "expected_effective_independent_per_seed": int(
-            production_cycles * n_temperatures / cycles_per_indep),
-        "storage_estimate_note": ("coords int16 gzip ~ "
-                                  "n_temperatures*n_beads*3*2 bytes/snapshot"),
-        "target_feasible_estimate": bool(
-            production_cycles * n_seeds * n_temperatures / cycles_per_indep
-            >= target_total),
-    }
+def _regime_lane_map(labels):
+    m = {r: [] for r in REGIME_NAMES}
+    for i, lab in enumerate(labels):
+        m.setdefault(lab, []).append(i)
+    return {r: m.get(r, []) for r in REGIME_NAMES}
 
-
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -355,111 +1235,317 @@ def main():
     ap.add_argument("--n-temperatures", type=int, default=8)
     ap.add_argument("--n-cycles", type=int, default=400)
     ap.add_argument("--steps-per-swap", type=int, default=60)
+    ap.add_argument("--structural-stride", type=int, default=5)
+    ap.add_argument("--snapshot-stride", type=int, default=5)
     ap.add_argument("--t-min", type=float, default=None)
     ap.add_argument("--t-max", type=float, default=None)
     ap.add_argument("--branch", choices=["auto", "low", "high"], default="auto")
+    ap.add_argument("--physical-branch", type=int, default=None)
+    ap.add_argument("--min-dT", type=float, default=0.25)
+    ap.add_argument("--min-dK", type=float, default=1e-4)
+    ap.add_argument("--allow-n-mismatch", action="store_true")
+    ap.add_argument("--allow-decreasing-k", action="store_true",
+                    help="DIAGNOSTIC override: permit a scientific run on a branch "
+                         "where K decreases with T (recorded in the manifest)")
+    ap.add_argument("--allow-failed-calibration", action="store_true")
+    ap.add_argument("--smoke-test", action="store_true",
+                    help="tiny software check; never scientifically validated")
+    ap.add_argument("--run-id", default=None)
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument("--output-dir", default=None)
     args = ap.parse_args()
 
-    out_dir = Path(args.output_dir) if args.output_dir else (
-        HERE / f"calibration_N{args.N}")
+    # Phase 11.3: JSON definitions and compatibility constants must agree.
+    sch.check_definitions_consistency()
+
+    seeds = args.seeds
+    if args.smoke_test:
+        seeds = args.seeds[:1] or [1]
+
+    # -- immutable run directory (Phase 11) ---------------------------------
+    run_id = args.run_id or _dt.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    base = Path(args.output_dir) if args.output_dir else (HERE / f"calibration_N{args.N}")
+    out_dir = base / run_id
+    if out_dir.exists() and not (args.overwrite or args.resume):
+        raise SystemExit(
+            f"run directory {out_dir} exists; pass --overwrite or --resume, or "
+            f"choose a new --run-id (outputs are immutable by default).")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    info, (T_lo, T_hi) = load_fitted_model(args.fit_summary_json,
-                                           args.t_min, args.t_max)
-    kinfo = analyze_K(info, T_lo, T_hi)
+    info, (T_lo, T_hi), nmeta = load_fitted_model(
+        args.fit_summary_json, args.t_min, args.t_max, args.N,
+        allow_n_mismatch=args.allow_n_mismatch)
+
+    # preserve inputs by copying + hashing
+    fit_copy = out_dir / "input_fit_summary.json"
+    if not fit_copy.exists():
+        shutil.copy(args.fit_summary_json, fit_copy)
+    defs_copy = out_dir / "project_definitions.json"
+    if not defs_copy.exists():
+        shutil.copy(str(sch.RESOLVED_DEFINITIONS_PATH), defs_copy)
+
+    kinfo = evaluate_K_grid(info, T_lo, T_hi)
+    branch = select_branch(kinfo, args.branch, args.physical_branch)
+    # Part 9: T-ordered inversion; recompute K by calling the ACTUAL fitted model.
+    ladder_info = build_k_ladder(
+        branch["Ts"], branch["K"], args.n_temperatures,
+        min_dT=args.min_dT, min_dK=args.min_dK,
+        k_of_T=lambda t: _K_of(info, t))
+    ladder = ladder_info["temperatures"]
+    K_ladder = [float(_K_of(info, t)) for t in ladder]
+
+    # Part 9.2: a scientific PNIPAM run refuses a decreasing-K branch (unless an
+    # explicit diagnostic override is recorded) and a ladder that cannot meet the
+    # spacing/count constraints.
+    branch_decreasing = (branch["K_direction"] == "decreasing")
+    decreasing_override_used = bool(branch_decreasing and args.allow_decreasing_k)
+    if not args.smoke_test:
+        if branch_decreasing and not args.allow_decreasing_k:
+            raise SystemExit(
+                "selected branch has K DECREASING with T (not PNIPAM-LCST "
+                "compatible); pass --allow-decreasing-k to override (recorded), "
+                "or choose the other --branch.")
+        if not ladder_info["spacing_ok"]:
+            raise SystemExit(
+                "K ladder cannot satisfy the spacing/count constraints: "
+                f"{ladder_info['recommendation']} (reduce --n-temperatures or "
+                f"relax --min-dT/--min-dK).")
+
+    commands = []
+    manifest = {
+        "calibration_report_schema_version": CALIBRATION_REPORT_SCHEMA_VERSION,
+        "run_id": run_id, "status": "running",
+        "created": _dt.datetime.now().isoformat(),
+        "model": info["model_name"], "params": info["params"], "N": args.N,
+        "requested_seeds": args.seeds, "effective_seeds": seeds,
+        "smoke_test": bool(args.smoke_test),
+        "fitted_temperature_interval": [T_lo, T_hi],
+        "chain_length_check": nmeta,
+        "branch_selection": {k: v for k, v in branch.items() if k not in ("Ts", "K")},
+        "branch_decreasing_override_used": decreasing_override_used,
+        "ladder": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                   for k, v in ladder_info.items()},
+        "K_ladder": K_ladder,
+        "input_fit_summary_sha256": _sha256(args.fit_summary_json),
+        "project_definitions_sha256": _sha256(str(sch.RESOLVED_DEFINITIONS_PATH)),
+        "project_definitions_path": str(sch.RESOLVED_DEFINITIONS_PATH),
+        "commands": commands,
+    }
+    (out_dir / "run_manifest.json").write_text(
+        json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
+
+    print(f"Run dir: {out_dir}")
     print(f"Model {info['model_name']} on [{T_lo:.2f}, {T_hi:.2f}]: "
           f"K_increases_with_T={kinfo['K_increases_with_T']} "
-          f"monotonic={kinfo['monotonic']} zero_crossing={kinfo['zero_crossing_T']}")
-
-    ladder, branch_note = build_K_ladder(kinfo, args.n_temperatures, args.branch)
-    if ladder.size < 2:
-        raise SystemExit("could not build a >=2-point K ladder")
-    K_ladder = [float(_K_of(info, t)) for t in ladder]
+          f"branch={branch['branch_index']}/{branch['n_branches']} "
+          f"dir={branch['K_direction']} zero_crossing={kinfo['zero_crossing_T']}")
     print(f"Ladder ({ladder.size}): T={[round(float(t),1) for t in ladder]}")
     print(f"K ladder: {[round(k,4) for k in K_ladder]}")
 
-    prefixes = [run_seed(out_dir, args.N, s, ladder, args.fit_summary_json,
-                         args.n_cycles, args.steps_per_swap)
-                for s in args.seeds]
-    prefixes = [str(p) for p in prefixes]
+    status = "complete"
+    try:
+        prefixes = [run_seed(out_dir, args.N, s, ladder, args.fit_summary_json,
+                             args.n_cycles, args.steps_per_swap,
+                             args.structural_stride, args.snapshot_stride,
+                             resume=args.resume, commands=commands)
+                    for s in seeds]
+    except Exception:
+        manifest["status"] = "failed"
+        (out_dir / "run_manifest.json").write_text(
+            json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
+        raise
 
     trends = analyze_trends(prefixes, info)
     mixing = analyze_mixing(prefixes, info)
-    recommendation = recommend_production(
-        mixing, ladder.size, len(args.seeds), 5, 5)
 
-    pnipam_consistent = bool(kinfo["K_increases_with_T"]
-                             and trends["pnipam_signs_consistent"])
+    # -- regime classification from SEED-AGGREGATED lane observables (Part 5) --
+    agg = aggregate_lane_observables(prefixes, info, args.N)
+    a = agg["aggregate"]
+    regimes = classify_regimes(
+        agg["K"], a["m"], a["rg2"], a["global_frac"], a["smax_over_N"],
+        agg["within_lane_std"], DEFAULT_GATE_THRESHOLDS["min_regime_effect_size"])
+    # per-seed labels + stability (unstable lanes disagree with the aggregate)
+    per_seed_labels = []
+    for s in range(agg["n_seeds"]):
+        ps = agg["per_seed"]
+        lab = classify_regimes(
+            agg["K"], ps["m"][s], ps["rg2"][s], ps["global_frac"][s],
+            ps["smax"][s] / max(1, args.N), agg["within_lane_std"],
+            DEFAULT_GATE_THRESHOLDS["min_regime_effect_size"])["labels"]
+        per_seed_labels.append(lab)
+    agree = []
+    unstable_lanes = []
+    for k in range(agg["n_temperatures"]):
+        votes = [per_seed_labels[s][k] for s in range(agg["n_seeds"])]
+        frac = (sum(1 for v in votes if v == regimes["labels"][k]) / len(votes)
+                if votes else 0.0)
+        agree.append(frac)
+        if frac < 1.0:
+            unstable_lanes.append(k)
+    regimes["seed_stability"] = {
+        "per_seed_labels": per_seed_labels,
+        "fraction_agreeing_with_aggregate": agree,
+        "unstable_lanes": unstable_lanes,
+        "between_seed_std": {k: [float(x) for x in v]
+                             for k, v in agg["between_seed_std"].items()},
+    }
+    regime_map = _regime_lane_map(regimes["labels"])
+
+    production = production_requirement(
+        regime_map, mixing["tau_by_lane"], post_burnin_frac=0.5,
+        snapshot_stride=args.snapshot_stride, n_seeds=len(seeds))
+
+    metrics = dict(mixing["metrics"])
+    metrics["seed_relative_spread"] = trends["seed_relative_spread_delta_m"]
+    metrics = {k: (0.0 if v is None else v) for k, v in metrics.items()}
+    gates = evaluate_sampling_gates(metrics)
+
+    model_K_ok = bool(branch["K_increases_with_T"])
+    sampled_ok = trends["sampled_direction_is_LCST_compatible"]
+    stat_ok = trends["structural_change_is_statistically_supported"]
+    stat_status = trends["statistical_support_status"]
+    distinct_ok = regimes["distinct_regimes_resolved"]
+    sampling_ok = gates["_all_passed"]
+    enough_seeds = len(seeds) >= 2
+    run_mode = "smoke" if args.smoke_test else "scientific"
+
+    calibration_gate_passed = bool(
+        model_K_ok and sampled_ok and stat_ok and distinct_ok
+        and sampling_ok and enough_seeds and not args.smoke_test)
+
+    # Part 3: scientifically_validated is the gate result, NOT merely "not smoke".
     report = {
         "calibration_report_schema_version": CALIBRATION_REPORT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "run_mode": run_mode,
+        "scientific_run_attempted": bool(not args.smoke_test),
+        "allow_failed_calibration_used": bool(args.allow_failed_calibration),
+        "scientifically_validated": bool(calibration_gate_passed),
+        "smoke_test": bool(args.smoke_test),
         "model": info["model_name"], "params": info["params"],
-        "N": args.N, "seeds": args.seeds,
+        "N": args.N, "seeds": seeds,
         "fitted_temperature_interval": [T_lo, T_hi],
-        "branch_note": branch_note,
+        "chain_length_check": nmeta,
+        "branch_selection": {k: v for k, v in branch.items() if k not in ("Ts", "K")},
+        "branch_decreasing_override_used": decreasing_override_used,
         "K_analysis": {
             "K_increases_with_T": kinfo["K_increases_with_T"],
             "monotonic": kinfo["monotonic"],
             "zero_crossing_T": kinfo["zero_crossing_T"],
-            "T_grid_endpoints": [float(kinfo["T"][0]), float(kinfo["T"][-1])],
-            "K_grid_endpoints": [float(kinfo["K"][0]), float(kinfo["K"][-1])],
         },
-        "temperature_ladder": [float(t) for t in ladder],
+        "ladder": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                   for k, v in ladder_info.items()},
         "K_ladder": K_ladder,
         "trends": trends,
+        "regimes": regimes,
         "mixing": mixing,
-        "recommended_production": recommendation,
-        "pnipam_lcst_assessment": {
-            "K_increases_with_T": kinfo["K_increases_with_T"],
-            "m_increases_with_K": trends["endpoint_delta_m_highK_minus_lowK"]["mean"] > 0,
-            "Rg2_decreases_with_K": trends["endpoint_delta_Rg2_highK_minus_lowK"]["mean"] < 0,
-            "consistent_with_PNIPAM_LCST": pnipam_consistent,
-            "ladder_spans_distinct_states": bool(
-                trends["pnipam_signs_consistent"]),
-            "sampling_mixing_adequate": bool(
-                (mixing["min_ess_observed"] or 0) >= 20),
+        "sampling_gates": gates,
+        "recommended_production": production,
+        "scientific_conclusions": {
+            "model_K_direction_is_LCST_compatible": model_K_ok,
+            "sampled_direction_is_LCST_compatible": sampled_ok,
+            "structural_change_is_statistically_supported": stat_ok,
+            "statistical_support_status": stat_status,
+            "distinct_regimes_are_resolved": distinct_ok,
+            "sampling_is_adequate": sampling_ok,
+            "enough_seeds_for_calibration": enough_seeds,
+            "calibration_gate_passed": calibration_gate_passed,
         },
     }
+    # Part 6: ladder refinement from the POOLED (seed-order-invariant) overlap.
+    report["ladder_refinement"] = refine_ladder(
+        ladder, mixing["pooled_adjacent_overlap"])
+
+    manifest["status"] = status
+    manifest["commands"] = commands
+    (out_dir / "run_manifest.json").write_text(
+        json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
     (out_dir / "calibration_report.json").write_text(
         json.dumps(sch.json_safe(report), indent=2), encoding="utf-8")
     (out_dir / "recommended_production_config.json").write_text(
-        json.dumps(sch.json_safe(recommendation), indent=2), encoding="utf-8")
+        json.dumps(sch.json_safe(production), indent=2), encoding="utf-8")
     _write_report_md(out_dir / "calibration_report.md", report)
-    print(f"\nPNIPAM LCST consistent: {pnipam_consistent}")
+
+    print(f"\nrun_mode: {run_mode}  "
+          f"scientifically_validated: {report['scientifically_validated']}")
+    print(f"calibration_gate_passed: {calibration_gate_passed}  "
+          f"statistical_support: {stat_status}")
+    for name, gr in gates.items():
+        if name.startswith("_"):
+            continue
+        if "minimum_value" in gr:      # band gate
+            print(f"  gate {name}: passed={gr['passed']} "
+                  f"min={gr['minimum_value']}/{gr['minimum_threshold']} "
+                  f"max={gr['maximum_value']}/{gr['maximum_threshold']}")
+        else:
+            print(f"  gate {name}: passed={gr['passed']} "
+                  f"value={gr['value']} thr={gr['threshold']}")
     print(f"Reports in {out_dir}")
-    if not kinfo["K_increases_with_T"]:
-        print("WARNING: fitted K(T) does NOT increase with T over this interval "
-              "-> NOT a standard PNIPAM LCST direction. Check the model/interval.")
-    if not trends["pnipam_signs_consistent"]:
-        print("WARNING: structural endpoint signs conflict with PNIPAM "
-              "expectation (Δ<m> and Δ<Rg2>); calibration NOT successful.")
+
+    if args.smoke_test:
+        print("SMOKE TEST: software check only; NOT scientifically validated.")
+        return
+    if not calibration_gate_passed and not args.allow_failed_calibration:
+        raise SystemExit(
+            "SCIENTIFIC CALIBRATION GATE FAILED (see calibration_report.json). "
+            "Pass --allow-failed-calibration to exit 0 anyway.")
 
 
 def _write_report_md(path, report):
-    a = report["pnipam_lcst_assessment"]
+    c = report["scientific_conclusions"]
+    prod = report["recommended_production"]
     lines = [
         f"# PNIPAM calibration report — N={report['N']} ({report['model']})",
         "",
+        f"- run_id: {report['run_id']}",
+        f"- scientifically validated: **{report['scientifically_validated']}**",
         f"- fitted interval: {report['fitted_temperature_interval']}",
-        f"- K increases with T: **{a['K_increases_with_T']}**",
-        f"- <m> increases with K: **{a['m_increases_with_K']}**",
-        f"- <Rg^2> decreases with K: **{a['Rg2_decreases_with_K']}**",
-        f"- consistent with PNIPAM LCST: **{a['consistent_with_PNIPAM_LCST']}**",
-        f"- ladder spans distinct states: **{a['ladder_spans_distinct_states']}**",
-        f"- sampling/mixing adequate: **{a['sampling_mixing_adequate']}**",
+        f"- branch: {report['branch_selection']}",
+        "",
+        "## Scientific conclusions (separate claims)",
+    ] + [f"- {k}: **{v}**" for k, v in c.items()] + [
+        "",
+        f"- statistical support status: **{report['trends']['statistical_support_status']}**",
         "",
         "## Endpoint effect sizes (high-K minus low-K)",
-        f"- Δ<m> = {report['trends']['endpoint_delta_m_highK_minus_lowK']}",
-        f"- Δ<Rg^2> = {report['trends']['endpoint_delta_Rg2_highK_minus_lowK']}",
+        f"- Δ<m> (point) = {report['trends']['endpoint_delta_m_point']}",
+        f"- Δ<Rg^2> (point) = {report['trends']['endpoint_delta_Rg2_point']}",
+        f"- hierarchical bootstrap: {_hb_summary(report['trends']['hierarchical_bootstrap'])}",
+        "",
+        "## Regimes",
+        f"- labels: {report['regimes']['labels']}",
+        f"- rule: {report['regimes']['rule']}",
+        "",
+        "## Sampling gates",
+    ] + [f"- {k}: passed={v['passed']} " + _gate_md(v)
+         for k, v in report["sampling_gates"].items() if not k.startswith("_")] + [
         "",
         "## Recommended production (NOT launched)",
-        f"- slowest tau_int_cycles: {report['recommended_production']['slowest_tau_int_cycles']}",
-        f"- recommended production cycles: {report['recommended_production']['recommended_production_cycles']}",
-        f"- target feasible: {report['recommended_production']['target_feasible_estimate']}",
+        f"- recommended cycles/seed: {prod['recommended_production_cycles_per_seed']}",
+        f"- limiting regime: {prod['limiting_regime']}",
+        f"- every regime reaches target: {prod['every_regime_reaches_target']}",
         "",
-        "_Independent-sample counts are from 2*tau_int_cycles, not raw snapshots._",
+        "_Effective saved configs use Delta_eff = max(snapshot_stride, "
+        "2*tau_int_cycles), not raw snapshots._",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _gate_md(v):
+    if "minimum_value" in v:
+        return (f"min={v['minimum_value']}/{v['minimum_threshold']} "
+                f"max={v['maximum_value']}/{v['maximum_threshold']}")
+    return f"value={v['value']} thr={v['threshold']}"
+
+
+def _hb_summary(hb):
+    if not hb:
+        return "not available"
+    dm = hb["delta_contacts"]; dr = hb["delta_rg2"]
+    return (f"Δ<m> CI95={dm['ci95']}, Δ<Rg^2> CI95={dr['ci95']} "
+            f"(n_seeds={dm['n_seeds']}, blocks L={dm['block_length']}, "
+            f"reps={dm['n_bootstrap_replicates']})")
 
 
 if __name__ == "__main__":

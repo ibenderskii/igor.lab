@@ -7,556 +7,672 @@
     "snapshot_index",
     "temperature_index"
   ],
+  "provenance_metadata_fields": [
+    "definitions_version",
+    "code_definitions_version",
+    "project_definitions_path",
+    "primary_key"
+  ],
   "fields": [
     {
       "name": "run_id",
       "dtype": "string",
       "units": "none",
-      "definition": "run identifier",
-      "source": "metadata",
+      "mathematical_definition": "run identifier string",
+      "source_representation": "run metadata",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "constant within a run"
     },
     {
       "name": "seed",
       "dtype": "int64",
       "units": "none",
-      "definition": "RNG seed",
-      "source": "metadata",
+      "mathematical_definition": "master RNG seed",
+      "source_representation": "run metadata",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "constant within a run"
     },
     {
       "name": "snapshot_index",
       "dtype": "int64",
       "units": "none",
-      "definition": "committed snapshot row index",
-      "source": "index",
+      "mathematical_definition": "committed snapshot row index in the input file",
+      "source_representation": "sample index",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "0 <= snapshot_index < committed_rows; rows sorted ascending"
     },
     {
       "name": "cycle",
       "dtype": "int64",
       "units": "cycles",
-      "definition": "originating REMD cycle",
-      "source": "index",
+      "mathematical_definition": "originating REMD cycle number",
+      "source_representation": "sample index",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "strictly increasing across distinct snapshots"
     },
     {
       "name": "temperature_index",
       "dtype": "int64",
       "units": "none",
-      "definition": "lane index",
-      "source": "index",
+      "mathematical_definition": "temperature-lane index k",
+      "source_representation": "sample index",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "0 <= k < n_temperatures"
     },
     {
       "name": "temperature",
       "dtype": "float64",
       "units": "K",
-      "definition": "lane temperature",
-      "source": "metadata",
+      "mathematical_definition": "lane temperature T_k",
+      "source_representation": "run metadata (ladder)",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "constant for a given temperature_index"
     },
     {
       "name": "walker_id",
       "dtype": "int64",
       "units": "none",
-      "definition": "walker occupying the lane",
-      "source": "index",
+      "mathematical_definition": "walker occupying the lane at this snapshot",
+      "source_representation": "sample index",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "permutation of 0..nT-1 per snapshot"
     },
     {
       "name": "n_beads",
       "dtype": "int64",
       "units": "beads",
-      "definition": "chain length N",
-      "source": "config",
+      "mathematical_definition": "chain length N",
+      "source_representation": "config",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== file n_beads"
     },
     {
       "name": "n_steps",
       "dtype": "int64",
       "units": "bonds",
-      "definition": "N-1",
-      "source": "config",
+      "mathematical_definition": "N - 1",
+      "source_representation": "config",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== n_beads - 1"
     },
     {
       "name": "m",
       "dtype": "int64",
       "units": "contacts",
-      "definition": "total nonbonded contacts",
-      "source": "contact_map",
+      "mathematical_definition": "m = #{(i,j): j-i>1, |r_i-r_j|=1}",
+      "source_representation": "contact_map",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== len(row contact pairs) == sum_r m_r"
     },
     {
       "name": "Rg2_lattice",
       "dtype": "float64",
       "units": "lattice^2",
-      "definition": "radius of gyration squared",
-      "source": "geometry",
+      "mathematical_definition": "R_g^2 = (1/N) sum_i |r_i - r_cm|^2",
+      "source_representation": "geometry",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== stored rg2_lattice within tol"
     },
     {
       "name": "Ree2_lattice",
       "dtype": "float64",
       "units": "lattice^2",
-      "definition": "end-to-end distance squared",
-      "source": "geometry",
+      "mathematical_definition": "R_ee^2 = |r_{N-1} - r_0|^2",
+      "source_representation": "geometry",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== stored ree2_lattice within tol"
     },
     {
       "name": "asphericity",
       "dtype": "float64",
       "units": "lattice^2",
-      "definition": "lam3-0.5(lam1+lam2)",
-      "source": "geometry",
+      "mathematical_definition": "lam3 - 0.5 (lam1 + lam2)",
+      "source_representation": "gyration tensor",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "lam ascending eigenvalues; >= 0"
     },
     {
       "name": "gyration_lambda_1",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "gyration lambda 1",
-      "source": "contact_map/graph",
+      "units": "lattice^2",
+      "mathematical_definition": "smallest gyration-tensor eigenvalue",
+      "source_representation": "gyration tensor",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "lam1 <= lam2 <= lam3"
     },
     {
       "name": "gyration_lambda_2",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "gyration lambda 2",
-      "source": "contact_map/graph",
+      "units": "lattice^2",
+      "mathematical_definition": "middle gyration-tensor eigenvalue",
+      "source_representation": "gyration tensor",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "lam1 <= lam2 <= lam3"
     },
     {
       "name": "gyration_lambda_3",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "gyration lambda 3",
-      "source": "contact_map/graph",
+      "units": "lattice^2",
+      "mathematical_definition": "largest gyration-tensor eigenvalue",
+      "source_representation": "gyration tensor",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "lam1+lam2+lam3 == Rg2 within tol"
     },
     {
       "name": "mean_contact_separation",
       "dtype": "float64",
       "units": "beads",
-      "definition": "mean r among contacts",
-      "source": "contact_map",
+      "mathematical_definition": "mean r = j-i over contacts",
+      "source_representation": "contact_map",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "None when m == 0"
     },
     {
       "name": "max_contact_separation",
       "dtype": "float64",
       "units": "beads",
-      "definition": "max r among contacts",
-      "source": "contact_map",
+      "mathematical_definition": "max r = j-i over contacts",
+      "source_representation": "contact_map",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "None when m == 0"
     },
     {
       "name": "m_short_fixed",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "m short fixed",
-      "source": "contact_map/graph",
+      "units": "contacts",
+      "mathematical_definition": "#contacts with short_min<=r<=short_max",
+      "source_representation": "m_r + fixed bins",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "m_short+m_medium+m_long == m"
     },
     {
       "name": "m_medium_fixed",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "m medium fixed",
-      "source": "contact_map/graph",
+      "units": "contacts",
+      "mathematical_definition": "#contacts with medium_min<=r<long_threshold",
+      "source_representation": "m_r + fixed bins",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of fixed partition"
     },
     {
       "name": "m_long_fixed",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "m long fixed",
-      "source": "contact_map/graph",
+      "units": "contacts",
+      "mathematical_definition": "#contacts with r>=long_threshold",
+      "source_representation": "m_r + fixed bins",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of fixed partition"
     },
     {
       "name": "m_local_scaled",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "m local scaled",
-      "source": "contact_map/graph",
+      "units": "contacts",
+      "mathematical_definition": "#contacts with r/N<=local_max_ratio",
+      "source_representation": "m_r + scaled bins",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "m_local+m_meso+m_global == m"
     },
     {
       "name": "m_mesoscopic_scaled",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "m mesoscopic scaled",
-      "source": "contact_map/graph",
+      "units": "contacts",
+      "mathematical_definition": "#contacts with local_max_ratio<r/N<meso_max_ratio",
+      "source_representation": "m_r + scaled bins",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of scaled partition"
     },
     {
       "name": "m_global_scaled",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "m global scaled",
-      "source": "contact_map/graph",
+      "units": "contacts",
+      "mathematical_definition": "#contacts with r/N>=meso_max_ratio",
+      "source_representation": "m_r + scaled bins",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of scaled partition"
     },
     {
       "name": "pair_shared_endpoint",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "pair shared endpoint",
-      "source": "contact_map/graph",
+      "units": "pairs",
+      "mathematical_definition": "#contact-pairs sharing >=1 bead index",
+      "source_representation": "contact_pairs",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "sum of 4 classes == C(m,2)"
     },
     {
       "name": "pair_disjoint",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "pair disjoint",
-      "source": "contact_map/graph",
+      "units": "pairs",
+      "mathematical_definition": "#contact-pairs i<j<k<l (or swapped)",
+      "source_representation": "contact_pairs",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of C(m,2) partition"
     },
     {
       "name": "pair_nested",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "pair nested",
-      "source": "contact_map/graph",
+      "units": "pairs",
+      "mathematical_definition": "#contact-pairs i<k<l<j (or swapped)",
+      "source_representation": "contact_pairs",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of C(m,2) partition"
     },
     {
       "name": "pair_interleaved",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "pair interleaved",
-      "source": "contact_map/graph",
+      "units": "pairs",
+      "mathematical_definition": "#contact-pairs i<k<j<l (or swapped)",
+      "source_representation": "contact_pairs",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "part of C(m,2) partition"
     },
     {
       "name": "pair_total",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "pair total",
-      "source": "contact_map/graph",
+      "units": "pairs",
+      "mathematical_definition": "C(m,2) total contact-pair count",
+      "source_representation": "contact_pairs",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== m(m-1)/2 == sum of 4 motif classes"
     },
     {
       "name": "contact_vertices",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "contact vertices",
-      "source": "contact_map/graph",
+      "units": "vertices",
+      "mathematical_definition": "#bead indices in >=1 nonbonded contact",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "V of contact graph"
     },
     {
       "name": "contact_graph_components",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "contact graph components",
-      "source": "contact_map/graph",
+      "units": "components",
+      "mathematical_definition": "#connected components (contacts)",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "C of contact graph"
     },
     {
       "name": "contact_graph_edges",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "contact graph edges",
-      "source": "contact_map/graph",
+      "units": "edges",
+      "mathematical_definition": "#contact edges",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== m"
     },
     {
       "name": "sum_component_edges",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "sum component edges",
-      "source": "contact_map/graph",
+      "units": "edges",
+      "mathematical_definition": "sum of per-component edge counts",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== m"
     },
     {
       "name": "largest_component_vertices",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "largest component vertices",
-      "source": "contact_map/graph",
+      "units": "vertices",
+      "mathematical_definition": "S_max: vertices in largest component",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "tie-break by smallest min vertex index"
     },
     {
       "name": "largest_component_edges",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "largest component edges",
-      "source": "contact_map/graph",
+      "units": "edges",
+      "mathematical_definition": "edges in the largest component",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "<= m"
     },
     {
       "name": "largest_component_fraction_of_N",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "largest component fraction of N",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "S_max / N",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "in [0,1]"
     },
     {
       "name": "largest_component_fraction_of_contact_vertices",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "largest component fraction of contact vertices",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "S_max / contact_vertices",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "in [0,1]; 0 when no contacts"
     },
     {
       "name": "mean_degree_nonisolated",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "mean degree nonisolated",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "mean degree over contact vertices",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": ">= 0"
     },
     {
       "name": "degree_variance_nonisolated",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "degree variance nonisolated",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "degree variance over contact vertices",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": ">= 0"
     },
     {
       "name": "contact_graph_cycle_rank",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "contact graph cycle rank",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "E - V + C",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "== m - contact_vertices + components"
     },
     {
       "name": "number_of_multiedge_components",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "number of multiedge components",
-      "source": "contact_map/graph",
+      "units": "components",
+      "mathematical_definition": "#components with >=2 edges",
+      "source_representation": "contact graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": ">= 0"
     },
     {
       "name": "augmented_graph_vertices",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "augmented graph vertices",
-      "source": "contact_map/graph",
+      "units": "vertices",
+      "mathematical_definition": "all N beads",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": "== N"
     },
     {
       "name": "augmented_graph_edges",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "augmented graph edges",
-      "source": "contact_map/graph",
+      "units": "edges",
+      "mathematical_definition": "(N-1) backbone + m contact edges",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": "== N-1+m"
     },
     {
       "name": "augmented_graph_components",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "augmented graph components",
-      "source": "contact_map/graph",
+      "units": "components",
+      "mathematical_definition": "connected components",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": "== 1 for a connected chain"
     },
     {
       "name": "augmented_graph_cycle_rank",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "augmented graph cycle rank",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "E - V + C",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": "== m for a connected chain"
     },
     {
       "name": "augmented_mean_degree",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "augmented mean degree",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "mean degree over all N vertices",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": ">= 0"
     },
     {
       "name": "augmented_degree_variance",
       "dtype": "float64",
-      "units": "float64",
-      "definition": "augmented degree variance",
-      "source": "contact_map/graph",
+      "units": "none",
+      "mathematical_definition": "degree variance over all N vertices",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": ">= 0"
     },
     {
       "name": "augmented_largest_component_vertices",
       "dtype": "int64",
-      "units": "int64",
-      "definition": "augmented largest component vertices",
-      "source": "contact_map/graph",
+      "units": "vertices",
+      "mathematical_definition": "largest augmented component size",
+      "source_representation": "augmented graph",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 4,
+      "validation_identity": "== N"
     },
     {
       "name": "b_T",
       "dtype": "float64",
       "units": "kT",
-      "definition": "reduced contact bias b(T)",
-      "source": "thermo",
+      "mathematical_definition": "reduced contact bias b(T) from the fitted model",
+      "source_representation": "model(T)",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 4
+      "schema_version_introduced": 4,
+      "validation_identity": "== -K_T"
     },
     {
       "name": "K_T",
       "dtype": "float64",
       "units": "kT",
-      "definition": "K(T)=-b(T) (authoritative)",
-      "source": "thermo",
+      "mathematical_definition": "K(T) = -b(T) (authoritative)",
+      "source_representation": "model(T)",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 4
+      "schema_version_introduced": 4,
+      "validation_identity": "higher K favors more contacts"
     },
     {
       "name": "q_T",
       "dtype": "float64",
       "units": "none",
-      "definition": "exp(K); inf on overflow",
-      "source": "thermo",
+      "mathematical_definition": "q(T) = exp(K(T))",
+      "source_representation": "model(T)",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 4
+      "schema_version_introduced": 4,
+      "validation_identity": "== exp(K) when finite; inf on overflow"
     },
     {
       "name": "reduced_potential_u",
       "dtype": "float64",
       "units": "kT",
-      "definition": "u=-m K",
-      "source": "thermo",
+      "mathematical_definition": "u = m b(T) = -m K(T)",
+      "source_representation": "m + model(T)",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 4
+      "schema_version_introduced": 4,
+      "validation_identity": "== -m K_T"
     },
     {
       "name": "effective_energy_H",
       "dtype": "float64",
       "units": "energy",
-      "definition": "H=T u (model-implied)",
-      "source": "thermo",
+      "mathematical_definition": "H = T u (model-implied)",
+      "source_representation": "T + u",
       "cadence": "per (snapshot, lane) configuration",
       "nullable": true,
-      "schema_version_introduced": 4
+      "schema_version_introduced": 4,
+      "validation_identity": "== T * reduced_potential_u"
     },
     {
       "name": "m_r",
       "dtype": "uint16",
       "units": "contacts",
-      "definition": "dense contour-separation histogram length n_beads; m_r[r]=#contacts with separation r; sum_r==m",
-      "source": "contact_map",
-      "cadence": "per configuration",
+      "mathematical_definition": "m_r[r] = #contacts with contour separation r",
+      "source_representation": "dense histogram length n_beads",
+      "cadence": "per (snapshot, lane) configuration",
       "nullable": false,
-      "schema_version_introduced": 1
+      "schema_version_introduced": 1,
+      "validation_identity": "sum_r m_r == m; even-r entries zero; width n_beads"
     },
     {
-      "name": "contact_pairs",
-      "dtype": "ragged int64 (pairs+offsets)",
+      "name": "contact_pairs/pairs",
+      "dtype": "int64",
       "units": "bead-index pairs",
-      "definition": "row i pairs = pairs[offsets[i]:offsets[i+1]]; lexicographically sorted; row pair count == m",
-      "source": "contact_map",
-      "cadence": "per configuration",
+      "mathematical_definition": "concatenated sorted (i,j) contact pairs (j-i>1, r odd) across all rows",
+      "source_representation": "dataset pairs (total_contacts, 2)",
+      "cadence": "per (snapshot, lane) configuration (ragged)",
       "nullable": false,
-      "schema_version_introduced": 4
+      "schema_version_introduced": 4,
+      "validation_identity": "row i = pairs[offsets[i]:offsets[i+1]]; lexicographically sorted; no duplicates"
+    },
+    {
+      "name": "contact_pairs/offsets",
+      "dtype": "int64",
+      "units": "index",
+      "mathematical_definition": "row-start offsets into pairs (CSR-style)",
+      "source_representation": "dataset offsets (n_rows+1,)",
+      "cadence": "per feature file",
+      "nullable": false,
+      "schema_version_introduced": 4,
+      "validation_identity": "offsets[0]==0; nondecreasing; offsets[-1]==len(pairs); diff(offsets)==m"
+    },
+    {
+      "name": "definitions_version",
+      "dtype": "string",
+      "units": "none",
+      "mathematical_definition": "historical bin-definitions version this file was produced with",
+      "source_representation": "manifest.definitions_version",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "preserved exactly; never relabeled with the code version"
+    },
+    {
+      "name": "code_definitions_version",
+      "dtype": "string",
+      "units": "none",
+      "mathematical_definition": "installed code bin-definitions version at extraction time",
+      "source_representation": "manifest.code_definitions_version",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "== isaw_contact_observables.DEFINITIONS_VERSION"
+    },
+    {
+      "name": "project_definitions_path",
+      "dtype": "string",
+      "units": "none",
+      "mathematical_definition": "resolved project_definitions.json path used at extraction",
+      "source_representation": "manifest.project_definitions_path",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "existing file path (or 'unknown')"
+    },
+    {
+      "name": "primary_key",
+      "dtype": "json",
+      "units": "none",
+      "mathematical_definition": "primary-key column tuple",
+      "source_representation": "metadata.primary_key",
+      "cadence": "per feature file (provenance metadata)",
+      "nullable": false,
+      "schema_version_introduced": 1,
+      "validation_identity": "unique across all rows"
     }
   ]
 }

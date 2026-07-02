@@ -4023,6 +4023,11 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    # Phase 11.3: refuse to begin a simulation when the authoritative JSON
+    # definitions and the compatibility constants disagree.
+    import isaw_schema as _sch
+    _sch.check_definitions_consistency()
+
     if args.N < 3:
         raise ValueError("--N must be >= 3")
     if args.steps_per_swap < 1:
@@ -4151,8 +4156,13 @@ def main() -> None:
     # JSON override of either).  Both the requested override and the resolved
     # definitions are recorded in the run summary for provenance.
     requested_bin_definitions = None
-    fixed_defs = dict(ico.FIXED_BIN_DEFINITIONS)
-    scaled_defs = dict(ico.SCALED_BIN_DEFINITIONS)
+    # Phase 11.2: default runtime bin definitions come from the authoritative
+    # project-definitions JSON (via isaw_schema), not the compatibility fallback
+    # constants in isaw_contact_observables.  A consistency check at CLI entry
+    # (below, in the ladder-resolution block) refuses to run when they diverge.
+    import isaw_schema as _sch
+    fixed_defs = _sch.get_fixed_bin_definitions()
+    scaled_defs = _sch.get_scaled_bin_definitions()
     if args.structural_bins_json is not None:
         with open(args.structural_bins_json, encoding="utf-8") as fh:
             override = json.load(fh)

@@ -751,16 +751,30 @@ def _scaled_defs(defs: dict | None) -> dict:
 
 
 def assign_fixed_bin(r: int, defs: dict | None = None) -> str:
-    """Return 'short_fixed' | 'medium_fixed' | 'long_fixed' for separation r."""
+    """Return 'short_fixed' | 'medium_fixed' | 'long_fixed' for separation r.
+
+    Bins are ``short: short_min<=r<=short_max``, ``medium: medium_min<=r<
+    long_threshold``, ``long: r>=long_threshold``.  A separation that falls in an
+    *undeclared gap* (e.g. ``short_max < r < medium_min``) is NOT silently
+    folded into medium: it raises :class:`ContactMapError` so a gapped bin
+    definition surfaces instead of miscounting a contact.
+    """
     defs = _fixed_defs(defs)
     r = int(r)
     thr = int(defs["long_threshold_fixed"])
     short = defs["short_fixed"]
+    smin, smax = int(short["r_min"]), int(short["r_max"])
+    mmin = int(defs["medium_fixed"]["r_min"])
     if r >= thr:
         return "long_fixed"
-    if int(short["r_min"]) <= r <= int(short["r_max"]):
+    if smin <= r <= smax:
         return "short_fixed"
-    return "medium_fixed"
+    if mmin <= r < thr:
+        return "medium_fixed"
+    raise ContactMapError(
+        f"contour separation r={r} is not assigned to any fixed bin "
+        f"(short {smin}-{smax}, medium {mmin}-{thr - 1}, long >= {thr}); "
+        f"the fixed scheme has an undeclared gap")
 
 
 def assign_scaled_bin(r: int, n_beads: int, defs: dict | None = None) -> str:
@@ -922,6 +936,15 @@ def validate_fixed_bin_semantics(fixed_defs: dict, n_beads: int) -> None:
         raise ContactMapError(
             f"fixed scheme requires long_threshold < n_beads; got "
             f"{long_thr}, {n}")
+    # No undeclared gap: every valid odd separation between short and medium must
+    # be classified (medium_min must be the next valid odd after short_max).
+    orphan = [r for r in range(short_max + 1, medium_min)
+              if r % 2 == 1 and r >= MIN_CONTOUR_SEPARATION]
+    if orphan:
+        raise ContactMapError(
+            f"fixed scheme has an undeclared gap: valid odd separation(s) "
+            f"{orphan} fall between short_max={short_max} and "
+            f"medium_min={medium_min} and are assigned to no bin")
 
 
 def validate_scaled_bin_semantics(scaled_defs: dict) -> None:
@@ -942,6 +965,14 @@ def validate_scaled_bin_semantics(scaled_defs: dict) -> None:
         raise ContactMapError(
             f"scaled scheme requires 0 <= local_max_ratio < meso_max_ratio "
             f"<= 1; got local={local}, meso={meso}")
+    # Boundary-inclusion mode: only the canonical closed local upper bound is
+    # implemented (r/N == local_max_ratio -> local_scaled).  Reject any other
+    # declared mode rather than silently ignoring it.
+    mode = scaled_defs.get("local_boundary", "closed")
+    if str(mode) != "closed":
+        raise ContactMapError(
+            f"scaled scheme local_boundary={mode!r} is unsupported; only "
+            f"'closed' is implemented")
 
 
 def validate_bin_definitions(

@@ -34,7 +34,10 @@ import numpy as np
 import isaw_contact_observables as ico
 
 _HERE = Path(__file__).resolve().parent
+# Backward-compatible name: the repository-root definitions file.
 PROJECT_DEFINITIONS_PATH = _HERE / "project_definitions.json"
+# Environment variable that overrides the search (2nd precedence).
+DEFINITIONS_ENV_VAR = "ISAW_PROJECT_DEFINITIONS"
 
 PRIMARY_KEY = ("run_id", "seed", "snapshot_index", "temperature_index")
 
@@ -44,14 +47,59 @@ class SchemaError(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# Definitions-file resolution (Phase 1.1)
+# ---------------------------------------------------------------------------
+# One explicit precedence, resolved relative to this module's directory (the
+# repository root in the current flat layout), NOT the process CWD -- so an
+# unrelated ``project_definitions.json`` in the working directory is never
+# silently loaded:
+#     1. an explicit path argument;
+#     2. the ISAW_PROJECT_DEFINITIONS environment variable;
+#     3. configs/project_definitions.json (the packaged location);
+#     4. project_definitions.json at the repository root (backward compatible).
+
+def _candidate_definition_paths(explicit=None) -> list[Path]:
+    cands: list[Path] = []
+    if explicit is not None:
+        p = Path(explicit)
+        cands.append(p if p.is_absolute() else (_HERE / p))
+    env = os.environ.get(DEFINITIONS_ENV_VAR)
+    if env:
+        p = Path(env)
+        cands.append(p if p.is_absolute() else (_HERE / p))
+    cands.append(_HERE / "configs" / "project_definitions.json")
+    cands.append(_HERE / "project_definitions.json")
+    return cands
+
+
+def resolve_definitions_path(explicit=None) -> Path:
+    """Return the first existing definitions file by the documented precedence.
+
+    Raises :class:`SchemaError` listing every attempted path if none exists.
+    """
+    attempted = _candidate_definition_paths(explicit)
+    for p in attempted:
+        if p.exists():
+            return p.resolve()
+    raise SchemaError(
+        "no project definitions file found; attempted (in order): "
+        + "; ".join(str(p) for p in attempted)
+        + f" (set {DEFINITIONS_ENV_VAR} or place the file at one of these paths)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Load definitions
 # ---------------------------------------------------------------------------
 
 def load_project_definitions(path: str | os.PathLike | None = None) -> dict:
-    """Load and minimally validate the project definitions JSON (deep-copied)."""
-    p = Path(path) if path is not None else PROJECT_DEFINITIONS_PATH
-    if not p.exists():
-        raise SchemaError(f"project definitions file not found: {p}")
+    """Load and minimally validate the project definitions JSON (deep-copied).
+
+    ``path`` (if given) is honored first; otherwise the documented resolution
+    precedence applies.  The resolved absolute path is stored on the returned
+    record under ``_resolved_path`` so manifests can record provenance.
+    """
+    p = resolve_definitions_path(path)
     with open(p, encoding="utf-8") as fh:
         defs = json.load(fh)
     for key in ("project_name", "schema_version", "definitions_version",
@@ -59,10 +107,13 @@ def load_project_definitions(path: str | os.PathLike | None = None) -> dict:
                 "primary_key_definition", "required_metadata_fields"):
         if key not in defs:
             raise SchemaError(f"project definitions missing required key {key!r}")
-    return copy.deepcopy(defs)
+    out = copy.deepcopy(defs)
+    out["_resolved_path"] = str(p)
+    return out
 
 
 _DEFS = load_project_definitions()
+RESOLVED_DEFINITIONS_PATH = Path(_DEFS["_resolved_path"])
 
 PROJECT_SCHEMA_VERSION = int(_DEFS["schema_version"])
 DEFINITIONS_VERSION = str(_DEFS["definitions_version"])
@@ -79,15 +130,61 @@ REQUIRED_METADATA_FIELDS = tuple(_DEFS["required_metadata_fields"])
 
 
 # ---------------------------------------------------------------------------
-# Definition accessors (deep copies)
+# Definition accessors (Phase 11: authoritative, derived from the JSON)
 # ---------------------------------------------------------------------------
+# The runtime bin definitions are DERIVED FROM THE JSON, not copied from the
+# hardcoded ``isaw_contact_observables`` constants (those remain only as a
+# compatibility fallback that ``check_definitions_consistency`` cross-checks).
+# The accessors re-resolve the active definitions file on each call so an
+# ``ISAW_PROJECT_DEFINITIONS`` override (or an explicit path) is honored at
+# runtime, not frozen at import time.
+
+def _fixed_from_json(jf: dict) -> dict:
+    """Map the JSON ``fixed_contour_bins`` record to the ico runtime shape."""
+    thr = int(jf["long_threshold_fixed"])
+    smin = int(jf["short_fixed"]["r_min"])
+    smax = int(jf["short_fixed"]["r_max"])
+    mmin = int(jf["medium_fixed"]["r_min"])
+    return {
+        "scheme": "fixed",
+        "short_fixed": {"r_min": smin, "r_max": smax},
+        "medium_fixed": {"r_min": mmin},
+        "long_threshold_fixed": thr,
+        "description": (
+            f"short_fixed {smin}<=r<={smax}; medium_fixed {mmin}<=r<"
+            f"long_threshold_fixed; long_fixed r>=long_threshold_fixed"),
+    }
+
+
+def _scaled_from_json(js: dict) -> dict:
+    """Map the JSON ``scaled_contour_bins`` record to the ico runtime shape."""
+    local = float(js["local_max_ratio"])
+    meso = float(js["meso_max_ratio"])
+    boundary = str(js.get("local_boundary", "closed"))
+    return {
+        "scheme": "scaled",
+        "local_max_ratio": local,
+        "meso_max_ratio": meso,
+        "local_boundary": boundary,
+        "description": (
+            f"local_scaled r/N<={local}; mesoscopic_scaled {local}<r/N<{meso}; "
+            f"global_scaled r/N>={meso}"),
+    }
+
 
 def get_fixed_bin_definitions() -> dict:
-    return copy.deepcopy(ico.FIXED_BIN_DEFINITIONS)
+    """Authoritative fixed-bin definitions derived from the active JSON."""
+    return _fixed_from_json(load_project_definitions()["fixed_contour_bins"])
 
 
 def get_scaled_bin_definitions() -> dict:
-    return copy.deepcopy(ico.SCALED_BIN_DEFINITIONS)
+    """Authoritative scaled-bin definitions derived from the active JSON."""
+    return _scaled_from_json(load_project_definitions()["scaled_contour_bins"])
+
+
+def active_definitions_path() -> Path:
+    """The definitions file currently in effect (honors runtime overrides)."""
+    return resolve_definitions_path()
 
 
 def project_definitions() -> dict:
@@ -102,8 +199,76 @@ def validate_bin_definitions(n_beads, fixed_defs=None, scaled_defs=None):
 # Code <-> JSON consistency
 # ---------------------------------------------------------------------------
 
+# Complete declarative structure the definitions record MUST provide.  Each
+# entry is (key, subkeys-that-must-be-present).  Validated without any heavy
+# dependency (Pydantic is not assumed available).
+_REQUIRED_RECORDS = {
+    "chain_length_convention": ("N", "n_beads", "n_steps"),
+    "contact_definition": ("contact_indicator", "total_contact_number",
+                           "minimum_contour_separation", "parity_constraint"),
+    "pnipam_lcst_expectations": ("over_fitted_range",
+                                 "primary_contact_favoring_coordinate",
+                                 "expected_signs_high_minus_low_K"),
+    "fixed_contour_bins": ("short_fixed", "medium_fixed", "long_threshold_fixed",
+                           "labels"),
+    "scaled_contour_bins": ("local_max_ratio", "meso_max_ratio",
+                            "local_boundary", "labels"),
+    "pair_motif_taxonomy": ("shared_endpoint", "disjoint", "nested",
+                            "interleaved", "exhaustiveness"),
+    "contact_graph_definition": ("vertices", "edges", "cycle_rank",
+                                 "edge_conservation"),
+    "augmented_graph_definition": ("vertices", "edges",
+                                   "identities_connected_chain"),
+    "thermodynamic_feature_columns": ("b_T", "K_T", "q_T",
+                                      "reduced_potential_u", "effective_energy_H"),
+    "output_schema_versions": ("feature_schema_version", "snapshot_schema_version",
+                               "distributions_schema_version",
+                               "diagnostic_trajectory_schema_version",
+                               "calibration_report_schema_version",
+                               "model_api_version"),
+}
+
+_REQUIRED_TOP_LEVEL_STRINGS = (
+    "reduced_bias_definition", "K_definition", "q_definition",
+    "reduced_potential_definition", "effective_energy_definition",
+    "polymer_system", "transition_type",
+)
+
+
+def _check_record_shape(defs: dict) -> None:
+    for key, subkeys in _REQUIRED_RECORDS.items():
+        if key not in defs:
+            raise SchemaError(f"definitions missing required record {key!r}")
+        rec = defs[key]
+        if not isinstance(rec, dict):
+            raise SchemaError(f"definitions record {key!r} must be an object")
+        for sk in subkeys:
+            if sk not in rec:
+                raise SchemaError(
+                    f"definitions record {key!r} missing subkey {sk!r}")
+    for key in _REQUIRED_TOP_LEVEL_STRINGS:
+        if not isinstance(defs.get(key), str) or not defs[key]:
+            raise SchemaError(f"definitions missing/empty string field {key!r}")
+    if str(defs["polymer_system"]).upper() != "PNIPAM":
+        raise SchemaError("polymer_system must be PNIPAM")
+    if str(defs["transition_type"]).upper() != "LCST":
+        raise SchemaError("transition_type must be LCST")
+
+
 def check_definitions_consistency() -> None:
-    """Raise SchemaError if code-level definitions diverge from the JSON."""
+    """Raise SchemaError if the definitions record is incomplete OR code-level
+    constants diverge from the JSON.
+
+    Validates the complete nested record (chain-length convention, contact
+    definition, minimum separation, parity, both bin schemes with boundary
+    inclusion, pair taxonomy, graph identities, primary key, required metadata,
+    output schema versions, PNIPAM/LCST, and the K/q/u/H definitions) and then
+    cross-checks the code constants that mirror them.  The loaded record is
+    never mutated.
+    """
+    _check_record_shape(_DEFS)
+
+    # -- fixed bins ---------------------------------------------------------
     jf = _DEFS["fixed_contour_bins"]
     cf = ico.FIXED_BIN_DEFINITIONS
     if (int(jf["short_fixed"]["r_min"]) != int(cf["short_fixed"]["r_min"])
@@ -111,17 +276,59 @@ def check_definitions_consistency() -> None:
             or int(jf["medium_fixed"]["r_min"]) != int(cf["medium_fixed"]["r_min"])
             or int(jf["long_threshold_fixed"]) != int(cf["long_threshold_fixed"])):
         raise SchemaError("fixed bin definitions diverge between JSON and code")
+
+    # -- scaled bins (incl. boundary inclusion) -----------------------------
     js = _DEFS["scaled_contour_bins"]
     cs = ico.SCALED_BIN_DEFINITIONS
     if (float(js["local_max_ratio"]) != float(cs["local_max_ratio"])
             or float(js["meso_max_ratio"]) != float(cs["meso_max_ratio"])):
         raise SchemaError("scaled bin definitions diverge between JSON and code")
+    if str(js["local_boundary"]) != str(cs.get("local_boundary")):
+        raise SchemaError("scaled local_boundary diverges between JSON and code")
+
+    # -- minimum separation / parity ----------------------------------------
+    if int(_DEFS["contact_definition"]["minimum_contour_separation"]) != \
+            int(ico.MIN_CONTOUR_SEPARATION):
+        raise SchemaError("minimum_contour_separation diverges between JSON/code")
+    if any(r % 2 == 0 for r in ico._valid_separations(64)):
+        raise SchemaError("code valid separations include even r (parity broken)")
+
+    # -- versions -----------------------------------------------------------
     if str(_DEFS["definitions_version"]) != str(ico.DEFINITIONS_VERSION):
         raise SchemaError(
             f"definitions_version diverges: JSON {_DEFS['definitions_version']} "
             f"!= code {ico.DEFINITIONS_VERSION}")
     if list(_DEFS["primary_key_definition"]) != list(PRIMARY_KEY):
         raise SchemaError("primary_key_definition diverges between JSON and code")
+
+    # -- output schema versions cross-checked against the code modules ------
+    # (lazy imports so this module has no import cycle with the pipeline.)
+    ov = _DEFS["output_schema_versions"]
+    import isaw_config_io as _cio
+    import extract_contact_motif_features as _ext
+    import remd_uniform_chain_2_new as _remd
+    code_versions = {
+        "feature_schema_version": int(_ext.FEATURE_SCHEMA_VERSION),
+        "snapshot_schema_version": int(_cio.SNAPSHOT_SCHEMA_VERSION),
+        "distributions_schema_version": int(_remd.SCHEMA_VERSION),
+        "model_api_version": int(_remd.MODEL_API_VERSION),
+    }
+    for k, cv in code_versions.items():
+        if int(ov[k]) != cv:
+            raise SchemaError(
+                f"{k} diverges: JSON {ov[k]} != code {cv}")
+
+    # -- thermodynamic identities obeyed by the helpers ---------------------
+    for K in (-1.3, 0.0, 0.75):
+        if abs(reduced_potential_from_K(4, K) - (-4.0 * K)) > 1e-12:
+            raise SchemaError("reduced_potential_from_K violates u = -m K")
+    if abs(q_from_K(0.5) - math.exp(0.5)) > 1e-12:
+        raise SchemaError("q_from_K violates q = exp(K)")
+
+
+def output_schema_versions() -> dict:
+    """Deep copy of the frozen output-schema version block."""
+    return copy.deepcopy(_DEFS["output_schema_versions"])
 
 
 # ---------------------------------------------------------------------------

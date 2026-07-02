@@ -180,6 +180,10 @@ def main():
     if args.overwrite and args.keep_existing:
         ap.error("--overwrite and --keep-existing are mutually exclusive")
 
+    # Phase 11.3: JSON definitions and compatibility constants must agree.
+    import isaw_schema as _sch
+    _sch.check_definitions_consistency()
+
     if args.output_dir is not None:
         out_dir = Path(args.output_dir)
     elif args.overwrite or args.keep_existing:

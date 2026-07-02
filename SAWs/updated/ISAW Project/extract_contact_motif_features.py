@@ -147,6 +147,15 @@ class ExtractionError(RuntimeError):
     pass
 
 
+def _project_definitions_path() -> str:
+    """Resolved project-definitions path (for manifest provenance)."""
+    try:
+        import isaw_schema as _sch
+        return str(_sch.RESOLVED_DEFINITIONS_PATH)
+    except Exception:
+        return "unknown"
+
+
 def _safe_q(K: float) -> float:
     """q = exp(K); +inf on overflow (K is authoritative and stored separately)."""
     try:
@@ -367,10 +376,15 @@ def _git_commit() -> str:
 def _resolve_input_bin_defs(meta, n_beads):
     """Use the bin definitions stored in the input file (validated).
 
-    Returns ``(fixed_defs, scaled_defs, source)`` where ``source`` is
-    'input_file' when explicit definitions were present, else 'module_default'.
-    Never silently substitutes module defaults when the input carries explicit
-    definitions.
+    Returns ``(fixed_defs, scaled_defs, source, stored_version)`` where
+    ``source`` is 'input_file' when explicit definitions were present, else
+    'module_default'; ``stored_version`` is the definitions_version recorded IN
+    THE INPUT FILE (historical) when available, else the current code version.
+
+    The stored (historical) definitions and their version are preserved exactly
+    -- they are never relabeled with the installed code's ``DEFINITIONS_VERSION``
+    -- so a feature file extracted from an older run is validated against the
+    definitions it was actually produced with.
     """
     def _load(key):
         raw = meta.get(key)
@@ -379,26 +393,40 @@ def _resolve_input_bin_defs(meta, n_beads):
         if isinstance(raw, bytes):
             raw = raw.decode()
         if isinstance(raw, str):
-            return json.loads(raw)
+            try:
+                return json.loads(raw)
+            except (ValueError, TypeError):
+                return None
         if isinstance(raw, dict):
             return dict(raw)
         return None
 
+    combined = _load("structural_bin_definitions")
     fixed = _load("fixed_bin_definitions")
     scaled = _load("scaled_bin_definitions")
-    if fixed is None or scaled is None:
-        # Fall back to the structural_bin_definitions combined record if present.
-        combined = _load("structural_bin_definitions")
-        if isinstance(combined, dict):
-            fixed = fixed or combined.get("fixed")
-            scaled = scaled or combined.get("scaled")
+    if (fixed is None or scaled is None) and isinstance(combined, dict):
+        fixed = fixed or combined.get("fixed")
+        scaled = scaled or combined.get("scaled")
+
+    # Historical definitions_version: prefer the combined record, then a
+    # top-level metadata attribute, else the current code version.
+    stored_version = None
+    if isinstance(combined, dict):
+        stored_version = combined.get("definitions_version")
+    if stored_version is None:
+        dv = meta.get("definitions_version")
+        if isinstance(dv, bytes):
+            dv = dv.decode()
+        stored_version = dv
+    if stored_version is None:
+        stored_version = ico.DEFINITIONS_VERSION
 
     if fixed is not None and scaled is not None:
         ico.validate_bin_definitions(int(n_beads), fixed, scaled)
-        return fixed, scaled, "input_file"
+        return fixed, scaled, "input_file", str(stored_version)
     # No explicit definitions in the file -> module defaults (recorded).
     return (dict(ico.FIXED_BIN_DEFINITIONS), dict(ico.SCALED_BIN_DEFINITIONS),
-            "module_default")
+            "module_default", ico.DEFINITIONS_VERSION)
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +550,7 @@ class _StreamParquetWriter:
     for those); m_r is exported as m_r_<r> columns.
     """
 
-    def __init__(self, path, *, n_beads, run_id, definitions):
+    def __init__(self, path, *, n_beads, run_id, definitions, provenance=None):
         import pyarrow as pa
         self.pa = pa
         self.path = path
@@ -539,16 +567,35 @@ class _StreamParquetWriter:
             fields.append(pa.field(name, t))
         for r in self.mr_cols:
             fields.append(pa.field(f"m_r_{r}", pa.int64()))
+        # Phase 12: preserve the HISTORICAL definitions version this file was
+        # produced with (never relabel with the installed code version), plus the
+        # definitions source/path and input schema version.  Parquet is an
+        # explicitly EXPERIMENTAL scalar/tabular export -- it omits the ragged
+        # contact-pair arrays, so HDF5 remains authoritative.
+        prov = provenance or {}
         kv = {
             b"feature_schema_version": str(FEATURE_SCHEMA_VERSION).encode(),
             b"run_id": str(run_id).encode(),
             b"n_beads": str(int(n_beads)).encode(),
-            b"definitions_version": str(ico.DEFINITIONS_VERSION).encode(),
+            b"definitions_version": str(
+                prov.get("definitions_version", ico.DEFINITIONS_VERSION)).encode(),
+            b"code_definitions_version": str(ico.DEFINITIONS_VERSION).encode(),
+            b"uses_current_definitions": str(
+                bool(prov.get("uses_current_definitions", True))).encode(),
+            b"bin_definitions_source": str(
+                prov.get("bin_definitions_source", "module_default")).encode(),
+            b"project_definitions_path": str(
+                prov.get("project_definitions_path", "unknown")).encode(),
+            b"input_schema_version": str(
+                prov.get("input_schema_version", "unknown")).encode(),
             b"fixed_bin_definitions": json.dumps(definitions[0]).encode(),
             b"scaled_bin_definitions": json.dumps(definitions[1]).encode(),
             b"primary_key": json.dumps(list(PRIMARY_KEY)).encode(),
             b"format": b"parquet",
             b"experimental": b"true",
+            b"authoritative_representation": (
+                b"HDF5 (Parquet is a scalar/tabular export without ragged "
+                b"contact pairs)"),
             b"status_semantics": (
                 b"file present at final path => complete; committed_feature_rows"
                 b" == parquet num_rows; manifest is authoritative"),
@@ -664,7 +711,10 @@ def extract(
         seed = int(meta.get("seed", -1))
         temps = np.asarray(meta.get("temperatures", np.full(nT, np.nan)), dtype=float)
         schema_version = int(meta.get("schema_version", 0))
-        fixed_defs, scaled_defs, defs_source = _resolve_input_bin_defs(meta, n_beads)
+        (fixed_defs, scaled_defs, defs_source,
+         stored_defs_version) = _resolve_input_bin_defs(meta, n_beads)
+        uses_current_definitions = (
+            str(stored_defs_version) == str(ico.DEFINITIONS_VERSION))
         b_of_T, thermo_status = _model_bias_evaluator(meta)
         if validate and thermo_status != "ok":
             raise ExtractionError(
@@ -676,9 +726,16 @@ def extract(
         if fmt == "hdf5":
             writer = _StreamHDF5Writer(output_path, n_beads=int(n_beads), run_id=run_id)
         else:
-            writer = _StreamParquetWriter(output_path, n_beads=int(n_beads),
-                                          run_id=run_id,
-                                          definitions=(fixed_defs, scaled_defs))
+            writer = _StreamParquetWriter(
+                output_path, n_beads=int(n_beads), run_id=run_id,
+                definitions=(fixed_defs, scaled_defs),
+                provenance={
+                    "definitions_version": str(stored_defs_version),
+                    "uses_current_definitions": bool(uses_current_definitions),
+                    "bin_definitions_source": defs_source,
+                    "project_definitions_path": _project_definitions_path(),
+                    "input_schema_version": schema_version,
+                })
 
         mr_max = 0
         sample_index = 0
@@ -768,10 +825,16 @@ def extract(
                 "dense contour-separation histogram length n_beads; "
                 "m_r[r] = #contacts with separation r; even r are zero; sum_r == m"
             ),
-            "definitions_version": ico.DEFINITIONS_VERSION,
+            # definitions_version is the HISTORICAL version this file was
+            # produced with (authoritative for validating THIS file); the
+            # installed code version is recorded separately.
+            "definitions_version": str(stored_defs_version),
+            "code_definitions_version": ico.DEFINITIONS_VERSION,
+            "uses_current_definitions": bool(uses_current_definitions),
             "bin_definitions_source": defs_source,
             "fixed_bin_definitions": fixed_defs,
             "scaled_bin_definitions": scaled_defs,
+            "project_definitions_path": _project_definitions_path(),
             "primary_key": list(PRIMARY_KEY),
             "contact_pairs_representation": (
                 "HDF5 /features/contact_pairs/pairs (total_contacts,2) + "
@@ -828,65 +891,219 @@ def extract(
 # Feature dictionary + comprehensive schema validation (C4)
 # ---------------------------------------------------------------------------
 
+# Complete, explicit dictionary metadata for EVERY output field.  Tuple layout:
+#   (units, mathematical_definition, source_representation, nullable,
+#    schema_version_introduced, validation_identity)
+# No entry is auto-generated from the field name; every column is documented.
 _FEATURE_META = {
-    "run_id": ("string", "none", "run identifier", "metadata", False, 1),
-    "seed": ("int", "none", "RNG seed", "metadata", False, 1),
-    "snapshot_index": ("int", "none", "committed snapshot row index", "index", False, 1),
-    "cycle": ("int", "cycles", "originating REMD cycle", "index", False, 1),
-    "temperature_index": ("int", "none", "lane index", "index", False, 1),
-    "temperature": ("float", "K", "lane temperature", "metadata", False, 1),
-    "walker_id": ("int", "none", "walker occupying the lane", "index", False, 1),
-    "n_beads": ("int", "beads", "chain length N", "config", False, 1),
-    "n_steps": ("int", "bonds", "N-1", "config", False, 1),
-    "m": ("int", "contacts", "total nonbonded contacts", "contact_map", False, 1),
-    "Rg2_lattice": ("float", "lattice^2", "radius of gyration squared", "geometry", False, 1),
-    "Ree2_lattice": ("float", "lattice^2", "end-to-end distance squared", "geometry", False, 1),
-    "asphericity": ("float", "lattice^2", "lam3-0.5(lam1+lam2)", "geometry", False, 1),
-    "mean_contact_separation": ("float", "beads", "mean r among contacts", "contact_map", True, 1),
-    "max_contact_separation": ("float", "beads", "max r among contacts", "contact_map", True, 1),
-    "b_T": ("float", "kT", "reduced contact bias b(T)", "thermo", True, 4),
-    "K_T": ("float", "kT", "K(T)=-b(T) (authoritative)", "thermo", True, 4),
-    "q_T": ("float", "none", "exp(K); inf on overflow", "thermo", True, 4),
-    "reduced_potential_u": ("float", "kT", "u=-m K", "thermo", True, 4),
-    "effective_energy_H": ("float", "energy", "H=T u (model-implied)", "thermo", True, 4),
+    # --- index / provenance ---
+    "run_id": ("none", "run identifier string", "run metadata", False, 1,
+               "constant within a run"),
+    "seed": ("none", "master RNG seed", "run metadata", False, 1,
+             "constant within a run"),
+    "snapshot_index": ("none", "committed snapshot row index in the input file",
+                       "sample index", False, 1,
+                       "0 <= snapshot_index < committed_rows; rows sorted ascending"),
+    "cycle": ("cycles", "originating REMD cycle number", "sample index", False, 1,
+              "strictly increasing across distinct snapshots"),
+    "temperature_index": ("none", "temperature-lane index k", "sample index",
+                          False, 1, "0 <= k < n_temperatures"),
+    "temperature": ("K", "lane temperature T_k", "run metadata (ladder)", False, 1,
+                    "constant for a given temperature_index"),
+    "walker_id": ("none", "walker occupying the lane at this snapshot",
+                  "sample index", False, 1, "permutation of 0..nT-1 per snapshot"),
+    # --- chain-length convention ---
+    "n_beads": ("beads", "chain length N", "config", False, 1, "== file n_beads"),
+    "n_steps": ("bonds", "N - 1", "config", False, 1, "== n_beads - 1"),
+    # --- contact map ---
+    "m": ("contacts", "m = #{(i,j): j-i>1, |r_i-r_j|=1}", "contact_map", False, 1,
+          "== len(row contact pairs) == sum_r m_r"),
+    # --- geometry ---
+    "Rg2_lattice": ("lattice^2", "R_g^2 = (1/N) sum_i |r_i - r_cm|^2", "geometry",
+                    False, 1, "== stored rg2_lattice within tol"),
+    "Ree2_lattice": ("lattice^2", "R_ee^2 = |r_{N-1} - r_0|^2", "geometry", False, 1,
+                     "== stored ree2_lattice within tol"),
+    "asphericity": ("lattice^2", "lam3 - 0.5 (lam1 + lam2)", "gyration tensor",
+                    False, 1, "lam ascending eigenvalues; >= 0"),
+    "gyration_lambda_1": ("lattice^2", "smallest gyration-tensor eigenvalue",
+                          "gyration tensor", False, 1, "lam1 <= lam2 <= lam3"),
+    "gyration_lambda_2": ("lattice^2", "middle gyration-tensor eigenvalue",
+                          "gyration tensor", False, 1, "lam1 <= lam2 <= lam3"),
+    "gyration_lambda_3": ("lattice^2", "largest gyration-tensor eigenvalue",
+                          "gyration tensor", False, 1,
+                          "lam1+lam2+lam3 == Rg2 within tol"),
+    "mean_contact_separation": ("beads", "mean r = j-i over contacts",
+                                "contact_map", True, 1, "None when m == 0"),
+    "max_contact_separation": ("beads", "max r = j-i over contacts", "contact_map",
+                               True, 1, "None when m == 0"),
+    # --- fixed contour bins ---
+    "m_short_fixed": ("contacts", "#contacts with short_min<=r<=short_max",
+                      "m_r + fixed bins", False, 1,
+                      "m_short+m_medium+m_long == m"),
+    "m_medium_fixed": ("contacts", "#contacts with medium_min<=r<long_threshold",
+                       "m_r + fixed bins", False, 1, "part of fixed partition"),
+    "m_long_fixed": ("contacts", "#contacts with r>=long_threshold",
+                     "m_r + fixed bins", False, 1, "part of fixed partition"),
+    # --- scaled contour bins ---
+    "m_local_scaled": ("contacts", "#contacts with r/N<=local_max_ratio",
+                       "m_r + scaled bins", False, 1,
+                       "m_local+m_meso+m_global == m"),
+    "m_mesoscopic_scaled": ("contacts",
+                            "#contacts with local_max_ratio<r/N<meso_max_ratio",
+                            "m_r + scaled bins", False, 1, "part of scaled partition"),
+    "m_global_scaled": ("contacts", "#contacts with r/N>=meso_max_ratio",
+                        "m_r + scaled bins", False, 1, "part of scaled partition"),
+    # --- pair motifs ---
+    "pair_shared_endpoint": ("pairs", "#contact-pairs sharing >=1 bead index",
+                             "contact_pairs", False, 1, "sum of 4 classes == C(m,2)"),
+    "pair_disjoint": ("pairs", "#contact-pairs i<j<k<l (or swapped)",
+                      "contact_pairs", False, 1, "part of C(m,2) partition"),
+    "pair_nested": ("pairs", "#contact-pairs i<k<l<j (or swapped)",
+                    "contact_pairs", False, 1, "part of C(m,2) partition"),
+    "pair_interleaved": ("pairs", "#contact-pairs i<k<j<l (or swapped)",
+                         "contact_pairs", False, 1, "part of C(m,2) partition"),
+    "pair_total": ("pairs", "C(m,2) total contact-pair count", "contact_pairs",
+                   False, 1, "== m(m-1)/2 == sum of 4 motif classes"),
+    # --- contact graph (backbone edges excluded) ---
+    "contact_vertices": ("vertices", "#bead indices in >=1 nonbonded contact",
+                         "contact graph", False, 1, "V of contact graph"),
+    "contact_graph_components": ("components", "#connected components (contacts)",
+                                 "contact graph", False, 1, "C of contact graph"),
+    "contact_graph_edges": ("edges", "#contact edges", "contact graph", False, 1,
+                            "== m"),
+    "sum_component_edges": ("edges", "sum of per-component edge counts",
+                            "contact graph", False, 1, "== m"),
+    "largest_component_vertices": ("vertices", "S_max: vertices in largest component",
+                                   "contact graph", False, 1,
+                                   "tie-break by smallest min vertex index"),
+    "largest_component_edges": ("edges", "edges in the largest component",
+                                "contact graph", False, 1, "<= m"),
+    "largest_component_fraction_of_N": ("none", "S_max / N", "contact graph", False,
+                                        1, "in [0,1]"),
+    "largest_component_fraction_of_contact_vertices": (
+        "none", "S_max / contact_vertices", "contact graph", False, 1,
+        "in [0,1]; 0 when no contacts"),
+    "mean_degree_nonisolated": ("none", "mean degree over contact vertices",
+                                "contact graph", False, 1, ">= 0"),
+    "degree_variance_nonisolated": ("none", "degree variance over contact vertices",
+                                    "contact graph", False, 1, ">= 0"),
+    "contact_graph_cycle_rank": ("none", "E - V + C", "contact graph", False, 1,
+                                 "== m - contact_vertices + components"),
+    "number_of_multiedge_components": ("components",
+                                       "#components with >=2 edges", "contact graph",
+                                       False, 1, ">= 0"),
+    # --- augmented backbone+contact graph ---
+    "augmented_graph_vertices": ("vertices", "all N beads", "augmented graph", False,
+                                 4, "== N"),
+    "augmented_graph_edges": ("edges", "(N-1) backbone + m contact edges",
+                              "augmented graph", False, 4, "== N-1+m"),
+    "augmented_graph_components": ("components", "connected components",
+                                   "augmented graph", False, 4,
+                                   "== 1 for a connected chain"),
+    "augmented_graph_cycle_rank": ("none", "E - V + C", "augmented graph", False, 4,
+                                   "== m for a connected chain"),
+    "augmented_mean_degree": ("none", "mean degree over all N vertices",
+                              "augmented graph", False, 4, ">= 0"),
+    "augmented_degree_variance": ("none", "degree variance over all N vertices",
+                                  "augmented graph", False, 4, ">= 0"),
+    "augmented_largest_component_vertices": ("vertices",
+                                             "largest augmented component size",
+                                             "augmented graph", False, 4, "== N"),
+    # --- thermodynamic (K authoritative; q may overflow) ---
+    "b_T": ("kT", "reduced contact bias b(T) from the fitted model",
+            "model(T)", True, 4, "== -K_T"),
+    "K_T": ("kT", "K(T) = -b(T) (authoritative)", "model(T)", True, 4,
+            "higher K favors more contacts"),
+    "q_T": ("none", "q(T) = exp(K(T))", "model(T)", True, 4,
+            "== exp(K) when finite; inf on overflow"),
+    "reduced_potential_u": ("kT", "u = m b(T) = -m K(T)", "m + model(T)", True, 4,
+                            "== -m K_T"),
+    "effective_energy_H": ("energy", "H = T u (model-implied)", "T + u", True, 4,
+                           "== T * reduced_potential_u"),
 }
 
 
 def build_feature_dictionary() -> dict:
-    """Machine-readable feature dictionary for every column."""
+    """Machine-readable feature dictionary for every output field.
+
+    Each entry carries name, dtype, units, mathematical_definition,
+    source_representation, cadence, nullable, schema_version_introduced, and a
+    validation_identity.  Every ``FEATURE_COLUMNS`` entry plus ``m_r`` and
+    ``contact_pairs`` is covered exactly once (a test enforces the bijection).
+    """
     fields = []
     for name in FEATURE_COLUMNS:
         kind = _col_dtype(name)
         dtype = {"str": "string", "float": "float64", "int": "int64"}[kind]
-        units, _u2, definition, source, nullable, ver = _FEATURE_META.get(
-            name, (dtype, "various", name.replace("_", " "),
-                   "contact_map/graph", False, 1))
-        if name in _FEATURE_META:
-            units = _FEATURE_META[name][1]
+        if name not in _FEATURE_META:
+            raise ExtractionError(f"feature dictionary missing entry for {name!r}")
+        units, mdef, srep, nullable, ver, ident = _FEATURE_META[name]
         fields.append({
             "name": name, "dtype": dtype, "units": units,
-            "definition": definition, "source": source,
+            "mathematical_definition": mdef,
+            "source_representation": srep,
             "cadence": "per (snapshot, lane) configuration",
             "nullable": bool(nullable),
             "schema_version_introduced": int(ver),
+            "validation_identity": ident,
         })
     fields.append({
         "name": "m_r", "dtype": str(np.dtype(_M_R_DTYPE)), "units": "contacts",
-        "definition": "dense contour-separation histogram length n_beads; "
-                      "m_r[r]=#contacts with separation r; sum_r==m",
-        "source": "contact_map", "cadence": "per configuration",
-        "nullable": False, "schema_version_introduced": 1})
+        "mathematical_definition": "m_r[r] = #contacts with contour separation r",
+        "source_representation": "dense histogram length n_beads",
+        "cadence": "per (snapshot, lane) configuration",
+        "nullable": False, "schema_version_introduced": 1,
+        "validation_identity": "sum_r m_r == m; even-r entries zero; width n_beads"})
+    # Ragged contact pairs are stored as TWO physical datasets; document each.
     fields.append({
-        "name": "contact_pairs", "dtype": "ragged int64 (pairs+offsets)",
-        "units": "bead-index pairs",
-        "definition": "row i pairs = pairs[offsets[i]:offsets[i+1]]; "
-                      "lexicographically sorted; row pair count == m",
-        "source": "contact_map", "cadence": "per configuration",
-        "nullable": False, "schema_version_introduced": 4})
+        "name": "contact_pairs/pairs", "dtype": "int64", "units": "bead-index pairs",
+        "mathematical_definition": "concatenated sorted (i,j) contact pairs "
+                                   "(j-i>1, r odd) across all rows",
+        "source_representation": "dataset pairs (total_contacts, 2)",
+        "cadence": "per (snapshot, lane) configuration (ragged)",
+        "nullable": False, "schema_version_introduced": 4,
+        "validation_identity": "row i = pairs[offsets[i]:offsets[i+1]]; "
+                               "lexicographically sorted; no duplicates"})
+    fields.append({
+        "name": "contact_pairs/offsets", "dtype": "int64", "units": "index",
+        "mathematical_definition": "row-start offsets into pairs (CSR-style)",
+        "source_representation": "dataset offsets (n_rows+1,)",
+        "cadence": "per feature file",
+        "nullable": False, "schema_version_introduced": 4,
+        "validation_identity": "offsets[0]==0; nondecreasing; offsets[-1]==len(pairs); "
+                               "diff(offsets)==m"})
+    # Provenance metadata fields (recorded in the manifest, not per-row columns).
+    prov = {
+        "definitions_version": (
+            "historical bin-definitions version this file was produced with",
+            "string", "manifest.definitions_version",
+            "preserved exactly; never relabeled with the code version"),
+        "code_definitions_version": (
+            "installed code bin-definitions version at extraction time",
+            "string", "manifest.code_definitions_version",
+            "== isaw_contact_observables.DEFINITIONS_VERSION"),
+        "project_definitions_path": (
+            "resolved project_definitions.json path used at extraction",
+            "string", "manifest.project_definitions_path",
+            "existing file path (or 'unknown')"),
+        "primary_key": (
+            "primary-key column tuple",
+            "json", "metadata.primary_key",
+            "unique across all rows"),
+    }
+    for name, (mdef, dt, srep, ident) in prov.items():
+        fields.append({
+            "name": name, "dtype": dt, "units": "none",
+            "mathematical_definition": mdef,
+            "source_representation": srep,
+            "cadence": "per feature file (provenance metadata)",
+            "nullable": False, "schema_version_introduced": 1,
+            "validation_identity": ident})
     return {
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "definitions_version": ico.DEFINITIONS_VERSION,
         "primary_key": list(PRIMARY_KEY),
+        "provenance_metadata_fields": list(prov),
         "fields": fields,
     }
 
@@ -900,10 +1117,19 @@ def write_feature_dictionary(path=None) -> str:
     return str(p)
 
 
-def validate_feature_file_hdf5(path: str) -> dict:
+def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
     """Comprehensive structural/identity validation of a feature HDF5 file.
 
-    Raises :class:`ExtractionError` on any failure; returns a summary dict.
+    Independently RECONSTRUCTS every derived representation from the stored
+    contact pairs and requires exact agreement with the stored scalar columns --
+    the scalar columns are never trusted merely because the same extractor wrote
+    them.  On any failure it raises :class:`ExtractionError` identifying the row
+    index and the violated invariant.
+
+    The file is validated against ITS OWN stored (possibly historical)
+    definitions record; it is never required to equal the currently installed
+    code version.  ``deep=False`` skips the per-row reconstruction (aggregate
+    checks only) for very large files.
     """
     import isaw_schema as sch
     with h5py.File(path, "r") as f:
@@ -912,25 +1138,38 @@ def validate_feature_file_hdf5(path: str) -> dict:
         feats = f["features"]
         scalars = feats["scalars"]
         idxg = feats["sample_index"]
-        m = scalars["m"][()]
+        S = {name: scalars[name][()] for name in scalars}
+        I = {name: idxg[name][()] for name in idxg}
+        m = S["m"].astype(np.int64)
         n_rows = int(m.shape[0])
         committed = int(feats.attrs.get("committed_feature_rows", -1))
         if committed != n_rows:
             raise ExtractionError(
                 f"committed_feature_rows {committed} != row count {n_rows}")
-        for grp, label in ((scalars, "scalar"), (idxg, "index")):
-            for name in grp:
-                if grp[name].shape[0] != n_rows:
+        for label, grp in (("scalar", S), ("index", I)):
+            for name, arr in grp.items():
+                if arr.shape[0] != n_rows:
                     raise ExtractionError(f"{label} dataset {name} length mismatch")
         n_beads = int(f.attrs["n_beads"])
+
+        # -- n_steps / chain-length convention ------------------------------
+        if not np.array_equal(S["n_beads"].astype(np.int64),
+                              np.full(n_rows, n_beads, np.int64)):
+            raise ExtractionError("n_beads column != file n_beads")
+        if not np.array_equal(S["n_steps"].astype(np.int64),
+                              np.full(n_rows, n_beads - 1, np.int64)):
+            raise ExtractionError("n_steps != n_beads - 1 for some row")
+
+        # -- m_r block ------------------------------------------------------
         m_r = feats["m_r"][()]
         if m_r.shape != (n_rows, n_beads):
             raise ExtractionError(f"m_r shape {m_r.shape} != {(n_rows, n_beads)}")
-        if not np.array_equal(m_r.sum(axis=1).astype(np.int64), m.astype(np.int64)):
+        if not np.array_equal(m_r.sum(axis=1).astype(np.int64), m):
             raise ExtractionError("sum_r m_r != m for some row")
-        # contact-pair offsets / counts
+
+        # -- contact-pair offsets (aggregate) -------------------------------
         pairs = feats["contact_pairs/pairs"][()]
-        offsets = feats["contact_pairs/offsets"][()]
+        offsets = feats["contact_pairs/offsets"][()].astype(np.int64)
         if offsets.shape[0] != n_rows + 1:
             raise ExtractionError("offsets length != n_rows+1")
         if int(offsets[0]) != 0:
@@ -939,44 +1178,267 @@ def validate_feature_file_hdf5(path: str) -> dict:
             raise ExtractionError("offsets not nondecreasing")
         if int(offsets[-1]) != pairs.shape[0]:
             raise ExtractionError("offsets[-1] != len(pairs)")
-        row_pair_counts = np.diff(offsets)
-        if not np.array_equal(row_pair_counts.astype(np.int64), m.astype(np.int64)):
-            raise ExtractionError("row pair count != m")
-        if pairs.shape[0]:
-            if int(pairs.min()) < 0 or int(pairs.max()) >= n_beads:
-                raise ExtractionError("contact pair index out of bounds")
-            if not np.all(pairs[:, 0] < pairs[:, 1]):
-                raise ExtractionError("contact pair violates i<j")
-        # graph identities
-        cge = scalars["contact_graph_edges"][()]
-        sce = scalars["sum_component_edges"][()]
-        if not (np.array_equal(cge.astype(np.int64), m.astype(np.int64))
-                and np.array_equal(sce.astype(np.int64), m.astype(np.int64))):
-            raise ExtractionError("contact graph edge totals != m")
-        aug_e = scalars["augmented_graph_edges"][()]
-        aug_cyc = scalars["augmented_graph_cycle_rank"][()]
-        if not np.array_equal(aug_e.astype(np.int64),
-                              (n_beads - 1 + m).astype(np.int64)):
-            raise ExtractionError("augmented edges != N-1+m")
-        if not np.array_equal(aug_cyc.astype(np.int64), m.astype(np.int64)):
-            raise ExtractionError("augmented cycle rank != m")
-        # thermodynamic identity: u == -m K (where finite)
-        K = scalars["K_T"][()]
-        u = scalars["reduced_potential_u"][()]
-        finite = np.isfinite(K) & np.isfinite(u)
-        if finite.any():
-            if not np.allclose(u[finite], -(m.astype(float)[finite]) * K[finite],
-                               atol=1e-6, rtol=1e-9):
-                raise ExtractionError("reduced_potential_u != -m K")
-        # primary key uniqueness
-        cols = {k: idxg[k][()] for k in PRIMARY_KEY}
-        sch.validate_feature_primary_keys(cols)
+        if not np.array_equal(np.diff(offsets), m):
+            bad = int(np.argmax(np.diff(offsets) != m))
+            raise ExtractionError(f"[row {bad}] pair count != m")
+
+        # -- stored (historical) definitions: validate the file against its OWN
+        #    record; never require equality with the installed code version ---
         man = json.loads(f["metadata"].attrs["manifest"])
         if int(man.get("row_count", -1)) != n_rows:
             raise ExtractionError("manifest row_count mismatch")
-        if str(man.get("definitions_version")) != str(ico.DEFINITIONS_VERSION):
-            raise ExtractionError("definitions_version mismatch")
-    return {"row_count": n_rows, "n_beads": n_beads, "ok": True}
+        fixed_defs = man.get("fixed_bin_definitions") or dict(ico.FIXED_BIN_DEFINITIONS)
+        scaled_defs = man.get("scaled_bin_definitions") or dict(ico.SCALED_BIN_DEFINITIONS)
+        # Validate the scaled scheme always; validate the fixed partition only
+        # when it is dimensionally applicable (long_threshold < n_beads).  For a
+        # degenerate tiny chain the fixed scheme cannot partition, but the
+        # per-row bin recomputation below still catches any tampering.
+        try:
+            ico.validate_scaled_bin_semantics(scaled_defs)
+            if int(fixed_defs.get("long_threshold_fixed", n_beads)) < n_beads:
+                ico.validate_bin_definitions(n_beads, fixed_defs, scaled_defs)
+        except ico.ContactMapError as exc:
+            raise ExtractionError(f"stored bin definitions invalid: {exc}") from exc
+        stored_ver = str(man.get("definitions_version", ico.DEFINITIONS_VERSION))
+        uses_current = (stored_ver == str(ico.DEFINITIONS_VERSION))
+
+        # -- temperature-index <-> temperature ladder -----------------------
+        ti = I["temperature_index"].astype(np.int64)
+        tv = I["temperature"].astype(float)
+        if ti.size and (int(ti.min()) < 0):
+            raise ExtractionError("negative temperature_index")
+        ladder = {}
+        for r in range(n_rows):
+            k = int(ti[r])
+            if k in ladder:
+                if not (math.isnan(ladder[k]) and math.isnan(float(tv[r]))) \
+                        and abs(ladder[k] - float(tv[r])) > 1e-9:
+                    raise ExtractionError(
+                        f"[row {r}] temperature {tv[r]} != ladder[{k}]={ladder[k]}")
+            else:
+                ladder[k] = float(tv[r])
+        nT_man = int(man.get("temperature_count", len(ladder)))
+        if len(ladder) and (max(ladder) >= nT_man):
+            raise ExtractionError("temperature_index out of ladder bounds")
+
+        # -- deterministic (snapshot_index, temperature_index) ordering -----
+        order = list(zip(I["snapshot_index"].astype(np.int64).tolist(),
+                         ti.tolist()))
+        if order != sorted(order):
+            raise ExtractionError("rows not in (snapshot_index, temperature_index) order")
+
+        # -- primary-key uniqueness -----------------------------------------
+        try:
+            sch.validate_feature_primary_keys({k: I[k] for k in PRIMARY_KEY})
+        except sch.SchemaError as exc:
+            raise ExtractionError(f"primary-key validation failed: {exc}") from exc
+
+        # -- aggregate graph / thermo identities ----------------------------
+        if not (np.array_equal(S["contact_graph_edges"].astype(np.int64), m)
+                and np.array_equal(S["sum_component_edges"].astype(np.int64), m)):
+            raise ExtractionError("contact graph edge totals != m")
+        if not np.array_equal(S["augmented_graph_edges"].astype(np.int64),
+                              (n_beads - 1 + m)):
+            raise ExtractionError("augmented edges != N-1+m")
+        if not np.array_equal(S["augmented_graph_cycle_rank"].astype(np.int64), m):
+            raise ExtractionError("augmented cycle rank != m")
+        # -- thermodynamic identities (K authoritative; NO nonfinite substitution)
+        # (Part 1.1) A thermodynamic file must carry finite b_T, K_T, u for every
+        # row; q_T may only overflow to +inf / underflow to 0 in the documented
+        # ranges (NaN and arbitrary inf are rejected); effective_energy_H must be
+        # finite whenever T and u are finite.  Every failure identifies its row.
+        b = S["b_T"][()].astype(float); K = S["K_T"][()].astype(float)
+        q = S["q_T"][()].astype(float)
+        u = S["reduced_potential_u"][()].astype(float)
+        H = S["effective_energy_H"][()].astype(float)
+        mf = m.astype(float)
+        thermo_status = str(man.get("thermodynamic_status", "ok"))
+        has_thermo = bool(np.isfinite(K).any())
+        if thermo_status == "ok" and not has_thermo:
+            raise ExtractionError(
+                "manifest declares thermodynamic_status 'ok' but every K_T is "
+                "nonfinite (thermodynamic columns were wholesale corrupted)")
+        if has_thermo:
+            for arr, nm in ((b, "b_T"), (K, "K_T"), (u, "reduced_potential_u")):
+                bad = np.nonzero(~np.isfinite(arr))[0]
+                if bad.size:
+                    raise ExtractionError(
+                        f"[row {int(bad[0])}] nonfinite {nm} in a thermodynamic "
+                        f"file (NaN/inf substitution rejected)")
+            bad = np.nonzero(np.abs(b - (-K)) > 1e-9)[0]
+            if bad.size:
+                raise ExtractionError(f"[row {int(bad[0])}] b_T != -K_T")
+            tgt = -(mf * K)
+            bad = np.nonzero(np.abs(u - tgt) > (1e-6 * np.maximum(1.0, np.abs(tgt)) + 1e-9))[0]
+            if bad.size:
+                raise ExtractionError(
+                    f"[row {int(bad[0])}] reduced_potential_u != -m K_T")
+            # q_T = exp(K): finite in-range, +inf on overflow, 0 on underflow.
+            nanq = np.nonzero(np.isnan(q))[0]
+            if nanq.size:
+                raise ExtractionError(f"[row {int(nanq[0])}] q_T is NaN")
+            in_range = (K >= -700.0) & (K <= 700.0)
+            over = K > 700.0
+            under = K < -700.0
+            expK = np.exp(np.clip(K, -700.0, 700.0))
+            bad = np.nonzero(in_range & (~np.isfinite(q)
+                   | (np.abs(q - expK) > 1e-6 * np.maximum(1.0, expK) + 1e-9)))[0]
+            if bad.size:
+                raise ExtractionError(
+                    f"[row {int(bad[0])}] q_T != exp(K_T) (finite range)")
+            bad = np.nonzero(over & (q != np.inf))[0]
+            if bad.size:
+                raise ExtractionError(
+                    f"[row {int(bad[0])}] q_T must be +inf on overflow "
+                    f"(K_T={float(K[bad[0]]):.3g})")
+            bad = np.nonzero(under & (q != 0.0))[0]
+            if bad.size:
+                raise ExtractionError(
+                    f"[row {int(bad[0])}] q_T must underflow to 0 "
+                    f"(K_T={float(K[bad[0]]):.3g})")
+            # H = T u; reject arbitrary inf/NaN when T and u are finite.
+            Tfin = np.isfinite(tv) & np.isfinite(u)
+            bad = np.nonzero(Tfin & ~np.isfinite(H))[0]
+            if bad.size:
+                raise ExtractionError(
+                    f"[row {int(bad[0])}] effective_energy_H nonfinite though "
+                    f"T and u are finite")
+            tgtH = tv * u
+            bad = np.nonzero(Tfin & (np.abs(H - tgtH)
+                   > 1e-6 * np.maximum(1.0, np.abs(tgtH)) + 1e-9))[0]
+            if bad.size:
+                raise ExtractionError(
+                    f"[row {int(bad[0])}] effective_energy_H != T u")
+
+        # -- geometric identities (Part 1.3) --------------------------------
+        lam1 = S["gyration_lambda_1"][()].astype(float)
+        lam2 = S["gyration_lambda_2"][()].astype(float)
+        lam3 = S["gyration_lambda_3"][()].astype(float)
+        rg2 = S["Rg2_lattice"][()].astype(float)
+        asph = S["asphericity"][()].astype(float)
+        gtol = 1e-6
+        bad = np.nonzero((lam1 > lam2 + gtol) | (lam2 > lam3 + gtol))[0]
+        if bad.size:
+            raise ExtractionError(
+                f"[row {int(bad[0])}] gyration eigenvalues not ascending")
+        bad = np.nonzero(lam1 < -gtol)[0]
+        if bad.size:
+            raise ExtractionError(
+                f"[row {int(bad[0])}] materially negative gyration eigenvalue")
+        lam_sum = lam1 + lam2 + lam3
+        bad = np.nonzero(np.abs(lam_sum - rg2) > gtol + 1e-6 * np.abs(rg2))[0]
+        if bad.size:
+            raise ExtractionError(
+                f"[row {int(bad[0])}] lambda_1+lambda_2+lambda_3 != Rg2")
+        exp_asph = lam3 - 0.5 * (lam1 + lam2)
+        bad = np.nonzero(np.abs(asph - exp_asph) > gtol + 1e-6 * np.abs(exp_asph))[0]
+        if bad.size:
+            raise ExtractionError(
+                f"[row {int(bad[0])}] asphericity != lambda_3-(lambda_1+lambda_2)/2")
+
+        # -- per-row reconstruction from stored pairs (deep) ----------------
+        if deep:
+            for r in range(n_rows):
+                lo, hi = int(offsets[r]), int(offsets[r + 1])
+                p = pairs[lo:hi].astype(np.int64).reshape(-1, 2)
+                mr = int(m[r])
+                if p.shape[0] != mr:
+                    raise ExtractionError(f"[row {r}] pair count {p.shape[0]} != m {mr}")
+                if mr:
+                    i, j = p[:, 0], p[:, 1]
+                    if int(i.min()) < 0 or int(j.max()) >= n_beads:
+                        raise ExtractionError(f"[row {r}] pair index out of bounds")
+                    if not np.all(i < j):
+                        raise ExtractionError(f"[row {r}] pair violates i<j")
+                    if not np.all((j - i) > 1):
+                        raise ExtractionError(f"[row {r}] bonded pair (j-i<=1)")
+                    if not np.all(((j - i) % 2) == 1):
+                        raise ExtractionError(f"[row {r}] even contour separation")
+                    keys = list(zip(i.tolist(), j.tolist()))
+                    if len(set(keys)) != mr:
+                        raise ExtractionError(f"[row {r}] duplicate contact pair")
+                    if keys != sorted(keys):
+                        raise ExtractionError(f"[row {r}] pairs not lexicographically sorted")
+                # stored m_r must satisfy cubic parity (even-r entries zero) and
+                # the r<3 zero convention (Part 1.5), then equal the pairs.
+                try:
+                    ico.validate_m_r(m_r[r], n_beads=n_beads)
+                except ico.ContactMapError as exc:
+                    raise ExtractionError(f"[row {r}] stored m_r invalid: {exc}") from exc
+                # reconstruct m_r
+                mr_rec = ico.contact_separation_counts(p, n_beads)
+                if not np.array_equal(mr_rec.astype(np.int64),
+                                      m_r[r].astype(np.int64)):
+                    raise ExtractionError(f"[row {r}] reconstructed m_r != stored m_r")
+                # recompute pair motifs
+                motifs = ico.count_pair_motifs(p)
+                for key in ("pair_shared_endpoint", "pair_disjoint",
+                            "pair_nested", "pair_interleaved", "pair_total"):
+                    if int(S[key][r]) != int(motifs[key]):
+                        raise ExtractionError(
+                            f"[row {r}] {key} {int(S[key][r])} != recomputed "
+                            f"{int(motifs[key])}")
+                if int(motifs["pair_total"]) != mr * (mr - 1) // 2:
+                    raise ExtractionError(f"[row {r}] pair_total != C(m,2)")
+                # recompute graph summaries (integer fields exact)
+                g = ico.contact_graph_summary(p, n_beads)
+                for key in ("contact_vertices", "contact_graph_components",
+                            "contact_graph_edges", "sum_component_edges",
+                            "largest_component_vertices", "largest_component_edges",
+                            "contact_graph_cycle_rank", "number_of_multiedge_components"):
+                    if int(S[key][r]) != int(g[key]):
+                        raise ExtractionError(
+                            f"[row {r}] graph field {key} mismatch")
+                # contact-graph floating fields (Part 1.2), absolute+relative tol
+                for key in ("largest_component_fraction_of_N",
+                            "largest_component_fraction_of_contact_vertices",
+                            "mean_degree_nonisolated", "degree_variance_nonisolated"):
+                    got = float(S[key][r]); exp = float(g[key])
+                    if abs(got - exp) > 1e-9 + 1e-9 * abs(exp):
+                        raise ExtractionError(
+                            f"[row {r}] graph float field {key} {got} != "
+                            f"recomputed {exp}")
+                ag = ico.augmented_graph_summary(p, n_beads)
+                for key in ("augmented_graph_vertices", "augmented_graph_edges",
+                            "augmented_graph_components", "augmented_graph_cycle_rank",
+                            "augmented_largest_component_vertices"):
+                    if int(S[key][r]) != int(ag[key]):
+                        raise ExtractionError(
+                            f"[row {r}] augmented graph field {key} mismatch")
+                for key in ("augmented_mean_degree", "augmented_degree_variance"):
+                    got = float(S[key][r]); exp = float(ag[key])
+                    if abs(got - exp) > 1e-9 + 1e-9 * abs(exp):
+                        raise ExtractionError(
+                            f"[row {r}] augmented graph float field {key} {got} "
+                            f"!= recomputed {exp}")
+                # separation summaries recomputed from stored pairs (Part 1.4)
+                sm = float(S["mean_contact_separation"][r])
+                sx = float(S["max_contact_separation"][r])
+                if mr == 0:
+                    if not (math.isnan(sm) and math.isnan(sx)):
+                        raise ExtractionError(
+                            f"[row {r}] zero-contact separation summary must be "
+                            f"null/NaN; got mean={sm}, max={sx}")
+                else:
+                    seps = (p[:, 1] - p[:, 0]).astype(float)
+                    if abs(sm - float(seps.mean())) > 1e-6:
+                        raise ExtractionError(
+                            f"[row {r}] mean_contact_separation {sm} != "
+                            f"recomputed {float(seps.mean())}")
+                    if int(sx) != int(seps.max()):
+                        raise ExtractionError(
+                            f"[row {r}] max_contact_separation {int(sx)} != "
+                            f"recomputed {int(seps.max())}")
+                # recompute contour bins from stored definitions
+                fb = ico.bin_contact_separations_fixed(m_r[r], n_beads, fixed_defs)
+                sb = ico.bin_contact_separations_scaled(m_r[r], n_beads, scaled_defs)
+                for key, val in {**fb, **sb}.items():
+                    if int(S[key][r]) != int(val):
+                        raise ExtractionError(
+                            f"[row {r}] contour bin {key} mismatch")
+    return {"row_count": n_rows, "n_beads": n_beads,
+            "definitions_version": stored_ver,
+            "uses_current_definitions": bool(uses_current), "ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1073,13 +1535,27 @@ def main() -> None:
     ap.add_argument("--format", type=str, default="hdf5",
                     choices=["hdf5", "parquet"],
                     help="output format (default hdf5; parquet needs pyarrow)")
+    ap.add_argument("--experimental-parquet", action="store_true",
+                    dest="experimental_parquet",
+                    help="permit the EXPERIMENTAL Parquet export (scalar/tabular "
+                         "only; HDF5 remains authoritative)")
     ap.add_argument("--quick-test", action="store_true",
                     help="run the self-contained extractor smoke test and exit")
     args = ap.parse_args()
 
+    # Phase 11.3: refuse to run when JSON definitions and compatibility
+    # constants disagree (skipped for the self-contained --quick-test).
+    if not args.quick_test:
+        import isaw_schema as _sch
+        _sch.check_definitions_consistency()
+
     if args.quick_test:
         run_quick_test()
         return
+    if args.format == "parquet" and not args.experimental_parquet:
+        ap.error("Parquet is an EXPERIMENTAL scalar/tabular export (no ragged "
+                 "contact pairs; HDF5 is authoritative). Pass "
+                 "--experimental-parquet to use it in production.")
     if not args.input or not args.output:
         ap.error("--input and --output are required (or use --quick-test)")
     if args.chunk_size < 1:

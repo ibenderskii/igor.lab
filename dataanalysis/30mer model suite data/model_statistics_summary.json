@@ -1,0 +1,83 @@
+{
+  "final_joint_baseline_30mer": {
+    "settings": {
+      "alpha": 0.05,
+      "bootstrap_replicates": 10000,
+      "seed": 12345,
+      "practical_equivalence_epsilon": 0.001,
+      "multiple_testing": "holm"
+    },
+    "n_models": 5,
+    "min_paired_seeds": 10,
+    "low_power": false,
+    "raw_winner": "heat_capacity",
+    "parsimony": {
+      "best_model": "heat_capacity",
+      "recommended_model": "hs",
+      "reason": "hs is statistically/practically indistinguishable from the best model heat_capacity but has fewer parameters"
+    },
+    "statistically_supported_differences": [],
+    "practical_equivalences": [
+      {
+        "model_a": "hs",
+        "model_b": "hs_quadratic",
+        "prob_practical_equivalent": 1.0,
+        "mean_delta": -0.00021533339385644974
+      },
+      {
+        "model_a": "hs",
+        "model_b": "poly2",
+        "prob_practical_equivalent": 0.9993,
+        "mean_delta": 7.590172777114518e-05
+      },
+      {
+        "model_a": "hs",
+        "model_b": "poly3",
+        "prob_practical_equivalent": 1.0,
+        "mean_delta": 0.0001278628961574671
+      },
+      {
+        "model_a": "hs",
+        "model_b": "heat_capacity",
+        "prob_practical_equivalent": 1.0,
+        "mean_delta": 0.00026367993807195205
+      },
+      {
+        "model_a": "hs_quadratic",
+        "model_b": "poly2",
+        "prob_practical_equivalent": 0.9808,
+        "mean_delta": 0.0002912351216275949
+      },
+      {
+        "model_a": "hs_quadratic",
+        "model_b": "poly3",
+        "prob_practical_equivalent": 0.9968,
+        "mean_delta": 0.00034319629001391684
+      },
+      {
+        "model_a": "hs_quadratic",
+        "model_b": "heat_capacity",
+        "prob_practical_equivalent": 0.9903,
+        "mean_delta": 0.0004790133319284018
+      },
+      {
+        "model_a": "poly2",
+        "model_b": "poly3",
+        "prob_practical_equivalent": 1.0,
+        "mean_delta": 5.196116838632192e-05
+      },
+      {
+        "model_a": "poly2",
+        "model_b": "heat_capacity",
+        "prob_practical_equivalent": 0.9999,
+        "mean_delta": 0.00018777821030080687
+      },
+      {
+        "model_a": "poly3",
+        "model_b": "heat_capacity",
+        "prob_practical_equivalent": 1.0,
+        "mean_delta": 0.00013581704191448495
+      }
+    ]
+  }
+}
