@@ -80,18 +80,42 @@ def _fields_same_path(f):
         snapshot_stride=f["snapshot_stride"], burnin_frac=f["burnin_frac"])
 
 
-# --- stage_reusable end-to-end with a real feature file + certificate --------
+# --- stage_reusable end-to-end (FULL artifact validation, Part 2) ------------
+# stage_reusable must require full artifact-manifest hash + semantic validation,
+# not merely a trusted certificate and present filenames.
 
-def _make_stage(tmp):
-    nb, nT = len(HAIRPIN6), 2
+import csv as _csv
+
+FP = "fp-" + "abc123" * 10   # >0-length deterministic fingerprint
+LADDER = [300.0, 350.0]
+MODEL = {"model_name": "hs", "param_names": ["h", "s"], "params": [647.7, 1.874],
+         "Tref": 320.0, "Tscale": 80.0}
+
+
+def _wcsv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+def _build_full_stage(tmp):
+    import remd_uniform_chain_2_new as remd
+    from pathlib import Path
+    nb, nT = len(HAIRPIN6), len(LADDER)
     cp, _ = ico.build_contact_map(HAIRPIN6)
     m = cp.shape[0]
     rg2 = ico.radius_of_gyration_squared(HAIRPIN6)
     ree2 = ico.end_to_end_distance_squared(HAIRPIN6)
-    meta = {"run_id": "cf", "seed": 1, "temperatures": [300.0, 350.0],
-            "model_name": "hs", "param_names": ["h", "s"],
-            "model_params": [647.7, 1.874], "Tref": 320.0, "Tscale": 80.0}
-    cfg = os.path.join(tmp, "cfg.h5")
+    prefix = os.path.join(tmp, "calib_N6_s1")
+    cfg = prefix + "_configurations.h5"
+    feat = prefix + "_features.h5"
+    meta = {"run_id": "cf", "seed": 1, "temperatures": LADDER}
+    meta.update({"model_name": MODEL["model_name"],
+                 "param_names": MODEL["param_names"],
+                 "model_params": MODEL["params"],
+                 "Tref": MODEL["Tref"], "Tscale": MODEL["Tscale"]})
     w = cio.SnapshotWriter(cfg, n_beads=nb, n_temperatures=nT, metadata=meta)
     for c in range(3):
         w.append(cycle=c,
@@ -101,56 +125,113 @@ def _make_stage(tmp):
                  ree2_lattice=np.full(nT, ree2))
     w.mark_complete()
     w.close()
-    feat = os.path.join(tmp, "feat.h5")
+    fields = {"model_name": MODEL["model_name"], "seed": 1}
+    cal._embed_fingerprint_hdf5(cfg, FP, fields)
     ext.extract(cfg, feat, validate=True, output_format="hdf5", overwrite=True)
-    return cfg, feat
-
-
-def _companions(tmp, cfg, feat):
-    # create empty placeholder companion files so presence checks pass
-    prefix = os.path.join(tmp, "calib")
+    cal._embed_fingerprint_feature(feat, FP, fields)
+    cal._deep_validate_and_certify(feat, stage_fingerprint=FP,
+                                   stage_fingerprint_fields=fields,
+                                   source_config=cfg)
+    _wcsv(prefix + "_results.csv", ["T", "C_mean", "Rg2_mean_lattice"],
+          [[LADDER[i], 3.0, rg2] for i in range(nT)])
+    _wcsv(prefix + "_swap_rates.csv",
+          ["pair", "T_lo", "T_hi", "proposals", "acceptances", "rate"],
+          [[0, LADDER[0], LADDER[1], 10, 5, "0.5"]])
+    ma = [[i, LADDER[i], mn, 10, 8, 6] for i in range(nT) for mn in remd.MOVE_NAMES]
+    _wcsv(prefix + "_move_acceptance.csv",
+          ["temperature_index", "temperature", "move_type",
+           "proposed", "geometrically_valid", "metropolis_accepted"], ma)
+    Path(prefix + "_diagnostics.json").write_text(json.dumps(
+        {"temperatures": LADDER, "n_temperatures": nT, "burnin_frac": 0.5}),
+        encoding="utf-8")
+    arrs = {k: np.zeros((nT, 8), np.float32) for k in
+            ("contacts_post", "rg2_post", "m_long_post", "m_global_scaled_post",
+             "smax_post", "largest_component_fraction_post")}
+    np.savez(prefix + "_diagnostic_trajectories.npz", Ts=np.asarray(LADDER),
+             stage_fingerprint=np.array(FP), **arrs)
+    np.savez(prefix + "_distributions.npz", Ts=np.asarray(LADDER),
+             temps=np.asarray(LADDER), Pc=np.zeros((nT, 5)), Prg=np.zeros((nT, 7)),
+             model_name=np.array(MODEL["model_name"]),
+             param_names=np.array(MODEL["param_names"]),
+             model_params=np.array(MODEL["params"], float),
+             Tref=np.array(MODEL["Tref"]), Tscale=np.array(MODEL["Tscale"]),
+             n_beads=np.array(nb))
+    Path(prefix + "_run_summary.json").write_text(json.dumps({
+        "N": nb, "n_beads": nb, "seed": 1, "temperatures": LADDER,
+        "model": MODEL["model_name"], "param_names": MODEL["param_names"],
+        "params": MODEL["params"], "Tref": MODEL["Tref"],
+        "Tscale": MODEL["Tscale"], "burnin_frac": 0.5, "n_cycles": 400,
+        "steps_per_swap": 60, "snapshot_stride": 5}), encoding="utf-8")
     comp = cal._companion_paths(prefix, cfg, feat)
-    for name, path in comp.items():
-        if not os.path.exists(path):
-            open(path, "w").close()
-    return comp
+    cal.build_artifact_manifest(cal._full_companion_paths(prefix, cfg, feat),
+                                comp["artifact_manifest_json"])
+    info = {"model_name": MODEL["model_name"], "param_names": MODEL["param_names"],
+            "params": MODEL["params"], "Tref": MODEL["Tref"],
+            "Tscale": MODEL["Tscale"]}
+    record = cal.build_expected_stage_record(
+        N=nb, seed=1, run_id=None, ladder=LADDER, K_ladder=[0.0, 0.0], info=info,
+        fit_summary_sha256=None, burnin_frac=0.5, n_cycles=400, steps_per_swap=60,
+        structural_stride=5, snapshot_stride=5, stage_fingerprint=FP)
+    return prefix, cfg, feat, comp, record
+
+
+def _reusable(cfg, feat, comp, record, **over):
+    kw = dict(feature_path=feat, source_config=cfg,
+              artifact_manifest_path=comp["artifact_manifest_json"],
+              expected_N=6, expected_seed=1, expected_ladder=LADDER,
+              expected_stage_fingerprint=FP, expected_run_id=None,
+              expected_model_record=record, sampler_controls={},
+              definitions_context=cal.sch.active_definitions_context(),
+              companions=comp)
+    kw.update(over)
+    return cal.stage_reusable(**kw)
 
 
 def test_stage_reusable_accepts_matching_and_rejects_mismatch():
     with tempfile.TemporaryDirectory() as tmp:
-        cfg, feat = _make_stage(tmp)
-        comp = _companions(tmp, cfg, feat)
-        fp = "fp-abc"
-        cal._deep_validate_and_certify(feat, stage_fingerprint=fp,
-                                       source_config=cfg)
-        ok, reason = cal.stage_reusable(feat, cfg, fp, comp)
+        prefix, cfg, feat, comp, record = _build_full_stage(tmp)
+        ok, reason = _reusable(cfg, feat, comp, record)
         assert ok is True, reason
-        # wrong fingerprint -> not reusable
-        ok2, reason2 = cal.stage_reusable(feat, cfg, "fp-different", comp)
+        ok2, reason2 = _reusable(cfg, feat, comp, record,
+                                 expected_stage_fingerprint="fp-different")
         assert ok2 is False and "fingerprint" in reason2
 
 
 def test_stage_reusable_rejects_missing_companion():
     with tempfile.TemporaryDirectory() as tmp:
-        cfg, feat = _make_stage(tmp)
-        comp = _companions(tmp, cfg, feat)
-        fp = "fp-abc"
-        cal._deep_validate_and_certify(feat, stage_fingerprint=fp,
-                                       source_config=cfg)
+        prefix, cfg, feat, comp, record = _build_full_stage(tmp)
         os.remove(comp["diagnostic_trajectories_npz"])
-        ok, reason = cal.stage_reusable(feat, cfg, fp, comp)
+        ok, reason = _reusable(cfg, feat, comp, record)
         assert ok is False and "companion" in reason
 
 
 def test_stage_reusable_rejects_changed_source_hash():
     with tempfile.TemporaryDirectory() as tmp:
-        cfg, feat = _make_stage(tmp)
-        comp = _companions(tmp, cfg, feat)
-        fp = "fp-abc"
-        cal._deep_validate_and_certify(feat, stage_fingerprint=fp,
-                                       source_config=cfg)
-        # mutate the source configuration so its hash no longer matches the cert
+        prefix, cfg, feat, comp, record = _build_full_stage(tmp)
         with open(cfg, "ab") as fh:
             fh.write(b"\x00")
-        ok, reason = cal.stage_reusable(feat, cfg, fp, comp)
+        ok, reason = _reusable(cfg, feat, comp, record)
         assert ok is False and "source configuration hash" in reason
+
+
+def test_stage_reusable_rejects_corrupted_artifact_hash():
+    # File changed WITHOUT updating the artifact-manifest hash -> hash check fails.
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix, cfg, feat, comp, record = _build_full_stage(tmp)
+        with open(prefix + "_results.csv", "a", encoding="utf-8") as f:
+            f.write("\n# tamper\n")
+        ok, reason = _reusable(cfg, feat, comp, record)
+        assert ok is False and "artifact validation failed" in reason
+
+
+def test_stage_reusable_rejects_semantic_corruption_with_updated_hash():
+    # File changed AND manifest hash updated -> semantic validation must fail.
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix, cfg, feat, comp, record = _build_full_stage(tmp)
+        _wcsv(prefix + "_results.csv", ["T", "C_mean", "Rg2_mean_lattice"],
+              [[999.0, 3.0, 1.0], [LADDER[1], 3.0, 1.0]])
+        cal.build_artifact_manifest(
+            cal._full_companion_paths(prefix, cfg, feat),
+            comp["artifact_manifest_json"])
+        ok, reason = _reusable(cfg, feat, comp, record)
+        assert ok is False and "artifact validation failed" in reason

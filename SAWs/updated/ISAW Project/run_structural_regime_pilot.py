@@ -645,10 +645,48 @@ def aggregate_lane_observables(prefixes, info, n_beads):
         "smax": "Smax_mean",
         "largest_component_fraction": "largest_component_fraction_mean",
     }
+    if not prefixes:
+        raise SeedAlignmentError("no seed prefixes to aggregate")
     per_seed_rows = [sorted(_read_results(p), key=lambda r: float(r["T"]))
                      for p in prefixes]
-    nT = min(len(r) for r in per_seed_rows)
-    per_seed_rows = [rows[:nT] for rows in per_seed_rows]
+    # -- strict cross-seed alignment (NO silent truncation, Part 5) ----------
+    # Every seed must contribute exactly the same temperature grid, one row per
+    # lane, with all required observable columns finite.  A short/long/shifted/
+    # duplicate grid is a data-integrity failure, not something to be trimmed
+    # away with rows[:min_len]; the helper is therefore safe even when called
+    # without a prior alignment audit.
+    required_cols = ("T",) + tuple(cols.values())
+    counts = {p: len(r) for p, r in zip(prefixes, per_seed_rows)}
+    if len(set(counts.values())) != 1:
+        raise SeedAlignmentError(
+            f"seeds disagree on lane count: {counts}")
+    nT = next(iter(counts.values()))
+    if nT == 0:
+        raise SeedAlignmentError("results contain no lanes")
+    ref_temps = None
+    for p, rows in zip(prefixes, per_seed_rows):
+        for k, row in enumerate(rows):
+            for col in required_cols:
+                if col not in row:
+                    raise SeedAlignmentError(
+                        f"seed {p!r} lane {k} missing required column {col!r}")
+        temps = np.array([float(row["T"]) for row in rows])
+        if not np.all(np.isfinite(temps)):
+            raise SeedAlignmentError(f"seed {p!r} has non-finite temperatures")
+        rounded = [round(float(t), 6) for t in temps]
+        if len(set(rounded)) != nT:
+            raise SeedAlignmentError(f"seed {p!r} has duplicate temperatures")
+        srt = np.sort(temps)
+        if ref_temps is None:
+            ref_temps = srt
+        elif not np.allclose(srt, ref_temps, atol=ALIGN_TOL, rtol=0.0):
+            raise SeedAlignmentError(
+                f"seed {p!r} temperature grid differs from the reference grid")
+        for name, col in cols.items():
+            vals = np.array([float(row[col]) for row in rows])
+            if not np.all(np.isfinite(vals)):
+                raise SeedAlignmentError(
+                    f"seed {p!r} has non-finite {col} values")
     T = np.array([float(per_seed_rows[0][k]["T"]) for k in range(nT)])
     K = np.array([_K_of(info, t) for t in T])
     S = len(per_seed_rows)
@@ -1007,6 +1045,74 @@ def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
     }
 
 
+def finalize_production_status(production, *, smoke_test,
+                               n_complete_calibration_seeds,
+                               n_requested_calibration_seeds,
+                               all_requested_seeds_valid, seeds_aligned,
+                               statistical_support_status, regime_labels_stable,
+                               sampling_gates_passed, calibration_gate_passed):
+    """Attach a scientifically-meaningful production status (Part 8/12).
+
+    A production recommendation always keeps its numeric cycle estimate, but the
+    estimate is only trustworthy as a definitive plan when the whole calibration
+    is sound.  ``status`` may be ``definitive`` ONLY when every one of the
+    following holds; otherwise it is ``provisional`` (with the reasons recorded):
+
+    * the run is not a smoke test;
+    * at least two INDEPENDENT requested seeds completed;
+    * every requested seed passed artifact validation;
+    * the seeds are aligned;
+    * statistical support is assessable (not ``not_assessable``);
+    * regime labels are stable across seeds;
+    * the sampling gates pass;
+    * the overall calibration gate passed.
+
+    A single seed can never be "stable merely because it agrees with itself":
+    with fewer than two complete seeds the status is provisional regardless of
+    any degenerate per-seed agreement.
+    """
+    reasons = []
+    if smoke_test:
+        reasons.append("run is a smoke test")
+    if int(n_complete_calibration_seeds) < 2:
+        reasons.append(
+            f"only {int(n_complete_calibration_seeds)} complete calibration "
+            f"seed(s); >= 2 independent seeds required")
+    if not all_requested_seeds_valid:
+        reasons.append("not every requested seed passed artifact validation")
+    if not seeds_aligned:
+        reasons.append("seeds are not aligned")
+    if str(statistical_support_status) == "not_assessable":
+        reasons.append("statistical support is not assessable")
+    if not regime_labels_stable:
+        reasons.append("regime labels are not stable across seeds")
+    if not sampling_gates_passed:
+        reasons.append("sampling gates did not pass")
+    if not calibration_gate_passed:
+        reasons.append("calibration gate did not pass")
+    definitive = (len(reasons) == 0)
+    status = "definitive" if definitive else "provisional"
+    production["status"] = status
+    production["status_reasons"] = reasons
+    production["n_complete_calibration_seeds"] = int(n_complete_calibration_seeds)
+    production["n_requested_calibration_seeds"] = int(
+        n_requested_calibration_seeds)
+    production["statistical_support_status"] = str(statistical_support_status)
+    production["calibration_gate_passed"] = bool(calibration_gate_passed)
+    # A single complete seed can never establish stability (it only agrees with
+    # itself), so its stability is NOT_ASSESSABLE regardless of the flag.
+    production["regime_label_stability_status"] = (
+        "not_assessable" if int(n_complete_calibration_seeds) < 2 else
+        "stable" if regime_labels_stable else "unstable")
+    production["numeric_recommendation_is_provisional"] = bool(not definitive)
+    # A provisional overall status forces every per-regime status to provisional
+    # too (a regime cannot be more authoritative than the calibration as a whole).
+    if not definitive:
+        for rr in production.get("per_regime", {}).values():
+            rr["status"] = "provisional"
+    return production
+
+
 # ---------------------------------------------------------------------------
 # Sampling / mixing gates (Phase 8)
 # ---------------------------------------------------------------------------
@@ -1102,6 +1208,16 @@ def evaluate_sampling_gates(metrics, thresholds=None):
 # ---------------------------------------------------------------------------
 # Run + provenance (Phase 11)
 # ---------------------------------------------------------------------------
+
+def _atomic_write_json(path, obj):
+    """Write JSON to ``path`` atomically (temp file + replace) so a crashed write
+    never leaves a half-written manifest/report on disk."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(sch.json_safe(obj), indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return str(path)
+
 
 def _sha256(path):
     if path is None or not Path(path).exists():
@@ -1350,29 +1466,66 @@ def _current_certificate_expectations():
             str(sch.DEFINITIONS_VERSION), int(ext.FEATURE_SCHEMA_VERSION))
 
 
-def stage_reusable(feat, cfg, stage_fingerprint, companions):
-    """(reusable, reason) — a resumed stage may be reused only if EVERYTHING
-    matches the requested stage (Phase 4/5).
+def stage_reusable(*, feature_path, source_config, artifact_manifest_path,
+                   expected_N, expected_seed, expected_ladder,
+                   expected_stage_fingerprint, expected_run_id,
+                   expected_model_record, sampler_controls,
+                   definitions_context, companions):
+    """(reusable, reason) — a resumed stage may be reused only after FULL artifact
+    validation, never merely because its certificate is trusted and companion
+    filenames exist (Phase 4/5/6).
 
-    Delegates certificate trust to :func:`validate_feature_certificate` (the one
-    shared trust function) and additionally requires the source configuration and
-    every companion artifact to be present.
+    Required sequence:
+
+    1. validate the feature certificate (the one shared trust function);
+    2. require the artifact manifest to exist and be readable;
+    3. validate every artifact's recorded hash;
+    4. validate every artifact's scientific metadata against the expected stage
+       (model, parameters, Tref/Tscale, ladder, seed, N, fingerprint);
+    5. return ``(True, "reusable")`` only if all checks pass.
+
+    Any missing, corrupted, hash-mismatched, or semantically mismatched artifact
+    returns ``(False, precise reason)`` so the stage reruns rather than being
+    silently reused and caught only by a later seed audit.
     """
-    if not Path(cfg).exists():
+    if not Path(source_config).exists():
         return False, "source configuration missing"
-    defs_sha, defs_ver, feat_ver = _current_certificate_expectations()
+    ctx = definitions_context if definitions_context is not None else sch.CONTEXT
+    defs_sha = str(ctx.sha256)
+    defs_ver = str(ctx.definitions_version)
+    feat_ver = int(ext.FEATURE_SCHEMA_VERSION)
+    # 1. certificate trust
     ok, reason = validate_feature_certificate(
-        feat, source_configuration_path=cfg,
-        expected_stage_fingerprint=stage_fingerprint,
+        feature_path, source_configuration_path=source_config,
+        expected_stage_fingerprint=expected_stage_fingerprint,
         expected_validator_revision=VALIDATOR_REVISION,
         expected_definitions_sha256=defs_sha,
         expected_definitions_version=defs_ver,
         expected_feature_schema_version=feat_ver)
     if not ok:
         return False, reason
-    for name, path in companions.items():
+    # 2. every companion artifact must be present (including the manifest).
+    for name, path in (companions or {}).items():
         if not Path(path).exists():
             return False, f"missing companion artifact: {name}"
+    if not artifact_manifest_path or not Path(artifact_manifest_path).exists():
+        return False, "missing artifact manifest"
+    try:
+        json.loads(Path(artifact_manifest_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"unreadable artifact manifest: {exc}"
+    # 3 + 4. full hash + SEMANTIC validation against the expected stage.
+    try:
+        man_ok, man_report = validate_artifact_manifest(
+            artifact_manifest_path, N=expected_N, seed=expected_seed,
+            ladder=expected_ladder, source_config=source_config,
+            stage_fingerprint=expected_stage_fingerprint,
+            run_id=expected_run_id, model_record=expected_model_record)
+    except Exception as exc:
+        return False, f"artifact manifest validation error: {exc}"
+    if not man_ok:
+        bad = {k: v for k, v in man_report.items() if v != "ok"}
+        return False, f"artifact validation failed: {bad}"
     return True, "reusable"
 
 
@@ -1424,6 +1577,75 @@ def _ladder_close(a, b, tol=1e-3):
     return a.size == b.size and np.allclose(a, b, atol=tol, rtol=0.0)
 
 
+def _num_close(a, b, atol=1e-6, rtol=1e-9):
+    """Serialization-appropriate scalar float comparison (never string-based)."""
+    try:
+        return abs(float(a) - float(b)) <= atol + rtol * abs(float(b))
+    except (TypeError, ValueError):
+        return False
+
+
+def _params_close(a, b, atol=1e-6, rtol=1e-9):
+    """Element-wise float comparison of two model-parameter vectors."""
+    try:
+        a = [float(x) for x in np.asarray(a, float).ravel()]
+        b = [float(x) for x in np.asarray(b, float).ravel()]
+    except (TypeError, ValueError):
+        return False
+    return len(a) == len(b) and all(_num_close(x, y, atol, rtol)
+                                    for x, y in zip(a, b))
+
+
+def build_expected_stage_record(*, N, seed, run_id, ladder, K_ladder, info,
+                                fit_summary_sha256, burnin_frac, n_cycles,
+                                steps_per_swap, structural_stride,
+                                snapshot_stride, stage_fingerprint):
+    """One expected scientific-stage record shared by every artifact validator.
+
+    Artifact validators must require EQUALITY to this record (not merely that
+    model metadata exists), so a stage produced for a different fitted model,
+    parameter set, reference/scale temperature, ladder, seed, or N is rejected
+    even when its recorded hashes were faked to match.
+    """
+    return {
+        "N": int(N),
+        "seed": int(seed),
+        "run_id": (None if run_id is None else str(run_id)),
+        "temperature_ladder": [float(t) for t in ladder],
+        "K_ladder": [float(k) for k in K_ladder],
+        "model_name": str(info["model_name"]),
+        "param_names": [str(x) for x in info.get("param_names", [])],
+        "model_params": [float(x) for x in info["params"]],
+        "Tref": float(info["Tref"]),
+        "Tscale": float(info["Tscale"]),
+        "fit_summary_sha256": fit_summary_sha256,
+        "burnin_frac": float(burnin_frac),
+        "n_cycles": int(n_cycles),
+        "steps_per_swap": int(steps_per_swap),
+        "structural_stride": int(structural_stride),
+        "snapshot_stride": int(snapshot_stride),
+        "stage_fingerprint": stage_fingerprint,
+    }
+
+
+def _expected_record_from_fingerprint_fields(fields, *, run_id,
+                                             stage_fingerprint):
+    """Build an expected stage record from the canonical fingerprint fields."""
+    info = {"model_name": fields["model_name"],
+            "param_names": fields.get("param_names", []),
+            "params": fields["model_params"],
+            "Tref": fields["Tref"], "Tscale": fields["Tscale"]}
+    return build_expected_stage_record(
+        N=fields["N"], seed=fields["seed"], run_id=run_id,
+        ladder=fields["temperature_ladder"], K_ladder=fields["K_ladder"],
+        info=info, fit_summary_sha256=fields.get("fit_summary_sha256"),
+        burnin_frac=fields["burnin_frac"], n_cycles=fields["n_cycles"],
+        steps_per_swap=fields["steps_per_swap"],
+        structural_stride=fields["structural_stride"],
+        snapshot_stride=fields["snapshot_stride"],
+        stage_fingerprint=stage_fingerprint)
+
+
 def _read_csv_rows(path):
     import csv as _csv
     with open(path, newline="", encoding="utf-8") as f:
@@ -1432,7 +1654,7 @@ def _read_csv_rows(path):
 
 
 def validate_config_artifact(path, *, N, seed, ladder, stage_fingerprint=None,
-                             run_id=None):
+                             run_id=None, expected=None):
     import h5py
     with h5py.File(path, "r") as f:
         if str(f.attrs.get("status", f["snapshots"].attrs.get("status"))) \
@@ -1462,6 +1684,22 @@ def validate_config_artifact(path, *, N, seed, ladder, stage_fingerprint=None,
         if stage_fingerprint is not None:
             if str(f.attrs.get("stage_fingerprint")) != str(stage_fingerprint):
                 raise ArtifactValidationError("configuration stage fingerprint mismatch")
+        if expected is not None:
+            mn = meta.get("model_name")
+            if isinstance(mn, bytes):
+                mn = mn.decode()
+            if mn is not None and str(mn) != str(expected["model_name"]):
+                raise ArtifactValidationError(
+                    "configuration model_name != expected stage")
+            if meta.get("model_params") is not None and not _params_close(
+                    meta["model_params"], expected["model_params"]):
+                raise ArtifactValidationError(
+                    "configuration model_params != expected stage")
+            for key in ("Tref", "Tscale"):
+                if meta.get(key) is not None and not _num_close(
+                        meta[key], expected[key]):
+                    raise ArtifactValidationError(
+                        f"configuration {key} != expected stage")
 
 
 def require_exact_integer_from(v):
@@ -1480,7 +1718,7 @@ def validate_feature_artifact(path, *, source_config, stage_fingerprint):
                 raise ArtifactValidationError("feature stage fingerprint mismatch")
 
 
-def validate_distributions_artifact(path, *, N, ladder):
+def validate_distributions_artifact(path, *, N, ladder, expected=None):
     with np.load(path, allow_pickle=True) as z:
         if "Ts" not in z or not _ladder_close(z["Ts"], ladder):
             raise ArtifactValidationError("distributions Ts != requested ladder")
@@ -1498,10 +1736,37 @@ def validate_distributions_artifact(path, *, N, ladder):
         for key in ("n_beads", "N"):
             if key in z and int(np.asarray(z[key]).ravel()[0]) != int(N):
                 raise ArtifactValidationError("distributions N mismatch")
+        if expected is not None:
+            # The distributions NPZ is authoritative for the fitted model; it MUST
+            # carry the model record and it MUST equal the expected stage.
+            if str(np.asarray(z["model_name"]).item()) != str(
+                    expected["model_name"]):
+                raise ArtifactValidationError(
+                    "distributions model_name != expected stage")
+            if "param_names" not in z:
+                raise ArtifactValidationError(
+                    "distributions missing param_names for model validation")
+            got = [str(x) for x in np.asarray(z["param_names"]).ravel().tolist()]
+            if got != [str(x) for x in expected["param_names"]]:
+                raise ArtifactValidationError(
+                    "distributions param_names != expected order")
+            if "model_params" not in z:
+                raise ArtifactValidationError("distributions missing model_params")
+            if not _params_close(z["model_params"], expected["model_params"]):
+                raise ArtifactValidationError(
+                    "distributions model_params != expected stage")
+            for key in ("Tref", "Tscale"):
+                if key not in z:
+                    raise ArtifactValidationError(
+                        f"distributions missing {key} for model validation")
+                if not _num_close(np.asarray(z[key]).ravel()[0], expected[key]):
+                    raise ArtifactValidationError(
+                        f"distributions {key} != expected stage")
 
 
 def validate_diagnostic_trajectories_artifact(path, *, ladder,
-                                              stage_fingerprint=None):
+                                              stage_fingerprint=None,
+                                              expected=None):
     with np.load(path, allow_pickle=True) as z:
         if "Ts" not in z or not _ladder_close(z["Ts"], ladder):
             raise ArtifactValidationError(
@@ -1521,9 +1786,38 @@ def validate_diagnostic_trajectories_artifact(path, *, ladder,
             if str(z["stage_fingerprint"]) != str(stage_fingerprint):
                 raise ArtifactValidationError(
                     "diagnostic trajectories stage fingerprint mismatch")
+        # Model / stage identity agreement WHEN STORED (the NPZ carries the model
+        # record only via embedded fingerprint fields, not natively).
+        if expected is not None:
+            if ("model_name" in z and str(np.asarray(z["model_name"]).item())
+                    != str(expected["model_name"])):
+                raise ArtifactValidationError(
+                    "diagnostic trajectories model_name != expected stage")
+            if ("model_params" in z and not _params_close(
+                    z["model_params"], expected["model_params"])):
+                raise ArtifactValidationError(
+                    "diagnostic trajectories model_params != expected stage")
+            if "stage_fingerprint_fields" in z:
+                try:
+                    ff = json.loads(str(np.asarray(
+                        z["stage_fingerprint_fields"]).item()))
+                except Exception:
+                    ff = None
+                if isinstance(ff, dict):
+                    if (ff.get("model_name") is not None
+                            and str(ff["model_name"])
+                            != str(expected["model_name"])):
+                        raise ArtifactValidationError(
+                            "diagnostic trajectories fingerprint model_name "
+                            "!= expected stage")
+                    if (ff.get("seed") is not None
+                            and int(ff["seed"]) != int(expected["seed"])):
+                        raise ArtifactValidationError(
+                            "diagnostic trajectories fingerprint seed "
+                            "!= expected stage")
 
 
-def validate_diagnostics_json_artifact(path, *, ladder):
+def validate_diagnostics_json_artifact(path, *, ladder, expected=None):
     d = json.loads(Path(path).read_text(encoding="utf-8"))
     nT = len(np.asarray(ladder).ravel())
     temps = d.get("temperatures")
@@ -1533,10 +1827,16 @@ def validate_diagnostics_json_artifact(path, *, ladder):
         if len(temps) != nT or not _ladder_close(temps, ladder):
             raise ArtifactValidationError("diagnostics temperatures != ladder")
     lc = d.get("n_temperatures", d.get("lane_count"))
+    if lc is None:
+        lc = (d.get("summary", {}) or {}).get("n_temperatures")
     if lc is not None and int(lc) != nT:
         raise ArtifactValidationError("diagnostics lane count != ladder size")
-    if "burnin_frac" not in d and "burnin_frac" not in (d.get("summary", {}) or {}):
+    bf = d.get("burnin_frac", (d.get("summary", {}) or {}).get("burnin_frac"))
+    if bf is None:
         raise ArtifactValidationError("diagnostics missing burnin_frac")
+    if expected is not None and not _num_close(bf, expected["burnin_frac"]):
+        raise ArtifactValidationError(
+            "diagnostics burnin_frac != expected stage")
 
 
 def validate_results_csv_artifact(path, *, ladder):
@@ -1598,7 +1898,7 @@ def validate_move_acceptance_csv_artifact(path, *, ladder):
 
 
 def validate_run_summary_artifact(path, *, N, seed, ladder,
-                                  stage_fingerprint=None):
+                                  stage_fingerprint=None, expected=None):
     d = json.loads(Path(path).read_text(encoding="utf-8"))
     if int(d.get("N", d.get("n_beads", -1))) != int(N):
         raise ArtifactValidationError("run-summary N mismatch")
@@ -1612,22 +1912,57 @@ def validate_run_summary_artifact(path, *, N, seed, ladder,
     if stage_fingerprint is not None and "stage_fingerprint" in d:
         if str(d["stage_fingerprint"]) != str(stage_fingerprint):
             raise ArtifactValidationError("run-summary stage fingerprint mismatch")
+    if expected is not None:
+        model = d.get("model", d.get("model_name"))
+        if str(model) != str(expected["model_name"]):
+            raise ArtifactValidationError("run-summary model != expected stage")
+        if d.get("param_names") is not None and [
+                str(x) for x in d["param_names"]] != [
+                str(x) for x in expected["param_names"]]:
+            raise ArtifactValidationError(
+                "run-summary param_names != expected order")
+        params = d.get("params", d.get("model_params"))
+        if params is not None and not _params_close(
+                params, expected["model_params"]):
+            raise ArtifactValidationError("run-summary params != expected stage")
+        for key in ("Tref", "Tscale"):
+            if d.get(key) is not None and not _num_close(d[key], expected[key]):
+                raise ArtifactValidationError(
+                    f"run-summary {key} != expected stage")
+        if d.get("burnin_frac") is not None and not _num_close(
+                d["burnin_frac"], expected["burnin_frac"]):
+            raise ArtifactValidationError(
+                "run-summary burnin_frac != expected stage")
+        if d.get("n_cycles") is not None and int(d["n_cycles"]) != int(
+                expected["n_cycles"]):
+            raise ArtifactValidationError(
+                "run-summary n_cycles != expected stage")
+        if d.get("steps_per_swap") is not None and int(
+                d["steps_per_swap"]) != int(expected["steps_per_swap"]):
+            raise ArtifactValidationError(
+                "run-summary steps_per_swap != expected stage")
+        if d.get("snapshot_stride") is not None and int(
+                d["snapshot_stride"]) != int(expected["snapshot_stride"]):
+            raise ArtifactValidationError(
+                "run-summary snapshot_stride != expected stage")
 
 
 _ARTIFACT_SEMANTIC = {
     "configuration_h5": lambda p, C: validate_config_artifact(
         p, N=C["N"], seed=C["seed"], ladder=C["ladder"],
-        stage_fingerprint=C["stage_fingerprint"], run_id=C.get("run_id")),
+        stage_fingerprint=C["stage_fingerprint"], run_id=C.get("run_id"),
+        expected=C.get("expected")),
     "feature_h5": lambda p, C: validate_feature_artifact(
         p, source_config=C["source_config"],
         stage_fingerprint=C["stage_fingerprint"]),
     "distributions_npz": lambda p, C: validate_distributions_artifact(
-        p, N=C["N"], ladder=C["ladder"]),
+        p, N=C["N"], ladder=C["ladder"], expected=C.get("expected")),
     "diagnostic_trajectories_npz": lambda p, C:
         validate_diagnostic_trajectories_artifact(
-            p, ladder=C["ladder"], stage_fingerprint=C["stage_fingerprint"]),
+            p, ladder=C["ladder"], stage_fingerprint=C["stage_fingerprint"],
+            expected=C.get("expected")),
     "diagnostics_json": lambda p, C: validate_diagnostics_json_artifact(
-        p, ladder=C["ladder"]),
+        p, ladder=C["ladder"], expected=C.get("expected")),
     "results_csv": lambda p, C: validate_results_csv_artifact(
         p, ladder=C["ladder"]),
     "swap_rates_csv": lambda p, C: validate_swap_rates_csv_artifact(
@@ -1636,23 +1971,26 @@ _ARTIFACT_SEMANTIC = {
         p, ladder=C["ladder"]),
     "run_summary_json": lambda p, C: validate_run_summary_artifact(
         p, N=C["N"], seed=C["seed"], ladder=C["ladder"],
-        stage_fingerprint=C["stage_fingerprint"]),
+        stage_fingerprint=C["stage_fingerprint"], expected=C.get("expected")),
 }
 
 
 def validate_artifact_manifest(manifest_path, *, N, seed, ladder, source_config,
-                               stage_fingerprint, run_id=None):
+                               stage_fingerprint, run_id=None, model_record=None):
     """Validate every artifact's HASH and SEMANTIC content (Phase 6).
 
     Returns ``(ok, report)`` where ``report`` maps each artifact to ``"ok"`` or a
     failure reason.  A recorded-hash mismatch OR any semantic failure marks that
-    artifact (and the whole manifest) invalid.
+    artifact (and the whole manifest) invalid.  When ``model_record`` (an expected
+    scientific-stage record from :func:`build_expected_stage_record`) is supplied,
+    each artifact must additionally EQUAL that record's fitted model, parameters,
+    Tref/Tscale, and stage identity -- not merely carry some model metadata.
     """
     man = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     entries = man.get("artifacts", {})
     ctx = {"N": N, "seed": seed, "ladder": ladder,
            "source_config": source_config, "stage_fingerprint": stage_fingerprint,
-           "run_id": run_id}
+           "run_id": run_id, "expected": model_record}
     report = {}
     ok_all = True
     for name, entry in entries.items():
@@ -1861,7 +2199,8 @@ def audit_seed_artifacts(seed_companions, *, feature_validator=None,
                 comp["artifact_manifest_json"], N=exp["N"], seed=exp["seed"],
                 ladder=exp["ladder"], source_config=exp["source_config"],
                 stage_fingerprint=exp["stage_fingerprint"],
-                run_id=exp.get("run_id"))
+                run_id=exp.get("run_id"),
+                model_record=exp.get("model_record"))
             if not ok:
                 invalid.append(seed)
                 failures[seed] = {"artifact_validation": {
@@ -1973,10 +2312,29 @@ def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
     feat = out_dir / f"calib_N{N}_s{seed}_features.h5"
     companions = _companion_paths(prefix, cfg, feat)
     if resume:
-        ok, reason = stage_reusable(feat, cfg, stage_fingerprint, companions)
+        expected_record = (
+            _expected_record_from_fingerprint_fields(
+                stage_fingerprint_fields, run_id=None,
+                stage_fingerprint=stage_fingerprint)
+            if stage_fingerprint_fields else None)
+        ok, reason = stage_reusable(
+            feature_path=feat, source_config=cfg,
+            artifact_manifest_path=companions["artifact_manifest_json"],
+            expected_N=int(N), expected_seed=int(seed),
+            expected_ladder=[float(t) for t in ladder],
+            expected_stage_fingerprint=stage_fingerprint, expected_run_id=None,
+            expected_model_record=expected_record,
+            sampler_controls={"n_cycles": int(n_cycles),
+                              "steps_per_swap": int(steps_per_swap),
+                              "structural_stride": int(structural_stride),
+                              "snapshot_stride": int(snapshot_stride),
+                              "burnin_frac": float(burnin_frac),
+                              "n_workers": int(n_workers)},
+            definitions_context=sch.active_definitions_context(),
+            companions=companions)
         if ok:
-            print(f"RESUME: seed {seed} reused (stage fingerprint + companions "
-                  f"match; {feat})")
+            print(f"RESUME: seed {seed} reused (full artifact validation passed; "
+                  f"{feat})")
             return str(prefix)
         print(f"RESUME: seed {seed} NOT reusable ({reason}); rerunning.")
     temps = ",".join(f"{t:.4f}" for t in ladder)
@@ -2375,6 +2733,51 @@ def _regime_lane_map(labels):
     return {r: m.get(r, []) for r in REGIME_NAMES}
 
 
+REQUIRED_REPORT_FILES = ("calibration_report.json", "calibration_report.md",
+                         "recommended_production_config.json",
+                         "run_manifest.json")
+
+
+def finalize_run(out_dir, manifest, report, production):
+    """Transactionally finalize a calibration run (Part 1).
+
+    The manifest stays ``running`` until every required output has been written
+    AND verified readable; only then is it flipped to ``complete`` and written
+    atomically.  Any failure during report generation records
+    ``status = failed`` with ``failure_stage``, ``failure_exception_type`` and
+    ``failure_exception_message`` before re-raising, so an incompletely generated
+    calibration is never left marked ``complete``.
+    """
+    out_dir = Path(out_dir)
+    try:
+        (out_dir / "calibration_report.json").write_text(
+            json.dumps(sch.json_safe(report), indent=2), encoding="utf-8")
+        (out_dir / "recommended_production_config.json").write_text(
+            json.dumps(sch.json_safe(production), indent=2), encoding="utf-8")
+        _write_report_md(out_dir / "calibration_report.md", report)
+        # Every generated report must exist and be readable BEFORE completing.
+        for name in ("calibration_report.json", "calibration_report.md",
+                     "recommended_production_config.json"):
+            p = out_dir / name
+            if not p.exists():
+                raise RuntimeError(f"required report {name} was not written")
+            p.read_text(encoding="utf-8")
+        manifest["status"] = "complete"
+        _atomic_write_json(out_dir / "run_manifest.json", manifest)
+        (out_dir / "run_manifest.json").read_text(encoding="utf-8")
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["failure_stage"] = "report_generation"
+        manifest["failure_exception_type"] = type(exc).__name__
+        manifest["failure_exception_message"] = str(exc)
+        try:
+            _atomic_write_json(out_dir / "run_manifest.json", manifest)
+        except Exception:
+            (out_dir / "run_manifest.json").write_text(
+                json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2552,7 +2955,10 @@ def main():
             "N": int(args.N), "seed": int(s),
             "ladder": [float(t) for t in ladder],
             "source_config": str(cfg),
-            "stage_fingerprint": stage_fingerprints[s], "run_id": None}
+            "stage_fingerprint": stage_fingerprints[s], "run_id": None,
+            "model_record": _expected_record_from_fingerprint_fields(
+                stage_fingerprint_fields[s], run_id=None,
+                stage_fingerprint=stage_fingerprints[s])}
         align_records.append(_seed_alignment_record(prefix, feat, info, args.N))
     seed_audit = audit_seed_artifacts(companions_by_seed,
                                       expectations=seed_expectations)
@@ -2658,6 +3064,19 @@ def main():
         and sampling_ok and enough_seeds and seeds_assessable
         and not args.smoke_test)
 
+    # Part 8/12: label the production recommendation.  It keeps its numeric cycle
+    # estimate but is only DEFINITIVE when the whole calibration is sound.
+    finalize_production_status(
+        production, smoke_test=bool(args.smoke_test),
+        n_complete_calibration_seeds=len(seed_audit["complete_seeds"]),
+        n_requested_calibration_seeds=len(seed_audit["requested_seeds"]),
+        all_requested_seeds_valid=bool(seed_audit["all_requested_complete"]),
+        seeds_aligned=bool(alignment_ok),
+        statistical_support_status=stat_status,
+        regime_labels_stable=bool(regime_labels_stable),
+        sampling_gates_passed=bool(sampling_ok),
+        calibration_gate_passed=bool(calibration_gate_passed))
+
     # Part 3: scientifically_validated is the gate result, NOT merely "not smoke".
     report = {
         "calibration_report_schema_version": CALIBRATION_REPORT_SCHEMA_VERSION,
@@ -2710,15 +3129,9 @@ def main():
     report["ladder_refinement"] = refine_ladder(
         ladder, mixing["adjacent_overlap_aggregate"])
 
-    manifest["status"] = status
     manifest["commands"] = commands
-    (out_dir / "run_manifest.json").write_text(
-        json.dumps(sch.json_safe(manifest), indent=2), encoding="utf-8")
-    (out_dir / "calibration_report.json").write_text(
-        json.dumps(sch.json_safe(report), indent=2), encoding="utf-8")
-    (out_dir / "recommended_production_config.json").write_text(
-        json.dumps(sch.json_safe(production), indent=2), encoding="utf-8")
-    _write_report_md(out_dir / "calibration_report.md", report)
+    _ = status  # retained for backward compatibility; status is set in _finalize_run.
+    finalize_run(out_dir, manifest, report, production)
 
     print(f"\nrun_mode: {run_mode}  "
           f"scientifically_validated: {report['scientifically_validated']}")
@@ -2727,13 +3140,7 @@ def main():
     for name, gr in gates.items():
         if name.startswith("_"):
             continue
-        if "minimum_value" in gr:      # band gate
-            print(f"  gate {name}: passed={gr['passed']} "
-                  f"min={gr['minimum_value']}/{gr['minimum_threshold']} "
-                  f"max={gr['maximum_value']}/{gr['maximum_threshold']}")
-        else:
-            print(f"  gate {name}: passed={gr['passed']} "
-                  f"value={gr['value']} thr={gr['threshold']}")
+        print(f"  gate {name}: passed={gr.get('passed')} " + _format_gate(gr))
     print(f"Reports in {out_dir}")
 
     if args.smoke_test:
@@ -2771,25 +3178,58 @@ def _write_report_md(path, report):
         f"- rule: {report['regimes']['rule']}",
         "",
         "## Sampling gates",
-    ] + [f"- {k}: passed={v['passed']} " + _gate_md(v)
+    ] + [f"- {k}: passed={v.get('passed')} " + _format_gate(v)
          for k, v in report["sampling_gates"].items() if not k.startswith("_")] + [
         "",
         "## Recommended production (NOT launched)",
-        f"- recommended cycles/seed: {prod['recommended_production_cycles_per_seed']}",
+        f"- production status: **{prod.get('status')}**",
+        f"- status reasons: {prod.get('status_reasons')}",
+        f"- recommended cycles/seed (provisional unless status definitive): "
+        f"{prod['recommended_production_cycles_per_seed']}",
         f"- limiting regime: {prod['limiting_regime']}",
         f"- every regime reaches target: {prod['every_regime_reaches_target']}",
         "",
         "_Effective saved configs use Delta_eff = max(snapshot_stride, "
-        "2*tau_int_cycles), not raw snapshots._",
+        "tau_int_cycles), not raw snapshots (NO extra factor of two)._",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _format_gate(v):
+    """Deterministic one-line detail string for ANY gate shape (Part 1).
+
+    Handles scalar gates (``value``/``threshold``), band gates
+    (``minimum_value``/``maximum_value``), the strong high-contact-tail gate, and
+    any unknown structured gate -- the last renders via sorted JSON rather than
+    assuming ``value``/``threshold`` and crashing with ``KeyError``.
+    """
+    if not isinstance(v, dict):
+        return json.dumps(sch.json_safe(v), sort_keys=True, separators=(",", ":"))
+    if "minimum_value" in v and "maximum_value" in v:      # band gate
+        return (f"min={v.get('minimum_value')}/{v.get('minimum_threshold')} "
+                f"max={v.get('maximum_value')}/{v.get('maximum_threshold')}")
+    if "value" in v and "threshold" in v:                  # scalar gate
+        return f"value={v.get('value')} thr={v.get('threshold')}"
+    if "raw_tail_count_pooled" in v:                        # strong tail gate
+        return (
+            f"raw_pooled={v.get('raw_tail_count_pooled')}/"
+            f"{v.get('min_raw_pooled_tail_count')} "
+            f"eff_pooled={v.get('effective_tail_count_pooled')}/"
+            f"{v.get('min_effective_pooled_tail_count')} "
+            f"seed_frac={v.get('seed_tail_fraction')}/"
+            f"{v.get('min_seed_tail_fraction')} "
+            f"min_per_seed={v.get('min_per_seed_tail_count')}/"
+            f"{v.get('min_per_seed_tail_count_threshold')} "
+            f"accounting_ok={v.get('pooled_raw_equals_seed_sum')}")
+    # Unknown structured gate: deterministic JSON of every field except 'passed'.
+    detail = {k: val for k, val in v.items() if k != "passed"}
+    return json.dumps(sch.json_safe(detail), sort_keys=True,
+                      separators=(",", ":"))
+
+
+# Backwards-compatible alias for the old single-purpose renderer.
 def _gate_md(v):
-    if "minimum_value" in v:
-        return (f"min={v['minimum_value']}/{v['minimum_threshold']} "
-                f"max={v['maximum_value']}/{v['maximum_threshold']}")
-    return f"value={v['value']} thr={v['threshold']}"
+    return _format_gate(v)
 
 
 def _hb_summary(hb):
