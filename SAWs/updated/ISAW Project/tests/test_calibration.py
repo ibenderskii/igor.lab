@@ -285,6 +285,11 @@ def test_gates_pass_and_fail():
             "min_swap_rate": 0.4, "max_swap_rate": 0.6,
             "max_drift_in_std": 0.2, "min_state_changing_acceptance": 0.1,
             "tail_probability": 0.05, "raw_tail_count_pooled": 100.0,
+            # Phase 9: the strong tail gate now needs pooled effective count,
+            # seed coverage, and per-seed support to pass.
+            "effective_tail_count_pooled": 50.0,
+            "raw_tail_count_per_seed": [40.0, 60.0], "n_seeds": 2,
+            "seed_coverage": 2, "pooled_raw_equals_seed_sum": True,
             "seed_relative_spread": 0.1}
     g = cal.evaluate_sampling_gates(good)
     assert g["_all_passed"] is True

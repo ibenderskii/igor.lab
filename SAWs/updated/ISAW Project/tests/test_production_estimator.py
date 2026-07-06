@@ -28,8 +28,8 @@ def test_snapshot_stride_changes_result():
     p1 = r1["recommended_production_cycles_per_seed"]
     p10 = r10["recommended_production_cycles_per_seed"]
     p100 = r100["recommended_production_cycles_per_seed"]
-    # Delta_eff = max(stride, 2*tau); non-decreasing in stride, strictly larger
-    # once stride exceeds 2*tau (max tau 5 -> 2*tau=10).
+    # Delta_eff = max(stride, tau_int_cycles); non-decreasing in stride and
+    # strictly larger once stride exceeds tau (max tau 5).
     assert p1 <= p10 < p100
 
 
@@ -56,6 +56,38 @@ def test_limiting_observable_identified():
                                    limiting_observable_by_lane=obs_by_lane)
     # collapsed regime's slowest lane (tau 5) is a smax lane
     assert r["per_regime"]["collapsed"]["limiting_observable"] == "smax"
+
+
+def test_limiting_lane_identified():
+    # lane 5 has the max tau in the collapsed regime {4,5}
+    tau = [2.0, 2.0, 3.0, 3.0, 4.0, 9.0]
+    r = cal.production_requirement(_regimes(), tau, 0.5, 1, n_seeds=4)
+    assert r["per_regime"]["collapsed"]["limiting_lane"] == 5
+    assert r["per_regime"]["collapsed"]["limiting_tau_int_cycles"] == 9.0
+
+
+def test_stride_changes_raw_and_effective_counts():
+    r1 = cal.production_requirement(_regimes(), TAU, 0.5, 1, n_seeds=4,
+                                    target_ess=10)
+    r100 = cal.production_requirement(_regimes(), TAU, 0.5, 100, n_seeds=4,
+                                      target_ess=10)
+    a = r1["per_regime"]["collapsed"]
+    b = r100["per_regime"]["collapsed"]
+    # coarser stride -> larger effective spacing -> more required cycles, and the
+    # raw saved-per-lane count reflects the stride.
+    assert b["required_production_cycles"] > a["required_production_cycles"]
+    assert "expected_raw_saved_configs_per_lane_per_seed" in a
+    assert "expected_effective_configs_per_lane_per_seed" in a
+
+
+def test_regime_lane_count_changes_result():
+    one = cal.production_requirement({"r": [0]}, TAU, 0.5, 1, n_seeds=4,
+                                     target_ess=10)
+    many = cal.production_requirement({"r": [0, 1, 2, 3]}, TAU, 0.5, 1, n_seeds=4,
+                                      target_ess=10)
+    # more lanes in a regime -> fewer cycles needed to reach the same pooled ESS
+    assert many["recommended_production_cycles_per_seed"] < \
+        one["recommended_production_cycles_per_seed"]
 
 
 def test_unstable_regimes_are_provisional():

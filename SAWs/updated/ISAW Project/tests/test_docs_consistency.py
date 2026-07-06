@@ -4,6 +4,7 @@ from pathlib import Path
 
 import isaw_schema as sch
 import extract_contact_motif_features as ext
+import run_structural_regime_pilot as cal
 
 DOCS = Path(ext.__file__).resolve().parent / "docs"
 
@@ -11,6 +12,15 @@ DOCS = Path(ext.__file__).resolve().parent / "docs"
 def test_definitions_md_matches_committed():
     committed = (DOCS / "definitions.md").read_text(encoding="utf-8")
     assert committed == sch.render_definitions_md()
+
+
+def test_artifact_provenance_md_matches_committed():
+    committed = (DOCS / "artifact_provenance.md").read_text(encoding="utf-8")
+    assert committed == cal.render_artifact_provenance_md()
+
+
+def test_artifact_provenance_regeneration_is_deterministic():
+    assert cal.render_artifact_provenance_md() == cal.render_artifact_provenance_md()
 
 
 def test_feature_dictionary_matches_committed():

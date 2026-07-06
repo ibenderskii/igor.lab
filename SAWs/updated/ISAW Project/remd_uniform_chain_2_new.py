@@ -897,7 +897,10 @@ def run_remd(
     if bin_defs is None:
         import isaw_schema as _sch
         _ctx = _sch.active_definitions_context()
-        _fixed_in, _scaled_in = _ctx.fixed_bins, _ctx.scaled_bins
+        # Thaw the recursively-frozen context bins to plain dicts before handing
+        # them to normalize_bin_definitions (which deep-copies its inputs).
+        _fixed_in = _sch._thaw(_ctx.fixed_bins)
+        _scaled_in = _sch._thaw(_ctx.scaled_bins)
         _src = _sch.PROV_JSON
     elif isinstance(bin_defs, dict):
         _fixed_in = bin_defs.get("fixed")

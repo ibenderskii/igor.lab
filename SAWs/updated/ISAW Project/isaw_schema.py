@@ -28,8 +28,10 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 
@@ -200,28 +202,54 @@ PROV_EXPLICIT_CALLER = "explicit_caller_definitions"
 PROV_COMPAT_FALLBACK = "compatibility_fallback"
 
 
+def _freeze(obj):
+    """Recursively convert an object into a read-only structure.
+
+    Dicts become :class:`types.MappingProxyType` (item assignment raises
+    ``TypeError``) and lists/tuples become tuples, so a resolved
+    :class:`DefinitionsContext` cannot be mutated even one level deep -- a frozen
+    dataclass holding plain dicts is NOT sufficient.
+    """
+    if isinstance(obj, Mapping):
+        return MappingProxyType({str(k): _freeze(v) for k, v in obj.items()})
+    if isinstance(obj, (list, tuple)):
+        return tuple(_freeze(v) for v in obj)
+    return obj
+
+
+def _thaw(obj):
+    """Recursively convert a frozen structure back into mutable dict/list."""
+    if isinstance(obj, Mapping):
+        return {k: _thaw(v) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return [_thaw(v) for v in obj]
+    return obj
+
+
 @dataclass(frozen=True)
 class DefinitionsContext:
-    """Immutable bundle of everything derived from ONE resolved definitions file.
+    """Deeply immutable bundle of everything derived from ONE definitions file.
 
     Resolving a context once (at process startup, or explicitly for a CLI) avoids
     a split-brain process in which some values are re-read from an alternate JSON
     while version/path globals stay frozen: a context always carries a mutually
-    consistent record, path, hash, version, bins, and schema versions.
+    consistent record, path, hash, version, bins, and schema versions.  All
+    mapping/sequence fields are recursively frozen (``MappingProxyType`` /
+    tuples), so no consumer can mutate them.
     """
-    record: dict
+    record: MappingProxyType
     resolved_path: Path
     sha256: str
     definitions_version: str
-    fixed_bins: dict
-    scaled_bins: dict
-    schema_versions: dict
+    fixed_bins: MappingProxyType
+    scaled_bins: MappingProxyType
+    schema_versions: MappingProxyType
     provenance: str = PROV_JSON
 
     def bin_defs(self, n_beads: int) -> dict:
-        """Normalized (validated, deep-copied) bin-definition record for N."""
+        """Normalized (validated) bin-definition record for N (thawed copy)."""
         rec = ico.normalize_bin_definitions(
-            copy.deepcopy(self.fixed_bins), copy.deepcopy(self.scaled_bins),
+            _thaw(self.fixed_bins), _thaw(self.scaled_bins),
             n_beads=int(n_beads), source=self.provenance)
         return rec
 
@@ -244,13 +272,13 @@ def resolve_definitions_context(path: str | os.PathLike | None = None
     rec = load_project_definitions(path)
     resolved = Path(rec["_resolved_path"])
     return DefinitionsContext(
-        record=rec,
+        record=_freeze(rec),
         resolved_path=resolved,
         sha256=_sha256_file(resolved),
         definitions_version=str(rec["definitions_version"]),
-        fixed_bins=_fixed_from_json(rec["fixed_contour_bins"]),
-        scaled_bins=_scaled_from_json(rec["scaled_contour_bins"]),
-        schema_versions=copy.deepcopy(rec.get("output_schema_versions", {})),
+        fixed_bins=_freeze(_fixed_from_json(rec["fixed_contour_bins"])),
+        scaled_bins=_freeze(_scaled_from_json(rec["scaled_contour_bins"])),
+        schema_versions=_freeze(rec.get("output_schema_versions", {})),
         provenance=PROV_JSON,
     )
 

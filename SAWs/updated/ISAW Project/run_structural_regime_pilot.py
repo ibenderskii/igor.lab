@@ -310,36 +310,101 @@ def build_k_ladder(Ts, K, n_points, min_dT=0.25, min_dK=1e-4, round_to=4,
     }
 
 
-def refine_ladder(temps, adjacent_overlap, low_overlap=0.15, high_overlap=0.90):
-    """Recommend ladder edits from adjacent contact-histogram overlap.
+def _normalize_gap_records(adjacent_gaps):
+    """Coerce adjacent-gap records into a structured pooled/worst/median/spread
+    form (accepts either the structured aggregate dicts or a legacy list of
+    pooled floats)."""
+    out = []
+    for g in adjacent_gaps:
+        if isinstance(g, (int, float, np.floating)):
+            v = float(g)
+            out.append({"pooled_overlap": v, "min_seed_overlap": v,
+                        "median_seed_overlap": v, "overlap_spread": 0.0,
+                        "per_seed": [v]})
+            continue
+        per = [float(x) for x in g.get("overlap_per_seed", [])]
+        pooled = float(g.get("pooled_count_overlap",
+                             g.get("pooled_overlap",
+                                   np.median(per) if per else float("nan"))))
+        mn = float(g.get("minimum_overlap",
+                         g.get("min_seed_overlap", min(per) if per else pooled)))
+        med = float(g.get("median_overlap",
+                          g.get("median_seed_overlap",
+                                np.median(per) if per else pooled)))
+        spread = float((max(per) - min(per)) if per else 0.0)
+        out.append({"pooled_overlap": pooled, "min_seed_overlap": mn,
+                    "median_seed_overlap": med, "overlap_spread": spread,
+                    "per_seed": per})
+    return out
 
-    Returns per-gap recommendations (delete a redundant lane / insert a lane in
-    a poorly overlapping gap) plus a refined temperature recommendation.  Does
-    NOT rerun anything.
+
+def refine_ladder(temps, adjacent_gaps, low_overlap=0.15, high_overlap=0.90,
+                  max_disagreement=0.25):
+    """Recommend ladder edits from a STRUCTURED adjacent-gap overlap record (Phase 10).
+
+    Each gap carries pooled overlap, minimum/median per-seed overlap, the
+    across-seed spread, and the per-seed values.  Every recommendation states its
+    cause: ``poor pooled overlap``, ``poor worst-seed overlap``, ``high seed
+    disagreement``, or ``redundant overlap across all seeds``.
+
+    A lane is deleted as redundant ONLY when both the pooled AND the worst-seed
+    overlap are high, so a seed with poor connectivity is never ignored because
+    the pooled overlap looks acceptable; a gap with poor worst-seed overlap gets
+    an insert even if pooled overlap is fine.  Ladder ENDPOINTS are preserved
+    (never deleted) unless explicitly recorded.  Does NOT rerun anything.
     """
     temps = [float(t) for t in temps]
-    ov = [float(x) for x in adjacent_overlap]
+    gaps = _normalize_gap_records(adjacent_gaps)
+    endpoints = {temps[0], temps[-1]} if temps else set()
     recs = []
-    refined = list(temps)
-    for a, o in enumerate(ov):
+    drop = set()
+    inserts = []
+    for a, g in enumerate(gaps):
         lo, hi = temps[a], temps[a + 1]
-        if o >= high_overlap:
-            recs.append({"gap": [lo, hi], "overlap": o,
-                         "action": "delete_redundant_lane",
-                         "detail": f"lanes at {lo} and {hi} overlap {o:.3f} "
-                                   f">= {high_overlap}"})
-        elif o <= low_overlap:
-            recs.append({"gap": [lo, hi], "overlap": o,
-                         "action": "insert_lane",
-                         "insert_temperature": round(0.5 * (lo + hi), 4),
-                         "detail": f"overlap {o:.3f} <= {low_overlap}"})
-    # Build a refined ladder: drop the higher lane of each redundant pair, insert
-    # midpoints for sparse gaps.
-    drop = {r["gap"][1] for r in recs if r["action"] == "delete_redundant_lane"}
-    inserts = [r["insert_temperature"] for r in recs if r["action"] == "insert_lane"]
-    refined = sorted(set([t for t in refined if t not in drop] + inserts))
+        pooled = g["pooled_overlap"]
+        worst = g["min_seed_overlap"]
+        spread = g["overlap_spread"]
+        base = {"gap": [lo, hi], "gap_index": a, "pooled_overlap": pooled,
+                "worst_seed_overlap": worst, "median_seed_overlap":
+                g["median_seed_overlap"], "overlap_spread": spread,
+                "per_seed_overlap": g["per_seed"]}
+        if spread >= max_disagreement:
+            recs.append({**base, "action": "resample_or_investigate",
+                         "cause": "high seed disagreement",
+                         "detail": f"per-seed overlap spread {spread:.3f} "
+                                   f">= {max_disagreement}"})
+        if pooled <= low_overlap or worst <= low_overlap:
+            cause = ("poor pooled overlap" if pooled <= low_overlap
+                     else "poor worst-seed overlap")
+            mid = round(0.5 * (lo + hi), 4)
+            recs.append({**base, "action": "insert_lane",
+                         "insert_temperature": mid, "cause": cause,
+                         "detail": f"pooled {pooled:.3f} / worst {worst:.3f} "
+                                   f"<= {low_overlap}"})
+            inserts.append(mid)
+        elif pooled >= high_overlap and worst >= high_overlap:
+            target = hi
+            if target in endpoints:
+                recs.append({**base, "action": "preserve_endpoint",
+                             "cause": "redundant overlap across all seeds",
+                             "detail": f"lane {target} is a ladder endpoint; "
+                                       f"preserved despite pooled {pooled:.3f} "
+                                       f"/ worst {worst:.3f} >= {high_overlap}"})
+            else:
+                recs.append({**base, "action": "delete_redundant_lane",
+                             "cause": "redundant overlap across all seeds",
+                             "detail": f"pooled {pooled:.3f} AND worst "
+                                       f"{worst:.3f} >= {high_overlap}"})
+                drop.add(target)
+    refined = sorted(set([t for t in temps if t not in drop] + inserts))
+    # Endpoints must survive refinement.
+    for e in endpoints:
+        if e not in refined:
+            refined = sorted(set(refined + [e]))
     return {"recommendations": recs, "refined_temperatures": refined,
-            "overlap_metric": "Bhattacharyya coefficient"}
+            "overlap_metric": "Bhattacharyya coefficient",
+            "adjacent_gaps": gaps,
+            "endpoints_preserved": sorted(endpoints)}
 
 
 # ---------------------------------------------------------------------------
@@ -785,10 +850,14 @@ def evaluate_tail_gate(tail, thresholds=None):
     n_seeds = max(1, int(tail.get("n_seeds", len(per_seed) or 1)))
     seed_cov = int(tail.get("seed_coverage", 0))
     min_per_seed = float(min(per_seed)) if per_seed else 0.0
+    # The common-threshold accounting identity (pooled raw == sum of per-seed raw)
+    # is part of the gate: if it is broken the tail statistics are inconsistent.
+    accounting_ok = bool(tail.get("pooled_raw_equals_seed_sum", True))
     passed = (raw_pooled >= t["min_raw_pooled_tail_count"]
               and eff_pooled >= t["min_effective_pooled_tail_count"]
               and (seed_cov / n_seeds) >= t["min_seed_tail_fraction"]
-              and min_per_seed >= t["min_per_seed_tail_count"])
+              and min_per_seed >= t["min_per_seed_tail_count"]
+              and accounting_ok)
     return {
         "passed": bool(passed),
         "raw_tail_count_pooled": raw_pooled,
@@ -799,7 +868,9 @@ def evaluate_tail_gate(tail, thresholds=None):
         "min_seed_tail_fraction": t["min_seed_tail_fraction"],
         "min_per_seed_tail_count": min_per_seed,
         "min_per_seed_tail_count_threshold": t["min_per_seed_tail_count"],
-        "explanation": "high-contact tail has adequate pooled + per-seed support",
+        "pooled_raw_equals_seed_sum": accounting_ok,
+        "explanation": "high-contact tail has adequate pooled + per-seed support "
+                       "and consistent common-threshold accounting",
     }
 
 
@@ -813,20 +884,26 @@ def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
                            regime_labels_stable=True):
     """Snapshot-stride-aware required production cycles per structural regime (Part 8).
 
-    The effective sample spacing in CYCLES accounts for BOTH autocorrelation and
-    the snapshot stride::
+    Autocorrelation convention (reconciled, Phase 11)
+    -------------------------------------------------
+    ``tau_int_cycles`` is the integrated autocorrelation time in CYCLE units and
+    the diagnostics define ``ESS = n / tau_int``.  Converting to SNAPSHOT-indexed
+    units, the saved autocorrelation time is ``tau_saved = tau_int_cycles /
+    snapshot_stride`` and the raw saved count is ``n_saved = post_burnin_cycles /
+    snapshot_stride``, so ``ESS ~= n_saved / max(1, tau_saved)``.  Written back in
+    cycle units this is exactly::
 
-        Delta_eff = max(snapshot_stride, 2 * tau_int_cycles)
+        Delta_eff = max(snapshot_stride, tau_int_cycles)
+        ESS_per_lane_per_seed = post_burnin_cycles / Delta_eff
 
-    so coarsely strided saving (stride > 2*tau) is autocorrelation-independent
-    and finely strided saving is autocorrelation-limited.  Effective independent
-    saved configurations per lane per seed ~ post_burnin_cycles / Delta_eff, and
-    the raw saved snapshots per lane per seed ~ post_burnin_cycles /
-    snapshot_stride.  Required cycles solve
+    with NO extra factor of two -- the effective spacing is simply the larger of
+    the save stride (coarse saving is already independent) and the autocorrelation
+    time (fine saving is autocorrelation-limited), consistent with the
+    ``ESS = n / tau_int`` used by the diagnostics.  Required cycles solve
     ``L*n_seeds*(f*P/Delta_eff) >= target_ess``; the recommended length is the
-    MAXIMUM required length over all regimes (and, via tau being the max over key
-    observables, over key observables).  Changing the snapshot stride changes
-    both the expected raw and effective saved-configuration counts.
+    MAXIMUM required length over all regimes (and, via tau being the max over the
+    key observables, over key observables).  ``limiting_observable`` names the
+    observable at the regime's slowest lane.
     """
     f = float(post_burnin_frac)
     stride = max(1, int(snapshot_stride))
@@ -838,30 +915,37 @@ def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
                 and tau_by_lane[i] > 0]
         L = len(lanes)
         limiting_obs = None
-        if limiting_observable_by_lane is not None and taus:
-            islow = max((i for i in lanes if i < len(tau_by_lane)
-                         and np.isfinite(tau_by_lane[i]) and tau_by_lane[i] > 0),
-                        key=lambda i: tau_by_lane[i], default=None)
-            if islow is not None and islow < len(limiting_observable_by_lane):
-                limiting_obs = limiting_observable_by_lane[islow]
+        limiting_lane = None
+        if taus:
+            limiting_lane = max(
+                (i for i in lanes if i < len(tau_by_lane)
+                 and np.isfinite(tau_by_lane[i]) and tau_by_lane[i] > 0),
+                key=lambda i: tau_by_lane[i], default=None)
+            if (limiting_observable_by_lane is not None
+                    and limiting_lane is not None
+                    and limiting_lane < len(limiting_observable_by_lane)):
+                limiting_obs = limiting_observable_by_lane[limiting_lane]
         if not taus or L == 0 or f <= 0:
             per_regime[regime] = {
                 "lane_indices": list(lanes), "number_of_lanes": L,
                 "number_of_seeds": int(n_seeds), "snapshot_stride": stride,
                 "post_burnin_frac": f, "limiting_observable": limiting_obs,
+                "limiting_lane": limiting_lane, "limiting_tau_int_cycles": None,
                 "slowest_tau_int_cycles": None, "effective_sample_spacing_cycles": None,
                 "required_production_cycles": None, "reaches_target": False,
                 "limiting_reason": "no valid tau / lanes"}
             required_P[regime] = float("inf")
             continue
         tau = max(taus)
-        delta_eff = max(float(stride), 2.0 * tau)
+        delta_eff = max(float(stride), float(tau))
         P = int(np.ceil(target_ess * delta_eff / max(1e-9, (L * n_seeds * f))))
         required_P[regime] = P
         per_regime[regime] = {
             "lane_indices": list(lanes), "number_of_lanes": L,
             "number_of_seeds": int(n_seeds), "snapshot_stride": stride,
             "post_burnin_frac": f, "limiting_observable": limiting_obs,
+            "limiting_lane": limiting_lane,
+            "limiting_tau_int_cycles": float(tau),
             "slowest_tau_int_cycles": float(tau),
             "effective_sample_spacing_cycles": float(delta_eff),
             "required_production_cycles": int(P),
@@ -874,13 +958,19 @@ def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
         L = rr["number_of_lanes"]
         if tau and L:
             delta_eff = rr["effective_sample_spacing_cycles"]
-            eff = L * n_seeds * (f * P_rec) / delta_eff
+            raw_per_lane_per_seed = int(np.floor(f * P_rec / stride))
+            eff_per_lane_per_seed = float(f * P_rec / delta_eff)
+            eff = L * n_seeds * eff_per_lane_per_seed
+            rr["expected_raw_saved_configs_per_lane_per_seed"] = raw_per_lane_per_seed
+            rr["expected_effective_configs_per_lane_per_seed"] = eff_per_lane_per_seed
             rr["expected_effective_configs_pooled"] = float(eff)
-            rr["expected_raw_saved_configs_per_seed"] = int(np.floor(f * P_rec / stride))
-            rr["expected_raw_saved_configs_per_regime"] = int(
-                np.floor(f * P_rec / stride) * L)
+            rr["expected_raw_saved_configs_per_seed"] = raw_per_lane_per_seed * L
+            rr["expected_raw_saved_configs_per_regime"] = (
+                raw_per_lane_per_seed * L * int(n_seeds))
             rr["reaches_target"] = bool(eff >= target_ess)
         else:
+            rr["expected_raw_saved_configs_per_lane_per_seed"] = 0
+            rr["expected_effective_configs_per_lane_per_seed"] = 0.0
             rr["expected_effective_configs_pooled"] = 0.0
             rr["expected_raw_saved_configs_per_seed"] = 0
             rr["expected_raw_saved_configs_per_regime"] = 0
@@ -904,8 +994,13 @@ def production_requirement(regime_to_lanes, tau_by_lane, post_burnin_frac,
         "snapshot_stride": stride,
         "n_seeds": int(n_seeds),
         "every_regime_reaches_target": bool(all_reach),
+        "autocorrelation_convention": (
+            "ESS = n/tau_int (diagnostics); production uses Delta_eff = "
+            "max(snapshot_stride, tau_int_cycles) so ESS_saved = n_saved/"
+            "max(1, tau_saved) with tau_saved = tau_int_cycles/snapshot_stride "
+            "-- NO extra factor of two."),
         "rationale": ("effective spacing Delta_eff = max(snapshot_stride, "
-                      "2*tau_int_cycles); effective saved ~ post_burnin_cycles/"
+                      "tau_int_cycles); effective saved ~ post_burnin_cycles/"
                       "Delta_eff summed over retained lanes and seeds; raw saved ~ "
                       "post_burnin_cycles/snapshot_stride; recommended length is "
                       "the max required length over regimes and key observables."),
@@ -978,12 +1073,23 @@ def evaluate_sampling_gates(metrics, thresholds=None):
         metrics.get("min_state_changing_acceptance", 0),
         t["min_state_changing_acceptance"],
         "minimum state-changing local-move acceptance")
-    g["high_contact_tail_support"] = _gate(
-        (metrics.get("tail_probability", 0) >= t["min_tail_probability"])
-        and (metrics.get("raw_tail_count_pooled", 0)
-             >= t["min_raw_pooled_tail_count"]),
-        metrics.get("raw_tail_count_pooled", 0), t["min_raw_pooled_tail_count"],
-        "high-contact tail has pooled sampled support (probability + raw count)")
+    # Phase 9: the STRONG tail gate is authoritative -- pooled raw + effective
+    # counts, seed coverage, minimum per-seed tail, and the common-threshold
+    # accounting identity (pooled raw == sum of per-seed raw).  It is never
+    # replaced by a weaker probability-only recompute.
+    tail_gate = metrics.get("tail_gate")
+    if tail_gate is None:
+        tail_gate = evaluate_tail_gate({
+            "raw_tail_count_pooled": metrics.get("raw_tail_count_pooled", 0.0),
+            "effective_tail_count_pooled": metrics.get(
+                "effective_tail_count_pooled", 0.0),
+            "raw_tail_count_per_seed": metrics.get("raw_tail_count_per_seed", []),
+            "n_seeds": metrics.get("n_seeds", 1),
+            "seed_coverage": metrics.get("seed_coverage", 0),
+            "pooled_raw_equals_seed_sum": metrics.get(
+                "pooled_raw_equals_seed_sum", True),
+        }, thresholds)
+    g["high_contact_tail_support"] = tail_gate
     g["seed_agreement"] = _gate(
         metrics.get("seed_relative_spread", 1.0) <= t["max_seed_relative_spread"],
         metrics.get("seed_relative_spread", 1.0), t["max_seed_relative_spread"],
@@ -1029,14 +1135,20 @@ def _stage_fingerprint(fields):
 def build_stage_fingerprint_fields(*, N, seed, ladder, K_ladder, info,
                                    fit_summary_path, n_cycles, steps_per_swap,
                                    n_workers, structural_stride, snapshot_stride,
-                                   burnin_frac):
+                                   burnin_frac, context=None):
     """Canonical fields that uniquely identify a requested calibration stage.
 
     Any change to N, seed, the ladders, the fitted model (path/hash/params), the
     sampler control parameters, the definitions, or the schema/validator
     revisions produces a different fingerprint, so a resumed stage can be reused
     only when it was produced for exactly the requested configuration.
+
+    The definitions path/hash/version and the output schema versions are taken
+    from ONE resolved :class:`DefinitionsContext` (``context`` or ``sch.CONTEXT``)
+    rather than a mix of frozen module globals and dynamic accessors (Phase 8).
     """
+    ctx = context if context is not None else sch.CONTEXT
+    sv = ctx.schema_versions
     return {
         "N": int(N),
         "seed": int(seed),
@@ -1055,33 +1167,81 @@ def build_stage_fingerprint_fields(*, N, seed, ladder, K_ladder, info,
         "structural_stride": int(structural_stride),
         "snapshot_stride": int(snapshot_stride),
         "burnin_frac": float(burnin_frac),
-        "definitions_path": str(sch.RESOLVED_DEFINITIONS_PATH),
-        "definitions_sha256": _sha256(str(sch.RESOLVED_DEFINITIONS_PATH)),
-        "definitions_version": str(sch.DEFINITIONS_VERSION),
-        "sampler_schema_version": int(remd.SCHEMA_VERSION),
-        "snapshot_schema_version": int(cio.SNAPSHOT_SCHEMA_VERSION),
-        "feature_schema_version": int(ext.FEATURE_SCHEMA_VERSION),
+        "definitions_path": str(ctx.resolved_path),
+        "definitions_sha256": str(ctx.sha256),
+        "definitions_version": str(ctx.definitions_version),
+        "sampler_schema_version": int(sv["distributions_schema_version"]),
+        "snapshot_schema_version": int(sv["snapshot_schema_version"]),
+        "feature_schema_version": int(sv["feature_schema_version"]),
         "diagnostic_trajectory_schema_version": int(
-            sch.DIAGNOSTIC_TRAJECTORY_SCHEMA_VERSION),
+            sv["diagnostic_trajectory_schema_version"]),
         "validator_revision": int(VALIDATOR_REVISION),
     }
 
 
+def _embed_fingerprint_hdf5(path, fingerprint, fields):
+    """Embed the stage fingerprint (+canonical field record) into an HDF5 file.
+
+    Adds a top-level ``stage_fingerprint`` attribute and, when a ``/metadata``
+    group is present, the fingerprint plus the JSON field record there, so the
+    configuration/feature artifact carries an independent copy of the fingerprint
+    it was produced for (Phase 4).
+    """
+    import h5py
+    if not Path(path).exists():
+        return
+    with h5py.File(path, "r+") as f:
+        f.attrs["stage_fingerprint"] = str(fingerprint)
+        if "metadata" in f:
+            f["metadata"].attrs["stage_fingerprint"] = str(fingerprint)
+            f["metadata"].attrs["stage_fingerprint_fields"] = json.dumps(
+                sch.json_safe(fields))
+
+
+def _embed_fingerprint_feature(feat_path, fingerprint, fields):
+    """Embed the fingerprint into the feature file manifest AND its companion
+    ``<feature>.manifest.json`` (Phase 4)."""
+    import h5py
+    if Path(feat_path).exists():
+        with h5py.File(feat_path, "r+") as f:
+            f.attrs["stage_fingerprint"] = str(fingerprint)
+            man = json.loads(f["metadata"].attrs["manifest"])
+            man["stage_fingerprint"] = str(fingerprint)
+            man["stage_fingerprint_fields"] = sch.json_safe(fields)
+            f["metadata"].attrs["manifest"] = json.dumps(man, default=str)
+    comp = Path(str(feat_path) + ".manifest.json")
+    if comp.exists():
+        m = json.loads(comp.read_text(encoding="utf-8"))
+        m["stage_fingerprint"] = str(fingerprint)
+        m["stage_fingerprint_fields"] = sch.json_safe(fields)
+        comp.write_text(json.dumps(m, indent=2), encoding="utf-8")
+
+
+def _embed_fingerprint_npz(path, fingerprint, fields):
+    """Embed the fingerprint into a diagnostic-trajectory NPZ (Phase 4)."""
+    if not Path(path).exists():
+        return
+    with np.load(path, allow_pickle=True) as z:
+        data = {k: z[k] for k in z.files
+                if k not in ("stage_fingerprint", "stage_fingerprint_fields")}
+    data["stage_fingerprint"] = np.array(str(fingerprint))
+    data["stage_fingerprint_fields"] = np.array(
+        json.dumps(sch.json_safe(fields)))
+    np.savez(path, **data)
+
+
 def _companion_paths(prefix, cfg, feat):
-    """The full set of per-seed companion artifacts a stage must produce."""
-    return {
-        "distributions_npz": f"{prefix}_distributions.npz",
-        "diagnostics_json": f"{prefix}_diagnostics.json",
-        "diagnostic_trajectories_npz": f"{prefix}_diagnostic_trajectories.npz",
-        "results_csv": f"{prefix}_results.csv",
-        "swap_rates_csv": f"{prefix}_swap_rates.csv",
-        "move_acceptance_csv": f"{prefix}_move_acceptance.csv",
-        "configuration_h5": str(cfg),
-        "feature_h5": str(feat),
-    }
+    """Every per-seed artifact a stage must produce, including the feature
+    manifest, validation certificate, run summary, and the artifact manifest
+    (Phase 6/7).  This is the single canonical companion set used by resume,
+    audit, and artifact-manifest generation."""
+    paths = _full_companion_paths(prefix, cfg, feat)
+    paths["artifact_manifest_json"] = f"{prefix}_artifact_manifest.json"
+    return paths
 
 
 def _deep_validate_and_certify(feat_path, *, stage_fingerprint=None,
+                               stage_fingerprint_fields=None,
                                source_config=None):
     """Deep-validate a completed feature file and write a full certificate.
 
@@ -1090,7 +1250,9 @@ def _deep_validate_and_certify(feat_path, *, stage_fingerprint=None,
     records the stage fingerprint and source-configuration hash so a later
     ``--resume`` can prove the file belongs to the exact requested stage.
     """
-    info = ext.validate_feature_file_hdf5(str(feat_path), deep=True)
+    info = ext.validate_feature_file_hdf5(
+        str(feat_path), deep=True, require_source=True,
+        source_path_override=(str(source_config) if source_config else None))
     src_sha = (_sha256(source_config)
                if source_config and Path(source_config).exists() else None)
     cert = {
@@ -1100,10 +1262,16 @@ def _deep_validate_and_certify(feat_path, *, stage_fingerprint=None,
                                       if source_config else None),
         "source_configuration_sha256": src_sha,
         "stage_fingerprint": stage_fingerprint,
+        "stage_fingerprint_fields": (sch.json_safe(stage_fingerprint_fields)
+                                     if stage_fingerprint_fields is not None
+                                     else None),
         "validator_revision": int(VALIDATOR_REVISION),
         "validation_timestamp": _dt.datetime.now().isoformat(),
         "validator_schema_version": int(ext.FEATURE_SCHEMA_VERSION),
+        "feature_schema_version": int(ext.FEATURE_SCHEMA_VERSION),
         "definitions_version": info.get("definitions_version"),
+        "definitions_sha256": _sha256(str(sch.RESOLVED_DEFINITIONS_PATH)),
+        "source_verification_status": info.get("source_verification_status"),
         "validation_result": "passed",
     }
     _certificate_path(feat_path).write_text(
@@ -1111,19 +1279,34 @@ def _deep_validate_and_certify(feat_path, *, stage_fingerprint=None,
     return cert
 
 
-def stage_reusable(feat, cfg, stage_fingerprint, companions):
-    """(reusable, reason) — a resumed stage may be reused only if EVERYTHING
-    matches the requested stage (Phase 4).
+def validate_feature_certificate(feature_path, *, source_configuration_path,
+                                 expected_stage_fingerprint,
+                                 expected_validator_revision,
+                                 expected_definitions_sha256,
+                                 expected_definitions_version=None,
+                                 expected_feature_schema_version=None):
+    """The ONE shared certificate-trust function (Phase 5).
 
-    Requires: feature + source config exist; the certificate exists, passed, and
-    matches the current feature hash, validator revision, stage fingerprint, and
-    source-configuration hash; and every companion artifact is present.
+    Returns ``(trusted: bool, reason: str)``.  A certificate is trusted ONLY when
+    every one of the following holds, so no older certificate is accepted merely
+    because its feature hash still matches:
+
+    * ``validation_result == "passed"``;
+    * the certificate references this exact feature path;
+    * the recorded feature SHA-256 equals the current file hash;
+    * the source configuration exists and its SHA-256 equals the recorded hash;
+    * the stage fingerprint equals the expected stage fingerprint;
+    * the validator revision equals the expected revision;
+    * the definitions SHA-256 (and, when given, version) equal the expected ones;
+    * the feature schema version equals the expected one (when given).
+
+    Used by resume validation, the seed-artifact audit, and scientific
+    calibration analysis alike.
     """
-    if not Path(feat).exists():
+    feature_path = Path(feature_path)
+    if not feature_path.exists():
         return False, "feature file missing"
-    if not Path(cfg).exists():
-        return False, "source configuration missing"
-    cert_p = _certificate_path(feat)
+    cert_p = _certificate_path(feature_path)
     if not cert_p.exists():
         return False, "no validation certificate"
     try:
@@ -1132,37 +1315,491 @@ def stage_reusable(feat, cfg, stage_fingerprint, companions):
         return False, "unreadable certificate"
     if cert.get("validation_result") != "passed":
         return False, "certificate validation_result != passed"
-    if cert.get("feature_sha256") != _sha256(feat):
+    cert_feat = cert.get("feature_path")
+    if cert_feat is not None and Path(str(cert_feat)).name != feature_path.name:
+        return False, "certificate references a different feature path"
+    if cert.get("feature_sha256") != _sha256(feature_path):
         return False, "feature file hash changed since certification"
-    if int(cert.get("validator_revision", -1)) != int(VALIDATOR_REVISION):
-        return False, "certificate validator revision differs from current"
-    if cert.get("stage_fingerprint") != stage_fingerprint:
-        return False, "stage fingerprint differs from the requested stage"
-    if cert.get("source_configuration_sha256") != _sha256(cfg):
+    if int(cert.get("validator_revision", -1)) != int(expected_validator_revision):
+        return False, "certificate validator revision differs from expected"
+    if cert.get("stage_fingerprint") != expected_stage_fingerprint:
+        return False, "stage fingerprint differs from the expected stage"
+    if (not source_configuration_path
+            or not Path(source_configuration_path).exists()):
+        return False, "source configuration missing"
+    if cert.get("source_configuration_sha256") != _sha256(source_configuration_path):
         return False, "source configuration hash changed"
+    if cert.get("definitions_sha256") != expected_definitions_sha256:
+        return False, "definitions hash differs from expected"
+    if (expected_definitions_version is not None
+            and str(cert.get("definitions_version"))
+            != str(expected_definitions_version)):
+        return False, "definitions version differs from expected"
+    if (expected_feature_schema_version is not None
+            and int(cert.get("feature_schema_version",
+                             cert.get("validator_schema_version", -1)))
+            != int(expected_feature_schema_version)):
+        return False, "feature schema version differs from expected"
+    return True, "certificate trusted"
+
+
+def _current_certificate_expectations():
+    """Expected (defs_sha256, defs_version, feature_schema_version) for the
+    installed code + active definitions."""
+    return (_sha256(str(sch.RESOLVED_DEFINITIONS_PATH)),
+            str(sch.DEFINITIONS_VERSION), int(ext.FEATURE_SCHEMA_VERSION))
+
+
+def stage_reusable(feat, cfg, stage_fingerprint, companions):
+    """(reusable, reason) — a resumed stage may be reused only if EVERYTHING
+    matches the requested stage (Phase 4/5).
+
+    Delegates certificate trust to :func:`validate_feature_certificate` (the one
+    shared trust function) and additionally requires the source configuration and
+    every companion artifact to be present.
+    """
+    if not Path(cfg).exists():
+        return False, "source configuration missing"
+    defs_sha, defs_ver, feat_ver = _current_certificate_expectations()
+    ok, reason = validate_feature_certificate(
+        feat, source_configuration_path=cfg,
+        expected_stage_fingerprint=stage_fingerprint,
+        expected_validator_revision=VALIDATOR_REVISION,
+        expected_definitions_sha256=defs_sha,
+        expected_definitions_version=defs_ver,
+        expected_feature_schema_version=feat_ver)
+    if not ok:
+        return False, reason
     for name, path in companions.items():
         if not Path(path).exists():
             return False, f"missing companion artifact: {name}"
     return True, "reusable"
 
 
-def _feature_certified(feat_path):
-    """True only when ``feat_path`` DEEP-validates (never a shallow check).
+# ---------------------------------------------------------------------------
+# Artifact manifest: SHA-256 + SEMANTIC validation of every companion (Phase 6)
+# ---------------------------------------------------------------------------
 
-    A validation certificate is reused only when its recorded SHA-256 matches
-    the current file; otherwise deep validation is rerun (and a fresh
-    certificate written).  A missing/failed certificate or a failed validation
-    returns False so the seed stage reruns or fails clearly.
+ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
+
+
+class ArtifactValidationError(RuntimeError):
+    """Raised when a companion artifact fails its hash or semantic validation."""
+
+
+def _full_companion_paths(prefix, cfg, feat):
+    """Every artifact a seed stage must produce (Phase 6/7)."""
+    feat = str(feat)
+    return {
+        "configuration_h5": str(cfg),
+        "feature_h5": feat,
+        "feature_manifest_json": feat + ".manifest.json",
+        "validation_certificate": feat + ".validation.json",
+        "results_csv": f"{prefix}_results.csv",
+        "swap_rates_csv": f"{prefix}_swap_rates.csv",
+        "move_acceptance_csv": f"{prefix}_move_acceptance.csv",
+        "diagnostics_json": f"{prefix}_diagnostics.json",
+        "diagnostic_trajectories_npz": f"{prefix}_diagnostic_trajectories.npz",
+        "distributions_npz": f"{prefix}_distributions.npz",
+        "run_summary_json": f"{prefix}_run_summary.json",
+    }
+
+
+def build_artifact_manifest(paths, out_path):
+    """Write an artifact manifest recording the SHA-256 of every artifact."""
+    entries = {}
+    for name, p in paths.items():
+        entries[name] = {"path": str(p), "exists": bool(Path(p).exists()),
+                         "sha256": _sha256(p)}
+    man = {"artifact_manifest_schema_version": ARTIFACT_MANIFEST_SCHEMA_VERSION,
+           "artifacts": entries}
+    Path(out_path).write_text(json.dumps(sch.json_safe(man), indent=2),
+                              encoding="utf-8")
+    return man
+
+
+def _ladder_close(a, b, tol=1e-3):
+    a = np.asarray(a, float).ravel()
+    b = np.asarray(b, float).ravel()
+    return a.size == b.size and np.allclose(a, b, atol=tol, rtol=0.0)
+
+
+def _read_csv_rows(path):
+    import csv as _csv
+    with open(path, newline="", encoding="utf-8") as f:
+        r = _csv.DictReader(f)
+        return list(r.fieldnames or []), list(r)
+
+
+def validate_config_artifact(path, *, N, seed, ladder, stage_fingerprint=None,
+                             run_id=None):
+    import h5py
+    with h5py.File(path, "r") as f:
+        if str(f.attrs.get("status", f["snapshots"].attrs.get("status"))) \
+                != "complete":
+            raise ArtifactValidationError("configuration status != complete")
+        snap = f["snapshots"]
+        coords = snap["coordinates"]
+        if int(coords.shape[2]) != int(N):
+            raise ArtifactValidationError(
+                f"configuration N {coords.shape[2]} != {N}")
+        if int(cio.committed_rows(snap)) <= 0:
+            raise ArtifactValidationError("configuration has no committed rows")
+        meta = {k: v for k, v in f["metadata"].attrs.items()}
+        ms = meta.get("seed")
+        if ms is not None and int(require_exact_integer_from(ms)) != int(seed):
+            raise ArtifactValidationError("configuration seed mismatch")
+        temps = np.asarray(meta.get("temperatures", []), float).ravel()
+        if temps.size and not _ladder_close(temps, ladder):
+            raise ArtifactValidationError("configuration temperature ladder mismatch")
+        if meta.get("model_name") is None:
+            raise ArtifactValidationError("configuration missing model_name")
+        rid = meta.get("run_id")
+        if isinstance(rid, bytes):
+            rid = rid.decode()
+        if run_id is not None and rid is not None and str(rid) != str(run_id):
+            raise ArtifactValidationError("configuration run_id mismatch")
+        if stage_fingerprint is not None:
+            if str(f.attrs.get("stage_fingerprint")) != str(stage_fingerprint):
+                raise ArtifactValidationError("configuration stage fingerprint mismatch")
+
+
+def require_exact_integer_from(v):
+    """Reject a fractional value from an artifact scalar (delegates to ext)."""
+    return ext.require_exact_integer_scalar(v, field_name="artifact scalar")
+
+
+def validate_feature_artifact(path, *, source_config, stage_fingerprint):
+    ext.validate_feature_file_hdf5(
+        str(path), deep=True, require_source=True,
+        source_path_override=(str(source_config) if source_config else None))
+    if stage_fingerprint is not None:
+        import h5py
+        with h5py.File(path, "r") as f:
+            if str(f.attrs.get("stage_fingerprint")) != str(stage_fingerprint):
+                raise ArtifactValidationError("feature stage fingerprint mismatch")
+
+
+def validate_distributions_artifact(path, *, N, ladder):
+    with np.load(path, allow_pickle=True) as z:
+        if "Ts" not in z or not _ladder_close(z["Ts"], ladder):
+            raise ArtifactValidationError("distributions Ts != requested ladder")
+        if "temps" in z and not _ladder_close(z["temps"], z["Ts"]):
+            raise ArtifactValidationError("distributions temps alias != Ts")
+        nT = len(np.asarray(ladder).ravel())
+        for key in ("Pc", "Prg"):
+            if key not in z:
+                raise ArtifactValidationError(f"distributions missing {key}")
+            if int(np.asarray(z[key]).shape[0]) != nT:
+                raise ArtifactValidationError(
+                    f"distributions {key} lane count != {nT}")
+        if "model_name" not in z:
+            raise ArtifactValidationError("distributions missing model_name")
+        for key in ("n_beads", "N"):
+            if key in z and int(np.asarray(z[key]).ravel()[0]) != int(N):
+                raise ArtifactValidationError("distributions N mismatch")
+
+
+def validate_diagnostic_trajectories_artifact(path, *, ladder,
+                                              stage_fingerprint=None):
+    with np.load(path, allow_pickle=True) as z:
+        if "Ts" not in z or not _ladder_close(z["Ts"], ladder):
+            raise ArtifactValidationError(
+                "diagnostic trajectories Ts != requested ladder")
+        nT = len(np.asarray(ladder).ravel())
+        required = ("contacts_post", "rg2_post", "m_long_post",
+                    "m_global_scaled_post", "smax_post",
+                    "largest_component_fraction_post")
+        for key in required:
+            if key not in z:
+                raise ArtifactValidationError(
+                    f"diagnostic trajectories missing {key}")
+            if int(np.asarray(z[key]).shape[0]) != nT:
+                raise ArtifactValidationError(
+                    f"diagnostic trajectories {key} lane count != {nT}")
+        if stage_fingerprint is not None and "stage_fingerprint" in z:
+            if str(z["stage_fingerprint"]) != str(stage_fingerprint):
+                raise ArtifactValidationError(
+                    "diagnostic trajectories stage fingerprint mismatch")
+
+
+def validate_diagnostics_json_artifact(path, *, ladder):
+    d = json.loads(Path(path).read_text(encoding="utf-8"))
+    nT = len(np.asarray(ladder).ravel())
+    temps = d.get("temperatures")
+    if temps is None:
+        temps = (d.get("summary", {}) or {}).get("temperatures")
+    if temps is not None:
+        if len(temps) != nT or not _ladder_close(temps, ladder):
+            raise ArtifactValidationError("diagnostics temperatures != ladder")
+    lc = d.get("n_temperatures", d.get("lane_count"))
+    if lc is not None and int(lc) != nT:
+        raise ArtifactValidationError("diagnostics lane count != ladder size")
+    if "burnin_frac" not in d and "burnin_frac" not in (d.get("summary", {}) or {}):
+        raise ArtifactValidationError("diagnostics missing burnin_frac")
+
+
+def validate_results_csv_artifact(path, *, ladder):
+    header, rows = _read_csv_rows(path)
+    nT = len(np.asarray(ladder).ravel())
+    if len(rows) != nT:
+        raise ArtifactValidationError(
+            f"results CSV has {len(rows)} rows != {nT} lanes")
+    for col in ("T", "C_mean", "Rg2_mean_lattice"):
+        if col not in header:
+            raise ArtifactValidationError(f"results CSV missing column {col}")
+    temps = [float(r["T"]) for r in rows]
+    if len(set(round(t, 4) for t in temps)) != nT:
+        raise ArtifactValidationError("results CSV has duplicate lane temperatures")
+    if not _ladder_close(temps, ladder):
+        raise ArtifactValidationError("results CSV temperatures != ladder")
+
+
+def validate_swap_rates_csv_artifact(path, *, ladder):
+    header, rows = _read_csv_rows(path)
+    nT = len(np.asarray(ladder).ravel())
+    if len(rows) != nT - 1:
+        raise ArtifactValidationError(
+            f"swap-rates CSV has {len(rows)} rows != {nT - 1} pairs")
+    for col in ("pair", "T_lo", "T_hi"):
+        if col not in header:
+            raise ArtifactValidationError(f"swap-rates CSV missing column {col}")
+    for k, r in enumerate(rows):
+        if int(r["pair"]) != k:
+            raise ArtifactValidationError("swap-rates pair indices not contiguous")
+        if (abs(float(r["T_lo"]) - float(ladder[k])) > 1e-3
+                or abs(float(r["T_hi"]) - float(ladder[k + 1])) > 1e-3):
+            raise ArtifactValidationError(
+                f"swap-rates pair {k} T_lo/T_hi disagree with adjacent ladder")
+
+
+def validate_move_acceptance_csv_artifact(path, *, ladder):
+    header, rows = _read_csv_rows(path)
+    nT = len(np.asarray(ladder).ravel())
+    for col in ("temperature_index", "temperature", "move_type"):
+        if col not in header:
+            raise ArtifactValidationError(f"move-acceptance CSV missing {col}")
+    lanes = sorted(set(int(r["temperature_index"]) for r in rows))
+    if lanes != list(range(nT)):
+        raise ArtifactValidationError("move-acceptance CSV lanes != 0..nT-1")
+    move_names = set(remd.MOVE_NAMES)
+    for i in range(nT):
+        lane_moves = set(r["move_type"] for r in rows
+                         if int(r["temperature_index"]) == i)
+        if lane_moves != move_names:
+            raise ArtifactValidationError(
+                f"move-acceptance CSV lane {i} move types {lane_moves} "
+                f"!= {move_names}")
+        lane_temp = [float(r["temperature"]) for r in rows
+                     if int(r["temperature_index"]) == i][0]
+        if abs(lane_temp - float(ladder[i])) > 1e-3:
+            raise ArtifactValidationError(
+                f"move-acceptance CSV lane {i} temperature != ladder")
+
+
+def validate_run_summary_artifact(path, *, N, seed, ladder,
+                                  stage_fingerprint=None):
+    d = json.loads(Path(path).read_text(encoding="utf-8"))
+    if int(d.get("N", d.get("n_beads", -1))) != int(N):
+        raise ArtifactValidationError("run-summary N mismatch")
+    if int(d.get("seed", -999)) != int(seed):
+        raise ArtifactValidationError("run-summary seed mismatch")
+    temps = d.get("temperatures")
+    if temps is None or not _ladder_close(temps, ladder):
+        raise ArtifactValidationError("run-summary temperatures != ladder")
+    if d.get("model") is None and d.get("model_name") is None:
+        raise ArtifactValidationError("run-summary missing model metadata")
+    if stage_fingerprint is not None and "stage_fingerprint" in d:
+        if str(d["stage_fingerprint"]) != str(stage_fingerprint):
+            raise ArtifactValidationError("run-summary stage fingerprint mismatch")
+
+
+_ARTIFACT_SEMANTIC = {
+    "configuration_h5": lambda p, C: validate_config_artifact(
+        p, N=C["N"], seed=C["seed"], ladder=C["ladder"],
+        stage_fingerprint=C["stage_fingerprint"], run_id=C.get("run_id")),
+    "feature_h5": lambda p, C: validate_feature_artifact(
+        p, source_config=C["source_config"],
+        stage_fingerprint=C["stage_fingerprint"]),
+    "distributions_npz": lambda p, C: validate_distributions_artifact(
+        p, N=C["N"], ladder=C["ladder"]),
+    "diagnostic_trajectories_npz": lambda p, C:
+        validate_diagnostic_trajectories_artifact(
+            p, ladder=C["ladder"], stage_fingerprint=C["stage_fingerprint"]),
+    "diagnostics_json": lambda p, C: validate_diagnostics_json_artifact(
+        p, ladder=C["ladder"]),
+    "results_csv": lambda p, C: validate_results_csv_artifact(
+        p, ladder=C["ladder"]),
+    "swap_rates_csv": lambda p, C: validate_swap_rates_csv_artifact(
+        p, ladder=C["ladder"]),
+    "move_acceptance_csv": lambda p, C: validate_move_acceptance_csv_artifact(
+        p, ladder=C["ladder"]),
+    "run_summary_json": lambda p, C: validate_run_summary_artifact(
+        p, N=C["N"], seed=C["seed"], ladder=C["ladder"],
+        stage_fingerprint=C["stage_fingerprint"]),
+}
+
+
+def validate_artifact_manifest(manifest_path, *, N, seed, ladder, source_config,
+                               stage_fingerprint, run_id=None):
+    """Validate every artifact's HASH and SEMANTIC content (Phase 6).
+
+    Returns ``(ok, report)`` where ``report`` maps each artifact to ``"ok"`` or a
+    failure reason.  A recorded-hash mismatch OR any semantic failure marks that
+    artifact (and the whole manifest) invalid.
+    """
+    man = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    entries = man.get("artifacts", {})
+    ctx = {"N": N, "seed": seed, "ladder": ladder,
+           "source_config": source_config, "stage_fingerprint": stage_fingerprint,
+           "run_id": run_id}
+    report = {}
+    ok_all = True
+    for name, entry in entries.items():
+        p = entry.get("path")
+        if not p or not Path(p).exists():
+            report[name] = "missing"
+            ok_all = False
+            continue
+        if entry.get("sha256") != _sha256(p):
+            report[name] = "hash mismatch"
+            ok_all = False
+            continue
+        sem = _ARTIFACT_SEMANTIC.get(name)
+        if sem is None:
+            report[name] = "ok"
+            continue
+        try:
+            sem(p, ctx)
+            report[name] = "ok"
+        except Exception as exc:  # ArtifactValidationError / ExtractionError / ...
+            report[name] = f"semantic: {exc}"
+            ok_all = False
+    return bool(ok_all), report
+
+
+def _fingerprint_field_names():
+    """Deterministic sorted list of stage-fingerprint field names."""
+    fields = build_stage_fingerprint_fields(
+        N=0, seed=0, ladder=[0.0], K_ladder=[0.0],
+        info={"model_name": "", "param_names": [], "params": [],
+              "Tref": 0.0, "Tscale": 0.0},
+        fit_summary_path="__no_such_fit_summary__", n_cycles=0, steps_per_swap=0,
+        n_workers=0, structural_stride=0, snapshot_stride=0, burnin_frac=0.0)
+    return sorted(fields)
+
+
+def render_artifact_provenance_md():
+    """Deterministic markdown for ``docs/artifact_provenance.md`` (Phase 13).
+
+    Explains the configuration -> feature -> certificate -> seed-audit ->
+    calibration-report chain, which SHA-256 binds each stage, which fingerprint
+    fields identify a run, which artifacts are authoritative, and which validation
+    status is required for scientific use.  Contains NO timestamps or absolute
+    paths so it regenerates byte-for-byte.
+    """
+    artifacts = list(_full_companion_paths("<prefix>", "<cfg>", "<feat>"))
+    lines = [
+        "# Artifact provenance and trust chain",
+        "",
+        "> Generated by `run_structural_regime_pilot.render_artifact_provenance_md()`."
+        "  Do not edit by hand; regenerate with `python -c \"import "
+        "run_structural_regime_pilot as p; p.write_artifact_provenance_md()\"`.",
+        "",
+        "## Stage chain",
+        "",
+        "1. **configuration** (`<prefix>_configurations.h5`) — the REMD sampler "
+        "writes committed coordinate snapshots plus run metadata (N, seed, "
+        "run_id, temperature ladder, fitted-model record).  The stage fingerprint "
+        "is embedded as the `stage_fingerprint` attribute.",
+        "2. **feature extraction** (`<prefix>_features.h5`) — offline extraction "
+        "reads ONLY committed rows, validating raw source integers before any "
+        "cast, and writes one validated feature row per (snapshot, lane).  The "
+        "manifest records `source_configuration_sha256` binding the feature file "
+        "to the exact configuration bytes.",
+        "3. **certificate** (`<prefix>_features.h5.validation.json`) — a deep, "
+        "SOURCE-VERIFIED validation writes `feature_sha256`, "
+        "`source_configuration_sha256`, `stage_fingerprint`, `validator_revision`, "
+        "`definitions_sha256`, `definitions_version`, and "
+        "`source_verification_status`.",
+        "4. **artifact manifest** (`<prefix>_artifact_manifest.json`) — records "
+        "the SHA-256 of every companion artifact for hash + semantic validation.",
+        "5. **seed audit + calibration report** — every requested seed must be "
+        "complete (all artifacts present), certificate-trusted for exactly its "
+        "stage fingerprint, and cross-seed aligned before any multi-seed "
+        "inference; otherwise the report marks inference `not_assessable`.",
+        "",
+        "## SHA-256 bindings",
+        "",
+        "| binding | recorded in | ties |",
+        "| --- | --- | --- |",
+        "| `source_configuration_sha256` | feature manifest + certificate | "
+        "feature file to its configuration bytes |",
+        "| `feature_sha256` | certificate | certificate to the feature bytes |",
+        "| `definitions_sha256` | certificate + stage fingerprint | run to the "
+        "frozen `project_definitions.json` |",
+        "| `fit_summary_sha256` | stage fingerprint | run to the fitted-model file |",
+        "| artifact `sha256` map | artifact manifest | report to every companion |",
+        "",
+        "## Stage-fingerprint fields (identify a requested run)",
+        "",
+    ] + [f"- `{name}`" for name in _fingerprint_field_names()] + [
+        "",
+        "## Authoritative artifacts (required per seed)",
+        "",
+    ] + [f"- `{name}`" for name in artifacts] + [
+        "- `artifact_manifest_json`",
+        "",
+        "## Validation status required for scientific use",
+        "",
+        "- Feature validation must be `fully_source_verified` (the independent "
+        "source configuration was found, hash-matched, and agreed on the "
+        "temperature ladder, model, per-row b(T), seed, N, and definitions "
+        "version).  `internally_consistent_only` is acceptable ONLY for "
+        "historical inspection, never for resume or seed analysis.",
+        "- A certificate is trusted only when `validation_result == passed` and "
+        "its feature hash, source hash, stage fingerprint, validator revision, "
+        "definitions hash, definitions version, and feature schema version all "
+        "match the expected stage.",
+        "- Multi-seed inference is assessable only when every requested seed is "
+        "complete, certificate-trusted, and cross-seed aligned.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_artifact_provenance_md(path=None):
+    p = Path(path) if path is not None else (HERE / "docs" / "artifact_provenance.md")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(render_artifact_provenance_md(), encoding="utf-8")
+    return str(p)
+
+
+def _feature_certified(feat_path):
+    """True only when ``feat_path`` is a currently-trustworthy, source-verified
+    certified feature file (Phase 5 self-consistency check).
+
+    An existing certificate is reused ONLY when it references this file's current
+    hash, was written by the CURRENT validator revision, and matches the current
+    definitions hash; otherwise a fresh deep, SOURCE-VERIFIED validation is rerun
+    (and a new certificate written).  Any failure returns False so the seed stage
+    reruns or fails clearly.  This is the self-consistency check; cross-checking a
+    file against an EXTERNALLY expected stage fingerprint is done by
+    :func:`validate_feature_certificate`.
     """
     feat_path = Path(feat_path)
     if not feat_path.exists():
         return False
     cert_p = _certificate_path(feat_path)
+    defs_sha, _defs_ver, _feat_ver = _current_certificate_expectations()
     if cert_p.exists():
         try:
             cert = json.loads(cert_p.read_text(encoding="utf-8"))
             if (cert.get("validation_result") == "passed"
-                    and cert.get("feature_sha256") == _sha256(feat_path)):
+                    and cert.get("feature_sha256") == _sha256(feat_path)
+                    and int(cert.get("validator_revision", -1))
+                    == int(VALIDATOR_REVISION)
+                    and cert.get("definitions_sha256") == defs_sha):
                 return True
         except Exception:
             pass
@@ -1177,11 +1814,13 @@ def _feature_certified(feat_path):
 # Seed-artifact audit (Phase 5) + cross-seed alignment (Phase 6)
 # ---------------------------------------------------------------------------
 
-# The artifacts every requested seed must produce before it can contribute to a
-# multi-seed statistical analysis.
+# The complete artifact set every requested seed must produce before it can
+# contribute to a multi-seed statistical analysis (Phase 7).
 REQUIRED_SEED_ARTIFACTS = (
-    "results_csv", "diagnostics_json", "diagnostic_trajectories_npz",
-    "distributions_npz", "feature_h5")
+    "configuration_h5", "feature_h5", "feature_manifest_json",
+    "validation_certificate", "results_csv", "swap_rates_csv",
+    "move_acceptance_csv", "diagnostics_json", "diagnostic_trajectories_npz",
+    "distributions_npz", "run_summary_json", "artifact_manifest_json")
 
 ALIGN_TOL = 1e-6
 
@@ -1190,14 +1829,20 @@ class SeedAlignmentError(RuntimeError):
     """Raised when seeds disagree on the physics-defining run configuration."""
 
 
-def audit_seed_artifacts(seed_companions, *, feature_validator=None):
-    """Classify each requested seed as complete / missing / invalid (Phase 5).
+def audit_seed_artifacts(seed_companions, *, feature_validator=None,
+                         expectations=None):
+    """Classify each requested seed as complete / missing / invalid (Phase 5/7).
 
     ``seed_companions`` maps each requested seed to its companion-artifact path
     dict (as returned by :func:`_companion_paths`).  A seed is COMPLETE only when
-    every required artifact exists AND (when ``feature_validator`` is given) its
-    feature file deep-validates.  Missing artifacts never silently drop a seed;
-    they are reported so scientific inference can be marked not assessable.
+    EVERY required artifact (including the artifact manifest) exists and, when
+    ``expectations[seed]`` is supplied, its artifact manifest passes full
+    HASH + SEMANTIC validation (:func:`validate_artifact_manifest`) AND its
+    feature certificate is trusted for exactly the expected stage
+    (:func:`validate_feature_certificate`).  Otherwise the lighter
+    ``feature_validator`` is used.  Missing/invalid artifacts never silently drop
+    a seed; they are reported with a per-artifact reason so scientific inference
+    can be marked not assessable.
     """
     validator = feature_validator or _feature_certified
     complete, missing, invalid = [], [], []
@@ -1205,12 +1850,37 @@ def audit_seed_artifacts(seed_companions, *, feature_validator=None):
     for seed in sorted(seed_companions):
         comp = seed_companions[seed]
         miss = [n for n in REQUIRED_SEED_ARTIFACTS
-                if not Path(comp[n]).exists()]
+                if n not in comp or not Path(comp[n]).exists()]
         if miss:
             missing.append(seed)
             failures[seed] = {"missing_artifacts": miss}
             continue
-        if not validator(comp["feature_h5"]):
+        if expectations is not None and seed in expectations:
+            exp = expectations[seed]
+            ok, report = validate_artifact_manifest(
+                comp["artifact_manifest_json"], N=exp["N"], seed=exp["seed"],
+                ladder=exp["ladder"], source_config=exp["source_config"],
+                stage_fingerprint=exp["stage_fingerprint"],
+                run_id=exp.get("run_id"))
+            if not ok:
+                invalid.append(seed)
+                failures[seed] = {"artifact_validation": {
+                    k: v for k, v in report.items() if v != "ok"}}
+                continue
+            defs_sha, defs_ver, feat_ver = _current_certificate_expectations()
+            cok, creason = validate_feature_certificate(
+                comp["feature_h5"],
+                source_configuration_path=comp["configuration_h5"],
+                expected_stage_fingerprint=exp["stage_fingerprint"],
+                expected_validator_revision=VALIDATOR_REVISION,
+                expected_definitions_sha256=defs_sha,
+                expected_definitions_version=defs_ver,
+                expected_feature_schema_version=feat_ver)
+            if not cok:
+                invalid.append(seed)
+                failures[seed] = {"certificate": creason}
+                continue
+        elif not validator(comp["feature_h5"]):
             invalid.append(seed)
             failures[seed] = {"feature_validation": "failed"}
             continue
@@ -1296,7 +1966,8 @@ def require_seed_alignment(records, tol=ALIGN_TOL):
 
 def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
              structural_stride, snapshot_stride, resume=False, commands=None,
-             stage_fingerprint=None, burnin_frac=0.5, n_workers=1):
+             stage_fingerprint=None, stage_fingerprint_fields=None,
+             burnin_frac=0.5, n_workers=1):
     prefix = out_dir / f"calib_N{N}_s{seed}"
     cfg = f"{prefix}_configurations.h5"
     feat = out_dir / f"calib_N{N}_s{seed}_features.h5"
@@ -1323,16 +1994,27 @@ def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
         commands.append(" ".join(cmd))
     print("RUN:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(HERE))
+    # Embed the stage fingerprint (+field record) into the configuration HDF5 and
+    # the diagnostic-trajectory NPZ BEFORE extraction/hashing (Phase 4).
+    _embed_fingerprint_hdf5(cfg, stage_fingerprint, stage_fingerprint_fields)
+    _embed_fingerprint_npz(companions["diagnostic_trajectories_npz"],
+                           stage_fingerprint, stage_fingerprint_fields)
     ecmd = [PY, EXTRACT, "--input", cfg, "--output", str(feat),
             "--validate", "--overwrite"]
     if commands is not None:
         commands.append(" ".join(ecmd))
     subprocess.run(ecmd, check=True, cwd=str(HERE))
-    # Deep-validate the freshly extracted features and write a full certificate
-    # (stage fingerprint + source-config hash) so a later --resume can prove the
-    # stage belongs to exactly this requested configuration.
-    _deep_validate_and_certify(feat, stage_fingerprint=stage_fingerprint,
-                               source_config=cfg)
+    # Embed the same fingerprint into the feature manifest + companion JSON, then
+    # deep-validate and write a full certificate (stage fingerprint + field record
+    # + source-config hash) so a later --resume can prove the stage belongs to
+    # exactly this requested configuration.
+    _embed_fingerprint_feature(feat, stage_fingerprint, stage_fingerprint_fields)
+    _deep_validate_and_certify(
+        feat, stage_fingerprint=stage_fingerprint,
+        stage_fingerprint_fields=stage_fingerprint_fields, source_config=cfg)
+    # Phase 6: record the SHA-256 of every produced artifact.
+    build_artifact_manifest(_full_companion_paths(prefix, cfg, feat),
+                            f"{prefix}_artifact_manifest.json")
     return str(prefix)
 
 
@@ -1514,6 +2196,10 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
     min_swap = float("inf"); max_swap = 0.0; max_drift = 0.0
     min_state_changing = float("inf")
     tau_by_lane = None
+    # Phase 11: per-lane slowest-tau observable (the limiting observable), tracked
+    # across seeds -- the observable achieving each lane's global maximum tau.
+    limiting_obs_by_lane = {}
+    limiting_tau_by_lane = {}
     # Phase 11: worst finite drift across seeds, lanes, AND key observables.
     drift_limit = {"value": 0.0, "seed": None, "lane": None, "observable": None}
     total_round_trips = 0
@@ -1550,6 +2236,10 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
                     if tc and np.isfinite(tc):
                         slowest_tau_cycles = max(slowest_tau_cycles, float(tc))
                         lane_tau[i] = np.nanmax([lane_tau[i], float(tc)])
+                        if (i not in limiting_tau_by_lane
+                                or float(tc) > limiting_tau_by_lane[i]):
+                            limiting_tau_by_lane[i] = float(tc)
+                            limiting_obs_by_lane[i] = o
                     if e and np.isfinite(e):
                         min_ess = min(min_ess, float(e))
             c = lane.get("contacts", {})
@@ -1655,6 +2345,9 @@ def analyze_mixing(prefixes, info, support_maximum=None, support_source=None):
             "slowest_tau_int_cycles": slowest_tau_cycles,
             "tau_by_lane": [None if not np.isfinite(x) else float(x)
                             for x in (tau_by_lane if tau_by_lane is not None else [])],
+            "limiting_observable_by_lane": [
+                limiting_obs_by_lane.get(i)
+                for i in range(len(tau_by_lane) if tau_by_lane is not None else 0)],
             "round_trips": {
                 "total_round_trips_low": int(total_round_trips),
                 "min_round_trips_per_walker": (
@@ -1781,6 +2474,8 @@ def main():
     # -- per-seed stage fingerprints (Phase 4) ------------------------------
     BURNIN_FRAC = 0.5
     N_WORKERS = 1
+    # Resolve ONE definitions context for the whole CLI run (Phase 8).
+    defs_context = sch.active_definitions_context()
     stage_fingerprint_fields = {}
     stage_fingerprints = {}
     for s in seeds:
@@ -1789,7 +2484,8 @@ def main():
             fit_summary_path=args.fit_summary_json, n_cycles=args.n_cycles,
             steps_per_swap=args.steps_per_swap, n_workers=N_WORKERS,
             structural_stride=args.structural_stride,
-            snapshot_stride=args.snapshot_stride, burnin_frac=BURNIN_FRAC)
+            snapshot_stride=args.snapshot_stride, burnin_frac=BURNIN_FRAC,
+            context=defs_context)
         stage_fingerprint_fields[s] = ff
         stage_fingerprints[s] = _stage_fingerprint(ff)
 
@@ -1835,6 +2531,7 @@ def main():
                              args.structural_stride, args.snapshot_stride,
                              resume=args.resume, commands=commands,
                              stage_fingerprint=stage_fingerprints[s],
+                             stage_fingerprint_fields=stage_fingerprint_fields[s],
                              burnin_frac=BURNIN_FRAC, n_workers=N_WORKERS)
                     for s in seeds]
     except Exception:
@@ -1846,12 +2543,19 @@ def main():
     # -- seed-artifact audit (Phase 5) + cross-seed alignment (Phase 6) ------
     companions_by_seed = {}
     align_records = []
+    seed_expectations = {}
     for s, prefix in zip(seeds, prefixes):
         feat = Path(f"{prefix}_features.h5")
         cfg = f"{prefix}_configurations.h5"
         companions_by_seed[s] = _companion_paths(prefix, cfg, feat)
+        seed_expectations[s] = {
+            "N": int(args.N), "seed": int(s),
+            "ladder": [float(t) for t in ladder],
+            "source_config": str(cfg),
+            "stage_fingerprint": stage_fingerprints[s], "run_id": None}
         align_records.append(_seed_alignment_record(prefix, feat, info, args.N))
-    seed_audit = audit_seed_artifacts(companions_by_seed)
+    seed_audit = audit_seed_artifacts(companions_by_seed,
+                                      expectations=seed_expectations)
     alignment_ok, alignment_reason = True, None
     seed_alignment = {"aligned": True, "n_seeds": len(align_records)}
     if len(align_records) >= 2:
@@ -1923,11 +2627,15 @@ def main():
         post_burnin_frac=args.production_burnin_frac,
         snapshot_stride=prod_stride, n_seeds=int(args.production_seeds),
         target_ess=int(args.target_effective_per_regime),
+        limiting_observable_by_lane=mixing.get("limiting_observable_by_lane"),
         regime_labels_stable=regime_labels_stable)
 
     metrics = dict(mixing["metrics"])
     metrics["seed_relative_spread"] = trends["seed_relative_spread_delta_m"]
     metrics = {k: (0.0 if v is None else v) for k, v in metrics.items()}
+    # Phase 9: the strengthened tail gate (pooled raw + effective + seed coverage
+    # + per-seed support + accounting identity) is authoritative.
+    metrics["tail_gate"] = mixing["tail_gate"]
     gates = evaluate_sampling_gates(metrics)
 
     model_K_ok = bool(branch["K_increases_with_T"])
@@ -1974,6 +2682,8 @@ def main():
                    for k, v in ladder_info.items()},
         "K_ladder": K_ladder,
         "stage_fingerprints": {str(s): stage_fingerprints[s] for s in seeds},
+        "stage_fingerprint_fields": {str(s): stage_fingerprint_fields[s]
+                                     for s in seeds},
         "validator_revision": int(VALIDATOR_REVISION),
         "seed_audit": seed_audit,
         "seed_alignment": seed_alignment,
@@ -1998,7 +2708,7 @@ def main():
     }
     # Part 6: ladder refinement from the POOLED (seed-order-invariant) overlap.
     report["ladder_refinement"] = refine_ladder(
-        ladder, mixing["pooled_adjacent_overlap"])
+        ladder, mixing["adjacent_overlap_aggregate"])
 
     manifest["status"] = status
     manifest["commands"] = commands

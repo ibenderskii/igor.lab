@@ -205,6 +205,27 @@ def require_exact_integer_array(values, *, field_name, row=None):
         f"{loc}{field_name} has unsupported dtype {arr.dtype!r}")
 
 
+def require_exact_integer_scalar(value, *, field_name, row=None):
+    """Return a Python ``int`` ONLY after ``value`` is verified exactly integral.
+
+    Scalar counterpart of :func:`require_exact_integer_array` for single
+    schema/manifest/metadata integers (feature/schema versions, row counts,
+    temperature_count, seed, committed/allocated rows, validator revision, ...).
+    It delegates to the array validator, so ``4.5``, ``96.5``, ``NaN``, ``inf``,
+    complex values, string/bytes, out-of-int64 magnitudes, and multi-element
+    inputs are all REJECTED (never silently truncated by ``int(4.5) == 4``).
+    """
+    loc = f"[row {row}] " if row is not None else ""
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    elif arr.size != 1:
+        raise ExtractionError(
+            f"{loc}{field_name} must be a single integer scalar, "
+            f"got {arr.size} elements")
+    return int(require_exact_integer_array(arr, field_name=field_name, row=row)[0])
+
+
 def _project_definitions_path() -> str:
     """Resolved project-definitions path (for manifest provenance)."""
     try:
@@ -755,7 +776,16 @@ def extract(
         n_alloc, nT, n_beads, three = coords_ds.shape
         if three != 3:
             raise ExtractionError("coordinates last dim != 3")
-        n_committed = cio.committed_rows(snap)
+        # Phase 1/2: validate the raw committed-row / allocation integers BEFORE
+        # any cast so a fractional / NaN / inf committed_rows attribute is
+        # rejected here rather than truncated by int().
+        n_alloc = int(require_exact_integer_scalar(
+            n_alloc, field_name="snapshots/coordinates.shape[0] (allocated_rows)"))
+        if "committed_rows" in snap.attrs:
+            n_committed = require_exact_integer_scalar(
+                snap.attrs["committed_rows"], field_name="snapshots/committed_rows")
+        else:
+            n_committed = int(cio.committed_rows(snap))
         if n_committed > n_alloc:
             raise ExtractionError(f"committed_rows {n_committed} > allocated {n_alloc}")
 
@@ -766,9 +796,29 @@ def extract(
         ree2_ds = snap["ree2_lattice"]
 
         run_id = str(meta.get("run_id", Path(input_path).stem))
-        seed = int(meta.get("seed", -1))
+        # Phase 1/2: exact-integer validation of source metadata scalars.
+        seed = (require_exact_integer_scalar(meta["seed"], field_name="metadata/seed")
+                if "seed" in meta else -1)
         temps = np.asarray(meta.get("temperatures", np.full(nT, np.nan)), dtype=float)
-        schema_version = int(meta.get("schema_version", 0))
+        schema_version = (
+            require_exact_integer_scalar(meta["schema_version"],
+                                         field_name="metadata/schema_version")
+            if "schema_version" in meta else 0)
+        # Cross-check source n_beads / n_steps metadata (when present) against the
+        # authoritative coordinate shape; both must be exact integers.
+        if "n_beads" in meta:
+            meta_nb = require_exact_integer_scalar(
+                meta["n_beads"], field_name="metadata/n_beads")
+            if meta_nb != int(n_beads):
+                raise ExtractionError(
+                    f"metadata n_beads {meta_nb} != coordinate shape n_beads "
+                    f"{int(n_beads)}")
+        if "n_steps" in meta:
+            meta_ns = require_exact_integer_scalar(
+                meta["n_steps"], field_name="metadata/n_steps")
+            if meta_ns != int(n_beads) - 1:
+                raise ExtractionError(
+                    f"metadata n_steps {meta_ns} != n_beads-1 {int(n_beads) - 1}")
         # Phase 2: copy the authoritative model record from the source snapshot
         # metadata so the feature file carries an independent provenance copy.
         _model_name = meta.get("model_name")
@@ -831,8 +881,16 @@ def extract(
             pairs_chunk = []
             for si in range(s1 - s0):
                 snap_idx = s0 + si
-                cyc = int(cyc_block[si])
-                w = np.asarray(walk_block[si], dtype=np.int64)
+                # Phase 1: validate the raw source integers for this snapshot
+                # BEFORE any int cast (a fractional / NaN / inf cycle, walker_id,
+                # or contact count is rejected, never truncated).
+                cyc = int(require_exact_integer_array(
+                    np.asarray(cyc_block[si]).reshape(1),
+                    field_name="snapshots/cycle", row=snap_idx)[0])
+                w = require_exact_integer_array(
+                    walk_block[si], field_name="snapshots/walker_id", row=snap_idx)
+                cont_row = require_exact_integer_array(
+                    cont_block[si], field_name="snapshots/contacts", row=snap_idx)
                 if not np.array_equal(np.sort(w), np.arange(nT, dtype=np.int64)):
                     discrepancies["walker_permutation"] += 1
                     raise ExtractionError(
@@ -850,7 +908,7 @@ def extract(
                         coords_block[si, k],
                         n_beads=int(n_beads),
                         fixed_defs=fixed_defs, scaled_defs=scaled_defs,
-                        stored_contacts=int(cont_block[si, k]),
+                        stored_contacts=int(cont_row[k]),
                         stored_rg2=float(rg2_block[si, k]),
                         stored_ree2=float(ree2_block[si, k]),
                         temperature=T_k, b_T=b_k,
@@ -1245,7 +1303,9 @@ def write_feature_dictionary(path=None) -> str:
     return str(p)
 
 
-def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
+def validate_feature_file_hdf5(path: str, *, deep: bool = True,
+                               require_source: bool = False,
+                               source_path_override: str | None = None) -> dict:
     """Comprehensive structural/identity validation of a feature HDF5 file.
 
     Independently RECONSTRUCTS every derived representation from the stored
@@ -1258,7 +1318,27 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
     definitions record; it is never required to equal the currently installed
     code version.  ``deep=False`` skips the per-row reconstruction (aggregate
     checks only) for very large files.
+
+    Source-configuration verification (Phase 3)
+    -------------------------------------------
+    The returned ``source_verification_status`` is one of:
+
+    * ``"fully_source_verified"`` -- the source configuration file was found, its
+      SHA-256 matched, and the feature file's temperature ladder, model record,
+      per-row ``b(T)`` (recomputed from the SOURCE model), seed, run_id, N,
+      snapshot schema version, and definitions version all agreed with it.  A
+      COHERENT feature-only rewrite (manifest + rows changed together) fails
+      because the independent source disagrees.
+    * ``"internally_consistent_only"`` -- no source file was available; the file
+      is internally consistent but NOT independently corroborated.  This is
+      acceptable only for historical inspection.
+
+    ``require_source=True`` (scientific / production / resume validation) turns a
+    missing or unreadable source, or a source-hash mismatch, into a hard failure
+    (only ``fully_source_verified`` is accepted).  ``source_path_override`` lets a
+    caller supply the known source path explicitly.
     """
+    source_verification_status = "internally_consistent_only"
     import isaw_schema as sch
     with h5py.File(path, "r") as f:
         if str(f.attrs.get("status")) != "complete":
@@ -1280,7 +1360,12 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
                 I[name] = require_exact_integer_array(I[name], field_name=name)
         m = S["m"].astype(np.int64)
         n_rows = int(m.shape[0])
-        committed = int(feats.attrs.get("committed_feature_rows", -1))
+        # Phase 2: every stored integer file-attribute/manifest field is validated
+        # for exact integrality (no int(4.5)==4) before comparison.
+        committed = (require_exact_integer_scalar(
+            feats.attrs["committed_feature_rows"],
+            field_name="committed_feature_rows")
+            if "committed_feature_rows" in feats.attrs else -1)
         if committed != n_rows:
             raise ExtractionError(
                 f"committed_feature_rows {committed} != row count {n_rows}")
@@ -1326,8 +1411,22 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
         # -- stored (historical) definitions: validate the file against its OWN
         #    record; never require equality with the installed code version ---
         man = json.loads(f["metadata"].attrs["manifest"])
-        if int(man.get("row_count", -1)) != n_rows:
+        man_row_count = (require_exact_integer_scalar(
+            man["row_count"], field_name="manifest.row_count")
+            if "row_count" in man else -1)
+        if man_row_count != n_rows:
             raise ExtractionError("manifest row_count mismatch")
+        if "committed_feature_rows" in man:
+            man_committed = require_exact_integer_scalar(
+                man["committed_feature_rows"],
+                field_name="manifest.committed_feature_rows")
+            if man_committed != n_rows:
+                raise ExtractionError("manifest committed_feature_rows mismatch")
+        if "n_beads" in man:
+            man_nb = require_exact_integer_scalar(
+                man["n_beads"], field_name="manifest.n_beads")
+            if man_nb != n_beads:
+                raise ExtractionError("manifest n_beads mismatch")
         fixed_defs = man.get("fixed_bin_definitions") or dict(ico.FIXED_BIN_DEFINITIONS)
         scaled_defs = man.get("scaled_bin_definitions") or dict(ico.SCALED_BIN_DEFINITIONS)
         # Validate the scaled scheme always; validate the fixed partition only
@@ -1344,12 +1443,17 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
         uses_current = (stored_ver == str(ico.DEFINITIONS_VERSION))
 
         # -- feature-schema version support + file/manifest agreement (Phase 3)
-        file_ver = int(f.attrs.get("feature_schema_version", -1))
+        file_ver = (require_exact_integer_scalar(
+            f.attrs["feature_schema_version"], field_name="feature_schema_version")
+            if "feature_schema_version" in f.attrs else -1)
         if not (1 <= file_ver <= FEATURE_SCHEMA_VERSION):
             raise ExtractionError(
                 f"unsupported feature_schema_version {file_ver} "
                 f"(supported 1..{FEATURE_SCHEMA_VERSION})")
-        man_ver = int(man.get("feature_schema_version", file_ver))
+        man_ver = (require_exact_integer_scalar(
+            man["feature_schema_version"],
+            field_name="manifest.feature_schema_version")
+            if "feature_schema_version" in man else file_ver)
         if man_ver != file_ver:
             raise ExtractionError(
                 f"manifest/file feature_schema_version mismatch "
@@ -1372,8 +1476,10 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
         if ti.size and (int(ti.min()) < 0):
             raise ExtractionError("negative temperature_index")
         auth_temps = man.get("temperatures")
-        nT_man = int(man.get("temperature_count",
-                             len(np.unique(ti)) if ti.size else 0))
+        nT_man = (require_exact_integer_scalar(
+            man["temperature_count"], field_name="manifest.temperature_count")
+            if "temperature_count" in man
+            else (len(np.unique(ti)) if ti.size else 0))
         if auth_temps is not None:
             auth = np.asarray(auth_temps, dtype=float).ravel()
             if int(auth.size) != nT_man:
@@ -1457,17 +1563,37 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
                     f"than previous snapshot cycle {last_cycle}")
             last_cycle = this_cycle
 
-        # -- source-configuration + model-record provenance (Phase 2) -------
-        src_path = man.get("source_configuration_path")
+        # -- independent source-configuration verification (Phase 3) --------
+        # When the source configuration file is available it is read INDEPENDENTLY
+        # and the feature file's temperature ladder, model record, per-row b(T),
+        # seed, run_id, N, snapshot schema version, and definitions version must
+        # agree with it -- a coherent feature-only rewrite is defeated because the
+        # source is an independent witness.  In ``require_source`` mode a missing,
+        # unreadable, or hash-mismatched source is a hard failure.
+        src_path = source_path_override or man.get("source_configuration_path")
         src_sha = man.get("source_configuration_sha256")
-        if src_path and src_sha and Path(src_path).exists():
-            if _file_sha256(src_path) != str(src_sha):
+        src_available = bool(src_path and Path(src_path).exists())
+        if require_source and not src_available:
+            raise ExtractionError(
+                "scientific validation requires the source configuration file, "
+                f"which is missing ({src_path!r})")
+        if src_available:
+            if not src_sha:
+                if require_source:
+                    raise ExtractionError(
+                        "source configuration hash missing from manifest")
+            elif _file_sha256(src_path) != str(src_sha):
                 raise ExtractionError(
                     "source_configuration_sha256 does not match the actual "
                     "source configuration file")
             try:
                 with h5py.File(src_path, "r") as _sf:
                     src_meta = _read_metadata(_sf)
+                    try:
+                        src_nb = int(_sf["snapshots"]["coordinates"].shape[2])
+                    except (KeyError, IndexError, AttributeError):
+                        src_nb = None
+                # -- model record (name/param_names/params/Tref/Tscale) --------
                 for key, fv in (man.get("model_record") or {}).items():
                     sv = src_meta.get(key)
                     if isinstance(sv, bytes):
@@ -1491,8 +1617,75 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
                         raise ExtractionError(
                             f"feature-file model record {key} disagrees with "
                             f"source configuration")
-            except OSError:
-                pass  # unreadable source is treated as "unavailable", not a fail
+                # -- temperature ladder (per-lane; source is authoritative) ----
+                src_temps = np.asarray(src_meta.get("temperatures", []),
+                                       dtype=float).ravel()
+                if src_temps.size:
+                    if auth is not None and (src_temps.size != auth.size
+                            or not np.allclose(src_temps, auth, atol=1e-6, rtol=0.0)):
+                        raise ExtractionError(
+                            "feature temperature ladder disagrees with the source "
+                            "configuration")
+                    for r in range(n_rows):
+                        k = int(ti[r])
+                        if k < src_temps.size and abs(
+                                float(tv[r]) - float(src_temps[k])) > 1e-6:
+                            raise ExtractionError(
+                                f"[row {r}] temperature {float(tv[r])} disagrees "
+                                f"with source ladder[{k}]={float(src_temps[k])}")
+                # -- per-row b(T) recomputed from the SOURCE model -------------
+                b_of_T, _bstat = _model_bias_evaluator(src_meta)
+                if b_of_T is not None:
+                    bcol = S["b_T"][()].astype(float)
+                    for r in range(n_rows):
+                        Tr = float(tv[r])
+                        if not (math.isfinite(Tr) and math.isfinite(bcol[r])):
+                            continue
+                        b_exp = float(b_of_T(Tr))
+                        if abs(bcol[r] - b_exp) > 1e-6 * max(1.0, abs(b_exp)) + 1e-9:
+                            raise ExtractionError(
+                                f"[row {r}] b_T {bcol[r]} != source-model "
+                                f"b(T={Tr})={b_exp}")
+                # -- seed / run_id / N / schema / definitions version ----------
+                if "seed" in src_meta and seed_col.size:
+                    if int(require_exact_integer_scalar(
+                            src_meta["seed"], field_name="source seed")) != int(
+                            seed_col[0]):
+                        raise ExtractionError(
+                            "feature seed disagrees with source configuration")
+                src_run = src_meta.get("run_id")
+                if isinstance(src_run, bytes):
+                    src_run = src_run.decode()
+                if src_run is not None and str(src_run) != file_run_id:
+                    raise ExtractionError(
+                        "feature run_id disagrees with source configuration")
+                if src_nb is not None and int(src_nb) != int(n_beads):
+                    raise ExtractionError(
+                        f"feature n_beads {n_beads} disagrees with source "
+                        f"configuration N {src_nb}")
+                ssv = man.get("source_snapshot_schema_version")
+                src_ssv = src_meta.get("schema_version")
+                if ssv is not None and src_ssv is not None:
+                    if int(require_exact_integer_scalar(
+                            ssv, field_name="manifest.source_snapshot_schema_version"
+                            )) != int(require_exact_integer_scalar(
+                            src_ssv, field_name="source schema_version")):
+                        raise ExtractionError(
+                            "source_snapshot_schema_version disagrees with the "
+                            "source configuration")
+                src_defs_ver = src_meta.get("definitions_version")
+                if isinstance(src_defs_ver, bytes):
+                    src_defs_ver = src_defs_ver.decode()
+                if src_defs_ver is not None and str(src_defs_ver) != stored_ver:
+                    raise ExtractionError(
+                        f"definitions_version {stored_ver} disagrees with source "
+                        f"configuration ({src_defs_ver})")
+                source_verification_status = "fully_source_verified"
+            except OSError as exc:
+                if require_source:
+                    raise ExtractionError(
+                        f"source configuration is unreadable: {exc}") from exc
+                # weak mode: unreadable source stays internally_consistent_only
 
         # -- primary-key uniqueness -----------------------------------------
         try:
@@ -1703,9 +1896,15 @@ def validate_feature_file_hdf5(path: str, *, deep: bool = True) -> dict:
                     if int(S[key][r]) != int(val):
                         raise ExtractionError(
                             f"[row {r}] contour bin {key} mismatch")
+    if require_source and source_verification_status != "fully_source_verified":
+        raise ExtractionError(
+            "scientific validation could not fully verify the source "
+            f"configuration (status={source_verification_status})")
     return {"row_count": n_rows, "n_beads": n_beads,
             "definitions_version": stored_ver,
-            "uses_current_definitions": bool(uses_current), "ok": True}
+            "uses_current_definitions": bool(uses_current),
+            "source_verification_status": source_verification_status,
+            "ok": True}
 
 
 # ---------------------------------------------------------------------------
