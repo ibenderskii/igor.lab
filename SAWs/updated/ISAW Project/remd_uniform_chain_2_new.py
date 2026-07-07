@@ -1748,7 +1748,10 @@ def compute_run_diagnostics(
 # Saving
 # ---------------------------------------------------------------------------
 
-def save_results_csv(results: list[dict], out_prefix: str) -> str:
+def save_results_csv(
+    results: list[dict], out_prefix: str,
+    control_mode: str = "fitted_temperature",
+) -> str:
     path = f"{out_prefix}_results.csv"
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     keys = [
@@ -1768,12 +1771,26 @@ def save_results_csv(results: list[dict], out_prefix: str) -> str:
         "m_long_fixed_mean", "m_long_fixed_std",
         "m_global_scaled_mean", "m_global_scaled_std",
         "state_changing_acceptance_rate",
+        # Control-parameter column (appended; old readers ignore).  In direct-K
+        # mode this is the coupling K for the lane; in fitted-temperature mode it
+        # is K(T) = -b(T).
+        "K",
     ]
+    # In direct-K mode temperature is not physically defined, so the "T" column
+    # is written as NaN (least-disruptive: the column stays present, downstream
+    # numeric readers get NaN) while the coupling lives in the "K" column.
+    blank_temperature = control_mode == "direct_K"
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(keys)
         for r in results:
-            w.writerow([r.get(k, math.nan) for k in keys])
+            row = []
+            for k in keys:
+                if k == "T" and blank_temperature:
+                    row.append(math.nan)
+                else:
+                    row.append(r.get(k, math.nan))
+            w.writerow(row)
     print(f"Saved {path}")
     return path
 
@@ -1783,17 +1800,28 @@ def save_swap_csv(
     swap_accs:  np.ndarray,
     Ts: np.ndarray,
     out_prefix: str,
+    control_mode: str = "fitted_temperature",
+    K: np.ndarray | None = None,
 ) -> str:
     path = f"{out_prefix}_swap_rates.csv"
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # K_lo/K_hi are appended so direct-K swap statistics remain analyzable by
+    # coupling; in direct-K mode temperature is undefined so T_lo/T_hi are NaN.
+    blank_temperature = control_mode == "direct_K"
+    K = np.asarray(K, dtype=float) if K is not None else None
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["pair", "T_lo", "T_hi", "proposals", "acceptances", "rate"])
+        w.writerow(["pair", "T_lo", "T_hi", "proposals", "acceptances", "rate",
+                    "K_lo", "K_hi"])
         for k in range(len(swap_props)):
             prop = int(swap_props[k])
             acc  = int(swap_accs[k])
             rate = acc / prop if prop > 0 else float("nan")
-            w.writerow([k, float(Ts[k]), float(Ts[k + 1]), prop, acc, f"{rate:.4f}"])
+            t_lo = math.nan if blank_temperature else float(Ts[k])
+            t_hi = math.nan if blank_temperature else float(Ts[k + 1])
+            k_lo = float(K[k]) if K is not None else math.nan
+            k_hi = float(K[k + 1]) if K is not None else math.nan
+            w.writerow([k, t_lo, t_hi, prop, acc, f"{rate:.4f}", k_lo, k_hi])
     print(f"Saved {path}")
     return path
 
@@ -1986,6 +2014,7 @@ def save_diagnostic_trajectories_npz(
     rg_scale: float = 1.0,
     configured_structural_stride: int | None = None,
     bin_definitions: dict | None = None,
+    extra_metadata: dict | None = None,
 ) -> str:
     """Save compressed post-burn-in C/Rg/E and walker temperature-index traces.
 
@@ -2125,6 +2154,15 @@ def save_diagnostic_trajectories_npz(
             "separation r (0 <= r < n_beads); even r are zero; sum_r == m"
         )
         payload["n_beads"] = int(n_beads)
+
+    # Additive control-mode metadata (e.g. direct-K vs fitted-temperature).  Keys
+    # are stored verbatim; K_values is coerced to a float array for compactness.
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            if key == "K_values":
+                payload[key] = np.asarray(value, dtype=float)
+            else:
+                payload[key] = value
 
     np.savez_compressed(path, **payload)
     print(f"Saved {path}")
@@ -3087,6 +3125,98 @@ def run_diagnostics_quick_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Direct-K control mode (temperature-independent contact coupling)
+# ---------------------------------------------------------------------------
+# The direct-K ensemble is  P(C|K) ∝ exp[K m(C)], i.e. the reduced contact bias
+# is b_i = -K_i (recall the sampler uses P(C) ∝ exp[-u], u = m*b).  This is
+# realized by REUSING the existing ``poly2`` contact-bias model with the fixed
+# coefficients (a0, a1, a2) = (0, -1, 0) and (Tref, Tscale) = (0, 1), so that
+#     b(T) = a0 + a1*x + a2*x^2 = -x = -(T-0)/1 = -T .
+# The per-lane "temperature" label then carries the coupling K directly, giving
+#     b_i = b(K_i) = -K_i ,
+# with NO new registry model (which would break the cross-script model contract
+# in run_model_suite_2.py), NO change to the MC weight, and NO change to the
+# replica-exchange criterion.  With this encoding the existing swap_log_accept
+# reduces exactly to  (K_i - K_j)(m_j - m_i)  and the MC weight to exp(K_i * m).
+DIRECT_K_MODEL_NAME = "poly2"
+DIRECT_K_PARAMS = [0.0, -1.0, 0.0]
+DIRECT_K_TREF = 0.0
+DIRECT_K_TSCALE = 1.0
+
+
+def parse_k_values(k_str: str) -> list[float]:
+    """Parse/validate a comma-separated --K-values ladder; return sorted ascending.
+
+    Rejects: an empty string, non-finite values (nan/inf), duplicate couplings,
+    and fewer than two values.  Sorting into ascending order gives a
+    deterministic ladder (adjacent lanes have the closest couplings, which is
+    what the replica-exchange even/odd swap sweeps expect).
+    """
+    raw = [x.strip() for x in str(k_str).split(",") if x.strip()]
+    if not raw:
+        raise ValueError("--K-values was provided but no values were found")
+    vals: list[float] = []
+    for i, x in enumerate(raw, start=1):
+        try:
+            v = float(x)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--K-values entry {i} is not a finite number: {x!r}"
+            ) from exc
+        if not math.isfinite(v):
+            raise ValueError(f"--K-values entry {i} is not finite: {x!r}")
+        vals.append(v)
+    if len(vals) < 2:
+        raise ValueError(
+            f"--K-values needs at least two couplings, got {len(vals)}: {vals}"
+        )
+    ordered = sorted(vals)
+    for a, b in zip(ordered[:-1], ordered[1:]):
+        if a == b:
+            raise ValueError(
+                f"--K-values contains duplicate coupling {a!r}; couplings must "
+                f"be distinct"
+            )
+    return ordered
+
+
+def reject_direct_k_conflicts(args) -> None:
+    """Raise ValueError if direct-K (--K-values) is combined with temperature/
+    fitted-model arguments.
+
+    Direct-K mode defines the contact coupling itself, so a temperature ladder,
+    a fitted contact model, or explicit (Tref, Tscale, T0) are all meaningless
+    and are rejected rather than silently ignored.
+    """
+    conflicts = []
+    if getattr(args, "temps", None) is not None:
+        conflicts.append("--temps")
+    if getattr(args, "temps_from_npz", None) is not None:
+        conflicts.append("--temps-from-npz")
+    if getattr(args, "fit_summary_json", None) is not None:
+        conflicts.append("--fit-summary-json")
+    if getattr(args, "fit_params_csv", None) is not None:
+        conflicts.append("--fit-params-csv")
+    if getattr(args, "params", None) is not None:
+        conflicts.append("--params")
+    if getattr(args, "model", None) is not None:
+        conflicts.append("--model")
+    if getattr(args, "Tref", None) is not None:
+        conflicts.append("--Tref")
+    if getattr(args, "Tscale", None) is not None:
+        conflicts.append("--Tscale")
+    if getattr(args, "T0", None) is not None:
+        conflicts.append("--T0")
+    if conflicts:
+        raise ValueError(
+            "--K-values (direct-K mode) is mutually exclusive with temperature/"
+            "fitted-model arguments: " + ", ".join(conflicts) + ". Direct-K mode "
+            "sets the contact coupling directly (b_i = -K_i) and applies no "
+            "temperature mapping."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Model parameter resolution
 # ---------------------------------------------------------------------------
 
@@ -3876,6 +4006,20 @@ def main() -> None:
             "Overrides Tref for heat_capacity only."
         ),
     )
+    ap.add_argument(
+        "--K-values",
+        type=str,
+        default=None,
+        dest="K_values",
+        help=(
+            "Direct-K control mode: comma-separated contact couplings K for the "
+            "ladder, e.g. --K-values=-0.40,-0.32,...,0.35 (the '=' form is "
+            "required so a leading negative value is not read as a flag). Samples "
+            "P(C|K) proportional to exp[K*m(C)] with reduced bias b_i = -K_i and "
+            "NO temperature mapping. Mutually exclusive with --temps / "
+            "--fit-summary-json and the other fitted-model arguments."
+        ),
+    )
     temp_group = ap.add_mutually_exclusive_group()
     temp_group.add_argument(
         "--temps-from-npz",
@@ -4109,63 +4253,113 @@ def main() -> None:
     # creates it, so this is harmless there.
     Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
 
-    # Temperature ladder resolution: --temps-from-npz > --temps > linspace.
-    if args.temps_from_npz is not None:
-        Ts = load_temperatures_from_npz(args.temps_from_npz)
-        temp_source = f"npz:{args.temps_from_npz}"
-    elif args.temps is not None:
-        Ts = validate_temperature_ladder(
-            np.array(parse_params_string(args.temps), dtype=float)
-        )
-        temp_source = "cli:--temps"
+    # Two mutually exclusive control modes: direct-K (--K-values) sets the
+    # contact coupling itself; otherwise the fitted-temperature ladder is
+    # resolved (--temps-from-npz > --temps > linspace) with a fitted b(T) model.
+    direct_k_mode = args.K_values is not None
+    if direct_k_mode:
+        reject_direct_k_conflicts(args)
+        K_values = parse_k_values(args.K_values)
+        # The lane label carries the coupling K directly; poly2(0,-1,0) with
+        # (Tref, Tscale) = (0, 1) makes b(label) = -label = -K (see the direct-K
+        # section above), so no new model and no hot-loop change are needed.
+        Ts = np.asarray(K_values, dtype=float)
+        temp_source = "cli:--K-values"
+        model_name = DIRECT_K_MODEL_NAME
+        model_params = list(DIRECT_K_PARAMS)
+        param_names = MODEL_REGISTRY[model_name]["param_names"]
+        Tref, Tscale = DIRECT_K_TREF, DIRECT_K_TSCALE
+        parameter_source = "direct_K"
+        fit_summary_json = None
     else:
-        if args.nT < 2:
-            raise ValueError("--nT must be >= 2")
-        if not math.isfinite(args.Tmin) or not math.isfinite(args.Tmax):
-            raise ValueError("Temperatures must be finite")
-        if args.Tmin <= 0 or args.Tmax <= 0:
-            raise ValueError("Temperatures must be positive")
-        if args.Tmax <= args.Tmin:
-            raise ValueError("--Tmax must be greater than --Tmin")
-        Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
-        temp_source = "linspace"
+        if args.temps_from_npz is not None:
+            Ts = load_temperatures_from_npz(args.temps_from_npz)
+            temp_source = f"npz:{args.temps_from_npz}"
+        elif args.temps is not None:
+            Ts = validate_temperature_ladder(
+                np.array(parse_params_string(args.temps), dtype=float)
+            )
+            temp_source = "cli:--temps"
+        else:
+            if args.nT < 2:
+                raise ValueError("--nT must be >= 2")
+            if not math.isfinite(args.Tmin) or not math.isfinite(args.Tmax):
+                raise ValueError("Temperatures must be finite")
+            if args.Tmin <= 0 or args.Tmax <= 0:
+                raise ValueError("Temperatures must be positive")
+            if args.Tmax <= args.Tmin:
+                raise ValueError("--Tmax must be greater than --Tmin")
+            Ts = np.linspace(args.Tmin, args.Tmax, args.nT)
+            temp_source = "linspace"
+        (
+            model_name, model_params, param_names, Tref, Tscale,
+            parameter_source, fit_summary_json,
+        ) = resolve_model_params(args, Ts)
 
     nT = len(Ts)
     Tmin_resolved, Tmax_resolved = float(Ts.min()), float(Ts.max())
     diffs = np.diff(Ts)
+    # In direct-K mode this measures K-ladder uniformity, not temperature.
     temperature_uniform = bool(nT >= 2 and np.allclose(diffs, diffs[0]))
     total_steps = args.steps_per_swap * args.n_cycles
-    print(
-        f"Temperature ladder ({temp_source}): {nT} replicas, "
-        f"min={Tmin_resolved:.6g}, max={Tmax_resolved:.6g}, "
-        f"uniform={temperature_uniform}"
-    )
 
-    (
-        model_name, model_params, param_names, Tref, Tscale,
-        parameter_source, fit_summary_json,
-    ) = resolve_model_params(args, Ts)
-
-    print(
-        f"REMD: {nT} replicas, T in [{Tmin_resolved:.6g}, {Tmax_resolved:.6g}], "
-        f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
+    # Per-lane coupling K = -b(label); in direct-K mode this recovers the K
+    # ladder exactly, in fitted mode it is K(T).  Single source for the CSV/K
+    # columns and the control metadata below.
+    K_by_lane = np.array(
+        [-reduced_bias(model_name, model_params, float(T), Tref, Tscale)
+         for T in Ts],
+        dtype=float,
     )
-    print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
-    print(f"Parameter source: {parameter_source}")
-    if fit_summary_json is not None:
-        print(f"Fit summary: {fit_summary_json}")
-    print("Parameters:")
-    for name, val in zip(param_names, model_params):
-        print(f"  {name} = {val:.8g}")
-    if model_name == "heat_capacity":
-        print(f"T0 = {Tref:.8g}")
-        print(f"Tscale = {Tscale:.8g}")
+    control_mode = "direct_K" if direct_k_mode else "fitted_temperature"
+    control_metadata = {
+        "control_mode": control_mode,
+        "control_parameter": "K" if direct_k_mode else "temperature",
+        "K_values": [float(k) for k in K_by_lane],
+        "temperature_mapping_applied": bool(not direct_k_mode),
+    }
+
+    if direct_k_mode:
+        print(
+            f"Direct-K ladder ({temp_source}): {nT} lanes, "
+            f"K in [{Tmin_resolved:.6g}, {Tmax_resolved:.6g}], "
+            f"uniform={temperature_uniform}"
+        )
+        print(
+            f"REMD (direct-K): {nT} lanes, "
+            f"{args.n_cycles} cycles x {args.steps_per_swap} steps = "
+            f"{total_steps} steps/lane"
+        )
+        print("Sampling: P(C|K) proportional to exp[K*m(C)];  b_i = -K_i "
+              "(reused poly2 b(T) = -T with lane label = K; no temperature "
+              "mapping)")
     else:
-        print(f"Tref = {Tref:.8g}, Tscale = {Tscale:.8g}")
-    if model_name == "hs" and abs(model_params[1]) > 1e-15:
-        print(f"Derived Tc = {model_params[0] / model_params[1]:.8g}")
-    elif model_name == "tc_scale":
-        print(f"Tc = {model_params[1]:.8g}")
+        print(
+            f"Temperature ladder ({temp_source}): {nT} replicas, "
+            f"min={Tmin_resolved:.6g}, max={Tmax_resolved:.6g}, "
+            f"uniform={temperature_uniform}"
+        )
+        print(
+            f"REMD: {nT} replicas, T in [{Tmin_resolved:.6g}, "
+            f"{Tmax_resolved:.6g}], {args.n_cycles} cycles x "
+            f"{args.steps_per_swap} steps = {total_steps} steps/replica"
+        )
+        print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
+        print(f"Parameter source: {parameter_source}")
+        if fit_summary_json is not None:
+            print(f"Fit summary: {fit_summary_json}")
+        print("Parameters:")
+        for name, val in zip(param_names, model_params):
+            print(f"  {name} = {val:.8g}")
+        if model_name == "heat_capacity":
+            print(f"T0 = {Tref:.8g}")
+            print(f"Tscale = {Tscale:.8g}")
+        else:
+            print(f"Tref = {Tref:.8g}, Tscale = {Tscale:.8g}")
+        if model_name == "hs" and abs(model_params[1]) > 1e-15:
+            print(f"Derived Tc = {model_params[0] / model_params[1]:.8g}")
+        elif model_name == "tc_scale":
+            print(f"Tc = {model_params[1]:.8g}")
 
     # Contour-separation bin definitions (two independent schemes; optional
     # JSON override of either).  Both the requested override and the resolved
@@ -4250,6 +4444,8 @@ def main() -> None:
              temperature_bias_arrays(Ts, model_name, model_params,
                                      Tref, Tscale).items()}
         )
+        # Unambiguous control-mode tag (direct-K vs fitted-temperature).
+        snap_meta.update(control_metadata)
         snapshot_writer = SnapshotWriter(
             configuration_path,
             n_beads=int(args.N), n_temperatures=int(nT),
@@ -4343,9 +4539,23 @@ def main() -> None:
         snapshot_start_cycle=int(args.snapshot_start_cycle),
     )
     dist["structural_observables_enabled"] = bool(structural_observables)
+    # Control-mode tags so a direct-K distributions NPZ is self-identifying.
+    dist["control_mode"] = control_metadata["control_mode"]
+    dist["control_parameter"] = control_metadata["control_parameter"]
+    dist["K_values"] = np.asarray(K_by_lane, dtype=float)
+    dist["temperature_mapping_applied"] = bool(
+        control_metadata["temperature_mapping_applied"])
 
-    results_path = save_results_csv(results, args.out_prefix)
-    swap_path = save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix)
+    # Per-lane coupling K for the CSV "K" column (K(T) in fitted mode, the
+    # coupling itself in direct-K mode).
+    for i, r in enumerate(results):
+        r["K"] = float(K_by_lane[i])
+
+    results_path = save_results_csv(
+        results, args.out_prefix, control_mode=control_mode)
+    swap_path = save_swap_csv(
+        swap_props, swap_accs, Ts, args.out_prefix,
+        control_mode=control_mode, K=K_by_lane)
     move_acc_path = save_move_acceptance_csv(replicas, Ts, args.out_prefix)
     dist_path = save_distributions(dist, args.out_prefix)
     output_files = {
@@ -4388,6 +4598,9 @@ def main() -> None:
             thresholds=thresholds, rg_scale=args.rg_scale,
             structural_observables_enabled=structural_observables,
         )
+        # Tag the diagnostics with the control mode so a direct-K diagnostics
+        # JSON is self-identifying (lane "temperature" fields carry K).
+        diagnostics_result.update(control_metadata)
         output_files["diagnostics_json"] = save_diagnostics_json(
             diagnostics_result, args.out_prefix
         )
@@ -4408,6 +4621,7 @@ def main() -> None:
                 configured_structural_stride=(
                     structural_stride_eff if structural_observables else None),
                 bin_definitions=bin_defs,
+                extra_metadata=control_metadata,
             )
             output_files["diagnostic_trajectories_npz"] = traj_path
             # The diagnostic-trajectories NPZ also carries the post-burn-in
@@ -4435,6 +4649,14 @@ def main() -> None:
     run_summary = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "model_api_version": MODEL_API_VERSION,
+        # Control-mode tags: direct_K sets b_i = -K_i with no temperature
+        # mapping; fitted_temperature uses the fitted b(T) model.
+        "control_mode": control_metadata["control_mode"],
+        "control_parameter": control_metadata["control_parameter"],
+        "K_values": control_metadata["K_values"],
+        "temperature_mapping_applied": control_metadata[
+            "temperature_mapping_applied"],
+        "direct_k_mode": bool(direct_k_mode),
         "model": model_name,
         "param_names": list(param_names),
         "params": [float(v) for v in model_params],

@@ -1,0 +1,1200 @@
+#!/usr/bin/env python3
+"""
+Replica-exchange Monte Carlo for the multi-chain lattice aggregation model.
+
+Simulates M identical connected self-avoiding chains (N beads each) in a
+periodic cubic box of side L, reusing the validated single-chain contact free
+energy from ``remd_uniform_chain_2_new.py`` WITHOUT refitting.  The reduced
+potential is
+
+    u(X, T) = b(T) * [ lambda_intra * m_intra(X) + lambda_inter * m_inter(X) ]
+
+where b(T) is the fitted reduced contact bias loaded through the existing model
+registry / fit_summary.json interfaces.  Raw lattice contact counts m_intra and
+m_inter are authoritative; the single molecular-to-lattice contact offset is NOT
+applied to the Hamiltonian.  Default (lambda_intra, lambda_inter) = (1, 1) (the
+full-transferability null model); (1,0), (0,1), (0,0) select the other control
+modes without changing the energy implementation.
+
+Sampling weight P(X|T) ∝ exp(-u).  The REMD swap uses the generalized reduced-
+potential rule (both cached counts):
+
+    log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j)
+
+Sweep convention:
+    1 local sweep       = M * N local move proposals
+    1 translation sweep = M whole-chain translation proposals
+Each REMD cycle performs local_sweeps_per_swap local sweeps, then
+translation_sweeps_per_swap translation sweeps, then one even/odd swap stage.
+
+Quick test:  python remd_multichain.py --quick-test
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import math
+import multiprocessing as _mp
+import os
+import random
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import remd_uniform_chain_2_new as remd  # model registry + fitted-model loading
+import multichain_state as mcs
+import multichain_contacts as mcc
+import multichain_moves as mvs
+import multichain_observables as obs
+import multichain_config_io as mcio
+import multichain_diagnostics as mcd
+from multichain_state import MultiChainState, ContactCounts
+
+SCHEMA_VERSION = mcio.MULTICHAIN_OUTPUT_SCHEMA_VERSION
+MODEL_API_VERSION = remd.MODEL_API_VERSION
+
+
+def _import_matplotlib():
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception:  # pragma: no cover - depends on local plotting stack
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reduced potential and swap rule (both contact counts)
+# ---------------------------------------------------------------------------
+
+def reduced_potential_counts(
+    counts: ContactCounts, temperature: float, model_name: str, params,
+    Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
+) -> float:
+    """u = reduced_bias(T) * (lambda_intra * m_intra + lambda_inter * m_inter)."""
+    b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
+    return float(b) * (
+        float(lambda_intra) * int(counts.intra)
+        + float(lambda_inter) * int(counts.inter))
+
+
+def swap_log_accept_counts(
+    counts_i: ContactCounts, counts_j: ContactCounts, T_i: float, T_j: float,
+    model_name: str, params, Tref: float, Tscale: float,
+    lambda_intra: float, lambda_inter: float,
+) -> float:
+    """Generalized swap log-acceptance using BOTH intra/inter counts.
+
+    log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j).
+    """
+    def u(c, T):
+        return reduced_potential_counts(
+            c, T, model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
+    return (u(counts_i, T_i) + u(counts_j, T_j)
+            - u(counts_j, T_i) - u(counts_i, T_j))
+
+
+def metropolis_accept_delta(
+    delta_intra: int, delta_inter: int, reduced_bias_value: float,
+    lambda_intra: float, lambda_inter: float, random_value: float,
+) -> bool:
+    """Metropolis decision for a proposed contact-count change.
+
+    ``delta_u = b(T) * (lambda_intra * delta_intra + lambda_inter * delta_inter)``
+    where ``b(T)`` is the (precomputed) reduced contact bias.  Accept when
+    ``delta_u <= 0`` (favorable / neutral) or ``random_value < exp(-delta_u)``.
+    ``random_value`` is supplied by the caller so the decision is pure and
+    directly testable; the caller draws it only for unfavorable moves.
+    """
+    delta_u = float(reduced_bias_value) * (
+        float(lambda_intra) * int(delta_intra)
+        + float(lambda_inter) * int(delta_inter))
+    if delta_u <= 0.0:
+        return True
+    return float(random_value) < math.exp(-delta_u)
+
+
+def attempt_swap(
+    replica_a: "MultiReplica", replica_b: "MultiReplica",
+    model_name: str, params, Tref: float, Tscale: float,
+    lambda_intra: float, lambda_inter: float, rng: random.Random,
+) -> bool:
+    """Attempt a generalized REMD state exchange between two lanes.
+
+    Computes the generalized swap log-acceptance from both cached contact counts
+    at the two (fixed) lane temperatures, applies the Metropolis decision, and on
+    acceptance exchanges the complete :class:`MultiChainState` objects.
+    Temperatures stay pinned to their lanes; walker bookkeeping is the caller's
+    responsibility.  Returns ``True`` iff the states were exchanged.
+
+    The favorable branch (``log_accept >= 0``) short-circuits WITHOUT drawing a
+    random number, matching the sampler's lazy-draw convention so run
+    reproducibility (serial vs multiprocessing) is preserved.
+    """
+    log_accept = swap_log_accept_counts(
+        replica_a.state.counts, replica_b.state.counts, replica_a.T, replica_b.T,
+        model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
+    if log_accept >= 0.0 or rng.random() < math.exp(log_accept):
+        replica_a.state, replica_b.state = replica_b.state, replica_a.state
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Local MC sweep (one lane)
+# ---------------------------------------------------------------------------
+
+def mc_sweep(
+    state: MultiChainState, counters: np.ndarray, temperature: float,
+    model_name: str, params, Tref: float, Tscale: float,
+    lambda_intra: float, lambda_inter: float,
+    n_local: int, n_translation: int, rng: random.Random,
+    debug_contacts: bool = False,
+) -> None:
+    """Run one lane's local + translation proposals in place.
+
+    ``du = b(T) * (lambda_intra * d_intra + lambda_inter * d_inter)`` for the
+    proposed change; accept if ``du <= 0`` or ``random() < exp(-du)`` (via
+    :func:`metropolis_accept_delta`).  b(T) is
+    constant across the sweep and computed once.  Move counters are the shared
+    (n_moves, 4) block: proposed / geometrically_valid / state_changing /
+    metropolis_accepted (null proposals never count as state-changing).
+    """
+    # Environment-controlled contact debugging works even without the CLI flag.
+    debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
+    b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
+    li = float(lambda_intra)
+    lin = float(lambda_inter)
+
+    def _attempt(prop):
+        idx = mvs.MOVE_INDEX[prop.move_type]
+        counters[idx, 0] += 1  # proposed
+        if not prop.ok:
+            return
+        counters[idx, 1] += 1  # geometrically valid
+        if prop.state_changing:
+            counters[idx, 2] += 1  # state changing
+        d_intra, d_inter = mvs.proposal_delta(state, prop)
+        du = b * (li * d_intra + lin * d_inter)
+        # Draw a random number only for an unfavorable move (du > 0); the pure
+        # helper then makes the identical decision on that draw.
+        accept = (du <= 0.0) or metropolis_accept_delta(
+            d_intra, d_inter, b, li, lin, rng.random())
+        if accept:
+            mvs.apply_proposal(state, prop, (d_intra, d_inter))
+            if prop.state_changing:
+                counters[idx, 3] += 1  # accepted (state-changing)
+            if debug_contacts:
+                mcc.assert_counts_match(state, f"after {prop.move_type}")
+
+    for _ in range(int(n_local)):
+        _attempt(mvs.propose_local(state, rng))
+    for _ in range(int(n_translation)):
+        _attempt(mvs.propose_translation(state, rng))
+
+
+# ---------------------------------------------------------------------------
+# Replica
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MultiReplica:
+    """One temperature lane: fixed T, evolving multi-chain state, trajectories."""
+    T: float
+    state: MultiChainState
+    move_counters: np.ndarray = field(default_factory=mvs.new_move_counters)
+    u_traj: list = field(default_factory=list)
+    eeff_traj: list = field(default_factory=list)
+    m_intra_traj: list = field(default_factory=list)
+    m_inter_traj: list = field(default_factory=list)
+    f_inter_traj: list = field(default_factory=list)
+    rg_traj: list = field(default_factory=list)          # mean per-chain Rg (lattice)
+    rg2_traj: list = field(default_factory=list)         # mean per-chain Rg^2 (lattice)
+    per_chain_rg_traj: list = field(default_factory=list)  # full (M,) Rg vector/cycle (lattice)
+    std_chain_rg_traj: list = field(default_factory=list)  # std of per-chain Rg (lattice)
+    lcs_traj: list = field(default_factory=list)         # largest cluster size
+    lcf_traj: list = field(default_factory=list)         # largest cluster fraction
+    n_clusters_traj: list = field(default_factory=list)  # number of chain clusters
+    # Independent-initialization provenance (recorded per lane; Change 2).
+    init_seed: int = 0
+    init_m_intra: int = 0
+    init_m_inter: int = 0
+    init_mean_chain_rg_lattice: float = 0.0  # lattice units (rg_scale applied downstream)
+    init_largest_cluster_size: int = 0
+
+    def local_acceptance_rate(self) -> float:
+        c = np.asarray(self.move_counters, dtype=np.int64)
+        prop = int(c[:3, 0].sum())   # pivot, crankshaft, end
+        acc = int(c[:3, 3].sum())
+        return acc / prop if prop else float("nan")
+
+    def translation_acceptance_rate(self) -> float:
+        c = np.asarray(self.move_counters, dtype=np.int64)
+        idx = mvs.MOVE_INDEX["chain_translation"]
+        prop = int(c[idx, 0])
+        acc = int(c[idx, 3])
+        return acc / prop if prop else float("nan")
+
+
+# ---------------------------------------------------------------------------
+# Worker (top-level, pickleable under Windows 'spawn')
+# ---------------------------------------------------------------------------
+
+def evolve_lane_worker(
+    coords_unwrapped: np.ndarray, counts_tuple: Tuple[int, int], box_size: int,
+    temperature: float, move_counters: np.ndarray,
+    n_local: int, n_translation: int,
+    model_name: str, params, Tref: float, Tscale: float,
+    lambda_intra: float, lambda_inter: float, seed: int,
+    debug_contacts: bool,
+) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray]:
+    """Evolve one lane for a cycle without transferring trajectories.
+
+    The occupancy map is rebuilt from coordinates inside the worker, so only the
+    bounded coordinate array, the two cached counts, and the small move-counter
+    block cross the process boundary (no growing trajectory lists, no shared
+    mutable occupancy).
+    """
+    coords = np.asarray(coords_unwrapped, dtype=np.int64).copy()
+    site_owner = mcs.build_site_owner(coords, box_size)
+    state = MultiChainState(
+        coords_unwrapped=coords, site_owner=site_owner,
+        counts=ContactCounts.from_tuple(counts_tuple), box_size=int(box_size))
+    counters = np.asarray(move_counters, dtype=np.int64).copy()
+    rng = random.Random(int(seed))
+    mc_sweep(state, counters, temperature, model_name, params, Tref, Tscale,
+             lambda_intra, lambda_inter, n_local, n_translation, rng,
+             debug_contacts=debug_contacts)
+    return state.coords_unwrapped, state.counts.as_tuple(), counters
+
+
+def _lane_seed(base_seed: int, cycle: int, lane: int) -> int:
+    """Deterministic per-lane, per-cycle seed (base, cycle, temperature lane)."""
+    return int(base_seed) + 100_003 * int(cycle) + 131 * int(lane)
+
+
+# Stride for independent per-lane INITIALIZATION seeds.  Chosen large and
+# distinct from the per-cycle stride (100_003) and lane stride (131) used by
+# ``_lane_seed`` so an initialization seed never coincides with any per-cycle
+# sweep seed, and initialization RNG (numpy RandomState) is a different family
+# from the sweep RNG (random.Random) besides.
+INITIALIZATION_SEED_STRIDE = 1_000_003
+
+
+def _init_lane_seed(base_seed: int, lane: int) -> int:
+    """Deterministic per-lane initialization seed (independent starting states)."""
+    return int(base_seed) + INITIALIZATION_SEED_STRIDE * int(lane)
+
+
+def _build_independent_replicas(
+    Ts: np.ndarray, M: int, N: int, L: int, base_seed: int,
+    cluster_contact_threshold: int,
+) -> List[MultiReplica]:
+    """One independently initialized :class:`MultiReplica` per temperature lane.
+
+    Each lane is grown from its own deterministic seed so REMD walkers do not all
+    start from a single shared configuration.  Per-lane initial observables are
+    recorded on the replica for the run summary.  This runs in the main process
+    only, so serial and multiprocessing runs share identical starting states.
+    """
+    replicas: List[MultiReplica] = []
+    for lane, T in enumerate(Ts):
+        init_seed = _init_lane_seed(base_seed, lane)
+        state = mcs.initialize_dispersed_state(M, N, L, seed=init_seed)
+        clu = obs.cluster_summary(state, cluster_contact_threshold)
+        rep = MultiReplica(T=float(T), state=state)
+        rep.init_seed = int(init_seed)
+        rep.init_m_intra = int(state.counts.intra)
+        rep.init_m_inter = int(state.counts.inter)
+        rep.init_mean_chain_rg_lattice = float(mcs.per_chain_rg(state).mean())
+        rep.init_largest_cluster_size = int(clu["largest_cluster_size"])
+        replicas.append(rep)
+    return replicas
+
+
+# ---------------------------------------------------------------------------
+# Main REMD loop
+# ---------------------------------------------------------------------------
+
+def run_remd_multichain(
+    *, n_chains: int, chain_length: int, box_size: int, Ts: np.ndarray,
+    local_sweeps_per_swap: int, translation_sweeps_per_swap: int, n_cycles: int,
+    model_name: str, params, Tref: float, Tscale: float,
+    lambda_intra: float = 1.0, lambda_inter: float = 1.0,
+    cluster_contact_threshold: int = 1,
+    seed: int | None = None, n_workers: int = 1, verbose: bool = True,
+    debug_contacts: bool = False,
+    snapshot_writer=None, snapshot_stride: int = 1, snapshot_start_cycle: int = 0,
+) -> Tuple[List[MultiReplica], np.ndarray, np.ndarray, np.ndarray]:
+    """Run multi-chain REMD.
+
+    Returns ``(replicas, swap_props, swap_accs, walker_lane_history)`` where the
+    last is ``(n_cycles, nT)`` giving each walker's lane index per cycle (for
+    round-trip diagnostics).
+    """
+    if seed is None:
+        seed = random.SystemRandom().randrange(1, 2 ** 31)
+    base_seed = int(seed)
+    # Environment-controlled contact debugging works even without the CLI flag.
+    debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
+
+    M = int(n_chains)
+    N = int(chain_length)
+    L = int(box_size)
+    nT = len(Ts)
+    n_local = int(local_sweeps_per_swap) * M * N
+    n_translation = int(translation_sweeps_per_swap) * M
+
+    # Each REMD lane begins from its OWN independently generated dispersed state
+    # (deterministic per-lane seeds); no shared starting configuration.
+    replicas = _build_independent_replicas(
+        Ts, M, N, L, base_seed, cluster_contact_threshold)
+
+    swap_props = np.zeros(max(nT - 1, 0), dtype=np.int64)
+    swap_accs = np.zeros(max(nT - 1, 0), dtype=np.int64)
+    lane_walker = np.arange(nT, dtype=np.int64)   # walker currently in lane k
+    walker_lane = np.arange(nT, dtype=np.int64)   # lane of walker w
+    walker_lane_history = np.empty((n_cycles, nT), dtype=np.int32)
+
+    save_configurations = snapshot_writer is not None
+    report_every = max(1, n_cycles // 10)
+
+    executor = (
+        ProcessPoolExecutor(max_workers=min(n_workers, nT),
+                            mp_context=_mp.get_context("spawn"))
+        if n_workers > 1 else None)
+
+    try:
+        for cycle in range(n_cycles):
+            if executor is not None:
+                futures = [
+                    executor.submit(
+                        evolve_lane_worker,
+                        replicas[k].state.coords_unwrapped,
+                        replicas[k].state.counts.as_tuple(),
+                        L, replicas[k].T, replicas[k].move_counters,
+                        n_local, n_translation, model_name, params, Tref, Tscale,
+                        lambda_intra, lambda_inter,
+                        _lane_seed(base_seed, cycle, k), debug_contacts)
+                    for k in range(nT)]
+                for k, fut in enumerate(futures):
+                    coords, counts_tuple, counters = fut.result()
+                    rep = replicas[k]
+                    rep.state = MultiChainState(
+                        coords_unwrapped=np.asarray(coords, dtype=np.int64),
+                        site_owner=mcs.build_site_owner(coords, L),
+                        counts=ContactCounts.from_tuple(counts_tuple), box_size=L)
+                    rep.move_counters = counters
+            else:
+                for k, rep in enumerate(replicas):
+                    rng = random.Random(_lane_seed(base_seed, cycle, k))
+                    mc_sweep(rep.state, rep.move_counters, rep.T, model_name,
+                             params, Tref, Tscale, lambda_intra, lambda_inter,
+                             n_local, n_translation, rng,
+                             debug_contacts=debug_contacts)
+
+            # Even/odd adjacent swaps (temperatures fixed to lanes).  The actual
+            # production swap operation is attempt_swap; the deterministic
+            # per-(cycle, pair) RNG keeps serial and multiprocessing runs
+            # identical (swaps always run in the main process).
+            start = cycle % 2
+            for k in range(start, nT - 1, 2):
+                swap_props[k] += 1
+                swap_rng = random.Random(_lane_seed(base_seed, cycle, 1000 + k))
+                if attempt_swap(replicas[k], replicas[k + 1], model_name, params,
+                                Tref, Tscale, lambda_intra, lambda_inter,
+                                swap_rng):
+                    swap_accs[k] += 1
+                    wa, wb = lane_walker[k], lane_walker[k + 1]
+                    lane_walker[k], lane_walker[k + 1] = wb, wa
+                    walker_lane[wa], walker_lane[wb] = k + 1, k
+            walker_lane_history[cycle] = walker_lane
+
+            # Observable recording (main process only).
+            do_snapshot = (
+                save_configurations and cycle >= snapshot_start_cycle
+                and ((cycle - snapshot_start_cycle) % snapshot_stride) == 0)
+            if do_snapshot:
+                snap_coords = np.empty((nT, M, N, 3), dtype=np.int64)
+                snap_mi = np.empty(nT, dtype=np.int64)
+                snap_me = np.empty(nT, dtype=np.int64)
+                snap_rg2 = np.empty(nT, dtype=np.float64)
+                snap_lcs = np.empty(nT, dtype=np.int64)
+
+            for k, rep in enumerate(replicas):
+                cyc = obs.cycle_observables(rep.state, cluster_contact_threshold)
+                u = reduced_potential_counts(
+                    rep.state.counts, rep.T, model_name, params, Tref, Tscale,
+                    lambda_intra, lambda_inter)
+                rep.u_traj.append(u)
+                rep.eeff_traj.append(rep.T * u)
+                rep.m_intra_traj.append(cyc["m_intra"])
+                rep.m_inter_traj.append(cyc["m_inter"])
+                rep.f_inter_traj.append(cyc["f_inter"])
+                rep.rg_traj.append(cyc["mean_chain_rg_lattice"])
+                rep.rg2_traj.append(cyc["mean_chain_rg2_lattice"])
+                rep.per_chain_rg_traj.append(
+                    np.asarray(cyc["per_chain_rg_lattice"], dtype=np.float64))
+                rep.std_chain_rg_traj.append(cyc["std_chain_rg_lattice"])
+                rep.lcs_traj.append(cyc["largest_cluster_size"])
+                rep.lcf_traj.append(cyc["largest_cluster_fraction"])
+                rep.n_clusters_traj.append(cyc["n_clusters"])
+                if do_snapshot:
+                    snap_coords[k] = rep.state.coords_unwrapped
+                    snap_mi[k] = cyc["m_intra"]
+                    snap_me[k] = cyc["m_inter"]
+                    snap_rg2[k] = cyc["mean_chain_rg2_lattice"]
+                    snap_lcs[k] = cyc["largest_cluster_size"]
+
+            if do_snapshot:
+                snapshot_writer.append(
+                    cycle=cycle, coordinates=snap_coords,
+                    walker_id=lane_walker.astype(np.int64),
+                    m_intra=snap_mi, m_inter=snap_me,
+                    mean_chain_rg2=snap_rg2, largest_cluster_size=snap_lcs)
+
+            if verbose and (cycle + 1) % report_every == 0:
+                rates = " ".join(
+                    f"{swap_accs[k] / swap_props[k]:.2f}" if swap_props[k] else "n/a"
+                    for k in range(nT - 1))
+                print(f"  cycle {cycle + 1:>5}/{n_cycles}  swap: {rates}")
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    return replicas, swap_props, swap_accs, walker_lane_history
+
+
+# ---------------------------------------------------------------------------
+# Post-processing helpers
+# ---------------------------------------------------------------------------
+
+def _traj_dicts(replicas: List[MultiReplica]) -> List[dict]:
+    return [{
+        "u": rep.u_traj, "effective_energy": rep.eeff_traj,
+        "m_intra": rep.m_intra_traj, "m_inter": rep.m_inter_traj,
+        "f_inter": rep.f_inter_traj,
+        "mean_chain_rg_lattice": rep.rg_traj,
+        "mean_chain_rg2_lattice": rep.rg2_traj,
+        "std_chain_rg_lattice": rep.std_chain_rg_traj,
+        "per_chain_rg_lattice": rep.per_chain_rg_traj,
+        "largest_cluster_size": rep.lcs_traj,
+        "largest_cluster_fraction": rep.lcf_traj,
+        "n_clusters": rep.n_clusters_traj,
+        # M carried per lane so contact normalization uses an explicit chain
+        # count (never inferred from cluster sizes).
+        "n_chains": rep.state.n_chains,
+    } for rep in replicas]
+
+
+def summarize_results(replicas, Ts, burnin_frac, rg_scale):
+    traj = _traj_dicts(replicas)
+    n_chains = replicas[0].state.n_chains if replicas else None
+    results = obs.compute_statistics(traj, Ts, burnin_frac=burnin_frac,
+                                     rg_scale=rg_scale, n_chains=n_chains)
+    for rep, r in zip(replicas, results):
+        r["local_acceptance_rate"] = rep.local_acceptance_rate()
+        r["translation_acceptance_rate"] = rep.translation_acceptance_rate()
+    return results
+
+
+def build_run_distributions(replicas, Ts, *, burnin_frac, rg_bins, rg_scale):
+    return obs.build_distributions(
+        _traj_dicts(replicas), Ts, burnin_frac=burnin_frac, rg_bins=rg_bins,
+        rg_scale=rg_scale)
+
+
+def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
+                    model_params, Tref, Tscale, lambda_intra, lambda_inter,
+                    local_sweeps_per_swap, translation_sweeps_per_swap, n_cycles,
+                    burnin_frac, cluster_contact_threshold, parameter_source,
+                    fit_summary_json) -> dict:
+    """Inject full model + run provenance into a distributions/summary dict."""
+    dist["schema_version"] = int(SCHEMA_VERSION)
+    dist["model_api_version"] = int(MODEL_API_VERSION)
+    dist["model_name"] = str(model_name)
+    dist["param_names"] = np.array(list(param_names))
+    dist["model_params"] = np.array([float(v) for v in model_params], dtype=float)
+    dist["Tref"] = float(Tref)
+    dist["Tscale"] = float(Tscale)
+    dist["lambda_intra"] = float(lambda_intra)
+    dist["lambda_inter"] = float(lambda_inter)
+    dist["M"] = int(M)
+    dist["N"] = int(N)
+    dist["L"] = int(L)
+    dist["n_beads"] = int(M * N)
+    dist["volume_fraction"] = float(M * N) / float(L ** 3)
+    dist["seed"] = int(seed)
+    dist["temperatures"] = np.asarray(Ts, dtype=float)
+    dist["local_sweeps_per_swap"] = int(local_sweeps_per_swap)
+    dist["translation_sweeps_per_swap"] = int(translation_sweeps_per_swap)
+    dist["local_proposals_per_cycle"] = int(local_sweeps_per_swap) * M * N
+    dist["translation_proposals_per_cycle"] = int(translation_sweeps_per_swap) * M
+    dist["n_cycles"] = int(n_cycles)
+    dist["burnin_frac"] = float(burnin_frac)
+    dist["cluster_contact_threshold"] = int(cluster_contact_threshold)
+    dist["parameter_source"] = str(parameter_source)
+    dist["fit_summary_json"] = str(fit_summary_json) if fit_summary_json else ""
+    # Per-temperature reduced bias (model-independent bookkeeping).
+    dist["reduced_bias_by_temperature"] = np.array(
+        [remd.reduced_bias(model_name, model_params, float(T), Tref, Tscale)
+         for T in Ts], dtype=float)
+    return dist
+
+
+# ---------------------------------------------------------------------------
+# Plotting (lazy; minimal smoke plots)
+# ---------------------------------------------------------------------------
+
+def make_plots(results, dist, out_prefix: str) -> None:
+    plt = _import_matplotlib()
+    if plt is None:
+        print("  [plot] matplotlib unavailable; skipping plots")
+        return
+    Ts = [r["T"] for r in results]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].plot(Ts, [r["Rg_mean"] for r in results], "o-")
+    axes[0].set_xlabel("T"); axes[0].set_ylabel("mean per-chain Rg")
+    axes[1].plot(Ts, [r["m_intra_mean"] for r in results], "o-", label="m_intra")
+    axes[1].plot(Ts, [r["m_inter_mean"] for r in results], "s-", label="m_inter")
+    axes[1].set_xlabel("T"); axes[1].set_ylabel("mean contacts"); axes[1].legend()
+    axes[2].plot(Ts, [r["largest_cluster_fraction_mean"] for r in results], "o-")
+    axes[2].set_xlabel("T"); axes[2].set_ylabel("largest cluster fraction")
+    fig.tight_layout()
+    path = f"{out_prefix}_observables.png"
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    print(f"Saved {path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_temperatures(args) -> Tuple[np.ndarray, str]:
+    if args.temps_from_npz is not None:
+        return remd.load_temperatures_from_npz(args.temps_from_npz), \
+            f"npz:{args.temps_from_npz}"
+    if args.temps is not None:
+        Ts = remd.validate_temperature_ladder(
+            np.array(remd.parse_params_string(args.temps), dtype=float))
+        return Ts, "cli:--temps"
+    if args.nT < 2:
+        raise ValueError("--nT must be >= 2")
+    if args.Tmax <= args.Tmin:
+        raise ValueError("--Tmax must be greater than --Tmin")
+    return np.linspace(args.Tmin, args.Tmax, args.nT), "linspace"
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Replica-exchange MC for the multi-chain lattice aggregation model.")
+    ap.add_argument("--n-chains", type=int, default=4, dest="n_chains")
+    ap.add_argument("--N", type=int, default=20, help="beads per chain")
+    ap.add_argument("--box-size", type=int, default=16, dest="box_size")
+    ap.add_argument("--local-sweeps-per-swap", type=int, default=1,
+                    dest="local_sweeps_per_swap")
+    ap.add_argument("--translation-sweeps-per-swap", type=int, default=1,
+                    dest="translation_sweeps_per_swap")
+    ap.add_argument("--n-cycles", type=int, default=200, dest="n_cycles")
+    ap.add_argument("--lambda-intra", type=float, default=1.0, dest="lambda_intra")
+    ap.add_argument("--lambda-inter", type=float, default=1.0, dest="lambda_inter")
+    ap.add_argument("--cluster-contact-threshold", type=int, default=1,
+                    dest="cluster_contact_threshold")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--n-workers", type=int, default=1, dest="n_workers")
+    ap.add_argument("--out-prefix", type=str, default="remd_multichain_out",
+                    dest="out_prefix")
+    ap.add_argument("--rg-scale", type=float, default=1.0, dest="rg_scale")
+    ap.add_argument("--rg-bins", type=int, default=40, dest="rg_bins")
+    ap.add_argument("--burnin-frac", type=float, default=0.5, dest="burnin_frac")
+    # Model / parameter sources (reuse the single-chain resolution semantics).
+    ap.add_argument("--model", type=str, default=None,
+                    choices=list(remd.MODEL_REGISTRY.keys()))
+    ap.add_argument("--fit-summary-json", type=str, default=None,
+                    dest="fit_summary_json",
+                    help="preferred production parameter source")
+    ap.add_argument("--fit-params-csv", type=str, default=None,
+                    dest="fit_params_csv")
+    ap.add_argument("--params", type=str, default=None)
+    ap.add_argument("--Tref", type=float, default=None)
+    ap.add_argument("--Tscale", type=float, default=None)
+    ap.add_argument("--T0", type=float, default=None)
+    ap.add_argument("--dh", type=float, default=312.109,
+                    help="legacy hs enthalpy (used only for --model hs default)")
+    ap.add_argument("--ds", type=float, default=1.23278,
+                    help="legacy hs entropy (used only for --model hs default)")
+    # Temperatures.
+    ap.add_argument("--Tmin", type=float, default=300.0)
+    ap.add_argument("--Tmax", type=float, default=360.0)
+    ap.add_argument("--nT", type=int, default=8)
+    tg = ap.add_mutually_exclusive_group()
+    tg.add_argument("--temps-from-npz", type=str, default=None,
+                    dest="temps_from_npz")
+    tg.add_argument("--temps", type=str, default=None)
+    # Optional outputs.
+    ap.add_argument("--diagnostics", action="store_true")
+    ap.add_argument("--diagnostic-trajectories", action="store_true",
+                    dest="diagnostic_trajectories")
+    ap.add_argument("--save-configurations", action="store_true",
+                    dest="save_configurations")
+    ap.add_argument("--snapshot-stride", type=int, default=1,
+                    dest="snapshot_stride")
+    ap.add_argument("--configuration-path", type=str, default=None,
+                    dest="configuration_path")
+    ap.add_argument("--overwrite-configurations", action="store_true",
+                    dest="overwrite_configurations")
+    ap.add_argument("--debug-contacts", action="store_true", dest="debug_contacts",
+                    help="assert cached counts == full oracle after every accepted move")
+    ap.add_argument("--no-plots", action="store_true", dest="no_plots")
+    ap.add_argument("--quick-test", action="store_true", dest="quick_test")
+    return ap
+
+
+def _validate_cli(args) -> None:
+    if args.n_chains < 1:
+        raise ValueError("--n-chains must be >= 1")
+    if args.N < 3:
+        raise ValueError("--N must be >= 3")
+    if args.box_size < mcs.MIN_BOX_SIZE:
+        raise ValueError(f"--box-size must be >= {mcs.MIN_BOX_SIZE}")
+    if args.n_chains * args.N > args.box_size ** 3:
+        raise ValueError(
+            f"volume fraction > 1: M*N={args.n_chains * args.N} > "
+            f"L^3={args.box_size ** 3}")
+    if args.local_sweeps_per_swap < 0 or args.translation_sweeps_per_swap < 0:
+        raise ValueError("sweeps-per-swap must be >= 0")
+    if args.local_sweeps_per_swap + args.translation_sweeps_per_swap < 1:
+        raise ValueError("need at least one local or translation sweep per swap")
+    if args.n_cycles < 1:
+        raise ValueError("--n-cycles must be >= 1")
+    if not (0.0 <= args.burnin_frac < 1.0):
+        raise ValueError("--burnin-frac must be in [0, 1)")
+    if args.n_workers < 1:
+        raise ValueError("--n-workers must be >= 1")
+    if not math.isfinite(args.rg_scale) or args.rg_scale <= 0:
+        raise ValueError("--rg-scale must be finite and positive")
+    if args.rg_bins < 1:
+        raise ValueError("--rg-bins must be >= 1")
+    if args.cluster_contact_threshold < 1:
+        raise ValueError("--cluster-contact-threshold must be >= 1")
+    for name in ("lambda_intra", "lambda_inter"):
+        v = getattr(args, name)
+        if not math.isfinite(v):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    # Snapshot / diagnostic flag consistency (reject before initialization).
+    if args.save_configurations and args.snapshot_stride < 1:
+        raise ValueError("--snapshot-stride must be >= 1 when saving configurations")
+    if args.diagnostic_trajectories and not args.diagnostics:
+        raise ValueError("--diagnostic-trajectories requires --diagnostics")
+    if args.configuration_path is not None and not args.save_configurations:
+        raise ValueError("--configuration-path requires --save-configurations")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    if args.quick_test:
+        run_quick_test()
+        return
+
+    _validate_cli(args)
+    Ts, temp_source = _resolve_temperatures(args)
+    # Final guard: the resolved ladder must be 1-D, >= 2 entries, finite,
+    # positive, and strictly increasing regardless of how it was produced.
+    Ts = remd.validate_temperature_ladder(Ts)
+    (model_name, model_params, param_names, Tref, Tscale,
+     parameter_source, fit_summary_json) = remd.resolve_model_params(args, Ts)
+
+    M, N, L = args.n_chains, args.N, args.box_size
+    phi = M * N / L ** 3
+    print(f"Multi-chain REMD: M={M} N={N} L={L} phi={phi:.4f}, {len(Ts)} lanes "
+          f"T in [{Ts.min():.4g}, {Ts.max():.4g}] ({temp_source})")
+    print(f"Model: {model_name} — {remd.MODEL_REGISTRY[model_name]['description']}")
+    print(f"Parameter source: {parameter_source}"
+          + (f" ({fit_summary_json})" if fit_summary_json else ""))
+    print(f"lambda_intra={args.lambda_intra} lambda_inter={args.lambda_inter} "
+          f"cluster_contact_threshold={args.cluster_contact_threshold}")
+
+    Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot_writer = None
+    configuration_path = None
+    if args.save_configurations:
+        if not mcio.h5py_available():
+            raise RuntimeError("--save-configurations requires h5py")
+        configuration_path = (args.configuration_path
+                              or f"{args.out_prefix}_configurations.h5")
+        snap_meta = _snapshot_metadata(
+            args, Ts, model_name, param_names, model_params, Tref, Tscale,
+            temp_source, phi, fit_summary_json)
+        snapshot_writer = mcio.MultiChainSnapshotWriter(
+            configuration_path, n_chains=M, chain_length=N,
+            n_temperatures=len(Ts), metadata=snap_meta,
+            overwrite=args.overwrite_configurations)
+
+    t0 = time.perf_counter()
+    try:
+        replicas, swap_props, swap_accs, walker_hist = run_remd_multichain(
+            n_chains=M, chain_length=N, box_size=L, Ts=Ts,
+            local_sweeps_per_swap=args.local_sweeps_per_swap,
+            translation_sweeps_per_swap=args.translation_sweeps_per_swap,
+            n_cycles=args.n_cycles, model_name=model_name, params=model_params,
+            Tref=Tref, Tscale=Tscale,
+            lambda_intra=args.lambda_intra, lambda_inter=args.lambda_inter,
+            cluster_contact_threshold=args.cluster_contact_threshold,
+            seed=args.seed, n_workers=args.n_workers, verbose=True,
+            debug_contacts=args.debug_contacts,
+            snapshot_writer=snapshot_writer, snapshot_stride=args.snapshot_stride)
+        if snapshot_writer is not None:
+            snapshot_writer.update_metadata({
+                "end_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())})
+            snapshot_writer.mark_complete()
+    finally:
+        if snapshot_writer is not None:
+            snapshot_writer.close()
+    wall = time.perf_counter() - t0
+
+    results = summarize_results(replicas, Ts, args.burnin_frac, args.rg_scale)
+    dist = build_run_distributions(replicas, Ts, burnin_frac=args.burnin_frac,
+                                   rg_bins=args.rg_bins, rg_scale=args.rg_scale)
+    attach_metadata(
+        dist, M=M, N=N, L=L, Ts=Ts, seed=args.seed, model_name=model_name,
+        param_names=param_names, model_params=model_params, Tref=Tref,
+        Tscale=Tscale, lambda_intra=args.lambda_intra,
+        lambda_inter=args.lambda_inter,
+        local_sweeps_per_swap=args.local_sweeps_per_swap,
+        translation_sweeps_per_swap=args.translation_sweeps_per_swap,
+        n_cycles=args.n_cycles, burnin_frac=args.burnin_frac,
+        cluster_contact_threshold=args.cluster_contact_threshold,
+        parameter_source=parameter_source, fit_summary_json=fit_summary_json)
+
+    out_files = {
+        "results_csv": mcio.save_results_csv(results, args.out_prefix),
+        "swap_rates_csv": mcio.save_swap_csv(swap_props, swap_accs, Ts, args.out_prefix),
+        "move_acceptance_csv": mcio.save_move_acceptance_csv(
+            [r.move_counters for r in replicas], mvs.MOVE_TYPES, Ts, args.out_prefix),
+        "distributions_npz": mcio.save_distributions_npz(dist, args.out_prefix),
+    }
+    if configuration_path is not None:
+        out_files["configuration_hdf5"] = configuration_path
+        print(f"Saved {configuration_path} ({snapshot_writer.n_snapshots} snapshots)")
+
+    # Convergence / mixing diagnostics (reuse the validated single-chain
+    # primitives via the multi-chain adapter).
+    diagnostics = None
+    if args.diagnostics:
+        diagnostics = mcd.compute_multichain_diagnostics(
+            replicas, swap_props, swap_accs, walker_hist, Ts,
+            burnin_frac=args.burnin_frac, rg_scale=args.rg_scale)
+        diag_files = mcd.save_all_diagnostics(
+            diagnostics, replicas, walker_hist, Ts, out_prefix=args.out_prefix,
+            burnin_frac=args.burnin_frac, rg_scale=args.rg_scale,
+            save_trajectories=args.diagnostic_trajectories)
+        out_files.update(diag_files)
+        nwarn = len(diagnostics["warnings"])
+        print(f"Diagnostics: {nwarn} warning(s)"
+              + (":" if nwarn else "."))
+        for w in diagnostics["warnings"]:
+            print(f"  [warn:{w['type']}] {w['message']}")
+
+    if not args.no_plots:
+        make_plots(results, dist, args.out_prefix)
+
+    run_summary = _run_summary(
+        args, Ts, temp_source, model_name, param_names, model_params, Tref,
+        Tscale, parameter_source, fit_summary_json, phi, swap_props, swap_accs,
+        results, wall, out_files, replicas, diagnostics,
+        configuration_path is not None)
+    summary_path = f"{args.out_prefix}_run_summary.json"
+    out_files["run_summary_json"] = summary_path
+    mcio.save_run_summary(run_summary, summary_path)
+
+
+def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
+                       Tscale, temp_source, phi, fit_summary_json) -> dict:
+    return {
+        "schema_version": int(mcio.MULTICHAIN_SNAPSHOT_SCHEMA_VERSION),
+        "run_id": Path(args.out_prefix).name,
+        "M": int(args.n_chains), "N": int(args.N), "L": int(args.box_size),
+        "volume_fraction": float(phi),
+        "lambda_intra": float(args.lambda_intra),
+        "lambda_inter": float(args.lambda_inter),
+        "cluster_contact_threshold": int(args.cluster_contact_threshold),
+        "model_name": model_name, "param_names": list(param_names),
+        "model_params": [float(v) for v in model_params],
+        "Tref": float(Tref), "Tscale": float(Tscale),
+        "temperatures": [float(t) for t in Ts], "temperature_source": temp_source,
+        "seed": int(args.seed),
+        "local_sweeps_per_swap": int(args.local_sweeps_per_swap),
+        "translation_sweeps_per_swap": int(args.translation_sweeps_per_swap),
+        "n_cycles": int(args.n_cycles),
+        "snapshot_stride": int(args.snapshot_stride),
+        "fit_summary_json": str(fit_summary_json) if fit_summary_json else "null",
+        "git_commit": remd._git_commit(),
+        "start_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "end_time": "unknown",
+    }
+
+
+def _initial_states_metadata(replicas, rg_scale: float = 1.0) -> list:
+    """Per-lane independent-initialization provenance (seed + initial observables).
+
+    ``init_mean_chain_rg`` is a length: the lattice value is stored explicitly
+    and the scaled output value is ``rg_scale * init_mean_chain_rg_lattice``.
+    """
+    return [{
+        "temperature_index": int(k),
+        "temperature": float(rep.T),
+        "init_seed": int(rep.init_seed),
+        "init_m_intra": int(rep.init_m_intra),
+        "init_m_inter": int(rep.init_m_inter),
+        "init_mean_chain_rg_lattice": float(rep.init_mean_chain_rg_lattice),
+        "init_mean_chain_rg": float(rg_scale) * float(rep.init_mean_chain_rg_lattice),
+        "init_largest_cluster_size": int(rep.init_largest_cluster_size),
+    } for k, rep in enumerate(replicas)]
+
+
+def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
+                 Tref, Tscale, parameter_source, fit_summary_json, phi,
+                 swap_props, swap_accs, results, wall, out_files, replicas,
+                 diagnostics, snapshots_saved) -> dict:
+    swap_rates = [float(swap_accs[k] / swap_props[k]) if swap_props[k] else float("nan")
+                  for k in range(len(swap_props))]
+    summary = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "schema_version": int(SCHEMA_VERSION),
+        "multichain_output_schema_version": int(mcio.MULTICHAIN_OUTPUT_SCHEMA_VERSION),
+        "snapshot_schema_version": int(mcio.MULTICHAIN_SNAPSHOT_SCHEMA_VERSION),
+        "model_api_version": int(MODEL_API_VERSION),
+        "model": model_name, "param_names": list(param_names),
+        "params": [float(v) for v in model_params],
+        "Tref": float(Tref), "Tscale": float(Tscale),
+        "parameter_source": parameter_source, "fit_summary_json": fit_summary_json,
+        "M": int(args.n_chains), "N": int(args.N), "L": int(args.box_size),
+        "n_beads": int(args.n_chains * args.N), "volume_fraction": float(phi),
+        "lambda_intra": float(args.lambda_intra),
+        "lambda_inter": float(args.lambda_inter),
+        "cluster_contact_threshold": int(args.cluster_contact_threshold),
+        "temperatures": [float(t) for t in Ts], "temperature_count": int(len(Ts)),
+        "temperature_source": temp_source,
+        "local_sweeps_per_swap": int(args.local_sweeps_per_swap),
+        "translation_sweeps_per_swap": int(args.translation_sweeps_per_swap),
+        "local_proposals_per_cycle": int(args.local_sweeps_per_swap) * args.n_chains * args.N,
+        "translation_proposals_per_cycle": int(args.translation_sweeps_per_swap) * args.n_chains,
+        "n_cycles": int(args.n_cycles), "seed": int(args.seed),
+        "n_workers": int(args.n_workers), "burnin_frac": float(args.burnin_frac),
+        "rg_scale": float(args.rg_scale),
+        # Independent-initialization provenance (Change 2).
+        "initialization_seed_stride": int(INITIALIZATION_SEED_STRIDE),
+        "independent_initialization": True,
+        "initialization_seeds": [int(rep.init_seed) for rep in replicas],
+        "initial_states": _initial_states_metadata(replicas, float(args.rg_scale)),
+        # Representation provenance (Change 1 / Change 9).
+        "coordinate_canonicalization_enabled": True,
+        "snapshot_coordinate_dtype": "int32",
+        "snapshots_saved": bool(snapshots_saved),
+        # effective_energy is a TEMPERATURE-DEPENDENT effective energy, T * u,
+        # NOT a temperature-independent microscopic energy.
+        "effective_energy_definition": "effective_energy = T * u (temperature-dependent)",
+        "swap_rates": swap_rates,
+        "local_acceptance_rates": [r["local_acceptance_rate"] for r in results],
+        "translation_acceptance_rates": [r["translation_acceptance_rate"] for r in results],
+        "diagnostics_enabled": bool(diagnostics is not None),
+        "wall_time_seconds": float(wall),
+        "git_commit": remd._git_commit(),
+        "output_files": out_files,
+    }
+    if diagnostics is not None:
+        summary["diagnostic_thresholds"] = diagnostics["thresholds"]
+        summary["diagnostic_summary"] = diagnostics["summary"]
+        summary["diagnostic_warnings"] = diagnostics["warnings"]
+        summary["diagnostic_trajectories_saved"] = bool(
+            args.diagnostic_trajectories)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Quick test
+# ---------------------------------------------------------------------------
+
+def _qt_unit_invariants() -> None:
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=5)
+    mcs.validate_state(state)
+    # Athermal reduced potential is identically zero.
+    u = reduced_potential_counts(state.counts, 300.0, "hs", [300.0, 1.0],
+                                 300.0, 80.0, 0.0, 0.0)
+    assert u == 0.0
+    print("  quick-test unit invariants: PASSED")
+
+
+def _qt_m1_regression() -> None:
+    rng = np.random.RandomState(99)
+    for _ in range(10):
+        saw = mcs.generate_saw(18, rng)
+        state = mcs.make_state(np.stack([saw]), 60)
+        c = mcc.full_contact_counts(state)
+        chain = [tuple(int(v) for v in row) for row in saw]
+        m_ref = int(round(remd.contact_count(chain, set(chain))))
+        assert c.inter == 0 and c.intra == m_ref
+        # Reduced potential matches the single-chain u = m*b(T) at lambda_intra=1.
+        for T in (300.0, 340.0):
+            u_mc = reduced_potential_counts(c, T, "hs", [400.0, 1.3], 320.0, 80.0,
+                                            1.0, 1.0)
+            u_ref = remd.reduced_potential(m_ref, T, "hs", [400.0, 1.3], 320.0, 80.0)
+            assert abs(u_mc - u_ref) < 1e-9
+    print("  quick-test M=1 regression vs single-chain: PASSED")
+
+
+def _qt_lambda_modes() -> None:
+    # Build a state with both intra and inter contacts.
+    hp = np.array([(0, 0, 0), (1, 0, 0), (2, 0, 0), (2, 1, 0), (1, 1, 0), (0, 1, 0)],
+                  dtype=np.int64)
+    state = mcs.make_state(np.stack([hp, hp + np.array([0, 0, 1])]), 20)
+    c = state.counts
+    args_common = ("hs", [400.0, 1.3], 320.0, 80.0)
+    b = remd.reduced_bias(*(("hs", [400.0, 1.3], 340.0, 320.0, 80.0)))
+    # (0,0): athermal -> u == 0 for any counts.
+    assert reduced_potential_counts(c, 340.0, *args_common, 0.0, 0.0) == 0.0
+    # (1,0): u depends only on intra.
+    u10 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 0.0)
+    assert abs(u10 - b * c.intra) < 1e-9
+    # (0,1): u depends only on inter.
+    u01 = reduced_potential_counts(c, 340.0, *args_common, 0.0, 1.0)
+    assert abs(u01 - b * c.inter) < 1e-9
+    # (1,1): full transferability.
+    u11 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 1.0)
+    assert abs(u11 - b * (c.intra + c.inter)) < 1e-9
+    print("  quick-test lambda control modes: PASSED")
+
+
+def _qt_generalized_swap() -> None:
+    # Manual generalized swap with UNEQUAL intra/inter counts.
+    ci = ContactCounts(3, 5)
+    cj = ContactCounts(7, 2)
+    Ti, Tj = 300.0, 350.0
+    mp = ("poly2", [0.1, -0.4, 0.2], 320.0, 80.0)
+    li, lin = 1.0, 0.6
+
+    def u(c, T):
+        return reduced_potential_counts(c, T, *mp, li, lin)
+    expect = u(ci, Ti) + u(cj, Tj) - u(cj, Ti) - u(ci, Tj)
+    got = swap_log_accept_counts(ci, cj, Ti, Tj, *mp, li, lin)
+    assert abs(got - expect) < 1e-12
+    print("  quick-test generalized swap (unequal intra/inter): PASSED")
+
+
+def _qt_short_run(n_workers, tmp, tag, lambda_intra=1.0, lambda_inter=1.0,
+                  debug=True):
+    import os as _os
+    Ts = np.linspace(305, 350, 4)
+    reps, sp, sa, wh = run_remd_multichain(
+        n_chains=2, chain_length=8, box_size=10, Ts=Ts,
+        local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=12,
+        model_name="hs", params=[400.0, 1.3], Tref=320.0, Tscale=80.0,
+        lambda_intra=lambda_intra, lambda_inter=lambda_inter,
+        seed=13, n_workers=n_workers, verbose=False, debug_contacts=debug)
+    # Walker identities always a permutation.
+    assert wh.shape == (12, len(Ts))
+    for row in wh:
+        assert sorted(row.tolist()) == list(range(len(Ts)))
+    # States remain valid; cached counts match the oracle.
+    for rep in reps:
+        mcs.validate_state(rep.state)
+    return reps, sp, sa, wh, Ts
+
+
+def _qt_serial_vs_workers(tmp) -> None:
+    r1 = _qt_short_run(1, tmp, "serial")
+    r2 = _qt_short_run(2, tmp, "workers")
+    # Deterministic per-lane seeding => identical results across worker counts.
+    for a, b in zip(r1[0], r2[0]):
+        assert a.state.counts.as_tuple() == b.state.counts.as_tuple(), (
+            "serial and 2-worker runs diverged despite identical seeds")
+        assert np.array_equal(a.state.coords_unwrapped, b.state.coords_unwrapped)
+    print("  quick-test serial vs 2-worker determinism: PASSED")
+
+
+def _qt_output_roundtrip(tmp) -> None:
+    import os as _os
+    reps, sp, sa, wh, Ts = _qt_short_run(1, tmp, "io")
+    prefix = _os.path.join(tmp, "qt_mc")
+    results = summarize_results(reps, Ts, burnin_frac=0.4, rg_scale=1.0)
+    for rep, r in zip(reps, results):
+        r["local_acceptance_rate"] = rep.local_acceptance_rate()
+        r["translation_acceptance_rate"] = rep.translation_acceptance_rate()
+    dist = build_run_distributions(reps, Ts, burnin_frac=0.4, rg_bins=20,
+                                   rg_scale=1.0)
+    attach_metadata(
+        dist, M=2, N=8, L=10, Ts=Ts, seed=13, model_name="hs",
+        param_names=["h", "s"], model_params=[400.0, 1.3], Tref=320.0,
+        Tscale=80.0, lambda_intra=1.0, lambda_inter=1.0,
+        local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=12,
+        burnin_frac=0.4, cluster_contact_threshold=1,
+        parameter_source="params_cli", fit_summary_json=None)
+    mcio.save_results_csv(results, prefix)
+    mcio.save_swap_csv(sp, sa, Ts, prefix)
+    mcio.save_move_acceptance_csv([r.move_counters for r in reps], mvs.MOVE_TYPES,
+                                  Ts, prefix)
+    npz_path = mcio.save_distributions_npz(dist, prefix)
+    mcio.save_run_summary({"schema_version": SCHEMA_VERSION, "M": 2}, f"{prefix}_run_summary.json")
+
+    with np.load(npz_path, allow_pickle=True) as data:
+        for key in ("Ts", "m_intra_vals", "P_m_intra", "m_inter_vals",
+                    "P_m_inter", "rg_edges", "rg_centers", "P_mean_chain_rg",
+                    "fmax_edges", "fmax_centers", "P_fmax", "M", "N", "L",
+                    "lambda_intra", "lambda_inter", "model_params",
+                    "volume_fraction", "seed", "temperatures", "schema_version"):
+            assert key in data, f"distributions NPZ missing metadata key {key}"
+        assert int(data["M"]) == 2 and int(data["N"]) == 8 and int(data["L"]) == 10
+        assert float(data["lambda_intra"]) == 1.0
+        for name in ("P_m_intra", "P_m_inter", "P_mean_chain_rg", "P_fmax"):
+            for row in data[name]:
+                finite = row[np.isfinite(row)]
+                if finite.size:
+                    assert abs(float(finite.sum()) - 1.0) < 1e-6, f"{name} not normalized"
+
+    # HDF5 snapshot round-trip (explicit chain identity).
+    if mcio.h5py_available():
+        import h5py
+        h5_path = _os.path.join(tmp, "qt_snap.h5")
+        writer = mcio.MultiChainSnapshotWriter(
+            h5_path, n_chains=2, chain_length=8, n_temperatures=len(Ts),
+            metadata={"M": 2, "N": 8, "L": 10, "lambda_intra": 1.0,
+                      "lambda_inter": 1.0, "model_params": [400.0, 1.3],
+                      "temperatures": [float(t) for t in Ts]})
+        for cyc in range(3):
+            coords = np.stack([r.state.coords_unwrapped for r in reps])
+            writer.append(
+                cycle=cyc, coordinates=coords,
+                walker_id=np.arange(len(Ts)),
+                m_intra=np.array([r.state.counts.intra for r in reps]),
+                m_inter=np.array([r.state.counts.inter for r in reps]),
+                mean_chain_rg2=np.array(
+                    [obs.chain_geometry_summary(r.state)["mean_chain_rg2_lattice"]
+                     for r in reps]),
+                largest_cluster_size=np.array([1 for _ in reps]))
+        writer.mark_complete()
+        writer.close()
+        with h5py.File(h5_path, "r") as f:
+            assert f["snapshots"].attrs["status"] == "complete"
+            assert f["snapshots"].attrs["coordinate_dims"] == \
+                "snapshot,temperature_lane,chain,monomer,xyz"
+            coords = f["snapshots"]["coordinates"]
+            assert coords.shape == (3, len(Ts), 2, 8, 3)
+            assert int(f["metadata"].attrs["M"]) == 2
+        print("  quick-test output + HDF5 snapshot round-trip: PASSED")
+    else:
+        print("  quick-test output round-trip (HDF5 skipped): PASSED")
+
+
+def _qt_strong_attraction_smoke() -> None:
+    # A strong interchain attraction should increase m_inter and the largest
+    # cluster fraction relative to the athermal control (broad statistical check).
+    # Contacts are FAVORED when the reduced bias b(T) < 0 (coupling K = -b > 0);
+    # hs params (h=0, s=4) give a constant strongly-attractive b(T) = -4.
+    Ts = np.linspace(320, 340, 3)
+    common = dict(n_chains=4, chain_length=6, box_size=8, Ts=Ts,
+                  local_sweeps_per_swap=2, translation_sweeps_per_swap=3,
+                  n_cycles=120, model_name="hs", params=[0.0, 4.0], Tref=330.0,
+                  Tscale=40.0, seed=7, n_workers=1, verbose=False)
+    reps_ath, *_ = run_remd_multichain(lambda_intra=0.0, lambda_inter=0.0, **common)
+    reps_att, *_ = run_remd_multichain(lambda_intra=0.0, lambda_inter=1.0, **common)
+
+    def mean_tail(reps, attr):
+        vals = []
+        for rep in reps:
+            arr = np.asarray(getattr(rep, attr), dtype=float)
+            vals.append(arr[len(arr) // 2:].mean())
+        return float(np.mean(vals))
+    m_inter_ath = mean_tail(reps_ath, "m_inter_traj")
+    m_inter_att = mean_tail(reps_att, "m_inter_traj")
+    fmax_ath = mean_tail(reps_ath, "lcf_traj")
+    fmax_att = mean_tail(reps_att, "lcf_traj")
+    assert m_inter_att >= m_inter_ath, (
+        f"strong attraction did not raise m_inter ({m_inter_att} < {m_inter_ath})")
+    assert fmax_att >= fmax_ath, (
+        f"strong attraction did not raise largest-cluster fraction "
+        f"({fmax_att} < {fmax_ath})")
+    print("  quick-test strong-attraction smoke (m_inter/fmax up): PASSED")
+
+
+def _qt_independent_init() -> None:
+    Ts = np.linspace(305, 350, 4)
+    reps = _build_independent_replicas(Ts, 3, 6, 12, base_seed=1234,
+                                       cluster_contact_threshold=1)
+    assert not np.array_equal(reps[0].state.coords_unwrapped,
+                              reps[1].state.coords_unwrapped), \
+        "independent lanes must not share one starting configuration"
+    for lane, rep in enumerate(reps):
+        assert rep.init_seed == 1234 + INITIALIZATION_SEED_STRIDE * lane
+    print("  quick-test independent per-lane initialization: PASSED")
+
+
+def _qt_canonicalization() -> None:
+    state = mcs.initialize_dispersed_state(2, 6, 10, seed=7)
+    counts0 = state.counts.as_tuple()
+    rg0 = mcs.per_chain_rg2(state).copy()
+    wrapped0 = state.wrapped().copy()
+    L = state.box_size
+    state.coords_unwrapped[1] += np.array([2 * L, -3 * L, L], dtype=np.int64)
+    mcs.canonicalize_chain_coordinates(state, 1)
+    b0 = state.coords_unwrapped[1, 0]
+    assert np.all((b0 >= 0) & (b0 < L))
+    assert state.counts.as_tuple() == counts0
+    assert np.array_equal(state.wrapped(), wrapped0)
+    np.testing.assert_allclose(mcs.per_chain_rg2(state), rg0)
+    mcs.validate_state(state)
+    print("  quick-test coordinate canonicalization invariance: PASSED")
+
+
+def _qt_diagnostics(tmp) -> None:
+    import os as _os
+    reps, sp, sa, wh, Ts = _qt_short_run(1, tmp, "diag")
+    diag = mcd.compute_multichain_diagnostics(
+        reps, sp, sa, wh, Ts, burnin_frac=0.5, rg_scale=1.0)
+    prefix = _os.path.join(tmp, "qt_diag")
+    files = mcd.save_all_diagnostics(
+        diag, reps, wh, Ts, out_prefix=prefix, burnin_frac=0.5, rg_scale=1.0,
+        save_trajectories=True)
+    for key in ("diagnostics_json", "convergence_csv", "round_trips_csv",
+                "walker_occupancy_csv", "diagnostic_trajectories_npz"):
+        assert _os.path.exists(files[key]), f"diagnostics file {key} missing"
+    with np.load(files["diagnostic_trajectories_npz"]) as data:
+        for key in ("u_post", "m_intra_post", "m_inter_post",
+                    "per_chain_rg_post", "walker_temp_index_post"):
+            assert key in data and data[key].dtype != object
+    print("  quick-test diagnostics files + trajectories: PASSED")
+
+
+def run_quick_test() -> None:
+    import tempfile
+    print("multichain quick-test:")
+    _qt_unit_invariants()
+    _qt_m1_regression()
+    _qt_lambda_modes()
+    _qt_generalized_swap()
+    _qt_independent_init()
+    _qt_canonicalization()
+    with tempfile.TemporaryDirectory() as tmp:
+        _qt_serial_vs_workers(tmp)
+        _qt_output_roundtrip(tmp)
+        _qt_diagnostics(tmp)
+    _qt_strong_attraction_smoke()
+    print("quick-test complete.")
+
+
+if __name__ == "__main__":
+    main()

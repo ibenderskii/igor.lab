@@ -1,0 +1,58 @@
+{
+  "run_id": "N30_direct_K_refined_v1",
+  "timestamp": "2026-07-07T15:28:34",
+  "N": 30,
+  "K_values": [
+    0.4,
+    0.45,
+    0.5,
+    0.53,
+    0.55,
+    0.57,
+    0.59,
+    0.6,
+    0.61,
+    0.63,
+    0.66,
+    0.7,
+    0.75
+  ],
+  "seeds": [
+    101,
+    202
+  ],
+  "sampler_controls": {
+    "n_cycles": 7500,
+    "steps_per_swap": 60,
+    "burnin_frac": 0.5,
+    "structural_stride": 5,
+    "snapshot_stride": 5,
+    "n_workers": 8
+  },
+  "adequacy_thresholds": {
+    "min_ess": 200.0,
+    "min_round_trips": 5,
+    "min_swap_rate": 0.1,
+    "max_swap_rate": 0.9,
+    "min_adjacent_overlap": 0.2
+  },
+  "output_dir": "direct_K_outputs_new",
+  "seed_prefixes": [
+    "direct_K_outputs_new\\directK_N30_s101",
+    "direct_K_outputs_new\\directK_N30_s202"
+  ],
+  "reports": {
+    "report_json": "direct_K_outputs_new\\direct_K_report.json",
+    "report_md": "direct_K_outputs_new\\direct_K_report.md",
+    "response_curves_csv": "direct_K_outputs_new\\direct_K_response_curves.csv"
+  },
+  "commands": [
+    "C:\\Users\\ibend\\AppData\\Local\\Programs\\Python\\Python313\\python.exe C:\\Users\\ibend\\igor.lab\\SAWs\\updated\\ISAW Project\\remd_uniform_chain_2_new.py --N 30 --K-values=0.4,0.45,0.5,0.53,0.55,0.57,0.59,0.6,0.61,0.63,0.66,0.7,0.75 --steps-per-swap 60 --n-cycles 7500 --n-workers 8 --seed 101 --burnin-frac 0.5 --structural-observables --structural-stride 5 --diagnostics --diagnostic-trajectories --save-configurations --snapshot-stride 5 --overwrite-configurations --no-plots --out-prefix direct_K_outputs_new\\directK_N30_s101",
+    "C:\\Users\\ibend\\AppData\\Local\\Programs\\Python\\Python313\\python.exe C:\\Users\\ibend\\igor.lab\\SAWs\\updated\\ISAW Project\\extract_contact_motif_features.py --input direct_K_outputs_new\\directK_N30_s101_configurations.h5 --output direct_K_outputs_new\\directK_N30_s101_features.h5 --validate --overwrite",
+    "C:\\Users\\ibend\\AppData\\Local\\Programs\\Python\\Python313\\python.exe C:\\Users\\ibend\\igor.lab\\SAWs\\updated\\ISAW Project\\remd_uniform_chain_2_new.py --N 30 --K-values=0.4,0.45,0.5,0.53,0.55,0.57,0.59,0.6,0.61,0.63,0.66,0.7,0.75 --steps-per-swap 60 --n-cycles 7500 --n-workers 8 --seed 202 --burnin-frac 0.5 --structural-observables --structural-stride 5 --diagnostics --diagnostic-trajectories --save-configurations --snapshot-stride 5 --overwrite-configurations --no-plots --out-prefix direct_K_outputs_new\\directK_N30_s202",
+    "C:\\Users\\ibend\\AppData\\Local\\Programs\\Python\\Python313\\python.exe C:\\Users\\ibend\\igor.lab\\SAWs\\updated\\ISAW Project\\extract_contact_motif_features.py --input direct_K_outputs_new\\directK_N30_s202_configurations.h5 --output direct_K_outputs_new\\directK_N30_s202_features.h5 --validate --overwrite"
+  ],
+  "python_version": "3.13.0",
+  "numpy_version": "2.1.2",
+  "git_commit": "bb6571be0f88b3081ad5493123553e997feb21ce"
+}

@@ -27,6 +27,22 @@ Scientific vs smoke mode
 
 This script does NOT launch the eight-seed production campaign.
 
+Example
+-------
+    python run_structural_regime_pilot.py \
+        --fit-summary-json fit_summary_30_hs.json \
+        --N 30 \
+        --seeds 101 202 \
+        --n-temperatures 8 \
+        --n-workers 8 \
+        --n-cycles 5000 \
+        --steps-per-swap 60 \
+        --structural-stride 5 \
+        --snapshot-stride 5 \
+        --run-id N30_pilot_v1 \
+        --output-dir pilot_outputs \
+        --allow-failed-calibration
+
 Pure analysis helpers (``evaluate_K_grid``, ``monotonic_branches``,
 ``select_branch``, ``build_k_ladder``, ``spearman``, ``block_bootstrap_mean``,
 ``classify_regimes``, ``high_contact_tail``, ``production_requirement``,
@@ -2306,7 +2322,7 @@ def require_seed_alignment(records, tol=ALIGN_TOL):
 def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
              structural_stride, snapshot_stride, resume=False, commands=None,
              stage_fingerprint=None, stage_fingerprint_fields=None,
-             burnin_frac=0.5, n_workers=1):
+             burnin_frac=0.5, n_workers=8):
     prefix = out_dir / f"calib_N{N}_s{seed}"
     cfg = f"{prefix}_configurations.h5"
     feat = out_dir / f"calib_N{N}_s{seed}_features.h5"
@@ -2341,7 +2357,7 @@ def run_seed(out_dir, N, seed, ladder, summary_path, n_cycles, steps_per_swap,
     cmd = [PY, REMD, "--N", str(N), "--temps", temps,
            "--fit-summary-json", summary_path,
            "--steps-per-swap", str(steps_per_swap), "--n-cycles", str(n_cycles),
-           "--n-workers", str(int(n_workers)), "--seed", str(seed),
+           "--n-workers", str(n_workers), "--seed", str(seed),
            "--burnin-frac", str(float(burnin_frac)),
            "--structural-observables", "--structural-stride", str(structural_stride),
            "--diagnostics", "--diagnostic-trajectories",
@@ -2784,6 +2800,7 @@ def main():
     ap.add_argument("--fit-summary-json", required=True, dest="fit_summary_json")
     ap.add_argument("--N", type=int, required=True)
     ap.add_argument("--seeds", type=int, nargs="+", default=[1, 2])
+    ap.add_argument("--n-workers", type=int, default=8, help="Number of REMD lane-worker processes used within each seed.")
     ap.add_argument("--n-temperatures", type=int, default=8)
     ap.add_argument("--n-cycles", type=int, default=400)
     ap.add_argument("--steps-per-swap", type=int, default=60)
@@ -2817,6 +2834,14 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--output-dir", default=None)
     args = ap.parse_args()
+
+    if args.n_workers < 1:
+        ap.error("--n-workers must be at least 1")
+    if args.n_workers > args.n_temperatures:
+        ap.error(
+            "--n-workers cannot exceed --n-temperatures because REMD "
+            "parallelism is limited by the number of temperature lanes"
+        )
 
     # Phase 11.3: JSON definitions and compatibility constants must agree.
     sch.check_definitions_consistency()
@@ -2876,7 +2901,6 @@ def main():
 
     # -- per-seed stage fingerprints (Phase 4) ------------------------------
     BURNIN_FRAC = 0.5
-    N_WORKERS = 1
     # Resolve ONE definitions context for the whole CLI run (Phase 8).
     defs_context = sch.active_definitions_context()
     stage_fingerprint_fields = {}
@@ -2885,7 +2909,7 @@ def main():
         ff = build_stage_fingerprint_fields(
             N=args.N, seed=s, ladder=ladder, K_ladder=K_ladder, info=info,
             fit_summary_path=args.fit_summary_json, n_cycles=args.n_cycles,
-            steps_per_swap=args.steps_per_swap, n_workers=N_WORKERS,
+            steps_per_swap=args.steps_per_swap, n_workers=args.n_workers,
             structural_stride=args.structural_stride,
             snapshot_stride=args.snapshot_stride, burnin_frac=BURNIN_FRAC,
             context=defs_context)
@@ -2898,6 +2922,7 @@ def main():
         "run_id": run_id, "status": "running",
         "created": _dt.datetime.now().isoformat(),
         "model": info["model_name"], "params": info["params"], "N": args.N,
+        "n_workers": int(args.n_workers),
         "requested_seeds": args.seeds, "effective_seeds": seeds,
         "smoke_test": bool(args.smoke_test),
         "fitted_temperature_interval": [T_lo, T_hi],
@@ -2935,7 +2960,7 @@ def main():
                              resume=args.resume, commands=commands,
                              stage_fingerprint=stage_fingerprints[s],
                              stage_fingerprint_fields=stage_fingerprint_fields[s],
-                             burnin_frac=BURNIN_FRAC, n_workers=N_WORKERS)
+                             burnin_frac=BURNIN_FRAC, n_workers=args.n_workers)
                     for s in seeds]
     except Exception:
         manifest["status"] = "failed"
@@ -3087,7 +3112,7 @@ def main():
         "scientifically_validated": bool(calibration_gate_passed),
         "smoke_test": bool(args.smoke_test),
         "model": info["model_name"], "params": info["params"],
-        "N": args.N, "seeds": seeds,
+        "N": args.N, "n_workers": int(args.n_workers), "seeds": seeds,
         "fitted_temperature_interval": [T_lo, T_hi],
         "chain_length_check": nmeta,
         "branch_selection": {k: v for k, v in branch.items() if k not in ("Ts", "K")},

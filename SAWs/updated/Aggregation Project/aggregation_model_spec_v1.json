@@ -1,0 +1,278 @@
+{
+  "model_name": "multichain_lattice_aggregation",
+  "schema_version": 1,
+  "multichain_output_schema_version": 1,
+  "model_api_version": 1,
+  "description": "Minimal scientifically valid multi-chain lattice-polymer aggregation model. Extends the validated single-chain ISAW replica-exchange architecture (remd_uniform_chain_2_new.py) to M identical self-avoiding chains in a periodic cubic box, reusing the single-chain fitted contact free energy without refitting. This document is the model/software CONTRACT; it deliberately does NOT hard-code one set of runtime parameters (M, N, L, temperatures, lambda values). Those are chosen per run and recorded in each run's output metadata.",
+
+  "system": {
+    "number_of_chains_symbol": "M",
+    "number_of_chains_meaning": "number of identical, connected self-avoiding chains simulated simultaneously",
+    "beads_per_chain_symbol": "N",
+    "beads_per_chain_meaning": "beads per chain (chain length); n_steps = N - 1 covalent bonds per chain",
+    "total_beads_symbol": "MN",
+    "total_beads_definition": "MN = M * N",
+    "box_size_symbol": "L",
+    "box_size_meaning": "side length of the periodic cubic lattice box (integer); wrapped lattice sites number L^3",
+    "excluded_volume": "Each wrapped lattice site may contain at most one bead (single occupancy).",
+    "minimum_box_size": 3,
+    "minimum_box_size_reason": "L < 3 creates ambiguous nearest-neighbor wrapping (a bead's +d and -d neighbor sites can coincide); such boxes are rejected."
+  },
+
+  "volume_fraction": {
+    "symbol": "phi",
+    "definition": "phi = M * N / L^3",
+    "meaning": "monomer volume fraction: fraction of the L^3 lattice sites occupied by beads. Must satisfy phi <= 1 (M*N <= L^3)."
+  },
+
+  "coordinates": {
+    "unwrapped": {
+      "role": "AUTHORITATIVE representation for chain connectivity and per-chain geometry (radius of gyration).",
+      "shape": "(M, N, 3)",
+      "dtype": "integer",
+      "notes": "Unwrapped coordinates are contiguous along each chain: consecutive bonded beads differ by exactly one lattice step (unit Manhattan distance). A chain may extend beyond [0, L); it is never wrapped for geometry.",
+      "canonicalization": "After an ACCEPTED move, the moved chain is re-based by an integer multiple of L per axis so its bead 0 lies in the primary box [0, L)^3. This bounds unwrapped magnitudes (preventing whole-chain-translation drift to infinity) while preserving wrapped coordinates, occupancy, site_owner, connectivity, all contact counts, per-chain Rg, and the reduced potential. Canonicalization never runs on trial coordinates before the contact-delta evaluation."
+    },
+    "wrapped": {
+      "role": "Derived (coord mod L). Used for occupancy, excluded-volume checks, contact counting, and interchain collision tests.",
+      "definition": "wrapped = ((unwrapped % L) + L) % L, applied component-wise so results lie in [0, L).",
+      "notes": "A chain crossing a periodic boundary must retain the correct Rg after using the unwrapped coordinates; wrapped coordinates are used only for occupancy and contacts."
+    },
+    "occupancy": {
+      "representation": "mapping from wrapped lattice site (x, y, z) in [0, L)^3 to a unique global bead ID (NOT merely a set).",
+      "global_id_convention": "global_id = chain_index * N + monomer_index",
+      "global_id_inverse": "chain_index = global_id // N ; monomer_index = global_id % N"
+    }
+  },
+
+  "contacts": {
+    "authoritative_statement": "Raw lattice contact counts m_intra and m_inter are AUTHORITATIVE. Every contact is counted exactly once, canonicalized as the unordered global-ID pair (min_id, max_id).",
+    "nearest_neighbor_directions": [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
+    "m_intra": {
+      "symbol": "m_intra",
+      "definition": "number of unique nonbonded nearest-neighbor contacts between beads on the SAME chain (wrapped nearest neighbors), counted once per unordered pair.",
+      "bonded_exclusion": "Covalently bonded nearest neighbors (same chain, |monomer_i - monomer_j| == 1) MUST NOT be counted as intrachain contacts."
+    },
+    "m_inter": {
+      "symbol": "m_inter",
+      "definition": "number of unique nearest-neighbor contacts between beads on DIFFERENT chains (wrapped nearest neighbors), counted once per unordered pair.",
+      "bonded_exclusion": "Not applicable (different chains share no covalent bond); all interchain nearest-neighbor pairs count."
+    },
+    "m_total": "m_total = m_intra + m_inter",
+    "f_inter": {
+      "definition": "f_inter = m_inter / m_total",
+      "zero_convention": "f_inter = 0 when m_total == 0"
+    },
+    "counting_rule": "For every occupied bead, examine its six wrapped nearest-neighbor sites, retrieve any neighboring bead owner, canonicalize the pair as (min_id, max_id) so it is counted exactly once, classify as intra (same chain) or inter (different chains), and exclude covalently bonded same-chain neighbors. Integer counts throughout."
+  },
+
+  "contact_offset": {
+    "statement": "Any molecular-to-lattice contact offset stored in the single-chain fit is excluded from the raw multi-chain contact counts and Hamiltonian.",
+    "reason": "The offset was fitted for single-chain intrachain contact-number support alignment during free-energy fitting; it must not be applied to interchain contacts or to raw lattice counts used for sampling."
+  },
+
+  "contact_normalization": {
+    "purpose": "Raw m_intra and m_inter are extensive, globally-unique contact-PAIR counts and remain the Hamiltonian variables. Intensive per-chain normalizations (dividing by the number of chains M) are added for ANALYSIS ONLY so runs with different M can be compared. They do not modify sampling, energy, or acceptance.",
+    "definitions": {
+      "m_intra_per_chain": "m_intra / M",
+      "m_inter_pairs_per_chain": "m_inter / M",
+      "m_inter_incidences_per_chain": "2 * m_inter / M",
+      "m_total_pairs_per_chain": "(m_intra + m_inter) / M"
+    },
+    "interpretation": {
+      "m_inter_pairs_per_chain": "globally-unique interchain contact PAIRS divided by M (each interchain contact counted once globally).",
+      "m_inter_incidences_per_chain": "average number of interchain-contact ENDPOINTS (incidences) associated with a chain; each interchain pair contributes one incidence to each of its two participating chains, hence the factor of 2.",
+      "naming_rule": "The two interchain normalizations are named distinctly (pairs vs incidences); neither is called simply 'm_inter_per_chain' because that would be scientifically ambiguous."
+    },
+    "scope": "Comparisons across M should use the normalized quantities IN ADDITION to the raw totals. Normalization removes the leading extensive dependence on chain number only; it does NOT remove all finite-size or concentration effects.",
+    "invariance": "Normalized contacts, like raw contacts, are never rescaled by rg_scale (they are counts, not lengths)."
+  },
+
+  "reduced_potential": {
+    "equation": "u(X, T) = b(T) * [ lambda_intra * m_intra(X) + lambda_inter * m_inter(X) ]",
+    "sampling_weight": "P(X | T) proportional to exp(-u(X, T))",
+    "b_of_T": {
+      "meaning": "reduced contact bias b(T) for the selected contact-bias model, loaded with the SAME semantics as remd_uniform_chain_2_new.py (MODEL_REGISTRY, fitted params, Tref, Tscale).",
+      "loading": "Loaded through the existing fit_summary.json and model-registry interfaces (resolve_model_params / load_fit_summary_json). Fitted parameters are never modified or refit.",
+      "single_chain_consistency": "For M = 1 and lambda_intra = 1, u reduces to b(T) * m_intra, matching the single-chain reduced potential u = m * b(T)."
+    },
+    "effective_energy": {
+      "definition": "effective_energy = T * u",
+      "label": "temperature-dependent EFFECTIVE energy (reported for compatibility only; the reduced potential u is the canonical sampling quantity). It is NOT a temperature-independent microscopic energy."
+    },
+    "canonical_sampling_quantity": "reduced potential u"
+  },
+
+  "lambda_controls": {
+    "lambda_intra": {
+      "meaning": "coupling multiplier on intrachain contacts in the reduced potential",
+      "default": 1.0
+    },
+    "lambda_inter": {
+      "meaning": "coupling multiplier on interchain contacts in the reduced potential",
+      "default": 1.0
+    },
+    "note": "lambda_intra and lambda_inter select control modes WITHOUT changing the energy implementation.",
+    "control_modes": {
+      "full_transferability": {"lambda_intra": 1, "lambda_inter": 1, "meaning": "null model: a monomer-monomer contact has the same effective free energy whether intra- or interchain (DEFAULT)."},
+      "independent_collapse": {"lambda_intra": 1, "lambda_inter": 0, "meaning": "chains collapse independently; interchain contacts do not affect acceptance."},
+      "interchain_attraction_only": {"lambda_intra": 0, "lambda_inter": 1, "meaning": "only interchain contacts contribute; intrachain contacts do not affect acceptance."},
+      "athermal_control": {"lambda_intra": 0, "lambda_inter": 0, "meaning": "no contact energy; all valid configurations have equal reduced potential."}
+    }
+  },
+
+  "replica_exchange": {
+    "swap_rule": "log_accept = u(X_i, T_i) + u(X_j, T_j) - u(X_j, T_i) - u(X_i, T_j)",
+    "swap_rule_note": "Generalized reduced-potential swap rule. Because u depends on both m_intra and m_inter (and on lambda_intra, lambda_inter), swap calculations MUST use BOTH cached contact counts, not the total contact count alone.",
+    "temperatures": "Temperatures are fixed to lanes; complete MultiChainState objects are exchanged between adjacent lanes with even/odd alternation."
+  },
+
+  "sweep_conventions": {
+    "local_sweep": {
+      "definition": "1 local sweep = M * N local move proposals",
+      "local_moves": ["end", "crankshaft", "pivot"]
+    },
+    "translation_sweep": {
+      "definition": "1 translation sweep = M whole-chain translation proposals"
+    },
+    "remd_cycle": [
+      "local_sweeps_per_swap * (M * N) local move proposals",
+      "translation_sweeps_per_swap * M whole-chain translation proposals",
+      "one adjacent-replica (even/odd) swap stage"
+    ],
+    "interface": "The run is parameterized by local_sweeps_per_swap and translation_sweeps_per_swap (NOT a single ambiguous absolute steps_per_swap). Both the sweep counts and the actual per-cycle proposal counts are recorded in output metadata."
+  },
+
+  "moves": {
+    "local": [
+      {"name": "end", "description": "move one selected-chain end bead to a random empty neighbor of its anchor bead"},
+      {"name": "crankshaft", "description": "local corner/kink flip of one interior selected-chain bead about the axis through its two neighbors"},
+      {"name": "pivot", "description": "rotate a selected-chain tail about a randomly chosen pivot bead using a proper cubic lattice rotation"}
+    ],
+    "collective": [
+      {"name": "chain_translation", "description": "translate every bead of one selected chain by one of the six lattice unit vectors; symmetric proposal; own current sites ignored during the interchain collision test; intrachain contacts are exactly preserved and only interchain contacts involving the translated chain are recomputed"}
+    ],
+    "invariants": [
+      "preserve linear connectivity (unit bonds in unwrapped coordinates)",
+      "preserve self-avoidance",
+      "preserve interchain excluded volume via global wrapped occupancy",
+      "maintain wrapped/unwrapped coordinate consistency",
+      "null proposals (identical to current state) are not counted as state-changing acceptances"
+    ]
+  },
+
+  "move_counters": {
+    "columns": ["proposed", "geometrically_valid", "state_changing", "metropolis_accepted"],
+    "categories": ["pivot", "crankshaft", "end", "chain_translation"]
+  },
+
+  "contact_updates": {
+    "debug_path": "Recompute full_contact_counts for every geometrically valid trial state (exact oracle).",
+    "production_path": "Local delta-contact algorithm: enumerate incident canonical contact pairs before the move, build/update a temporary occupancy for the trial, enumerate incident pairs after, canonicalize IDs, determine removed/added intra/inter contacts (deduplicated when multiple moved beads share a contact), and update cached counts.",
+    "translation_optimization": "Whole-chain translation cannot change intrachain contacts; only interchain contacts involving the translated chain are recomputed.",
+    "debug_assertion": "An environment-controlled assertion (MULTICHAIN_DEBUG_CONTACTS, analogous to ISAW_DEBUG_CONTACTS) compares cached counts against full_contact_counts after every accepted move."
+  },
+
+  "observables": {
+    "per_chain_geometry": {
+      "quantities": ["Rg2 (per chain)", "Rg (per chain)"],
+      "coordinates": "computed from UNWRAPPED coordinates",
+      "per_cycle_records": ["mean per-chain Rg", "mean per-chain Rg2", "std of per-chain Rg across chains", "optional full per-chain Rg vector in diagnostic output"],
+      "rg_scale_note": "rg_scale is applied only to OUTPUT length quantities, never to sampling. Fields suffixed _lattice are raw lattice lengths; the same field without _lattice equals rg_scale times the lattice value (rg_scale**2 for squared lengths). The std of per-chain Rg follows this rule: std_chain_rg_lattice_post is unscaled, std_chain_rg_post = rg_scale * std_chain_rg_lattice_post; init_mean_chain_rg_lattice is unscaled, init_mean_chain_rg = rg_scale * init_mean_chain_rg_lattice."
+    },
+    "contacts": ["m_intra", "m_inter", "m_total", "f_inter"],
+    "contacts_per_chain": ["m_intra_per_chain", "m_inter_pairs_per_chain", "m_inter_incidences_per_chain", "m_total_pairs_per_chain"],
+    "chain_cluster_graph": {
+      "nodes": "chains",
+      "edge_rule": "connect two chains when they share at least cluster_contact_threshold interchain contacts",
+      "cluster_contact_threshold_default": 1,
+      "records": ["number of connected components", "largest cluster size s_max", "largest cluster fraction f_max = s_max / M"],
+      "note": "This is an explicit chain-level graph built from interchain contact pairs; it is NOT the single-chain bead-level contact-graph S_max."
+    }
+  },
+
+  "outputs": {
+    "canonical": [
+      "<prefix>_results.csv",
+      "<prefix>_swap_rates.csv",
+      "<prefix>_move_acceptance.csv",
+      "<prefix>_distributions.npz",
+      "<prefix>_run_summary.json"
+    ],
+    "optional": [
+      "<prefix>_diagnostics.json",
+      "<prefix>_diagnostic_trajectories.npz",
+      "<prefix>_configurations.h5"
+    ],
+    "results_csv_columns": [
+      "T", "u_mean", "effective_energy_mean",
+      "m_intra_mean", "m_inter_mean", "m_total_mean",
+      "m_intra_per_chain_mean", "m_intra_per_chain_std",
+      "m_inter_pairs_per_chain_mean", "m_inter_pairs_per_chain_std",
+      "m_inter_incidences_per_chain_mean", "m_inter_incidences_per_chain_std",
+      "m_total_pairs_per_chain_mean",
+      "Rg_mean", "Rg2_mean", "f_inter_mean",
+      "largest_cluster_size_mean", "largest_cluster_fraction_mean",
+      "std_chain_rg_mean", "std_chain_rg_mean_lattice", "n_clusters_mean",
+      "local_acceptance_rate", "translation_acceptance_rate"
+    ],
+    "npz_keys": [
+      "Ts", "m_intra_vals", "P_m_intra", "m_inter_vals", "P_m_inter",
+      "rg_edges", "rg_centers", "P_mean_chain_rg",
+      "chain_rg_edges", "chain_rg_centers", "P_chain_rg",
+      "fmax_edges", "fmax_centers", "P_fmax",
+      "model metadata", "multi-chain run metadata", "schema_version"
+    ],
+    "distribution_semantics": {
+      "P_mean_chain_rg": "cycle-level distribution of the MEAN per-chain Rg across chains.",
+      "P_chain_rg": "distribution of POOLED individual-chain Rg samples (all chains, all post-burn-in cycles); resolves homogeneous collapse vs mixed expanded/collapsed chains. Semantically distinct from P_mean_chain_rg."
+    },
+    "diagnostics": {
+      "files": ["<prefix>_diagnostics.json", "<prefix>_convergence.csv", "<prefix>_round_trips.csv", "<prefix>_walker_occupancy.csv", "<prefix>_diagnostic_trajectories.npz"],
+      "reused_from_single_chain": ["integrated_autocorr_time", "early_late_drift", "block_mean_stability", "analyze_walker_trajectory"],
+      "diagnosed_observables": ["u", "m_intra", "m_inter", "mean_chain_rg", "n_clusters", "largest_cluster_size", "largest_cluster_fraction", "m_intra_per_chain", "m_inter_pairs_per_chain"],
+      "central_observables": ["m_intra (single-chain collapse)", "m_inter (interchain association)", "largest_cluster_fraction (collective aggregation)"],
+      "central_observables_note": "Warnings are raised on the raw extensive central observables only; the per-chain normalized series are deterministic transforms and would raise duplicate warnings.",
+      "diagnostic_trajectory_normalized_keys": ["m_intra_per_chain_post", "m_inter_pairs_per_chain_post", "m_inter_incidences_per_chain_post", "m_total_pairs_per_chain_post", "std_chain_rg_lattice_post", "std_chain_rg_post"],
+      "multichain_specific_thresholds": ["min_translation_acceptance_rate"]
+    }
+  },
+
+  "snapshot_format": {
+    "coordinate_dimensions": "(snapshot, temperature_lane, chain, monomer, xyz)",
+    "coordinate_dtype_default": "int32",
+    "coordinate_dtype_note": "Production snapshots default to int32. The writer allocates the coordinate dtype once from the first snapshot and cannot widen it later, so it never auto-selects int16; int16 remains available only for explicit, size-bounded use. Coordinate canonicalization keeps unwrapped magnitudes bounded so int32 does not overflow.",
+    "stored_fields": [
+      "coordinates", "walker_id", "m_intra", "m_inter",
+      "mean_chain_rg2", "largest_cluster_size", "temperatures",
+      "M", "N", "L", "schema_version", "model_params",
+      "lambda_intra", "lambda_inter", "snapshot_stride", "completion_marker"
+    ],
+    "note": "The single-chain HDF5 schema (T, bead, xyz) is NOT reused for multi-chain coordinates; chain identity is explicit."
+  },
+
+  "initialization": {
+    "independent_walkers": "Each REMD temperature lane begins from its OWN independently generated dispersed state, using deterministic per-lane seeds init_seed = seed + INITIALIZATION_SEED_STRIDE * lane (stride 1000003, distinct from the per-cycle sweep-seed strides). Initialization occurs in the main process so serial and multiprocessing runs share identical starting states.",
+    "recorded_initial_observables": ["init_seed", "init_m_intra", "init_m_inter", "init_mean_chain_rg_lattice", "init_mean_chain_rg", "init_largest_cluster_size"]
+  },
+
+  "metadata_requirements": [
+    "M", "N", "L", "volume_fraction", "lambda_intra", "lambda_inter",
+    "model_name", "model_params", "param_names", "Tref", "Tscale",
+    "seed", "temperature_ladder", "schema_version",
+    "multichain_output_schema_version", "snapshot_schema_version",
+    "local_sweeps_per_swap", "translation_sweeps_per_swap",
+    "local_proposals_per_cycle", "translation_proposals_per_cycle",
+    "cluster_contact_threshold", "parameter_source", "fit_summary_json",
+    "initialization_seeds", "initial_states",
+    "coordinate_canonicalization_enabled", "snapshot_coordinate_dtype",
+    "diagnostics_enabled", "diagnostic_thresholds", "output_files"
+  ],
+
+  "scope_notes": [
+    "This is the minimum scientifically valid multi-chain simulator to test whether the single-chain contact free energy predicts aggregation.",
+    "No PNIPAM-specific extensions beyond the transferability null model are introduced.",
+    "Cluster translations, cluster rotations, configurational-bias regrowth, and kinetic acceleration moves are out of scope for this stage.",
+    "Reptation is optional and not required for initial completion."
+  ]
+}
