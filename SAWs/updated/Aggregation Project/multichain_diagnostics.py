@@ -32,9 +32,11 @@ import numpy as np
 import remd_uniform_chain_2_new as remd
 from multichain_config_io import _json_safe
 
-# Reuse the reference thresholds and add a translation-acceptance floor.
+# Reuse the reference thresholds and add whole-chain move acceptance floors.
 DEFAULT_MC_DIAG_THRESHOLDS = dict(remd.DEFAULT_DIAG_THRESHOLDS)
 DEFAULT_MC_DIAG_THRESHOLDS["min_translation_acceptance_rate"] = 0.01
+DEFAULT_MC_DIAG_THRESHOLDS["min_reptation_acceptance_rate"] = 0.01
+DEFAULT_MC_DIAG_THRESHOLDS["min_rotation_acceptance_rate"] = 0.01
 DEFAULT_MC_DIAG_N_BLOCKS = remd.DEFAULT_DIAG_N_BLOCKS
 
 # Per-lane per-cycle observables diagnosed (all cycle-spacing 1).  mean_chain_rg
@@ -107,6 +109,8 @@ def compute_multichain_diagnostics(
             "n_post_burnin": int(max(n - s, 0)),
             "local_acceptance_rate": float(rep.local_acceptance_rate()),
             "translation_acceptance_rate": float(rep.translation_acceptance_rate()),
+            "reptation_acceptance_rate": float(rep.reptation_acceptance_rate()),
+            "rotation_acceptance_rate": float(rep.rotation_acceptance_rate()),
         }
         for name in DIAGNOSED_OBSERVABLES:
             arr = series[name][s:]
@@ -158,6 +162,8 @@ def compute_multichain_diagnostics(
     total_round_trips = int(sum(rt_low))
     local_rates = [lane["local_acceptance_rate"] for lane in lane_conv]
     trans_rates = [lane["translation_acceptance_rate"] for lane in lane_conv]
+    rept_rates = [lane["reptation_acceptance_rate"] for lane in lane_conv]
+    rot_rates = [lane["rotation_acceptance_rate"] for lane in lane_conv]
 
     def _finite_min(vals):
         v = [x for x in vals if x is not None and np.isfinite(x)]
@@ -175,6 +181,8 @@ def compute_multichain_diagnostics(
         "median_swap_rate": float(np.median(finite_swap)) if finite_swap.size else float("nan"),
         "min_local_acceptance_rate": _finite_min(local_rates),
         "min_translation_acceptance_rate": _finite_min(trans_rates),
+        "min_reptation_acceptance_rate": _finite_min(rept_rates),
+        "min_rotation_acceptance_rate": _finite_min(rot_rates),
     }
     for name in DIAGNOSED_OBSERVABLES:
         ess = _obs_ess(name)
@@ -235,6 +243,20 @@ def compute_multichain_diagnostics(
                   f"lane T={lane['temperature']:.3g} whole-chain translation "
                   f"acceptance {tr:.4f} < {thr['min_translation_acceptance_rate']}",
                   float(tr), thr["min_translation_acceptance_rate"],
+                  temperature_index=i, temperature=lane["temperature"])
+        rp = lane["reptation_acceptance_rate"]
+        if np.isfinite(rp) and rp < float(thr["min_reptation_acceptance_rate"]):
+            _warn("reptation_freezing",
+                  f"lane T={lane['temperature']:.3g} whole-chain reptation "
+                  f"acceptance {rp:.4f} < {thr['min_reptation_acceptance_rate']}",
+                  float(rp), thr["min_reptation_acceptance_rate"],
+                  temperature_index=i, temperature=lane["temperature"])
+        ro = lane["rotation_acceptance_rate"]
+        if np.isfinite(ro) and ro < float(thr["min_rotation_acceptance_rate"]):
+            _warn("rotation_freezing",
+                  f"lane T={lane['temperature']:.3g} whole-chain rotation "
+                  f"acceptance {ro:.4f} < {thr['min_rotation_acceptance_rate']}",
+                  float(ro), thr["min_rotation_acceptance_rate"],
                   temperature_index=i, temperature=lane["temperature"])
 
     return {

@@ -24,8 +24,12 @@ potential rule (both cached counts):
 Sweep convention:
     1 local sweep       = M * N local move proposals
     1 translation sweep = M whole-chain translation proposals
+    1 reptation sweep   = M whole-chain reptation (slithering-snake) proposals
+    1 rotation sweep    = M whole-chain rigid-rotation proposals
 Each REMD cycle performs local_sweeps_per_swap local sweeps, then
-translation_sweeps_per_swap translation sweeps, then one even/odd swap stage.
+translation_sweeps_per_swap translation sweeps, then reptation_sweeps_per_swap
+reptation sweeps, then rotation_sweeps_per_swap rotation sweeps, then one
+even/odd swap stage.
 
 Quick test:  python remd_multichain.py --quick-test
 """
@@ -157,9 +161,10 @@ def mc_sweep(
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float,
     n_local: int, n_translation: int, rng: random.Random,
+    n_reptation: int = 1, n_rotation: int = 1,
     debug_contacts: bool = False,
 ) -> None:
-    """Run one lane's local + translation proposals in place.
+    """Run one lane's local + translation + reptation + rotation proposals in place.
 
     ``du = b(T) * (lambda_intra * d_intra + lambda_inter * d_inter)`` for the
     proposed change; accept if ``du <= 0`` or ``random() < exp(-du)`` (via
@@ -199,6 +204,10 @@ def mc_sweep(
         _attempt(mvs.propose_local(state, rng))
     for _ in range(int(n_translation)):
         _attempt(mvs.propose_translation(state, rng))
+    for _ in range(int(n_reptation)):
+        _attempt(mvs.propose_reptation(state, rng))
+    for _ in range(int(n_rotation)):
+        _attempt(mvs.propose_chain_rotation(state, rng))
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +252,20 @@ class MultiReplica:
         acc = int(c[idx, 3])
         return acc / prop if prop else float("nan")
 
+    def reptation_acceptance_rate(self) -> float:
+        c = np.asarray(self.move_counters, dtype=np.int64)
+        idx = mvs.MOVE_INDEX["reptation"]
+        prop = int(c[idx, 0])
+        acc = int(c[idx, 3])
+        return acc / prop if prop else float("nan")
+
+    def rotation_acceptance_rate(self) -> float:
+        c = np.asarray(self.move_counters, dtype=np.int64)
+        idx = mvs.MOVE_INDEX["rotation"]
+        prop = int(c[idx, 0])
+        acc = int(c[idx, 3])
+        return acc / prop if prop else float("nan")
+
 
 # ---------------------------------------------------------------------------
 # Worker (top-level, pickleable under Windows 'spawn')
@@ -251,7 +274,7 @@ class MultiReplica:
 def evolve_lane_worker(
     coords_unwrapped: np.ndarray, counts_tuple: Tuple[int, int], box_size: int,
     temperature: float, move_counters: np.ndarray,
-    n_local: int, n_translation: int,
+    n_local: int, n_translation: int, n_reptation: int, n_rotation: int,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float, seed: int,
     debug_contacts: bool,
@@ -272,6 +295,7 @@ def evolve_lane_worker(
     rng = random.Random(int(seed))
     mc_sweep(state, counters, temperature, model_name, params, Tref, Tscale,
              lambda_intra, lambda_inter, n_local, n_translation, rng,
+             n_reptation=n_reptation, n_rotation=n_rotation,
              debug_contacts=debug_contacts)
     return state.coords_unwrapped, state.counts.as_tuple(), counters
 
@@ -327,6 +351,7 @@ def _build_independent_replicas(
 def run_remd_multichain(
     *, n_chains: int, chain_length: int, box_size: int, Ts: np.ndarray,
     local_sweeps_per_swap: int, translation_sweeps_per_swap: int, n_cycles: int,
+    reptation_sweeps_per_swap: int = 1, rotation_sweeps_per_swap: int = 1,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float = 1.0, lambda_inter: float = 1.0,
     cluster_contact_threshold: int = 1,
@@ -352,6 +377,8 @@ def run_remd_multichain(
     nT = len(Ts)
     n_local = int(local_sweeps_per_swap) * M * N
     n_translation = int(translation_sweeps_per_swap) * M
+    n_reptation = int(reptation_sweeps_per_swap) * M
+    n_rotation = int(rotation_sweeps_per_swap) * M
 
     # Each REMD lane begins from its OWN independently generated dispersed state
     # (deterministic per-lane seeds); no shared starting configuration.
@@ -381,7 +408,8 @@ def run_remd_multichain(
                         replicas[k].state.coords_unwrapped,
                         replicas[k].state.counts.as_tuple(),
                         L, replicas[k].T, replicas[k].move_counters,
-                        n_local, n_translation, model_name, params, Tref, Tscale,
+                        n_local, n_translation, n_reptation, n_rotation,
+                        model_name, params, Tref, Tscale,
                         lambda_intra, lambda_inter,
                         _lane_seed(base_seed, cycle, k), debug_contacts)
                     for k in range(nT)]
@@ -399,6 +427,7 @@ def run_remd_multichain(
                     mc_sweep(rep.state, rep.move_counters, rep.T, model_name,
                              params, Tref, Tscale, lambda_intra, lambda_inter,
                              n_local, n_translation, rng,
+                             n_reptation=n_reptation, n_rotation=n_rotation,
                              debug_contacts=debug_contacts)
 
             # Even/odd adjacent swaps (temperatures fixed to lanes).  The actual
@@ -503,6 +532,8 @@ def summarize_results(replicas, Ts, burnin_frac, rg_scale):
     for rep, r in zip(replicas, results):
         r["local_acceptance_rate"] = rep.local_acceptance_rate()
         r["translation_acceptance_rate"] = rep.translation_acceptance_rate()
+        r["reptation_acceptance_rate"] = rep.reptation_acceptance_rate()
+        r["rotation_acceptance_rate"] = rep.rotation_acceptance_rate()
     return results
 
 
@@ -516,7 +547,8 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
                     model_params, Tref, Tscale, lambda_intra, lambda_inter,
                     local_sweeps_per_swap, translation_sweeps_per_swap, n_cycles,
                     burnin_frac, cluster_contact_threshold, parameter_source,
-                    fit_summary_json) -> dict:
+                    fit_summary_json, reptation_sweeps_per_swap=1,
+                    rotation_sweeps_per_swap=1) -> dict:
     """Inject full model + run provenance into a distributions/summary dict."""
     dist["schema_version"] = int(SCHEMA_VERSION)
     dist["model_api_version"] = int(MODEL_API_VERSION)
@@ -536,8 +568,12 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["temperatures"] = np.asarray(Ts, dtype=float)
     dist["local_sweeps_per_swap"] = int(local_sweeps_per_swap)
     dist["translation_sweeps_per_swap"] = int(translation_sweeps_per_swap)
+    dist["reptation_sweeps_per_swap"] = int(reptation_sweeps_per_swap)
+    dist["rotation_sweeps_per_swap"] = int(rotation_sweeps_per_swap)
     dist["local_proposals_per_cycle"] = int(local_sweeps_per_swap) * M * N
     dist["translation_proposals_per_cycle"] = int(translation_sweeps_per_swap) * M
+    dist["reptation_proposals_per_cycle"] = int(reptation_sweeps_per_swap) * M
+    dist["rotation_proposals_per_cycle"] = int(rotation_sweeps_per_swap) * M
     dist["n_cycles"] = int(n_cycles)
     dist["burnin_frac"] = float(burnin_frac)
     dist["cluster_contact_threshold"] = int(cluster_contact_threshold)
@@ -605,6 +641,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     dest="local_sweeps_per_swap")
     ap.add_argument("--translation-sweeps-per-swap", type=int, default=1,
                     dest="translation_sweeps_per_swap")
+    ap.add_argument("--reptation-sweeps-per-swap", type=int, default=1,
+                    dest="reptation_sweeps_per_swap")
+    ap.add_argument("--rotation-sweeps-per-swap", type=int, default=1,
+                    dest="rotation_sweeps_per_swap")
     ap.add_argument("--n-cycles", type=int, default=200, dest="n_cycles")
     ap.add_argument("--lambda-intra", type=float, default=1.0, dest="lambda_intra")
     ap.add_argument("--lambda-inter", type=float, default=1.0, dest="lambda_inter")
@@ -671,10 +711,15 @@ def _validate_cli(args) -> None:
         raise ValueError(
             f"volume fraction > 1: M*N={args.n_chains * args.N} > "
             f"L^3={args.box_size ** 3}")
-    if args.local_sweeps_per_swap < 0 or args.translation_sweeps_per_swap < 0:
+    if (args.local_sweeps_per_swap < 0 or args.translation_sweeps_per_swap < 0
+            or args.reptation_sweeps_per_swap < 0
+            or args.rotation_sweeps_per_swap < 0):
         raise ValueError("sweeps-per-swap must be >= 0")
-    if args.local_sweeps_per_swap + args.translation_sweeps_per_swap < 1:
-        raise ValueError("need at least one local or translation sweep per swap")
+    if (args.local_sweeps_per_swap + args.translation_sweeps_per_swap
+            + args.reptation_sweeps_per_swap + args.rotation_sweeps_per_swap) < 1:
+        raise ValueError(
+            "need at least one local, translation, reptation, or rotation sweep "
+            "per swap")
     if args.n_cycles < 1:
         raise ValueError("--n-cycles must be >= 1")
     if not (0.0 <= args.burnin_frac < 1.0):
@@ -751,6 +796,8 @@ def main(argv=None) -> None:
             n_chains=M, chain_length=N, box_size=L, Ts=Ts,
             local_sweeps_per_swap=args.local_sweeps_per_swap,
             translation_sweeps_per_swap=args.translation_sweeps_per_swap,
+            reptation_sweeps_per_swap=args.reptation_sweeps_per_swap,
+            rotation_sweeps_per_swap=args.rotation_sweeps_per_swap,
             n_cycles=args.n_cycles, model_name=model_name, params=model_params,
             Tref=Tref, Tscale=Tscale,
             lambda_intra=args.lambda_intra, lambda_inter=args.lambda_inter,
@@ -777,6 +824,8 @@ def main(argv=None) -> None:
         lambda_inter=args.lambda_inter,
         local_sweeps_per_swap=args.local_sweeps_per_swap,
         translation_sweeps_per_swap=args.translation_sweeps_per_swap,
+        reptation_sweeps_per_swap=args.reptation_sweeps_per_swap,
+        rotation_sweeps_per_swap=args.rotation_sweeps_per_swap,
         n_cycles=args.n_cycles, burnin_frac=args.burnin_frac,
         cluster_contact_threshold=args.cluster_contact_threshold,
         parameter_source=parameter_source, fit_summary_json=fit_summary_json)
@@ -840,6 +889,8 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         "seed": int(args.seed),
         "local_sweeps_per_swap": int(args.local_sweeps_per_swap),
         "translation_sweeps_per_swap": int(args.translation_sweeps_per_swap),
+        "reptation_sweeps_per_swap": int(args.reptation_sweeps_per_swap),
+        "rotation_sweeps_per_swap": int(args.rotation_sweeps_per_swap),
         "n_cycles": int(args.n_cycles),
         "snapshot_stride": int(args.snapshot_stride),
         "fit_summary_json": str(fit_summary_json) if fit_summary_json else "null",
@@ -892,8 +943,12 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "temperature_source": temp_source,
         "local_sweeps_per_swap": int(args.local_sweeps_per_swap),
         "translation_sweeps_per_swap": int(args.translation_sweeps_per_swap),
+        "reptation_sweeps_per_swap": int(args.reptation_sweeps_per_swap),
+        "rotation_sweeps_per_swap": int(args.rotation_sweeps_per_swap),
         "local_proposals_per_cycle": int(args.local_sweeps_per_swap) * args.n_chains * args.N,
         "translation_proposals_per_cycle": int(args.translation_sweeps_per_swap) * args.n_chains,
+        "reptation_proposals_per_cycle": int(args.reptation_sweeps_per_swap) * args.n_chains,
+        "rotation_proposals_per_cycle": int(args.rotation_sweeps_per_swap) * args.n_chains,
         "n_cycles": int(args.n_cycles), "seed": int(args.seed),
         "n_workers": int(args.n_workers), "burnin_frac": float(args.burnin_frac),
         "rg_scale": float(args.rg_scale),
@@ -912,6 +967,8 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "swap_rates": swap_rates,
         "local_acceptance_rates": [r["local_acceptance_rate"] for r in results],
         "translation_acceptance_rates": [r["translation_acceptance_rate"] for r in results],
+        "reptation_acceptance_rates": [r["reptation_acceptance_rate"] for r in results],
+        "rotation_acceptance_rates": [r["rotation_acceptance_rate"] for r in results],
         "diagnostics_enabled": bool(diagnostics is not None),
         "wall_time_seconds": float(wall),
         "git_commit": remd._git_commit(),
@@ -1160,6 +1217,133 @@ def _qt_canonicalization() -> None:
     print("  quick-test coordinate canonicalization invariance: PASSED")
 
 
+class _ScriptRandom:
+    """Minimal deterministic RNG stub for exact hand-constructed move tests.
+
+    ``randrange`` and ``random`` pop scripted values from independent queues so a
+    proposer's draws are fully controlled (and independent of the CPython PRNG
+    implementation).  Only the methods the proposers call are provided.
+    """
+
+    def __init__(self, ints, floats=()):
+        self._ints = list(ints)
+        self._floats = list(floats)
+
+    def randrange(self, n):  # noqa: ARG002 - n is intentionally ignored
+        return self._ints.pop(0)
+
+    def random(self):
+        return self._floats.pop(0)
+
+
+def _qt_reptation_regression() -> None:
+    # (a) Exact hand-constructed coordinates, head removal, v = (0, 1, 0).
+    chain = np.array([(2, 2, 2), (3, 2, 2), (4, 2, 2), (5, 2, 2)], dtype=np.int64)
+    v_head = mvs.NN6.index((0, 1, 0))
+    state = mcs.make_state(np.stack([chain]), 12)
+    prop = mvs.propose_reptation(state, _ScriptRandom([0, v_head], [0.1]))
+    assert prop.ok and prop.state_changing
+    assert prop.moved == {0: (3, 2, 2), 1: (4, 2, 2), 2: (5, 2, 2), 3: (5, 3, 2)}
+    # delta_contacts agrees with a full recount before/after applying the move.
+    d = mvs.proposal_delta(state, prop)
+    mvs.apply_proposal(state, prop, d)
+    mcc.assert_counts_match(state, "reptation head")
+    mcs.validate_state(state)
+
+    # (b) Exact tail removal, v = (0, 0, 1), on a fresh chain.
+    state2 = mcs.make_state(np.stack([chain]), 12)
+    v_tail = mvs.NN6.index((0, 0, 1))
+    prop2 = mvs.propose_reptation(state2, _ScriptRandom([0, v_tail], [0.9]))
+    assert prop2.ok and prop2.moved == {
+        0: (2, 2, 3), 1: (2, 2, 2), 2: (3, 2, 2), 3: (4, 2, 2)}
+    d2 = mvs.proposal_delta(state2, prop2)
+    mvs.apply_proposal(state2, prop2, d2)
+    mcc.assert_counts_match(state2, "reptation tail")
+    mcs.validate_state(state2)
+
+    # (c) Many reptation-only athermal moves keep a multi-chain state valid and
+    # the cached counts consistent (delta vs full recount, via debug_contacts).
+    ms = mcs.initialize_dispersed_state(3, 8, 12, seed=21)
+    counters = mvs.new_move_counters()
+    mc_sweep(ms, counters, 330.0, "hs", [400.0, 1.3], 320.0, 80.0,
+             lambda_intra=0.0, lambda_inter=0.0,
+             n_local=0, n_translation=0, rng=random.Random(3),
+             n_reptation=600, n_rotation=0, debug_contacts=True)
+    mcs.validate_state(ms)
+    idx = mvs.MOVE_INDEX["reptation"]
+    assert counters[idx, 0] == 600 and counters[idx, 3] > 0
+    print("  quick-test reptation regression (exact coords + delta + validity): PASSED")
+
+
+def _qt_rotation_regression() -> None:
+    # (a) Exact hand-constructed coordinates: pivot bead 0, 90-degree rotation
+    # about z (a proper cubic rotation guaranteed to be in the 24-element pool).
+    Rz90 = ((0, -1, 0), (1, 0, 0), (0, 0, 1))
+    idx_rot = remd.ROT_MATS.index(Rz90)
+    chain = np.array([(2, 2, 2), (3, 2, 2), (4, 2, 2)], dtype=np.int64)
+    state = mcs.make_state(np.stack([chain]), 12)
+    prop = mvs.propose_chain_rotation(state, _ScriptRandom([0, 0, idx_rot]))
+    assert prop.ok and prop.state_changing
+    # Bead 0 (pivot) excluded; beads 1,2 rotate about (2,2,2).
+    assert prop.moved == {1: (2, 3, 2), 2: (2, 4, 2)}
+    d = mvs.proposal_delta(state, prop)
+    mvs.apply_proposal(state, prop, d)
+    mcc.assert_counts_match(state, "rotation")
+    mcs.validate_state(state)
+
+    # (b) Identity rotation (the 24th pool element) moves nothing.
+    state_id = mcs.make_state(np.stack([chain]), 12)
+    prop_id = mvs.propose_chain_rotation(
+        state_id, _ScriptRandom([0, 1, len(remd.ROT_MATS)]))
+    assert prop_id.ok and not prop_id.state_changing
+
+    # (c) Rigid rotation preserves each chain's Rg^2 EXACTLY: many rotation-only
+    # athermal sweeps leave per-chain Rg^2 unchanged, and the state stays valid.
+    ms = mcs.initialize_dispersed_state(3, 8, 14, seed=31)
+    rg2_before = mcs.per_chain_rg2(ms).copy()
+    counters = mvs.new_move_counters()
+    mc_sweep(ms, counters, 330.0, "hs", [400.0, 1.3], 320.0, 80.0,
+             lambda_intra=0.0, lambda_inter=0.0,
+             n_local=0, n_translation=0, rng=random.Random(4),
+             n_reptation=0, n_rotation=600, debug_contacts=True)
+    mcs.validate_state(ms)
+    np.testing.assert_allclose(mcs.per_chain_rg2(ms), rg2_before)
+    idx = mvs.MOVE_INDEX["rotation"]
+    assert counters[idx, 0] == 600
+    print("  quick-test rotation regression (exact coords + Rg^2 invariance): PASSED")
+
+
+def _qt_athermal_move_baseline() -> None:
+    # Detailed-balance smoke: reptation-only sampling at an athermal potential
+    # must reproduce the self-avoiding-walk Rg^2 baseline within statistical
+    # error (reptation is symmetric and preserves the uniform SAW measure).
+    N, L = 8, 30
+    rng_np = np.random.RandomState(123)
+    saw_rg2 = np.array(
+        [mcs.chain_radius_of_gyration_squared(
+            mcs.make_state(np.stack([mcs.generate_saw(N, rng_np)]), L), 0)
+         for _ in range(400)])
+    baseline = float(saw_rg2.mean())
+
+    state = mcs.make_state(np.stack([mcs.generate_saw(N, np.random.RandomState(7))]), L)
+    counters = mvs.new_move_counters()
+    samples = []
+    for cyc in range(120):
+        mc_sweep(state, counters, 330.0, "hs", [400.0, 1.3], 320.0, 80.0,
+                 lambda_intra=0.0, lambda_inter=0.0,
+                 n_local=0, n_translation=0, rng=random.Random(1000 + cyc),
+                 n_reptation=40, n_rotation=0)
+        if cyc >= 40:  # discard burn-in
+            samples.append(mcs.chain_radius_of_gyration_squared(state, 0))
+    sampled = float(np.mean(samples))
+    rel = abs(sampled - baseline) / baseline
+    assert rel < 0.30, (
+        f"reptation athermal Rg^2 {sampled:.3f} deviates {rel:.2%} from SAW "
+        f"baseline {baseline:.3f} (>30%): detailed balance / ergodicity suspect")
+    print(f"  quick-test athermal reptation matches SAW Rg^2 baseline "
+          f"(rel={rel:.2%}): PASSED")
+
+
 def _qt_diagnostics(tmp) -> None:
     import os as _os
     reps, sp, sa, wh, Ts = _qt_short_run(1, tmp, "diag")
@@ -1188,10 +1372,13 @@ def run_quick_test() -> None:
     _qt_generalized_swap()
     _qt_independent_init()
     _qt_canonicalization()
+    _qt_reptation_regression()
+    _qt_rotation_regression()
     with tempfile.TemporaryDirectory() as tmp:
         _qt_serial_vs_workers(tmp)
         _qt_output_roundtrip(tmp)
         _qt_diagnostics(tmp)
+    _qt_athermal_move_baseline()
     _qt_strong_attraction_smoke()
     print("quick-test complete.")
 

@@ -10,6 +10,8 @@ periodic cubic box with global excluded volume:
     * ``crankshaft``       selected-chain corner/kink flip
     * ``pivot``            selected-chain tail pivot (proper cubic rotation)
     * ``chain_translation``whole-chain nearest-neighbour translation
+    * ``reptation``        whole-chain slithering-snake (grow one end)
+    * ``rotation``         whole-chain rigid rotation about one of its own beads
 
 Every proposal preserves linear connectivity (unit bonds in UNWRAPPED
 coordinates), self-avoidance, and interchain excluded volume (checked against
@@ -37,8 +39,12 @@ from multichain_contacts import delta_contacts, apply_moved_beads
 
 Site = Tuple[int, int, int]
 
-# Counter layout shared with the sampler / CSV writer.
-MOVE_TYPES = ("pivot", "crankshaft", "end", "chain_translation")
+# Counter layout shared with the sampler / CSV writer.  The three local moves
+# occupy indices 0-2 and ``chain_translation`` index 3; the two large-scale moves
+# below are appended AFTER them so ``MultiReplica.local_acceptance_rate``'s
+# ``[:3]`` slice keeps meaning pivot/crankshaft/end.
+MOVE_TYPES = ("pivot", "crankshaft", "end", "chain_translation",
+              "reptation", "rotation")
 MOVE_INDEX = {name: i for i, name in enumerate(MOVE_TYPES)}
 LOCAL_MOVE_TYPES = ("pivot", "crankshaft", "end")
 MOVE_COUNTER_COLS = ("proposed", "geometrically_valid", "state_changing",
@@ -48,7 +54,7 @@ _N_COLS = len(MOVE_COUNTER_COLS)
 
 
 def new_move_counters() -> np.ndarray:
-    """Zeroed (4, 4) counter block: proposed/valid/state_changing/accepted."""
+    """Zeroed (_N_MOVES, 4) counter block: proposed/valid/state_changing/accepted."""
     return np.zeros((_N_MOVES, _N_COLS), dtype=np.int64)
 
 
@@ -205,6 +211,126 @@ def propose_translation(state: MultiChainState, rng: random.Random) -> MovePropo
     # A whole-chain translation by a unit vector always changes positions.
     return MoveProposal(
         "chain_translation", c, ok=True, state_changing=True,
+        moved=moved, new_sites=new_sites)
+
+
+def propose_reptation(state: MultiChainState, rng: random.Random) -> MoveProposal:
+    """Slithering-snake (reptation) move on a whole random chain.
+
+    One end of chain ``c`` is REMOVED and a new bead is grown at the opposite
+    end in a uniformly drawn nearest-neighbour direction; every interior bead
+    inherits its neighbour's old position, so all N beads move.  Removing the
+    head (index 0): ``new_r[i] = old_r[i+1]`` for ``i = 0..N-2`` and
+    ``new_r[N-1] = old_r[N-1] + v``; removing the tail (index N-1):
+    ``new_r[i] = old_r[i-1]`` for ``i = 1..N-1`` and ``new_r[0] = old_r[0] + v``,
+    with ``v`` uniform over :data:`NN6`.
+
+    Detailed balance: this proposal is SYMMETRIC (no Metropolis-Hastings
+    correction).  The reverse of "remove head, grow tail in direction ``v``" is
+    "remove tail, grow head in direction ``w = -(r_1 - r_0)``", and ``w`` is
+    itself one of the six uniformly drawn NN6 directions available to the reverse
+    proposal.  Because the end choice (2 options) and the direction choice (6
+    options, including both ``v`` and ``-v``) are each drawn with uniform,
+    geometry-independent probability regardless of whether the move turns out
+    valid, the forward and reverse proposal probabilities are equal.  The sampler
+    therefore accepts with plain ``delta_u <= 0 or rand < exp(-delta_u)`` -- no
+    extra acceptance factor.
+
+    All N beads go through the SAME :func:`_check_validity` used by the other
+    proposers, which rejects duplicate new sites among the moved set and any new
+    site occupied by a bead NOT in the moved set (i.e. another chain).  This is an
+    O(N) move (same cost class as :func:`propose_translation`).
+    """
+    N = state.chain_length
+    c = rng.randrange(state.n_chains)
+    if N < 2:
+        return MoveProposal("reptation", c, ok=False, state_changing=False)
+    coords = state.coords_unwrapped[c].astype(np.int64)
+    v = NN6[rng.randrange(6)]
+    remove_head = rng.random() < 0.5
+    new_coords = np.empty((N, 3), dtype=np.int64)
+    if remove_head:
+        new_coords[:N - 1] = coords[1:]
+        new_coords[N - 1] = coords[N - 1] + np.asarray(v, dtype=np.int64)
+    else:
+        new_coords[1:] = coords[:N - 1]
+        new_coords[0] = coords[0] + np.asarray(v, dtype=np.int64)
+    moved: Dict[int, Tuple[int, int, int]] = {}
+    changed = False
+    for mono in range(N):
+        gid = c * N + mono
+        new_pos = (int(new_coords[mono, 0]), int(new_coords[mono, 1]),
+                   int(new_coords[mono, 2]))
+        old_pos = (int(coords[mono, 0]), int(coords[mono, 1]), int(coords[mono, 2]))
+        moved[gid] = new_pos
+        if new_pos != old_pos:
+            changed = True
+    new_sites = _check_validity(state, moved)
+    if new_sites is _INVALID:
+        return MoveProposal("reptation", c, ok=False, state_changing=False)
+    return MoveProposal(
+        "reptation", c, ok=True, state_changing=changed,
+        moved=moved, new_sites=new_sites)
+
+
+def propose_chain_rotation(state: MultiChainState, rng: random.Random) -> MoveProposal:
+    """Rotate a WHOLE random chain rigidly about one of its own bead positions.
+
+    Unlike :func:`propose_pivot` (which re-folds only the tail past a pivot), this
+    reorients the entire chain: a pivot bead index ``j`` is chosen uniformly in
+    ``[0, N-1]`` and stays fixed, while every other bead ``i`` maps to
+    ``pivot + R @ (r_i - pivot)`` for a proper cubic rotation ``R``.  ``R`` is
+    drawn from the SAME 24-element pool as :func:`multichain_state._random_cubic_rotation`
+    (the 23 proper rotations in ``remd_uniform_chain_2_new.ROT_MATS`` plus the
+    identity); that helper is bound to a NumPy RNG, so the identical 24-way draw
+    is inlined here for the ``random.Random`` the proposers receive.
+
+    Detailed balance: SYMMETRIC (no Metropolis-Hastings correction).  The reverse
+    move uses the same chain ``c``, the same pivot bead index ``j`` (its position
+    and identity are unchanged since it never moves), and rotation ``R^{-1}``,
+    which is itself a proper cubic rotation and therefore in the same 24-element
+    pool with the same 1/24 draw probability; forward and reverse proposal
+    probabilities are equal.
+
+    A rigid rotation preserves all pairwise distances, so the rotated chain is
+    automatically self-avoiding and connectivity-preserving (bond vectors map
+    NN6 -> NN6); only collisions with OTHER chains' stationary beads can
+    invalidate it, and :func:`_check_validity` already checks exactly that.  The
+    pivot bead is excluded from ``moved`` (it does not move), mirroring
+    :func:`propose_pivot`.  This is an O(N) move.
+    """
+    N = state.chain_length
+    c = rng.randrange(state.n_chains)
+    if N < 2:
+        return MoveProposal("rotation", c, ok=False, state_changing=False)
+    j = rng.randrange(N)
+    # Same 24-way draw as multichain_state._random_cubic_rotation (23 proper
+    # rotations + identity), inlined for the random.Random RNG.
+    idx = rng.randrange(len(_remd.ROT_MATS) + 1)
+    if idx == len(_remd.ROT_MATS):
+        R = np.eye(3, dtype=np.int64)
+    else:
+        R = np.asarray(_remd.ROT_MATS[idx], dtype=np.int64)
+    coords = state.coords_unwrapped[c].astype(np.int64)
+    pivot = coords[j]
+    rotated = (coords - pivot) @ R.T + pivot  # integer rotation about the pivot
+    moved: Dict[int, Tuple[int, int, int]] = {}
+    changed = False
+    for mono in range(N):
+        if mono == j:
+            continue
+        gid = c * N + mono
+        new_pos = (int(rotated[mono, 0]), int(rotated[mono, 1]),
+                   int(rotated[mono, 2]))
+        old_pos = (int(coords[mono, 0]), int(coords[mono, 1]), int(coords[mono, 2]))
+        moved[gid] = new_pos
+        if new_pos != old_pos:
+            changed = True
+    new_sites = _check_validity(state, moved)
+    if new_sites is _INVALID:
+        return MoveProposal("rotation", c, ok=False, state_changing=False)
+    return MoveProposal(
+        "rotation", c, ok=True, state_changing=changed,
         moved=moved, new_sites=new_sites)
 
 

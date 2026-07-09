@@ -680,7 +680,8 @@ def test_independent_collapse_translations_all_accepted():
     rng = random.Random(0)
     rmc.mc_sweep(state, counters, 330.0, "hs", [400.0, 1.3], 320.0, 80.0,
                  lambda_intra=1.0, lambda_inter=0.0,
-                 n_local=0, n_translation=500, rng=rng, debug_contacts=True)
+                 n_local=0, n_translation=500, rng=rng,
+                 n_reptation=0, n_rotation=0, debug_contacts=True)
     idx = mvs.MOVE_INDEX["chain_translation"]
     # accepted (col 3) == state-changing valid (col 2): none rejected by Metropolis.
     assert counters[idx, 3] == counters[idx, 2]
@@ -694,7 +695,8 @@ def test_athermal_all_valid_state_changing_moves_accepted():
     rng = random.Random(1)
     rmc.mc_sweep(state, counters, 330.0, "hs", [400.0, 1.3], 320.0, 80.0,
                  lambda_intra=0.0, lambda_inter=0.0,
-                 n_local=800, n_translation=200, rng=rng, debug_contacts=True)
+                 n_local=800, n_translation=200, rng=rng,
+                 n_reptation=200, n_rotation=200, debug_contacts=True)
     assert np.array_equal(counters[:, 3], counters[:, 2])
     assert counters[:, 2].sum() > 0
 

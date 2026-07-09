@@ -37,7 +37,9 @@ except Exception:  # pragma: no cover - import guard
     _HAVE_H5PY = False
 
 MULTICHAIN_SNAPSHOT_SCHEMA_VERSION = 1
-MULTICHAIN_OUTPUT_SCHEMA_VERSION = 1
+# v2: added reptation/rotation move types (extra move-acceptance CSV rows) and the
+# reptation_acceptance_rate / rotation_acceptance_rate results-CSV columns.
+MULTICHAIN_OUTPUT_SCHEMA_VERSION = 2
 
 _INT16_MIN, _INT16_MAX = -32768, 32767
 _INT16_SAFE = 30000
@@ -321,6 +323,7 @@ RESULTS_CSV_COLUMNS = [
     # (rg_scale applied); std_chain_rg_mean_lattice is the raw-lattice value.
     "std_chain_rg_mean", "std_chain_rg_mean_lattice", "n_clusters_mean",
     "local_acceptance_rate", "translation_acceptance_rate",
+    "reptation_acceptance_rate", "rotation_acceptance_rate",
 ]
 
 
