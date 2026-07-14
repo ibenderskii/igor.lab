@@ -56,6 +56,40 @@ def chain_geometry_summary(state: MultiChainState) -> dict:
     }
 
 
+def degree_of_cohesion(state: MultiChainState) -> dict:
+    """Mean interchain center-of-mass distance (the paper's Dc) and Dc/L.
+
+    Dc = < |r_c^alpha - r_c^beta| > over all unordered chain pairs (alpha < beta).
+    Chain COMs come from the UNWRAPPED coordinates (each chain is internally
+    contiguous there and is never wrapped for geometry, exactly as in
+    :func:`multichain_state.per_chain_rg2`), so a COM may legitimately lie
+    outside ``[0, L)^3``.  Pairwise separations then use the minimum-image
+    convention with L = ``state.box_size``.  ``Dc/L`` is the dimensionless form
+    reported by the paper (Dc for an ideal-gas arrangement scales with L).
+    With M < 2 there are no interchain pairs, so both outputs are NaN.
+    """
+    M = state.n_chains
+    if M < 2:
+        nan = float("nan")
+        return {"degree_of_cohesion_lattice": nan,
+                "degree_of_cohesion_over_L": nan}
+    L = float(state.box_size)
+    coms = state.coords_unwrapped.astype(np.float64).mean(axis=1)  # (M, 3)
+    d = coms[:, None, :] - coms[None, :, :]                        # (M, M, 3)
+    # Min-imaging the SEPARATION (never the COMs individually) is exact: each
+    # chain COM is a single well-defined point derived from contiguous unwrapped
+    # coordinates, so the nearest periodic image of the difference is the
+    # physical distance even when a COM sits outside the primary box (L >=
+    # MIN_BOX_SIZE keeps the nearest image unambiguous).
+    d -= L * np.round(d / L)
+    dist = np.sqrt((d * d).sum(axis=-1))
+    Dc = float(dist[np.triu_indices(M, k=1)].mean())
+    return {
+        "degree_of_cohesion_lattice": Dc,
+        "degree_of_cohesion_over_L": Dc / L,
+    }
+
+
 def _cluster_components(n_chains: int, edges: Sequence[tuple]) -> List[int]:
     """Union-find component sizes over ``n_chains`` nodes given chain-pair edges."""
     parent = list(range(n_chains))
@@ -147,6 +181,7 @@ def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
     """
     geo = chain_geometry_summary(state)
     clu = cluster_summary(state, cluster_contact_threshold)
+    coh = degree_of_cohesion(state)
     counts = state.counts
     out = {
         "m_intra": int(counts.intra),
@@ -160,6 +195,8 @@ def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
         "largest_cluster_size": int(clu["largest_cluster_size"]),
         "largest_cluster_fraction": float(clu["largest_cluster_fraction"]),
         "n_clusters": int(clu["n_clusters"]),
+        "degree_of_cohesion_lattice": coh["degree_of_cohesion_lattice"],
+        "degree_of_cohesion_over_L": coh["degree_of_cohesion_over_L"],
     }
     out.update(per_chain_contacts(int(counts.intra), int(counts.inter),
                                   state.n_chains))
@@ -219,6 +256,14 @@ def compute_statistics(
         n_clusters = np.asarray(
             lane.get("n_clusters", []), dtype=float)[sl] \
             if lane.get("n_clusters") is not None else np.array([])
+        # Degree of cohesion (Dc, Dc/L).  NaN for M < 2 lanes; the nan-aware
+        # helpers below propagate that as NaN rather than raising.
+        dc_lat = np.asarray(
+            lane.get("degree_of_cohesion_lattice", []), dtype=float)[sl] \
+            if lane.get("degree_of_cohesion_lattice") is not None else np.array([])
+        dc_over_L = np.asarray(
+            lane.get("degree_of_cohesion_over_L", []), dtype=float)[sl] \
+            if lane.get("degree_of_cohesion_over_L") is not None else np.array([])
 
         mi_mean, mi_std = _mean(m_intra), _std(m_intra)
         me_mean, me_std = _mean(m_inter), _std(m_inter)
@@ -246,6 +291,12 @@ def compute_statistics(
                 np.asarray(lane["largest_cluster_size"], dtype=float)[sl]),
             "largest_cluster_fraction_mean": _mean(
                 np.asarray(lane["largest_cluster_fraction"], dtype=float)[sl]),
+            # Degree of cohesion: raw Dc in lattice units and the dimensionless
+            # Dc/L reported by the paper.
+            "degree_of_cohesion_lattice_mean": _mean(dc_lat),
+            "degree_of_cohesion_lattice_std": _std(dc_lat),
+            "degree_of_cohesion_over_L_mean": _mean(dc_over_L),
+            "degree_of_cohesion_over_L_std": _std(dc_over_L),
             "std_chain_rg_mean_lattice": _mean(std_rg_lat),
             "std_chain_rg_mean": rg_scale * _mean(std_rg_lat),
             "n_clusters_mean": _mean(n_clusters),

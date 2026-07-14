@@ -39,7 +39,8 @@ except Exception:  # pragma: no cover - import guard
 MULTICHAIN_SNAPSHOT_SCHEMA_VERSION = 1
 # v2: added reptation/rotation move types (extra move-acceptance CSV rows) and the
 # reptation_acceptance_rate / rotation_acceptance_rate results-CSV columns.
-MULTICHAIN_OUTPUT_SCHEMA_VERSION = 2
+# v3: added the degree-of-cohesion results-CSV columns (Dc and Dc/L, mean/std).
+MULTICHAIN_OUTPUT_SCHEMA_VERSION = 3
 
 _INT16_MIN, _INT16_MAX = -32768, 32767
 _INT16_SAFE = 30000
@@ -318,6 +319,11 @@ RESULTS_CSV_COLUMNS = [
     "Rg2_mean", "Rg2_mean_lattice",
     "f_inter_mean",
     "largest_cluster_size_mean", "largest_cluster_fraction_mean",
+    # Degree of cohesion (Komatsu, Koga & Berx, JCP 163, 191101 (2025)): the mean
+    # interchain center-of-mass distance Dc in lattice units, and its
+    # dimensionless form Dc/L (Dc for an ideal-gas arrangement scales with L).
+    "degree_of_cohesion_lattice_mean", "degree_of_cohesion_lattice_std",
+    "degree_of_cohesion_over_L_mean", "degree_of_cohesion_over_L_std",
     # Per-chain Rg heterogeneity and chain-cluster count (chain-collapse vs
     # mixed expanded/collapsed discrimination).  std_chain_rg_mean is a length
     # (rg_scale applied); std_chain_rg_mean_lattice is the raw-lattice value.
