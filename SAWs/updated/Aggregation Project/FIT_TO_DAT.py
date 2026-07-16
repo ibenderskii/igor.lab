@@ -123,15 +123,31 @@ the lattice model to reproduce the data.  A fitted scale far from 0.345 does not
 license reporting that scale as a result — it indicates the lattice-to-molecular
 mapping, the chain length, or the baseline is mis-specified.
 
-Always run --rg-feasibility-scan.  It scans the contact bias directly and reports
-the range of scalar Rg the baseline can produce at ANY bias.  If observed Rg
-values fall outside that reachable range, no b(T) can reproduce them and the fit
-is not scientifically valid for those points, however small its residuals.
+Always run --rg-feasibility-scan.  It reports reachability at two strengths, which
+must not be conflated:
+
+  finite scan   the range of scalar Rg produced over the CONFIGURED bias interval
+                [--rg-bias-min, --rg-bias-max].  A target outside it is
+                unreachable WITHIN THE SCANNED INTERVAL.  Because the scan is
+                finite it can never prove that no real b reproduces a target;
+                widening the interval is always a legitimate response.
+  asymptotic    the exact scalar-Rg range in the limits b -> +/-inf, computed in
+                closed form from the minimum- and maximum-contact slices of the
+                baseline.  A target outside THIS range cannot be reproduced by any
+                real bias, given the baseline support.  This is the only
+                reachability statement that licenses an all-b claim.
+
+Both are scalar-summary statements about the fitted Rg(T) curve; neither is a
+claim about full-distribution support, which is reported separately.
+
+Scientific status is structured per scale (nominal vs fitted), never a single
+VALID/NOT VALID Boolean, and never follows from optimizer convergence.
 
 Transition descriptors are distinct and both are reported:
   T_bias_zero     temperature where b(T) = 0 (bias sign change)
   T_rg_max_slope  temperature maximizing -dRg/dT of the fitted finite-chain
-                  curve; the primary finite-chain transition descriptor
+                  curve; the primary finite-chain transition descriptor.  It is
+                  null when the curve shows no resolved collapse.
 """
 
 from __future__ import annotations
@@ -1774,17 +1790,49 @@ def run_quick_test() -> int:
     check(c1 > c0, "higher Rg weight worsens contact loss (genuine trade-off)")
 
     print("Quick test 11: contact-mode fit is unchanged (backward compatibility)")
-    # Golden values measured from the pre-scalar-mode implementation (verified
-    # bit-identical against fit_lattice_contact_model_2.py).  Any drift here means
-    # the contact-histogram code path moved.
+    # Tests the SCIENCE, not the optimizer build: that the contact-only path still
+    # recovers the known synthetic truth and drives the objective to ~0. Exact
+    # golden constants (1e-9..1e-20 on optimizer output) were removed because they
+    # encode the arithmetic of one SciPy/BLAS build and break on another even when
+    # the implementation is correct — a false alarm that hides real regressions.
     rec_bc = fit_model_on("hs", all_idx, seed=123)
-    check(abs(rec_bc[0] - 799.9966075094676) < 1e-9
-          and abs(rec_bc[1] - 2.599989342750689) < 1e-12,
-          f"contact-only hs fit reproduces the pre-change result to <1e-9: "
-          f"got ({rec_bc[0]!r}, {rec_bc[1]!r})")
+    check(
+        abs(rec_bc[0] - h_true) < 0.01 and abs(rec_bc[1] - s_true) < 1e-4,
+        f"contact-only hs fit recovers the known synthetic parameters "
+        f"(h={rec_bc[0]:.6g} vs {h_true}, s={rec_bc[1]:.6g} vs {s_true})",
+    )
     obj_bc = objective(rec_bc, temps, m_centers, p_obs_mass, p0_mass, b_hs, loss_fn)
-    check(abs(obj_bc - 3.4364269928372306e-11) < 1e-20,
-          f"contact-only objective reproduces the pre-change value: {obj_bc:.6e}")
+    check(
+        obj_bc < 1e-8,
+        f"contact-only synthetic objective remains negligible: {obj_bc:.6e}",
+    )
+
+    # Compare the OLD and NEW mathematical pathways directly, which is the claim
+    # the golden constants were standing in for: model_contact_mass() is what the
+    # contact objective consumes, and the joint path must reduce to it exactly when
+    # the joint baseline is the contact baseline crossed with a single Rg bin.
+    p0_single = p0_mass[:, None]                       # one Rg bin -> Rg carries no info
+    ce_single = centers_to_edges(m_centers)
+    re_single = np.array([0.0, 1.0])
+    _, joint_rg_mass = predict_rg_from_joint(
+        p0_single, ce_single, re_single, temps, rec_bc, b_hs
+    )
+    check(
+        np.allclose(joint_rg_mass, 1.0),
+        "degenerate single-Rg-bin joint reweighting normalizes to unit mass",
+    )
+    contact_direct = np.array(
+        [model_contact_mass(p0_mass, m_centers, float(T), rec_bc, b_hs) for T in temps]
+    )
+    joint_contact = np.zeros_like(contact_direct)
+    for i, T in enumerate(temps):
+        w = np.exp(-b_hs(rec_bc, float(T)) * m_centers)
+        w = w * p0_mass
+        joint_contact[i] = w / w.sum()
+    check(
+        np.allclose(contact_direct, joint_contact, rtol=1e-12, atol=1e-15),
+        "model_contact_mass agrees with explicit exp[-b m] reweighting of P0(m)",
+    )
 
     failures.extend(_run_rg_scalar_tests(check))
 
@@ -2132,6 +2180,701 @@ def _run_rg_scalar_tests(check: Callable[[bool, str], None]) -> List[str]:
     sub_check(abs(tm["T_rg_max_slope"] - zc[0]) > 1e-6,
               f"T_rg_max_slope ({tm['T_rg_max_slope']:.4g}) is distinct from "
               f"T_bias_zero ({zc[0]:.4g}) for a finite chain")
+
+    local_failures.extend(_run_rg_regression_tests(check, sub_check))
+    return local_failures
+
+
+def _scalar_args(**overrides: Any) -> argparse.Namespace:
+    """A fully-defaulted scalar-mode Namespace built from the real CLI parser."""
+    args = build_arg_parser().parse_args([])
+    for k, v in overrides.items():
+        if not hasattr(args, k):
+            raise AttributeError(f"unknown CLI dest {k!r} in test override")
+        setattr(args, k, v)
+    return args
+
+
+def _write_scalar_inputs(
+    tdp: Path,
+    temps: np.ndarray,
+    targets: np.ndarray,
+    crg: np.ndarray,
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    *,
+    half_width: float = 0.02,
+    name: str = "single.dat",
+    baseline: str = "baseline.npz",
+) -> Tuple[str, str]:
+    """Write a scalar .dat and a joint baseline NPZ; return (dat_path, npz_path)."""
+    dat = tdp / name
+    lines = [
+        f"{t:.8g} {v:.8g} {v * (1.0 - half_width):.8g} {v * (1.0 + half_width):.8g}"
+        for t, v in zip(temps, targets)
+    ]
+    dat.write_text("# T Rg lo hi\n" + "\n".join(lines) + "\n")
+    npz = tdp / baseline
+    np.savez_compressed(npz, crg_prob=crg, c_edges=c_edges, rg_edges=rg_edges)
+    return str(dat), str(npz)
+
+
+def _run_rg_regression_tests(
+    check: Callable[[bool, str], None],
+    sub_check: Callable[[bool, str], None],
+) -> List[str]:
+    """Regression tests for the scale/feasibility/validity fixes."""
+    import tempfile
+
+    local_failures: List[str] = []
+
+    def rcheck(cond: bool, msg: str) -> None:
+        check(cond, msg)
+        if not cond:
+            local_failures.append(msg)
+
+    crg_s, ce_s, re_s = _make_synthetic_joint(coupling=1.0)
+    temps_s = np.linspace(270.0, 360.0, 12)
+    Tref_s, Tscale_s = float(temps_s.mean()), float(temps_s.max() - temps_s.min())
+    bfn_s = make_b_fn("tc_scale", Tref_s, Tscale_s)
+    true_p = np.array([3.0, 315.0])
+
+    # ---------------------------------------------------------------- test G --
+    print("Scalar-Rg test 12: joint baseline validation rejects malformed input")
+    good_args = (ce_s, re_s, crg_s)
+    try:
+        validate_joint_baseline(*good_args)
+        ok_valid = True
+    except ValueError:
+        ok_valid = False
+    rcheck(ok_valid, "a valid joint baseline passes validation")
+
+    def _rejects(c_e: np.ndarray, r_e: np.ndarray, p: np.ndarray, label: str) -> bool:
+        try:
+            validate_joint_baseline(c_e, r_e, p)
+        except ValueError:
+            return True
+        return False
+
+    ce_nan = ce_s.copy(); ce_nan[2] = np.nan
+    re_nan = re_s.copy(); re_nan[3] = np.nan
+    crg_nan = crg_s.copy(); crg_nan[1, 1] = np.nan
+    crg_neg = crg_s.copy(); crg_neg[2, 2] = -0.5
+    crg_zero = np.zeros_like(crg_s)
+    ce_nonmono = ce_s.copy(); ce_nonmono[5] = ce_nonmono[3]
+    re_nonmono = re_s.copy(); re_nonmono[5] = re_nonmono[3]
+
+    rcheck(_rejects(ce_nan, re_s, crg_s, "c"), "NaN in c_edges is rejected")
+    rcheck(_rejects(ce_s, re_nan, crg_s, "r"), "NaN in rg_edges is rejected")
+    rcheck(_rejects(ce_s, re_s, crg_nan, "p"), "NaN in crg_prob is rejected")
+    rcheck(_rejects(ce_s, re_s, crg_neg, "n"), "negative probability is rejected")
+    rcheck(_rejects(ce_s, re_s, crg_zero, "z"), "zero total mass is rejected")
+    rcheck(_rejects(ce_s, re_s, crg_s[:-1], "s"), "shape mismatch is rejected")
+    rcheck(_rejects(ce_nonmono, re_s, crg_s, "m"), "non-monotonic c_edges is rejected")
+    rcheck(_rejects(ce_s, re_nonmono, crg_s, "m"), "non-monotonic rg_edges is rejected")
+    rcheck(
+        _rejects(ce_s.reshape(-1, 1), re_s, crg_s, "d"), "2-D c_edges is rejected"
+    )
+    rcheck(_rejects(ce_s, re_s, crg_s.ravel(), "d"), "1-D crg_prob is rejected")
+
+    # A NaN edge must not sneak through the np.diff(edges) <= 0 formulation.
+    rcheck(
+        not np.any(np.diff(ce_nan) <= 0),
+        "np.diff(edges) <= 0 alone does NOT catch a NaN edge (why order matters)",
+    )
+
+    # Tiny roundoff negatives are tolerated, clipped, and reported.
+    crg_tiny = crg_s.copy(); crg_tiny[0, 0] = -1e-16
+    san, notes = sanitize_joint_baseline(ce_s, re_s, crg_tiny)
+    rcheck(
+        np.all(san >= 0.0) and abs(san.sum() - 1.0) < 1e-12 and len(notes) >= 1,
+        "tiny negative roundoff is clipped, normalized, and reported",
+    )
+
+    # ---------------------------------------------------------------- test E --
+    print("Scalar-Rg test 13: asymptotic b -> +/-inf limits match the limiting slices")
+    for summ in ("mean", "rms"):
+        lim = asymptotic_rg_limits(
+            crg_s, ce_s, re_s, summary=summ, rg_scale=0.345
+        )
+        rg_centers_s = 0.5 * (re_s[:-1] + re_s[1:])
+        cmarg = crg_s.sum(axis=1)
+        nzb = np.flatnonzero(cmarg > 0.0)
+        lo_bin, hi_bin = int(nzb[0]), int(nzb[-1])
+        exp_pos = float(rg_summary_from_mass(
+            (crg_s[lo_bin] / crg_s[lo_bin].sum())[None, :], rg_centers_s, summ)[0])
+        exp_neg = float(rg_summary_from_mass(
+            (crg_s[hi_bin] / crg_s[hi_bin].sum())[None, :], rg_centers_s, summ)[0])
+        rcheck(
+            abs(lim["rg_limit_b_pos_inf_lattice"] - exp_pos) < 1e-12,
+            f"[{summ}] b->+inf limit equals the min-contact conditional slice summary",
+        )
+        rcheck(
+            abs(lim["rg_limit_b_neg_inf_lattice"] - exp_neg) < 1e-12,
+            f"[{summ}] b->-inf limit equals the max-contact conditional slice summary",
+        )
+        rcheck(
+            lim["asymptotic_reachable_rg_min"] == min(exp_pos, exp_neg)
+            and lim["asymptotic_reachable_rg_max"] == max(exp_pos, exp_neg),
+            f"[{summ}] asymptotic range uses min()/max(), not an assumed ordering",
+        )
+        rcheck(
+            abs(lim["rg_limit_b_pos_inf_observed"]
+                - 0.345 * lim["rg_limit_b_pos_inf_lattice"]) < 1e-12,
+            f"[{summ}] observed asymptotic limit = rg_scale * lattice limit",
+        )
+
+    # A large finite bias must approach the asymptotic limit.
+    m_c = 0.5 * (ce_s[:-1] + ce_s[1:])
+    r_c = 0.5 * (re_s[:-1] + re_s[1:])
+    lim_rms = asymptotic_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
+    big_pos = joint_reweight_stats(crg_s, m_c, r_c, 200.0, "rms")["pred_rg_lattice"]
+    big_neg = joint_reweight_stats(crg_s, m_c, r_c, -200.0, "rms")["pred_rg_lattice"]
+    rcheck(
+        abs(big_pos - lim_rms["rg_limit_b_pos_inf_lattice"]) < 1e-6,
+        "b=+200 numerically approaches the exact b->+inf limit",
+    )
+    rcheck(
+        abs(big_neg - lim_rms["rg_limit_b_neg_inf_lattice"]) < 1e-6,
+        "b=-200 numerically approaches the exact b->-inf limit",
+    )
+    # The ordering of the two limits flips with the sign of the contact-Rg coupling,
+    # which is exactly why min()/max() is required.
+    crg_anti, ce_a, re_a = _make_synthetic_joint(coupling=-1.0)
+    lim_anti = asymptotic_rg_limits(crg_anti, ce_a, re_a, summary="rms", rg_scale=1.0)
+    rcheck(
+        (lim_rms["rg_limit_b_pos_inf_lattice"] > lim_rms["rg_limit_b_neg_inf_lattice"])
+        != (lim_anti["rg_limit_b_pos_inf_lattice"]
+            > lim_anti["rg_limit_b_neg_inf_lattice"]),
+        "limit ordering flips with the sign of the contact-Rg coupling",
+    )
+
+    # ---------------------------------------------------------------- test H --
+    print("Scalar-Rg test 14: a no-collapse curve reports no transition temperature")
+    # coupling=0 makes Rg independent of contacts, so b(T) cannot move Rg at all.
+    crg_flat, ce_f, re_f = _make_synthetic_joint(coupling=0.0)
+    tm_flat = rg_curve_transition_metrics(
+        crg_flat, ce_f, re_f, true_p, bfn_s, 270.0, 360.0,
+        rg_scale=0.345, summary="rms", target_units="observed", n_grid=1001,
+    )
+    rcheck(tm_flat["collapse_detected"] is False,
+           "flat Rg(T) curve sets collapse_detected=False")
+    rcheck(tm_flat["T_rg_max_slope"] is None,
+           "flat Rg(T) curve sets T_rg_max_slope=None")
+    rcheck(tm_flat["slope_tolerance"] > 0.0, "slope_tolerance is reported and positive")
+
+    # An EXPANDING curve (Rg grows with T) must also report no collapse: the
+    # anti-coupled baseline with the same b(T) expands instead of collapsing.
+    tm_exp = rg_curve_transition_metrics(
+        crg_anti, ce_a, re_a, true_p, bfn_s, 270.0, 360.0,
+        rg_scale=0.345, summary="rms", target_units="observed", n_grid=1001,
+    )
+    rcheck(
+        tm_exp["curve"][-1] > tm_exp["curve"][0],
+        "the anti-coupled synthetic curve genuinely expands with temperature",
+    )
+    rcheck(
+        tm_exp["collapse_detected"] is False and tm_exp["T_rg_max_slope"] is None,
+        "expanding Rg(T) curve reports no collapse and no T_rg_max_slope",
+    )
+    # The real collapse case must still be detected.
+    tm_real = rg_curve_transition_metrics(
+        crg_s, ce_s, re_s, true_p, bfn_s, 270.0, 360.0,
+        rg_scale=0.345, summary="rms", target_units="observed", n_grid=1001,
+    )
+    rcheck(
+        tm_real["collapse_detected"] is True and tm_real["T_rg_max_slope"] is not None,
+        "a genuine collapse is still detected (no false negative)",
+    )
+
+    # ---------------------------------------------------------------- test D --
+    print("Scalar-Rg test 15: finite-scan wording makes no unsupported all-b claim")
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        reach = np.array([
+            joint_reweight_stats(crg_s, m_c, r_c, float(b), "rms")["pred_rg_lattice"]
+            for b in np.linspace(-10, 10, 401)
+        ])
+        # Just outside the scanned range but still inside the asymptotic range, so
+        # only the finite-scan warning fires and its wording can be checked alone.
+        lim_scan = asymptotic_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
+        gap_lo = float(lim_scan["asymptotic_reachable_rg_min"])
+        just_out = float(reach.min()) - 0.25 * (float(reach.min()) - gap_lo)
+        tgt_scan = np.array([just_out] * 3)
+        fs_scan = run_rg_feasibility_scan(
+            crg_s, ce_s, re_s, tgt_scan, 0.345 * tgt_scan,
+            rg_scale=0.345, summary="rms", bias_min=-10.0, bias_max=10.0,
+            bias_points=401, outdir=tdp, make_plots=False,
+        )
+        joined = " ".join(fs_scan["warnings"])
+        rcheck(
+            "within the scanned bias interval" in joined,
+            "the unreachable warning says 'within the scanned bias interval'",
+        )
+        rcheck(
+            "[-10, 10]" in joined,
+            f"the unreachable warning states the actual interval: {joined[:0] or '[-10, 10]'}",
+        )
+        rcheck(
+            "any bias" not in joined and "NO value of b(T)" not in joined,
+            "no warning claims 'any bias' or 'NO value of b(T)' from a finite scan",
+        )
+        rcheck(
+            fs_scan["reachability_status"] in (
+                "unreachable_within_scan", "boundary_limited"
+            ),
+            f"finite-scan miss classified as a scan-scoped status: "
+            f"{fs_scan['reachability_status']}",
+        )
+        rcheck(
+            "asymptotic" in fs_scan["definition_note"].lower()
+            and "not proof" in fs_scan["definition_note"].lower(),
+            "definition_note disclaims proof-of-impossibility for the finite scan",
+        )
+
+        # A target outside the ASYMPTOTIC range may make the stronger claim.
+        far = float(lim_scan["asymptotic_reachable_rg_max"]) * 3.0
+        tgt_far = np.array([far] * 3)
+        fs_far = run_rg_feasibility_scan(
+            crg_s, ce_s, re_s, tgt_far, 0.345 * tgt_far,
+            rg_scale=0.345, summary="rms", bias_min=-10.0, bias_max=10.0,
+            bias_points=401, outdir=tdp, make_plots=False,
+        )
+        asym_w = [w for w in fs_far["warnings"] if "asymptotic" in w.lower()]
+        rcheck(
+            bool(asym_w) and any("b -> +/-inf" in w for w in asym_w),
+            "an out-of-asymptotic-range target gets the stronger model-range warning",
+        )
+        rcheck(
+            fs_far["target_within_asymptotic_reachable_range"] is False,
+            "target_within_asymptotic_reachable_range=False for an impossible target",
+        )
+        rcheck(
+            any("any real bias" in w for w in asym_w),
+            "only the asymptotic warning is allowed to speak about all real bias",
+        )
+
+    # -------------------------------------------- unreachability vs roundoff --
+    print("Scalar-Rg test 15b: float noise never manufactures an unreachability claim")
+    # Unreachability is the strongest claim this script makes, so it must not rest
+    # on the last bit of a float. Converting a target observed -> lattice
+    # (x -> s*x -> s*x/s) is inexact for roughly 7% of values, by up to 1 ulp.
+    lo_r, hi_r = 2.0, 4.0
+    one_ulp_out = np.array([np.nextafter(hi_r, np.inf), np.nextafter(lo_r, -np.inf)])
+    rcheck(
+        int(np.sum((one_ulp_out < lo_r) | (one_ulp_out > hi_r))) == 2,
+        "a strict comparison DOES flag values 1 ulp outside the range (the artifact)",
+    )
+    rcheck(
+        _count_outside_range(one_ulp_out, lo_r, hi_r) == 0,
+        "the tolerance does not count values 1 ulp outside as unreachable",
+    )
+    # A real observed->lattice round-trip must never be counted as a miss.
+    rng_rt = np.random.default_rng(0)
+    xs = rng_rt.uniform(lo_r, hi_r, size=20000)
+    for s_rt in (0.345, 0.3, 1.0 / 3.0):
+        rt = (s_rt * xs) / s_rt
+        rcheck(
+            _count_outside_range(rt, float(xs.min()), float(xs.max())) == 0,
+            f"observed->lattice round-trip at scale {s_rt:.6g} yields no false "
+            f"unreachability",
+        )
+    # The tolerance must stay far below anything physically meaningful, so a real
+    # miss is still caught.
+    rcheck(
+        _count_outside_range(np.array([hi_r * 1.000001]), lo_r, hi_r) == 1
+        and _count_outside_range(np.array([hi_r * 2.0]), lo_r, hi_r) == 1,
+        "a physically meaningful excursion is still counted as unreachable",
+    )
+    rcheck(
+        RG_REACH_RTOL < 1e-6,
+        f"the reachability tolerance ({RG_REACH_RTOL:g}) is far below any "
+        f"experimental Rg precision",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        # A genuinely unreachable target must still be reported as such.
+        crg0, ce0, re0 = _make_synthetic_joint(coupling=0.0)
+        lim0 = asymptotic_rg_limits(crg0, ce0, re0, summary="rms", rg_scale=0.345)
+        far0 = float(lim0["asymptotic_reachable_rg_max"]) * 2.0
+        fs0_far = run_rg_feasibility_scan(
+            crg0, ce0, re0, np.array([far0] * 3), np.array([0.345 * far0] * 3),
+            rg_scale=0.345, summary="rms", bias_min=-10.0, bias_max=10.0,
+            bias_points=101, outdir=tdp, make_plots=False,
+        )
+        rcheck(
+            fs0_far["n_targets_outside_reachable"] == 3
+            and fs0_far["target_within_asymptotic_reachable_range"] is False,
+            "the tolerance still detects a genuinely unreachable target",
+        )
+        # A zero-coupling baseline is non-identifiable and must say so regardless.
+        rcheck(
+            any("weak" in w.lower() for w in fs0_far["warnings"])
+            and any("insensitive" in w.lower() for w in fs0_far["warnings"]),
+            "a zero-coupling baseline still reports weak coupling and bias "
+            "insensitivity",
+        )
+
+    # ---------------------------------------------------------------- test A --
+    print("Scalar-Rg test 16: effective-scale consistency in free-scale mode")
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        # Truth generated at 0.5, but --rg-scale starts at 0.30, so the fitted
+        # scale must move materially away from the initial value.
+        true_scale = 0.50
+        pred_lat_true, _, _ = predict_rg_summary_from_joint(
+            crg_s, ce_s, re_s, temps_s, true_p, bfn_s,
+            rg_scale=true_scale, summary="rms", target_units="observed",
+        )
+        tgt_true_obs = true_scale * pred_lat_true
+        dat_p, npz_p = _write_scalar_inputs(
+            tdp, temps_s, tgt_true_obs, crg_s, ce_s, re_s
+        )
+        out_a = tdp / "free"
+        a = _scalar_args(
+            rg_means_file=dat_p, baseline=npz_p, outdir=str(out_a),
+            model="tc_scale", rg_summary="rms", rg_target_units="observed",
+            rg_mean_loss="mse", rg_scale=0.30, fit_rg_scale=True,
+            rg_scale_min=0.2, rg_scale_max=0.8, no_plots=True,
+            rg_feasibility_scan=True, rg_bias_points=101, n_restarts=4, seed=7,
+        )
+        run_rg_scalar_mode(a)
+
+        summ_a = json.loads((out_a / "fit_summary.json").read_text())
+        # Copy the arrays out and close the handle: NpzFile keeps the file open,
+        # and Windows refuses to remove the temp directory while it is.
+        with np.load(out_a / "fit_results.npz", allow_pickle=False) as _z:
+            z = {k: _z[k] for k in _z.files}
+            z_files = list(_z.files)
+
+        eff = float(summ_a["rg_scale_effective"])
+        init = float(summ_a["rg_scale_initial"])
+        fitv = summ_a["rg_scale_fitted"]
+        rcheck(
+            summ_a["rg_scale_was_fitted"] is True and fitv is not None,
+            "free-scale run records rg_scale_was_fitted=True and a fitted scale",
+        )
+        rcheck(
+            abs(eff - float(fitv)) < 1e-12 and abs(init - 0.30) < 1e-12,
+            "rg_scale_effective == rg_scale_fitted and rg_scale_initial is preserved",
+        )
+        rcheck(
+            abs(eff - init) > 0.05,
+            f"the recovered scale differs materially from the initial "
+            f"({eff:.4g} vs {init:.4g})",
+        )
+        rcheck(
+            abs(eff - true_scale) < 1e-3,
+            f"the fitted scale recovers the synthetic truth ({eff:.6g} vs {true_scale})",
+        )
+        # The four consistency identities required of the effective scale.
+        rcheck(
+            np.allclose(z["rg_pred_observed"], eff * z["rg_pred_lattice"], rtol=1e-12),
+            "rg_pred_observed == rg_scale_effective * rg_pred_lattice",
+        )
+        rcheck(
+            np.allclose(z["rg_centers_observed"], eff * z["rg_centers_lattice"],
+                        rtol=1e-12),
+            "rg_centers_observed == rg_scale_effective * rg_centers_lattice",
+        )
+        rcheck(
+            np.allclose(z["rg_edges_observed"], eff * z["rg_edges_lattice"], rtol=1e-12),
+            "rg_edges_observed == rg_scale_effective * rg_edges_lattice",
+        )
+        rcheck(
+            np.allclose(z["rg_target_lattice"], z["rg_target_observed"] / eff,
+                        rtol=1e-12),
+            "rg_target_lattice == rg_target_observed / rg_scale_effective",
+        )
+        rcheck(
+            np.allclose(z["rg_target_observed"], z["rg_target_input"], rtol=1e-12),
+            "target_units=observed leaves rg_target_observed equal to the input",
+        )
+        # Nominal-scale fields must exist, be named _nominal, and differ.
+        rcheck(
+            np.allclose(z["rg_centers_observed_nominal"], init * z["rg_centers_lattice"],
+                        rtol=1e-12),
+            "rg_centers_observed_nominal uses rg_scale_initial",
+        )
+        rcheck(
+            not np.allclose(z["rg_centers_observed_nominal"], z["rg_centers_observed"]),
+            "nominal and effective observed centers are genuinely different arrays",
+        )
+        for key in ("rg_scale_initial", "rg_scale_fitted", "rg_scale_effective",
+                    "rg_scale_was_fitted"):
+            rcheck(key in z_files, f"NPZ carries {key}")
+        rcheck(
+            abs(float(z["rg_scale_effective"]) - eff) < 1e-12
+            and abs(float(z["rg_scale_initial"]) - init) < 1e-12
+            and bool(z["rg_scale_was_fitted"]) is True,
+            "NPZ scale provenance matches the JSON summary",
+        )
+
+        # ------------------------------------------------------------ test B --
+        print("Scalar-Rg test 17: nominal and fitted feasibility are separate results")
+        fd = summ_a["feasibility_diagnostics"]
+        rcheck(
+            isinstance(fd, dict) and "nominal_scale" in fd and "fitted_scale" in fd,
+            "feasibility_diagnostics has nominal_scale and fitted_scale sections",
+        )
+        rcheck(
+            fd["nominal_scale"] is not None and fd["fitted_scale"] is not None,
+            "free-scale mode populates BOTH feasibility sections",
+        )
+        rcheck(
+            abs(fd["nominal_scale"]["rg_scale_used"] - init) < 1e-12
+            and abs(fd["fitted_scale"]["rg_scale_used"] - eff) < 1e-12,
+            "each feasibility section records the scale it actually used",
+        )
+        rcheck(
+            fd["nominal_scale"]["rg_scale_used"] != fd["fitted_scale"]["rg_scale_used"],
+            "the two feasibility summaries differ",
+        )
+        for fn in ("rg_feasibility_nominal.csv", "rg_feasibility_nominal_summary.json",
+                   "rg_feasibility_fitted.csv", "rg_feasibility_fitted_summary.json"):
+            rcheck((out_a / fn).exists(), f"free-scale mode writes {fn}")
+        rcheck(
+            not (out_a / "rg_feasibility_summary.json").exists(),
+            "free-scale mode does not write the ambiguous unprefixed feasibility file",
+        )
+        # The nominal scan must not be clobbered by the fitted scan.
+        nom_txt = json.loads((out_a / "rg_feasibility_nominal_summary.json").read_text())
+        fit_txt = json.loads((out_a / "rg_feasibility_fitted_summary.json").read_text())
+        rcheck(
+            abs(nom_txt["rg_scale_used"] - init) < 1e-12
+            and abs(fit_txt["rg_scale_used"] - eff) < 1e-12,
+            "the fitted scan did not overwrite the nominal scan's file",
+        )
+        rcheck(
+            nom_txt["scale_label"] == "nominal scale"
+            and fit_txt["scale_label"] == "fitted scale",
+            "each feasibility file labels its own scale",
+        )
+
+        # The fitted model must be classified by the FITTED result, not the nominal.
+        sv = summ_a["scientific_validity"]
+        rcheck(
+            "fixed_or_nominal_scale" in sv and "fitted_scale" in sv,
+            "scientific_validity is split into nominal and fitted branches",
+        )
+        rcheck(
+            sv["fitted_scale"] is not None
+            and sv["fitted_scale"]["status"] == "supported_as_mapping_diagnostic",
+            f"a good fitted-scale run is a mapping diagnostic, not plain 'supported': "
+            f"{sv['fitted_scale']['status'] if sv['fitted_scale'] else None}",
+        )
+        rcheck(
+            sv["fitted_scale"]["within_asymptotic_range"] is True
+            and sv["fitted_scale"]["reachable_within_scan"] is True,
+            "the fitted-scale branch reports its own reachability, not the nominal's",
+        )
+
+        # ------------------------------------------------------------ test C --
+        print("Scalar-Rg test 18: fit_summary.json stays consumable downstream")
+        model_name = summ_a["model"]
+        param_names_c = summ_a["param_names"]
+        params_c = np.array([summ_a["params"][n] for n in param_names_c], dtype=float)
+        Tref_c = summ_a["Tref"]
+        Tscale_c = summ_a["Tscale"]
+        rcheck(
+            model_name == "tc_scale" and param_names_c == ["A", "Tc"],
+            f"top-level model/param_names match the registry: {model_name}, "
+            f"{param_names_c}",
+        )
+        rcheck(
+            param_names_c == list(MODEL_REGISTRY[model_name]["param_names"]),
+            "param_names is exactly the registry order for the model",
+        )
+        b_fn_c = make_b_fn(model_name, Tref_c, Tscale_c)
+        val_c = b_fn_c(params_c, 300.0)
+        rcheck(
+            np.isfinite(val_c),
+            f"make_b_fn accepts the reconstructed model vector: b(300)={val_c:.6g}",
+        )
+        rcheck(
+            "rg_scale" not in summ_a["params"],
+            "rg_scale is NOT inside summary['params']",
+        )
+        rcheck(
+            len(summ_a["params"]) == len(MODEL_REGISTRY[model_name]["param_names"]),
+            "params carries thermodynamic parameters only",
+        )
+        rcheck(
+            "rg_scale" in summ_a["parameters"],
+            "the fitted rg_scale is still reported, in 'parameters'",
+        )
+        # The prediction rebuilt from the summary alone must match the NPZ.
+        pl_c, _, _ = predict_rg_summary_from_joint(
+            crg_s, ce_s, re_s, z["temps"], params_c, b_fn_c,
+            rg_scale=float(summ_a["rg_scale_effective"]), summary="rms",
+            target_units="observed",
+        )
+        rcheck(
+            np.allclose(pl_c, z["rg_pred_lattice"], rtol=1e-10),
+            "the summary alone reproduces the saved prediction exactly",
+        )
+        # units section must not fabricate a physical unit.
+        rcheck(
+            summ_a["units"]["mapping"]
+            == "Rg_observed = rg_scale_effective * Rg_lattice",
+            "units.mapping states the effective-scale mapping",
+        )
+        rcheck(
+            summ_a["units"]["target_input"] == "observed",
+            "units.target_input records the target unit system",
+        )
+        # Strict JSON, no NaN/Infinity tokens anywhere.
+        for fn in ("fit_summary.json", "rg_feasibility_nominal_summary.json",
+                   "rg_feasibility_fitted_summary.json"):
+            txt = (out_a / fn).read_text()
+            json.loads(txt)
+            rcheck(
+                "NaN" not in txt and "Infinity" not in txt,
+                f"{fn} contains no NaN/Infinity tokens",
+            )
+
+    # ---------------------------------------------------------- fixed-scale ---
+    print("Scalar-Rg test 19: fixed-scale mode keeps its filenames and null fitted scale")
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        fixed_scale = 0.345
+        pl_fx, _, _ = predict_rg_summary_from_joint(
+            crg_s, ce_s, re_s, temps_s, true_p, bfn_s,
+            rg_scale=fixed_scale, summary="rms", target_units="observed",
+        )
+        dat_p, npz_p = _write_scalar_inputs(
+            tdp, temps_s, fixed_scale * pl_fx, crg_s, ce_s, re_s
+        )
+        out_f = tdp / "fixed"
+        a = _scalar_args(
+            rg_means_file=dat_p, baseline=npz_p, outdir=str(out_f),
+            model="tc_scale", rg_summary="rms", rg_target_units="observed",
+            rg_mean_loss="mse", rg_scale=fixed_scale, fit_rg_scale=False,
+            no_plots=True, rg_feasibility_scan=True, rg_bias_points=101,
+            n_restarts=4, seed=7,
+        )
+        run_rg_scalar_mode(a)
+        summ_f = json.loads((out_f / "fit_summary.json").read_text())
+        # Existing output filenames for fixed-scale scalar mode are unchanged.
+        for fn in ("rg_feasibility.csv", "rg_feasibility_summary.json"):
+            rcheck((out_f / fn).exists(),
+                   f"fixed-scale mode keeps the historical filename {fn}")
+        for fn in ("rg_feasibility_nominal_summary.json",
+                   "rg_feasibility_fitted_summary.json"):
+            rcheck(not (out_f / fn).exists(),
+                   f"fixed-scale mode does not emit {fn}")
+        rcheck(
+            summ_f["rg_scale_fitted"] is None
+            and summ_f["rg_scale_was_fitted"] is False
+            and abs(summ_f["rg_scale_effective"] - fixed_scale) < 1e-12
+            and abs(summ_f["rg_scale_initial"] - fixed_scale) < 1e-12,
+            "fixed-scale mode: fitted is null, effective == initial == --rg-scale",
+        )
+        fd_f = summ_f["feasibility_diagnostics"]
+        rcheck(
+            fd_f["fitted_scale"] is None and fd_f["nominal_scale"] is not None,
+            "fixed-scale mode: fitted_scale is null, nominal_scale is the result",
+        )
+        rcheck(
+            summ_f["scientific_validity"]["fitted_scale"] is None,
+            "fixed-scale mode: no fitted-scale validity branch",
+        )
+        rcheck(
+            summ_f["scientific_validity"]["fixed_or_nominal_scale"]["status"]
+            == "supported",
+            f"a good fixed-scale run is 'supported': "
+            f"{summ_f['scientific_validity']['fixed_or_nominal_scale']['status']}",
+        )
+        rcheck(
+            "rg_scale" not in summ_f["params"]
+            and summ_f["param_names"] == ["A", "Tc"],
+            "fixed-scale summary also keeps params thermodynamic-only",
+        )
+        # rg_scale is a mapping constant: it must never reach b_fn.
+        rcheck(
+            len(summ_f["params"]) == 2
+            and np.isfinite(make_b_fn("tc_scale", summ_f["Tref"], summ_f["Tscale"])(
+                np.array([summ_f["params"]["A"], summ_f["params"]["Tc"]]), 300.0)),
+            "fixed-scale summary reconstructs a working b_fn",
+        )
+
+    # ---------------------------------------------------------------- test F --
+    print("Scalar-Rg test 20: zero Rg support overlap is handled per mode")
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        # Baseline Rg support is [1, 5] lattice. At rg_scale=0.345 a target of
+        # ~40 observed units maps to ~116 lattice: entirely disjoint.
+        disjoint_obs = np.full(temps_s.size, 40.0)
+        dat_p, npz_p = _write_scalar_inputs(
+            tdp, temps_s, disjoint_obs, crg_s, ce_s, re_s
+        )
+        a_fixed = _scalar_args(
+            rg_means_file=dat_p, baseline=npz_p, outdir=str(tdp / "zs_fixed"),
+            model="tc_scale", rg_summary="rms", rg_target_units="observed",
+            rg_scale=0.345, fit_rg_scale=False, no_plots=True,
+            rg_feasibility_scan=False, n_restarts=2, seed=3,
+        )
+        raised = ""
+        try:
+            run_rg_scalar_mode(a_fixed)
+        except ValueError as exc:
+            raised = str(exc)
+        rcheck(
+            ZERO_SUPPORT_OVERLAP_MESSAGE in raised,
+            f"fixed-scale mode raises on zero support overlap: {raised[:60]!r}",
+        )
+        rcheck(
+            not (tdp / "zs_fixed" / "fit_results.npz").exists(),
+            "fixed-scale zero-overlap run aborts BEFORE optimization (no outputs)",
+        )
+
+        # Free-scale mode records the nominal failure but is allowed to proceed,
+        # because moving the scale can restore overlap.
+        out_z = tdp / "zs_free"
+        a_free = _scalar_args(
+            rg_means_file=dat_p, baseline=npz_p, outdir=str(out_z),
+            model="tc_scale", rg_summary="rms", rg_target_units="observed",
+            rg_scale=0.345, fit_rg_scale=True, rg_scale_min=5.0, rg_scale_max=30.0,
+            no_plots=True, rg_feasibility_scan=True, rg_bias_points=51,
+            n_restarts=3, seed=3,
+        )
+        ran = True
+        try:
+            run_rg_scalar_mode(a_free)
+        except ValueError:
+            ran = False
+        rcheck(ran, "free-scale mode is not aborted by a nominal support failure")
+        if ran:
+            summ_z = json.loads((out_z / "fit_summary.json").read_text())
+            sd = summ_z["support_diagnostics"]
+            rcheck(
+                sd["nominal_scale_support_overlap"]["zero_support_overlap"] is True,
+                "the nominal-scale support failure is recorded, not hidden",
+            )
+            rcheck(
+                summ_z["scientific_validity"]["fixed_or_nominal_scale"]["status"]
+                == "zero_support_overlap",
+                "nominal-scale validity is marked zero_support_overlap",
+            )
+            # rg_scale_max=30 lets the fitted scale restore overlap.
+            restored = (
+                sd["effective_scale_support_overlap"]["has_support_overlap"] is True
+            )
+            rcheck(
+                restored,
+                f"a fitted scale ({summ_z['rg_scale_effective']:.4g}) restores support "
+                f"overlap, and the fitted branch is reassessed on its own terms",
+            )
+            rcheck(
+                summ_z["scientific_validity"]["fitted_scale"]["support_overlap"]
+                is restored,
+                "fitted-scale diagnostics reassess support at the effective scale",
+            )
+            rcheck(
+                summ_z["scientific_validity"]["fitted_scale"]["status"]
+                != "zero_support_overlap",
+                "the fitted result is NOT classified by the nominal support failure",
+            )
 
     return local_failures
 
@@ -3491,6 +4234,113 @@ def load_rg_mean_file(path: str) -> Dict[str, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
+# Scalar Rg(T) mode: joint baseline validation
+# ---------------------------------------------------------------------------
+
+# Tiny negative entries are accepted as roundoff from whatever produced the
+# baseline and are clipped by sanitize_joint_baseline(); anything more negative
+# than this is a real defect and is rejected.
+JOINT_BASELINE_NEG_TOL = -1e-15
+
+
+def validate_joint_baseline(
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    crg_prob: np.ndarray,
+    *,
+    neg_tol: float = JOINT_BASELINE_NEG_TOL,
+) -> None:
+    """Validate the joint baseline P0(m, Rg) or raise ValueError.
+
+    Checks dimensionality, shape consistency, finiteness, strict monotonicity of
+    both edge vectors, non-negativity within ``neg_tol``, and positive total mass.
+
+    Finiteness is checked BEFORE monotonicity on purpose: ``np.diff`` of an array
+    containing NaN yields NaN, and ``NaN <= 0`` is False, so a NaN edge would
+    silently pass a bare ``np.any(np.diff(edges) <= 0)`` test.
+    """
+    c_edges = np.asarray(c_edges, dtype=float)
+    rg_edges = np.asarray(rg_edges, dtype=float)
+    crg_prob = np.asarray(crg_prob, dtype=float)
+
+    if c_edges.ndim != 1:
+        raise ValueError(f"c_edges must be 1-D, got shape {c_edges.shape}")
+    if rg_edges.ndim != 1:
+        raise ValueError(f"rg_edges must be 1-D, got shape {rg_edges.shape}")
+    if crg_prob.ndim != 2:
+        raise ValueError(f"crg_prob must be 2-D, got shape {crg_prob.shape}")
+    if c_edges.size < 2:
+        raise ValueError(f"c_edges needs >= 2 entries (>= 1 bin), got {c_edges.size}")
+    if rg_edges.size < 2:
+        raise ValueError(f"rg_edges needs >= 2 entries (>= 1 bin), got {rg_edges.size}")
+
+    expected = (c_edges.size - 1, rg_edges.size - 1)
+    if crg_prob.shape != expected:
+        raise ValueError(
+            f"crg_prob shape must be (len(c_edges)-1, len(rg_edges)-1) = {expected}, "
+            f"got {crg_prob.shape}"
+        )
+
+    # Finiteness first — see the docstring note about NaN and np.diff.
+    if not np.all(np.isfinite(c_edges)):
+        raise ValueError("c_edges contains non-finite value(s) (NaN or inf)")
+    if not np.all(np.isfinite(rg_edges)):
+        raise ValueError("rg_edges contains non-finite value(s) (NaN or inf)")
+    if not np.all(np.isfinite(crg_prob)):
+        raise ValueError("crg_prob contains non-finite value(s) (NaN or inf)")
+
+    if np.any(np.diff(c_edges) <= 0.0):
+        raise ValueError("c_edges must be strictly increasing")
+    if np.any(np.diff(rg_edges) <= 0.0):
+        raise ValueError("rg_edges must be strictly increasing")
+
+    if np.any(crg_prob < neg_tol):
+        worst = float(crg_prob.min())
+        raise ValueError(
+            f"crg_prob must be non-negative within tolerance {neg_tol:g}; "
+            f"most negative entry is {worst:.6g}"
+        )
+    total = float(crg_prob.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(f"crg_prob must carry positive total mass, got {total!r}")
+
+
+def sanitize_joint_baseline(
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    crg_prob: np.ndarray,
+    *,
+    neg_tol: float = JOINT_BASELINE_NEG_TOL,
+) -> Tuple[np.ndarray, List[str]]:
+    """Validate, clip roundoff negatives, and normalize the joint baseline once.
+
+    Returns (crg_prob_normalized, notes) where ``notes`` records any clipping or
+    renormalization that was applied, so callers can surface it rather than
+    silently changing the user's baseline.
+    """
+    validate_joint_baseline(c_edges, rg_edges, crg_prob, neg_tol=neg_tol)
+    crg = np.asarray(crg_prob, dtype=float).copy()
+    notes: List[str] = []
+
+    if np.any(crg < 0.0):
+        worst = float(crg.min())
+        crg = np.clip(crg, 0.0, None)
+        notes.append(
+            f"Joint baseline contained negative roundoff (most negative {worst:.3g}, "
+            f"within the {neg_tol:g} tolerance); clipped to zero."
+        )
+    total = float(crg.sum())
+    if total <= 0.0:
+        raise ValueError("crg_prob total mass is non-positive after clipping")
+    if abs(total - 1.0) > 1e-9:
+        crg = crg / total
+        notes.append(
+            f"Joint baseline total mass was {total:.10g}; normalized to 1."
+        )
+    return crg, notes
+
+
+# ---------------------------------------------------------------------------
 # Scalar Rg(T) mode: prediction
 # ---------------------------------------------------------------------------
 
@@ -3930,10 +4780,16 @@ def rg_curve_transition_metrics(
     Evaluates Rg(T) on a dense grid spanning the observed temperature interval
     and reports where the collapse is steepest:
 
-    ``T_rg_max_slope``        argmax_T of -dRg/dT
+    ``T_rg_max_slope``        argmax_T of -dRg/dT, or None when the curve shows no
+                              resolved collapse (flat or expanding with T)
     ``rg_max_negative_slope`` the value of -dRg/dT there (target units per K)
+    ``collapse_detected``     whether a collapse was resolved at all
     ``T_rg_half``             the temperature nearest the midpoint between the
                               fitted Rg at the low and high ends of the interval
+
+    A curve that is flat or expands with temperature has no collapse temperature;
+    reporting the argmax of numerical noise as one would be a fabricated
+    transition, so T_rg_max_slope is None in that case.
 
     T_rg_max_slope is the primary finite-chain transition descriptor and is a
     DIFFERENT quantity from the bias zero-crossing b(T) = 0.
@@ -3948,14 +4804,26 @@ def rg_curve_transition_metrics(
     slope = np.gradient(curve, grid)
     neg_slope = -slope
     k = int(np.argmax(neg_slope))
+    max_negative_slope = float(np.max(neg_slope))
+
+    # Scale-aware floor: a slope below this is indistinguishable from the
+    # numerical noise of the curve over this temperature interval.
+    slope_tolerance = max(
+        1e-10,
+        1e-6 * max(float(np.ptp(curve)), 1.0) / max(float(t_hi) - float(t_lo), 1.0),
+    )
+    collapse_detected = bool(max_negative_slope > slope_tolerance)
+    T_rg_max_slope: Optional[float] = float(grid[k]) if collapse_detected else None
 
     rg_start, rg_end = float(curve[0]), float(curve[-1])
     mid = 0.5 * (rg_start + rg_end)
     j = int(np.argmin(np.abs(curve - mid)))
 
     return {
-        "T_rg_max_slope": float(grid[k]),
-        "rg_max_negative_slope": float(neg_slope[k]),
+        "T_rg_max_slope": T_rg_max_slope,
+        "rg_max_negative_slope": max_negative_slope,
+        "collapse_detected": collapse_detected,
+        "slope_tolerance": float(slope_tolerance),
         "T_rg_half": float(grid[j]),
         "rg_half_value": float(curve[j]),
         "rg_at_T_low": rg_start,
@@ -4019,6 +4887,96 @@ def joint_reweight_stats(
     }
 
 
+def asymptotic_rg_limits(
+    crg_prob: np.ndarray,
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    *,
+    summary: str,
+    rg_scale: float,
+    tolerance: float = 0.0,
+) -> Dict[str, Any]:
+    """Exact scalar Rg limits of the contact-only reweighting model as b -> +/-inf.
+
+    Because P_b(m, Rg) ∝ P0(m, Rg) exp[-b m], the weight exp[-b m] becomes
+    infinitely peaked on one contact bin in each limit:
+
+        b -> +inf  concentrates on the MINIMUM contact value carrying baseline mass
+        b -> -inf  concentrates on the MAXIMUM contact value carrying baseline mass
+
+    The limiting scalar is therefore the chosen summary of the normalized
+    conditional P0(Rg | m) at that single contact bin.  Unlike a finite bias scan
+    this is an exact statement about the model (given an exact baseline support),
+    so it can support the stronger claim that a target is outside the model's
+    asymptotic scalar range.
+
+    Which limit is the compact one depends on the sign of the contact-Rg
+    relationship, so the reachable interval is built with min()/max() rather than
+    by assuming an ordering.
+    """
+    if summary not in RG_SUMMARY_CHOICES:
+        raise ValueError(
+            f"Unknown Rg summary {summary!r}. Choose from {RG_SUMMARY_CHOICES}."
+        )
+    validate_joint_baseline(c_edges, rg_edges, crg_prob)
+    crg_prob = np.asarray(crg_prob, dtype=float)
+    rg_edges = np.asarray(rg_edges, dtype=float)
+    rg_centers = 0.5 * (rg_edges[:-1] + rg_edges[1:])
+
+    contact_marginal = crg_prob.sum(axis=1)
+    nonzero_contact_bins = np.flatnonzero(contact_marginal > tolerance)
+    if nonzero_contact_bins.size == 0:
+        raise ValueError(
+            "joint baseline has no contact bin with mass above the tolerance; "
+            "asymptotic Rg limits are undefined"
+        )
+    min_bin = int(nonzero_contact_bins[0])
+    max_bin = int(nonzero_contact_bins[-1])
+
+    def _slice_summary(bin_index: int) -> float:
+        row = crg_prob[bin_index]
+        z = float(row.sum())
+        if not np.isfinite(z) or z <= 0.0:
+            raise ValueError(
+                f"contact bin {bin_index} has non-positive conditional Rg mass"
+            )
+        cond = row / z
+        return float(rg_summary_from_mass(cond[None, :], rg_centers, summary)[0])
+
+    rg_pos_inf = _slice_summary(min_bin)   # b -> +inf  -> fewest contacts
+    rg_neg_inf = _slice_summary(max_bin)   # b -> -inf  -> most contacts
+
+    lo = min(rg_pos_inf, rg_neg_inf)
+    hi = max(rg_pos_inf, rg_neg_inf)
+    scale = float(rg_scale)
+
+    m_centers = 0.5 * (np.asarray(c_edges, dtype=float)[:-1]
+                       + np.asarray(c_edges, dtype=float)[1:])
+    return {
+        "min_supported_contact_bin": min_bin,
+        "max_supported_contact_bin": max_bin,
+        "min_supported_contact_value": float(m_centers[min_bin]),
+        "max_supported_contact_value": float(m_centers[max_bin]),
+        "contact_support_tolerance": float(tolerance),
+        "rg_limit_b_pos_inf_lattice": rg_pos_inf,
+        "rg_limit_b_neg_inf_lattice": rg_neg_inf,
+        "rg_limit_b_pos_inf_observed": rg_pos_inf * scale,
+        "rg_limit_b_neg_inf_observed": rg_neg_inf * scale,
+        "asymptotic_reachable_rg_min": lo,
+        "asymptotic_reachable_rg_max": hi,
+        "asymptotic_reachable_rg_min_observed": lo * scale,
+        "asymptotic_reachable_rg_max_observed": hi * scale,
+        "rg_scale_used": scale,
+        "interpretation": (
+            "Exact scalar-Rg range of this fixed joint baseline under contact-only "
+            "reweighting, in the limits b -> +/-inf, assuming the baseline support is "
+            "exact. b -> +inf concentrates on the minimum-contact slice and b -> -inf "
+            "on the maximum-contact slice. This bounds the SCALAR SUMMARY only; it is "
+            "not a statement about full-distribution support."
+        ),
+    }
+
+
 def run_rg_feasibility_scan(
     crg_prob: np.ndarray,
     c_edges: np.ndarray,
@@ -4033,6 +4991,10 @@ def run_rg_feasibility_scan(
     bias_points: int,
     outdir: Path,
     make_plots: bool,
+    rg_lower_lattice: Optional[np.ndarray] = None,
+    rg_upper_lattice: Optional[np.ndarray] = None,
+    file_prefix: str = "rg_feasibility",
+    scale_label: str = "fixed scale",
 ) -> Dict[str, Any]:
     """Scan scalar contact bias b and report which Rg values are reachable.
 
@@ -4047,8 +5009,19 @@ def run_rg_feasibility_scan(
     identity is claimed: only the numerical derivative and the moments are
     reported.
 
-    Writes rg_feasibility.csv, rg_feasibility_summary.json, and (unless plots are
-    disabled) rg_feasibility.png.  Returns the summary dict.
+    The scan covers only the FINITE interval [bias_min, bias_max], so it can never
+    prove that no real b reproduces a target.  For that stronger statement the
+    exact b -> +/-inf limits are computed alongside it by asymptotic_rg_limits().
+
+    Writes <file_prefix>.csv, <file_prefix>_summary.json, and (unless plots are
+    disabled) <file_prefix>.png.  ``scale_label`` names the mapping being probed
+    ("fixed scale", "nominal scale", "fitted scale") and appears in the outputs so
+    a nominal-scale and a fitted-scale scan can never be confused.
+
+    Returns the summary dict.  Does not raise on zero support overlap: it reports
+    ``reachability_status == "zero_support_overlap"`` and leaves the decision to
+    abort to the caller, because a free-scale diagnostic run may legitimately
+    continue past a nominal-scale support failure.
     """
     if not np.isfinite(bias_min) or not np.isfinite(bias_max):
         raise ValueError("--rg-bias-min/--rg-bias-max must be finite")
@@ -4059,7 +5032,10 @@ def run_rg_feasibility_scan(
         )
     if int(bias_points) < 3:
         raise ValueError(f"--rg-bias-points must be >= 3, got {bias_points}")
+    if not np.isfinite(rg_scale) or rg_scale <= 0.0:
+        raise ValueError(f"rg_scale must be finite and positive, got {rg_scale!r}")
 
+    validate_joint_baseline(c_edges, rg_edges, crg_prob)
     c_edges = np.asarray(c_edges, dtype=float)
     rg_edges = np.asarray(rg_edges, dtype=float)
     crg_prob = np.asarray(crg_prob, dtype=float)
@@ -4096,6 +5072,37 @@ def run_rg_feasibility_scan(
     reach_lo_lat, reach_hi_lat = float(pred_lat.min()), float(pred_lat.max())
     tgt_lo_lat, tgt_hi_lat = float(rg_target_lattice.min()), float(rg_target_lattice.max())
 
+    # Exact b -> +/-inf limits: the only basis on which this function may claim a
+    # target is unreachable by ANY bias rather than merely by the scanned ones.
+    asym = asymptotic_rg_limits(
+        crg_prob, c_edges, rg_edges, summary=summary, rg_scale=rg_scale
+    )
+    asym_lo = float(asym["asymptotic_reachable_rg_min"])
+    asym_hi = float(asym["asymptotic_reachable_rg_max"])
+    n_outside_asym = _count_outside_range(rg_target_lattice, asym_lo, asym_hi)
+    target_within_asymptotic = bool(n_outside_asym == 0)
+    asym["n_targets_outside_asymptotic_range"] = n_outside_asym
+    asym["target_within_asymptotic_reachable_range"] = target_within_asymptotic
+
+    # Support overlap between the target bounds and the baseline Rg support,
+    # via the same helper the driver uses. The full lower/upper range is
+    # preferred; central values are the fallback when the caller has no bounds.
+    if rg_lower_lattice is not None and rg_upper_lattice is not None:
+        support_lo_arr, support_hi_arr = rg_lower_lattice, rg_upper_lattice
+        support_basis = "target lower/upper bounds"
+    else:
+        support_lo_arr, support_hi_arr = rg_target_lattice, rg_target_lattice
+        support_basis = "target central values"
+    support_info = rg_support_overlap(
+        support_lo_arr, support_hi_arr, baseline_rg_min, baseline_rg_max,
+        basis=support_basis,
+    )
+    target_support_min = support_info["target_support_min_lattice"]
+    target_support_max = support_info["target_support_max_lattice"]
+    support_overlap_lo = support_info["support_overlap_lo"]
+    support_overlap_hi = support_info["support_overlap_hi"]
+    zero_support_overlap = support_info["zero_support_overlap"]
+
     warnings: List[str] = []
 
     # 1. Target outside the baseline Rg support.
@@ -4103,26 +5110,46 @@ def run_rg_feasibility_scan(
         warnings.append(
             f"Target Rg range [{tgt_lo_lat:.4g}, {tgt_hi_lat:.4g}] (lattice) is not "
             f"fully inside the baseline Rg support [{baseline_rg_min:.4g}, "
-            f"{baseline_rg_max:.4g}] (lattice). The baseline cannot represent the "
-            f"out-of-support values at any bias."
+            f"{baseline_rg_max:.4g}] (lattice). Reweighting rescales P0(m, Rg) "
+            f"bin-by-bin and cannot create mass where the baseline has none, so the "
+            f"out-of-support values are unreachable for every real bias. This is an "
+            f"exact support statement, not a finite-scan conclusion."
         )
-    if not (baseline_rg_min < tgt_lo_lat or tgt_hi_lat < baseline_rg_max):
-        pass  # overlap presence is checked by the caller via support_overlap below
+    if zero_support_overlap:
+        warnings.append(
+            f"ZERO Rg support overlap at this scale: the target support "
+            f"[{target_support_min:.4g}, {target_support_max:.4g}] (lattice, from "
+            f"{support_basis}) does not intersect the joint baseline Rg support "
+            f"[{baseline_rg_min:.4g}, {baseline_rg_max:.4g}] (lattice). The scalar "
+            f"fit is meaningless at this scale."
+        )
 
-    # 2. Target outside the reachable scalar range over the scanned bias window.
-    n_unreach = int(
-        np.sum((rg_target_lattice < reach_lo_lat) | (rg_target_lattice > reach_hi_lat))
-    )
+    # 2. Target outside the reachable scalar range over the SCANNED bias interval.
+    #    A finite scan cannot license a claim about all real b; the asymptotic
+    #    limits below carry that claim instead.
+    n_unreach = _count_outside_range(rg_target_lattice, reach_lo_lat, reach_hi_lat)
     target_within_reachable = bool(n_unreach == 0)
     if not target_within_reachable:
         warnings.append(
             f"{n_unreach} of {rg_target_lattice.size} target Rg value(s) fall outside "
             f"the reachable scalar-{summary} range [{reach_lo_lat:.4g}, {reach_hi_lat:.4g}] "
             f"(lattice) = [{reach_lo_lat * rg_scale:.4g}, {reach_hi_lat * rg_scale:.4g}] "
-            f"(observed) over bias in [{bias_min:g}, {bias_max:g}]. "
-            f"NO value of b(T) can reproduce those points: the fit cannot be "
-            f"scientifically valid for them without changing the baseline, the "
-            f"chain length, or rg_scale."
+            f"(observed) within the scanned bias interval [{bias_min:g}, {bias_max:g}]. "
+            f"This is a statement about the scanned interval only, not about all real "
+            f"b: widen it with --rg-bias-min/--rg-bias-max to test further."
+        )
+
+    # 2b. Target outside the EXACT asymptotic range: a defensible model-level claim.
+    if not target_within_asymptotic:
+        warnings.append(
+            f"{n_outside_asym} of {rg_target_lattice.size} target Rg value(s) fall "
+            f"outside the asymptotic scalar-Rg range [{asym_lo:.4g}, {asym_hi:.4g}] "
+            f"(lattice) = [{asym_lo * rg_scale:.4g}, {asym_hi * rg_scale:.4g}] "
+            f"(observed) of this fixed joint baseline and contact-only reweighting "
+            f"model, evaluated exactly in the limits b -> +/-inf. Those points are "
+            f"outside the asymptotic scalar-Rg range of this model and cannot be "
+            f"reproduced by any real bias without changing the baseline, the chain "
+            f"length, or rg_scale."
         )
 
     # 3. Weak contact-Rg coupling at the baseline.
@@ -4146,12 +5173,14 @@ def run_rg_feasibility_scan(
             f"window; the bias cannot drive a collapse transition."
         )
 
-    # 5. Target range reachable only at a bias-grid boundary.
+    # 5. Target range matched or approached only at a bias-grid boundary. This
+    #    makes the finite-scan reachability verdict inconclusive in either
+    #    direction, so it is detected whether or not the target looked reachable.
     edge_frac = 0.02
     n_edge = max(1, int(np.ceil(edge_frac * bias_grid.size)))
     boundary_reached = False
-    if target_within_reachable and rg_span_lat > 0:
-        # Which bias index best reproduces each target?
+    if rg_span_lat > 0:
+        # Which bias index comes closest to each target?
         idx = np.array(
             [int(np.argmin(np.abs(pred_lat - t))) for t in rg_target_lattice], dtype=int
         )
@@ -4160,11 +5189,22 @@ def run_rg_feasibility_scan(
         )
         if boundary_reached:
             warnings.append(
-                f"At least one target Rg value is matched only at the edge of the "
-                f"scanned bias window [{bias_min:g}, {bias_max:g}]. Widen the window "
-                f"with --rg-bias-min/--rg-bias-max, or treat the implied bias as a "
+                f"The reachability conclusion is not conclusive because at least one "
+                f"target is matched or approached at the boundary of the scanned bias "
+                f"interval [{bias_min:g}, {bias_max:g}]. Repeat with a wider interval "
+                f"using --rg-bias-min/--rg-bias-max, or treat the implied bias as a "
                 f"lower bound in magnitude."
             )
+
+    # ---- reachability classification ---------------------------------------
+    if zero_support_overlap:
+        reachability_status = "zero_support_overlap"
+    elif boundary_reached:
+        reachability_status = "boundary_limited"
+    elif n_unreach > 0:
+        reachability_status = "unreachable_within_scan"
+    else:
+        reachability_status = "reachable_within_scan"
 
     # Theoretical derivative check (exact only for the 'mean' summary).
     deriv_check: Dict[str, Any] = {
@@ -4200,6 +5240,9 @@ def run_rg_feasibility_scan(
     summary_dict: Dict[str, Any] = {
         "rg_summary": summary,
         "rg_scale": float(rg_scale),
+        "rg_scale_used": float(rg_scale),
+        "scale_label": str(scale_label),
+        "file_prefix": str(file_prefix),
         "bias_min": float(bias_min),
         "bias_max": float(bias_max),
         "bias_points": int(bias_points),
@@ -4224,24 +5267,45 @@ def run_rg_feasibility_scan(
         "n_targets_outside_reachable": n_unreach,
         "target_within_reachable_range": target_within_reachable,
         "target_reached_only_at_bias_boundary": bool(boundary_reached),
+        "reachability_status": reachability_status,
         "max_abs_d_rg_db": float(max_abs_dg),
         "derivative_check": deriv_check,
+        "asymptotic_limits": asym,
+        "target_within_asymptotic_reachable_range": target_within_asymptotic,
+        "asymptotic_reachable_rg_min": asym_lo,
+        "asymptotic_reachable_rg_max": asym_hi,
+        "asymptotic_reachable_rg_min_observed": float(asym_lo * rg_scale),
+        "asymptotic_reachable_rg_max_observed": float(asym_hi * rg_scale),
+        "support_overlap": support_info,
         "warnings": warnings,
         "units_note": (
             "Fields without an explicit _observed suffix are in LATTICE units. "
-            "Observed units = rg_scale * lattice units."
+            "Observed units = rg_scale_used * lattice units."
         ),
         "definition_note": (
-            "reachable_rg_* is the range of the scalar Rg summary over the scanned "
-            "bias window, i.e. what P0(m,Rg) can produce for ANY constant bias b. "
-            "A target outside it cannot be fit by any b(T)."
+            "reachable_rg_* is the range of the scalar Rg summary over the SCANNED "
+            "bias interval [bias_min, bias_max] only. A target outside it is not "
+            "reachable within that interval; because the scan is finite this is NOT "
+            "proof that no real b reproduces it. The exact all-b statement lives in "
+            "asymptotic_limits, which evaluates b -> +/-inf in closed form."
+        ),
+        "reachability_status_note": (
+            "reachable_within_scan | unreachable_within_scan | boundary_limited | "
+            "zero_support_overlap. unreachable_within_scan is a statement about the "
+            "scanned interval, never a proof of impossibility over all real b."
         ),
     }
 
     outdir.mkdir(parents=True, exist_ok=True)
-    csv_path = outdir / "rg_feasibility.csv"
+    csv_path = outdir / f"{file_prefix}.csv"
     with open(csv_path, "w", newline="") as fh:
         writer = csv.writer(fh)
+        # Column-level provenance: every _observed column in this file uses this
+        # one scale, so a nominal and a fitted scan can never be read as one table.
+        writer.writerow([
+            f"# scale_label={scale_label}", f"rg_scale_used={rg_scale:.10g}",
+            f"rg_summary={summary}",
+        ])
         writer.writerow([
             "bias", "pred_rg_lattice", "pred_rg_observed", "mean_contacts",
             "cov_contact_rg", "corr_contact_rg", "d_rg_db",
@@ -4255,7 +5319,7 @@ def run_rg_feasibility_scan(
             ])
     print(f"Saved: {csv_path}")
 
-    json_path = outdir / "rg_feasibility_summary.json"
+    json_path = outdir / f"{file_prefix}_summary.json"
     with open(json_path, "w") as fh:
         json.dump(summary_dict, fh, indent=2, cls=_NpEncoder, allow_nan=False)
     print(f"Saved: {json_path}")
@@ -4274,18 +5338,23 @@ def run_rg_feasibility_scan(
         ax.axhline(float(rg_target_observed.min()), color="tab:orange", lw=0.8, ls="--")
         ax.axhline(float(rg_target_observed.max()), color="tab:orange", lw=0.8, ls="--")
         ax.axvline(0.0, color="gray", lw=0.8, ls=":")
+        ax.axhline(asym_lo * rg_scale, color="tab:purple", lw=1.0, ls="-.",
+                   label="asymptotic b→±∞ scalar-Rg limits")
+        ax.axhline(asym_hi * rg_scale, color="tab:purple", lw=1.0, ls="-.")
         ax.set_xlabel("contact bias b  (P ∝ P0(m,Rg) exp[-b m])")
         ax.set_ylabel(f"scalar Rg, observed units (rg_scale={rg_scale:g})")
-        status = "REACHABLE" if target_within_reachable else "NOT REACHABLE"
         ax.set_title(
-            f"Bias→Rg reachability [{summary}] — target range {status}\n"
+            f"Bias→Rg reachability [{summary}] — {scale_label}, "
+            f"rg_scale={rg_scale:.6g}\n"
+            f"status: {reachability_status} over scanned bias "
+            f"[{bias_min:g}, {bias_max:g}]\n"
             f"reachable [{reach_lo_lat * rg_scale:.4g}, {reach_hi_lat * rg_scale:.4g}], "
             f"target [{float(rg_target_observed.min()):.4g}, "
             f"{float(rg_target_observed.max()):.4g}]"
         )
         ax.legend(fontsize=8)
         fig.tight_layout()
-        p = outdir / "rg_feasibility.png"
+        p = outdir / f"{file_prefix}.png"
         fig.savefig(p, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {p}")
@@ -4403,6 +5472,222 @@ def _rg_scalar_transitions(
     }
 
 
+def baseline_rg_support(
+    crg_prob: np.ndarray, rg_edges: np.ndarray
+) -> Tuple[float, float]:
+    """Lattice-unit [min, max] Rg edges of the bins carrying baseline mass."""
+    rg_marginal = np.asarray(crg_prob, dtype=float).sum(axis=0)
+    nz = np.nonzero(rg_marginal > 0.0)[0]
+    if nz.size == 0:
+        raise ValueError("joint baseline has zero total Rg mass")
+    rg_edges = np.asarray(rg_edges, dtype=float)
+    return float(rg_edges[nz[0]]), float(rg_edges[nz[-1] + 1])
+
+
+def rg_targets_at_scale(
+    rg_target_input: np.ndarray,
+    rg_lower_input: np.ndarray,
+    rg_upper_input: np.ndarray,
+    *,
+    target_units: str,
+    rg_scale: float,
+) -> Dict[str, np.ndarray]:
+    """Express the scalar targets in both unit systems for ONE given scale.
+
+    The conversion is applied exactly once, in the direction fixed by
+    ``target_units``:
+
+        observed:  Rg_lattice  = Rg_observed / rg_scale
+        lattice :  Rg_observed = rg_scale * Rg_lattice   (reporting only; the
+                   supplied values are already lattice and are never divided)
+
+    Callers pass rg_scale_initial for nominal diagnostics and rg_scale_effective
+    for anything describing the fitted model, which is what keeps the two from
+    being mixed.
+    """
+    if target_units not in RG_TARGET_UNITS_CHOICES:
+        raise ValueError(
+            f"Unknown target_units {target_units!r}. "
+            f"Choose from {RG_TARGET_UNITS_CHOICES}."
+        )
+    if not np.isfinite(rg_scale) or rg_scale <= 0.0:
+        raise ValueError(f"rg_scale must be finite and positive, got {rg_scale!r}")
+    scale = float(rg_scale)
+    if target_units == "observed":
+        return {
+            "target_lattice": rg_target_input / scale,
+            "lower_lattice": rg_lower_input / scale,
+            "upper_lattice": rg_upper_input / scale,
+            "target_observed": rg_target_input.copy(),
+            "lower_observed": rg_lower_input.copy(),
+            "upper_observed": rg_upper_input.copy(),
+        }
+    return {
+        "target_lattice": rg_target_input.copy(),
+        "lower_lattice": rg_lower_input.copy(),
+        "upper_lattice": rg_upper_input.copy(),
+        "target_observed": scale * rg_target_input,
+        "lower_observed": scale * rg_lower_input,
+        "upper_observed": scale * rg_upper_input,
+    }
+
+
+def rg_support_overlap(
+    rg_lower_lattice: np.ndarray,
+    rg_upper_lattice: np.ndarray,
+    baseline_support_min: float,
+    baseline_support_max: float,
+    *,
+    basis: str = "target lower/upper bounds",
+) -> Dict[str, Any]:
+    """Overlap between the target Rg support and the joint baseline Rg support.
+
+    The target support uses the full supplied lower-upper range, which is the
+    most permissive honest reading of the data: if even that does not intersect
+    the baseline support, no bias and no temperature model can help.
+
+    Two intervals that merely touch at one point share no mass, so a positive-width
+    target support requires ``hi > lo`` to count as overlapping.  A target support
+    of zero width (identical bounds, or a caller falling back to central values) has
+    no interior to compare, so it is tested by containment instead — otherwise every
+    point target, including one sitting safely inside the baseline, would be
+    misreported as disjoint.
+    """
+    target_support_min = float(np.min(np.asarray(rg_lower_lattice, dtype=float)))
+    target_support_max = float(np.max(np.asarray(rg_upper_lattice, dtype=float)))
+    b_lo, b_hi = float(baseline_support_min), float(baseline_support_max)
+    lo = max(target_support_min, b_lo)
+    hi = min(target_support_max, b_hi)
+
+    if target_support_max <= target_support_min:
+        zero = not (b_lo <= target_support_min <= b_hi)
+        rule = "containment (zero-width target support)"
+    else:
+        zero = bool(hi <= lo)
+        rule = "interval intersection with positive width"
+
+    return {
+        "target_support_min_lattice": target_support_min,
+        "target_support_max_lattice": target_support_max,
+        "target_support_basis": basis,
+        "baseline_support_min_lattice": b_lo,
+        "baseline_support_max_lattice": b_hi,
+        "support_overlap_lo": lo,
+        "support_overlap_hi": hi,
+        "zero_support_overlap": bool(zero),
+        "has_support_overlap": bool(not zero),
+        "overlap_rule": rule,
+    }
+
+
+ZERO_SUPPORT_OVERLAP_MESSAGE = (
+    "Zero Rg support overlap between the scalar target bounds and the joint "
+    "baseline Rg support."
+)
+
+WEAK_CORR_THRESHOLD = 0.1
+
+# Relative slack when testing a target against a reachable/asymptotic Rg range.
+# Unreachability is the strongest claim this script makes, so it must not rest on
+# the last bit of a float: the observed -> lattice conversion (x -> s*x -> s*x/s) is
+# inexact for ~7% of values by up to 1 ulp (~2e-16 relative), which a strict
+# inequality would report as a genuine miss. 1e-9 leaves ample headroom over that
+# while staying orders of magnitude below any experimental Rg precision, so it can
+# only ever make the verdict MORE conservative, never manufacture a claim.
+RG_REACH_RTOL = 1e-9
+
+
+def _count_outside_range(
+    values: np.ndarray, lo: float, hi: float, *, rtol: float = RG_REACH_RTOL
+) -> int:
+    """Number of values outside [lo, hi], ignoring differences at rounding scale."""
+    v = np.asarray(values, dtype=float)
+    tol = rtol * max(abs(float(lo)), abs(float(hi)), 1.0)
+    return int(np.sum((v < float(lo) - tol) | (v > float(hi) + tol)))
+
+
+def observed_units_label(target_units: str) -> str:
+    """A generic label for the observed unit system.
+
+    The script has no CLI flag naming the physical unit, so the unit is whatever
+    the data file uses. Hardcoding "nm" would be a fabricated claim — especially
+    under --rg-target-units lattice, where no observed-unit data exists at all and
+    the observed axis is purely derived through rg_scale_effective.
+    """
+    if target_units == "observed":
+        return "observed units (as supplied in --rg-means-file)"
+    return "observed units (derived via rg_scale_effective; input was lattice units)"
+
+
+def classify_scientific_validity(
+    feasibility: Optional[Dict[str, Any]],
+    support: Dict[str, Any],
+    *,
+    is_fitted_scale: bool,
+) -> Dict[str, Any]:
+    """Structured validity for ONE scale, never a single overbroad Boolean.
+
+    Precedence, strongest objection first:
+      zero_support_overlap            target and baseline Rg supports are disjoint
+      outside_asymptotic_model_range  exact b -> +/-inf limits exclude the target
+      outside_scanned_range           unreachable within the scanned bias interval
+      boundary_limited                scan inconclusive at its own boundary
+      weak_contact_rg_coupling        contacts barely constrain Rg; near-unidentifiable
+      supported                       no objection survived
+
+    A clean fitted-scale result is reported as supported_as_mapping_diagnostic,
+    never plain "supported": moving the scale to fit the data is a sensitivity
+    probe, not an independent confirmation of the physically motivated mapping.
+    """
+    has_overlap = bool(support["has_support_overlap"])
+    out: Dict[str, Any] = {
+        "support_overlap": has_overlap,
+        "reachable_within_scan": None,
+        "within_asymptotic_range": None,
+        "reachability_status": None,
+        "contact_rg_correlation": None,
+        "status": None,
+    }
+    if feasibility is None:
+        out["status"] = (
+            "zero_support_overlap" if not has_overlap else "unverified_no_scan"
+        )
+        out["note"] = (
+            "No feasibility scan was run (--rg-feasibility-scan not given); "
+            "reachability is UNVERIFIED."
+            if has_overlap else ZERO_SUPPORT_OVERLAP_MESSAGE
+        )
+        return out
+
+    reachable = bool(feasibility["target_within_reachable_range"])
+    within_asym = bool(feasibility["target_within_asymptotic_reachable_range"])
+    boundary = bool(feasibility["target_reached_only_at_bias_boundary"])
+    corr = feasibility.get("baseline_contact_rg_correlation")
+    out.update({
+        "reachable_within_scan": reachable,
+        "within_asymptotic_range": within_asym,
+        "reachability_status": feasibility["reachability_status"],
+        "contact_rg_correlation": corr,
+    })
+
+    weak_coupling = corr is not None and abs(float(corr)) < WEAK_CORR_THRESHOLD
+
+    if not has_overlap or feasibility["reachability_status"] == "zero_support_overlap":
+        status = "zero_support_overlap"
+    elif not within_asym:
+        status = "outside_asymptotic_model_range"
+    elif not reachable:
+        status = "outside_scanned_range"
+    elif boundary:
+        status = "boundary_limited"
+    elif weak_coupling:
+        status = "weak_contact_rg_coupling"
+    else:
+        status = "supported_as_mapping_diagnostic" if is_fitted_scale else "supported"
+    out["status"] = status
+    return out
+
+
 def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     """Fit the contact-bias model directly to scalar Rg(T) data.
 
@@ -4479,34 +5764,68 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     c_edges = np.asarray(b_data["c_edges"], dtype=float)
     rg_edges_lattice = np.asarray(b_data["rg_edges"], dtype=float)
 
-    if c_edges.ndim != 1 or rg_edges_lattice.ndim != 1 or crg_prob.ndim != 2:
-        raise ValueError(
-            f"baseline shapes invalid: c_edges {c_edges.shape}, rg_edges "
-            f"{rg_edges_lattice.shape}, crg_prob {crg_prob.shape}"
-        )
-    expected = (c_edges.size - 1, rg_edges_lattice.size - 1)
-    if crg_prob.shape != expected:
-        raise ValueError(
-            f"baseline crg_prob shape must be (len(c_edges)-1, len(rg_edges)-1): "
-            f"got {crg_prob.shape}, expected {expected}"
-        )
-    if not np.all(np.isfinite(crg_prob)) or np.any(crg_prob < 0.0):
-        raise ValueError("baseline crg_prob must be finite and non-negative")
-    if crg_prob.sum() <= 0.0:
-        raise ValueError("baseline crg_prob must contain positive total mass")
-    if np.any(np.diff(c_edges) <= 0) or np.any(np.diff(rg_edges_lattice) <= 0):
-        raise ValueError("baseline c_edges and rg_edges must be strictly increasing")
+    # Single explicit gate: shapes, finiteness, monotonicity, non-negativity,
+    # positive mass. Runs before any clipping so a NaN edge cannot slip through a
+    # bare np.diff(edges) <= 0 test.
+    crg_prob, baseline_notes = sanitize_joint_baseline(
+        c_edges, rg_edges_lattice, crg_prob
+    )
+    for note in baseline_notes:
+        print(f"  NOTE: {note}")
 
     rg_centers_lattice = 0.5 * (rg_edges_lattice[:-1] + rg_edges_lattice[1:])
-    rg_scale = float(args.rg_scale)
+
+    # ---- the three scales -------------------------------------------------
+    # rg_scale_initial   the physically motivated --rg-scale, never overwritten
+    # rg_scale_fitted    the optimizer's value, only in --fit-rg-scale mode
+    # rg_scale_effective what every FITTED-model quantity is mapped with
+    # The effective scale is not known until after the fit; everything before it
+    # is nominal-scale by construction and is named accordingly.
+    rg_scale_initial = float(args.rg_scale)
 
     # ---- targets in both unit systems (conversion applied exactly once) -----
+    # Nominal-scale views, used for the pre-fit diagnostics only. The
+    # fitted-model views are recomputed with rg_scale_effective after the fit.
     if target_units == "observed":
-        rg_target_observed = rg_target_input.copy()
-        rg_target_lattice = rg_target_input / rg_scale
+        rg_target_observed_nominal = rg_target_input.copy()
+        rg_target_lattice_nominal = rg_target_input / rg_scale_initial
+        rg_lower_lattice_nominal = rg_lower_input / rg_scale_initial
+        rg_upper_lattice_nominal = rg_upper_input / rg_scale_initial
     else:
-        rg_target_lattice = rg_target_input.copy()
-        rg_target_observed = rg_scale * rg_target_input
+        # Targets are already lattice values: never divide them by any scale.
+        rg_target_lattice_nominal = rg_target_input.copy()
+        rg_lower_lattice_nominal = rg_lower_input.copy()
+        rg_upper_lattice_nominal = rg_upper_input.copy()
+        rg_target_observed_nominal = rg_scale_initial * rg_target_input
+
+    # ---- nominal-scale support overlap gate --------------------------------
+    # A fixed-scale run is a production fit: zero overlap means the target and the
+    # baseline describe disjoint Rg ranges, so the fit is meaningless and must not
+    # proceed. A free-scale run is a diagnostic: the scale may yet move the target
+    # into the baseline's support, so the nominal failure is recorded, not fatal,
+    # and is rechecked at rg_scale_effective after the fit.
+    baseline_rg_lo, baseline_rg_hi = baseline_rg_support(crg_prob, rg_edges_lattice)
+    nominal_support = rg_support_overlap(
+        rg_lower_lattice_nominal, rg_upper_lattice_nominal,
+        baseline_rg_lo, baseline_rg_hi,
+    )
+    if nominal_support["zero_support_overlap"]:
+        if not args.fit_rg_scale:
+            raise ValueError(
+                ZERO_SUPPORT_OVERLAP_MESSAGE
+                + f" Target support [{nominal_support['target_support_min_lattice']:.4g}, "
+                f"{nominal_support['target_support_max_lattice']:.4g}] (lattice) does "
+                f"not intersect the baseline support [{baseline_rg_lo:.4g}, "
+                f"{baseline_rg_hi:.4g}] (lattice) at rg_scale={rg_scale_initial:.6g}. "
+                f"A fixed-scale production fit cannot proceed. Check --rg-scale, the "
+                f"baseline, or the target units."
+            )
+        print(
+            "\n  WARNING: zero Rg support overlap at the NOMINAL scale "
+            f"(rg_scale={rg_scale_initial:.6g}). The nominal-scale mapping is INVALID. "
+            "Continuing only because --fit-rg-scale may move the target into the "
+            "baseline support; the check is repeated at the fitted scale."
+        )
 
     # ---- model setup --------------------------------------------------------
     spec = MODEL_REGISTRY[args.model]
@@ -4526,13 +5845,14 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     pspec = build_rg_scalar_param_spec(
         args.model,
         fit_rg_scale=bool(args.fit_rg_scale),
-        rg_scale=rg_scale,
+        rg_scale=rg_scale_initial,
         rg_scale_min=float(args.rg_scale_min),
         rg_scale_max=float(args.rg_scale_max),
         n_restarts=int(args.n_restarts),
         seed=int(args.seed),
     )
     param_names: List[str] = pspec["param_names"]
+    model_param_names: List[str] = pspec["model_param_names"]
     bounds: List[Tuple[float, float]] = pspec["bounds"]
     x0s: List[np.ndarray] = pspec["x0s"]
 
@@ -4543,7 +5863,10 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         "b_fn": b_fn,
         "spec": spec,
         "n_model_params": pspec["n_model_params"],
-        "rg_scale": rg_scale,
+        # In fixed-scale mode this is the scale the objective uses. In free-scale
+        # mode it is only the fallback for split_rg_scalar_params, which takes the
+        # scale from the parameter vector instead.
+        "rg_scale": rg_scale_initial,
         "fit_rg_scale": bool(args.fit_rg_scale),
         "rg_summary": args.rg_summary,
         "target_units": target_units,
@@ -4560,53 +5883,78 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     print(f"  temperatures: {n_temps}  range [{Tmin:.4g}, {Tmax:.4g}] K")
     print(f"  target units: {target_units}")
     print(f"  target Rg (input units):   [{rg_target_input.min():.4g}, {rg_target_input.max():.4g}]")
-    print(f"  target Rg (lattice units): [{rg_target_lattice.min():.4g}, {rg_target_lattice.max():.4g}]")
-    print(f"  target Rg (observed units):[{rg_target_observed.min():.4g}, {rg_target_observed.max():.4g}]")
+    print(f"  target Rg (lattice, nominal scale): "
+          f"[{rg_target_lattice_nominal.min():.4g}, {rg_target_lattice_nominal.max():.4g}]")
+    print(f"  target Rg (observed, nominal scale):"
+          f"[{rg_target_observed_nominal.min():.4g}, {rg_target_observed_nominal.max():.4g}]")
     print("  NOTE: the lower/upper columns are treated as DESCRIPTIVE BOUNDS, "
           "not standard errors.")
     print(f"Baseline NPZ: {args.baseline}")
     print(f"  keys: {list(b_data.files)}")
     print(f"  joint P0(m,Rg): available, shape {crg_prob.shape}")
     print(f"  Rg grid (lattice):  [{rg_edges_lattice.min():.4g}, {rg_edges_lattice.max():.4g}]")
-    print(f"  Rg grid (observed): [{rg_edges_lattice.min() * rg_scale:.4g}, "
-          f"{rg_edges_lattice.max() * rg_scale:.4g}]")
+    print(f"  Rg grid (observed, nominal scale): "
+          f"[{rg_edges_lattice.min() * rg_scale_initial:.4g}, "
+          f"{rg_edges_lattice.max() * rg_scale_initial:.4g}]")
     print(f"Model : {args.model}  —  {spec['description']}")
     print(f"  Rg summary: {args.rg_summary}   objective: {args.rg_mean_loss} "
           f"(mean per temperature)")
-    print(f"  rg_scale: {rg_scale:.8g} observed units per lattice unit"
+    print(f"  rg_scale (initial): {rg_scale_initial:.8g} observed units per lattice unit"
           + ("  [FITTED as a free parameter]" if args.fit_rg_scale else "  [FIXED]"))
-    print(f"  Parameters: {param_names}")
+    print(f"  Parameters: {param_names}"
+          + ("  (rg_scale is appended last and is NOT a thermodynamic parameter)"
+             if args.fit_rg_scale else ""))
 
-    # ---- feasibility scan (diagnostic only; never touches the fit) ----------
-    feasibility: Optional[Dict[str, Any]] = None
+    # ---- feasibility scan at the NOMINAL scale (diagnostic; never affects fit)
+    # In fixed-scale mode this is the production feasibility result and keeps the
+    # historical filenames. In free-scale mode it answers only "can the baseline
+    # reproduce the data using the physically motivated input scale?", is named
+    # *_nominal, and is never overwritten by the post-fit scan.
+    def _report_scan(fs: Dict[str, Any], label: str) -> None:
+        print(f"  [{label}] rg_scale used: {fs['rg_scale_used']:.8g}")
+        print(f"  baseline contact-Rg correlation: "
+              f"{fs['baseline_contact_rg_correlation']}")
+        print(f"  reachable scalar Rg (lattice):  "
+              f"[{fs['reachable_rg_min']:.4g}, {fs['reachable_rg_max']:.4g}]")
+        print(f"  reachable scalar Rg (observed): "
+              f"[{fs['reachable_rg_min_observed']:.4g}, "
+              f"{fs['reachable_rg_max_observed']:.4g}]")
+        print(f"  asymptotic scalar Rg (lattice, b -> +/-inf): "
+              f"[{fs['asymptotic_reachable_rg_min']:.4g}, "
+              f"{fs['asymptotic_reachable_rg_max']:.4g}]")
+        print(f"  target scalar Rg (observed):    "
+              f"[{fs['target_rg_min_observed']:.4g}, "
+              f"{fs['target_rg_max_observed']:.4g}]")
+        print(f"  reachability_status: {fs['reachability_status']}")
+        for w in fs["warnings"]:
+            print(f"  WARNING: {w}")
+        if not fs["warnings"]:
+            print("  No feasibility warnings.")
+
+    nominal_prefix = "rg_feasibility_nominal" if args.fit_rg_scale else "rg_feasibility"
+    nominal_label = "nominal scale" if args.fit_rg_scale else "fixed scale"
+
+    feasibility_nominal: Optional[Dict[str, Any]] = None
     if args.rg_feasibility_scan:
         # Console output stays ASCII: cp1252 terminals cannot encode arrows.
-        print("\n--- Bias-to-Rg feasibility scan (diagnostic; does not affect the fit) ---")
-        feasibility = run_rg_feasibility_scan(
+        print(f"\n--- Bias-to-Rg feasibility scan [{nominal_label}] "
+              f"(diagnostic; does not affect the fit) ---")
+        feasibility_nominal = run_rg_feasibility_scan(
             crg_prob, c_edges, rg_edges_lattice,
-            rg_target_lattice, rg_target_observed,
-            rg_scale=rg_scale,
+            rg_target_lattice_nominal, rg_target_observed_nominal,
+            rg_scale=rg_scale_initial,
             summary=args.rg_summary,
             bias_min=float(args.rg_bias_min),
             bias_max=float(args.rg_bias_max),
             bias_points=int(args.rg_bias_points),
             outdir=plot_dir,
             make_plots=make_plots,
+            rg_lower_lattice=rg_lower_lattice_nominal,
+            rg_upper_lattice=rg_upper_lattice_nominal,
+            file_prefix=nominal_prefix,
+            scale_label=nominal_label,
         )
-        print(f"  baseline contact-Rg correlation: "
-              f"{feasibility['baseline_contact_rg_correlation']}")
-        print(f"  reachable scalar Rg (lattice):  "
-              f"[{feasibility['reachable_rg_min']:.4g}, {feasibility['reachable_rg_max']:.4g}]")
-        print(f"  reachable scalar Rg (observed): "
-              f"[{feasibility['reachable_rg_min_observed']:.4g}, "
-              f"{feasibility['reachable_rg_max_observed']:.4g}]")
-        print(f"  target scalar Rg (observed):    "
-              f"[{feasibility['target_rg_min_observed']:.4g}, "
-              f"{feasibility['target_rg_max_observed']:.4g}]")
-        for w in feasibility["warnings"]:
-            print(f"  WARNING: {w}")
-        if not feasibility["warnings"]:
-            print("  No feasibility warnings.")
+        _report_scan(feasibility_nominal, nominal_label)
 
     # ---- train / validation split ------------------------------------------
     train_idx, val_idx = _resolve_split_indices(
@@ -4629,21 +5977,51 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     # ---- primary fit (training temperatures only) --------------------------
     best, best_obj, restart_records = fit_restarts(obj_fn, train_args, x0s, bounds)
     params_all = np.asarray(best.x, dtype=float)
-    model_params, fitted_scale = split_rg_scalar_params(
-        params_all, cfg["n_model_params"], cfg["fit_rg_scale"], rg_scale
+    n_model_params = cfg["n_model_params"]
+    model_params, _ = split_rg_scalar_params(
+        params_all, n_model_params, cfg["fit_rg_scale"], rg_scale_initial
     )
     boundary_hits = count_boundary_hits(params_all, bounds, param_names)
+
+    # ---- the three scales, resolved once -----------------------------------
+    # Every fitted-model quantity below maps with rg_scale_effective. The initial
+    # scale is kept verbatim for provenance and for the nominal diagnostics; it is
+    # never overwritten. model_params carries thermodynamic parameters ONLY, so
+    # b_fn never sees rg_scale.
+    rg_scale_fitted = (
+        float(params_all[n_model_params]) if args.fit_rg_scale else None
+    )
+    rg_scale_effective = (
+        rg_scale_fitted if rg_scale_fitted is not None else rg_scale_initial
+    )
 
     print("\nBest-fit parameters:")
     for name, val in zip(param_names, params_all):
         print(f"  {name} = {val:.6g}")
     if args.fit_rg_scale:
         print(f"  (rg_scale fitted within [{args.rg_scale_min:g}, {args.rg_scale_max:g}]; "
-              f"fixed-scale input was {rg_scale:g})")
+              f"initial input scale was {rg_scale_initial:g})")
+    print(f"  rg_scale_initial   = {rg_scale_initial:.8g}")
+    print(f"  rg_scale_fitted    = "
+          + (f"{rg_scale_fitted:.8g}" if rg_scale_fitted is not None else "None (not fitted)"))
+    print(f"  rg_scale_effective = {rg_scale_effective:.8g}  "
+          f"(used for ALL fitted-model outputs)")
     print(f"Objective ({args.rg_mean_loss}, mean over {train_idx.size} train temps) "
           f"= {best_obj:.6g}")
     if boundary_hits:
         print(f"  WARNING: parameter(s) resting on a bound: {', '.join(boundary_hits)}")
+
+    # ---- fitted-model target views (conversion applied exactly once) --------
+    tgt_eff = rg_targets_at_scale(
+        rg_target_input, rg_lower_input, rg_upper_input,
+        target_units=target_units, rg_scale=rg_scale_effective,
+    )
+    rg_target_lattice = tgt_eff["target_lattice"]
+    rg_target_observed = tgt_eff["target_observed"]
+    rg_lower_lattice = tgt_eff["lower_lattice"]
+    rg_upper_lattice = tgt_eff["upper_lattice"]
+    rg_centers_observed = rg_scale_effective * rg_centers_lattice
+    rg_edges_observed = rg_scale_effective * rg_edges_lattice
 
     # ---- predictions at all temperatures -----------------------------------
     pred = _rg_scalar_predict(cfg, params_all, temps)
@@ -4685,6 +6063,44 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
               f"objective={mt['objective_mean']:.6g}  rmse={mt['rmse']:.6g}  "
               f"mae={mt['mae']:.6g}  max|err|={mt['max_abs_error']:.6g}")
 
+    # ---- feasibility scan at the FITTED scale ------------------------------
+    # Answers a different question from the nominal scan: "can the fitted mapping
+    # reproduce the data after allowing the scale to move?" It is a
+    # mapping-sensitivity diagnostic, NOT the primary scientific test, and it never
+    # overwrites the nominal scan's files.
+    feasibility_fitted: Optional[Dict[str, Any]] = None
+    if args.rg_feasibility_scan and args.fit_rg_scale:
+        print("\n--- Bias-to-Rg feasibility scan [fitted scale] "
+              "(mapping-sensitivity diagnostic) ---")
+        feasibility_fitted = run_rg_feasibility_scan(
+            crg_prob, c_edges, rg_edges_lattice,
+            rg_target_lattice, rg_target_observed,
+            rg_scale=rg_scale_effective,
+            summary=args.rg_summary,
+            bias_min=float(args.rg_bias_min),
+            bias_max=float(args.rg_bias_max),
+            bias_points=int(args.rg_bias_points),
+            outdir=plot_dir,
+            make_plots=make_plots,
+            rg_lower_lattice=rg_lower_lattice,
+            rg_upper_lattice=rg_upper_lattice,
+            file_prefix="rg_feasibility_fitted",
+            scale_label="fitted scale",
+        )
+        _report_scan(feasibility_fitted, "fitted scale")
+
+    # ---- support overlap at the effective scale ----------------------------
+    fitted_support = rg_support_overlap(
+        rg_lower_lattice, rg_upper_lattice, baseline_rg_lo, baseline_rg_hi
+    )
+    if args.fit_rg_scale and fitted_support["zero_support_overlap"]:
+        print(
+            "\n  WARNING: zero Rg support overlap remains at the FITTED scale "
+            f"(rg_scale_effective={rg_scale_effective:.6g}). "
+            + ZERO_SUPPORT_OVERLAP_MESSAGE
+            + " The fitted result is marked INVALID."
+        )
+
     # ---- transition descriptors --------------------------------------------
     trans = _rg_scalar_transitions(cfg, params_all, Tmin, Tmax)
     print("\nTransition descriptors:")
@@ -4696,21 +6112,38 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     if trans["T_bias_zero_model_derived"] is not None:
         print(f"  Tc (model-derived bias zero, may lie outside the data range) = "
               f"{trans['T_bias_zero_model_derived']:.6g}")
-    print(f"  T_rg_max_slope = {trans['T_rg_max_slope']:.6g} K   "
-          f"(-dRg/dT = {trans['rg_max_negative_slope']:.6g} {target_units} units/K)")
+    no_collapse_warning = (
+        "The fitted scalar Rg curve does not show a resolved temperature-driven "
+        "collapse within the observed temperature interval."
+    )
+    if trans["collapse_detected"]:
+        print(f"  T_rg_max_slope = {trans['T_rg_max_slope']:.6g} K   "
+              f"(-dRg/dT = {trans['rg_max_negative_slope']:.6g} {target_units} units/K)")
+    else:
+        print(f"  T_rg_max_slope = None   (no resolved collapse: max -dRg/dT = "
+              f"{trans['rg_max_negative_slope']:.6g} <= tolerance "
+              f"{trans['slope_tolerance']:.3g} {target_units} units/K)")
     print(f"  T_rg_half      = {trans['T_rg_half']:.6g} K")
     print("  NOTE: T_bias_zero (bias sign change) and T_rg_max_slope (steepest "
           "finite-chain collapse) are distinct quantities.")
 
     # ---- assemble warnings --------------------------------------------------
     warnings_list: List[str] = []
-    if feasibility is not None:
-        warnings_list.extend(feasibility["warnings"])
+    if feasibility_nominal is not None:
+        warnings_list.extend(
+            f"[{nominal_label}] {w}" for w in feasibility_nominal["warnings"]
+        )
     else:
         warnings_list.append(
             "Feasibility diagnostics were not run (--rg-feasibility-scan not given). "
             "Whether the joint baseline can reach the observed Rg range is UNVERIFIED."
         )
+    if feasibility_fitted is not None:
+        warnings_list.extend(
+            f"[fitted scale] {w}" for w in feasibility_fitted["warnings"]
+        )
+    if not trans["collapse_detected"]:
+        warnings_list.append(no_collapse_warning)
     if boundary_hits:
         warnings_list.append(
             f"Fitted parameter(s) rest on an optimization bound: {', '.join(boundary_hits)}. "
@@ -4724,11 +6157,7 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             f"interval coverage."
         )
 
-    # ---- support diagnostics -----------------------------------------------
-    rg_marg = crg_prob.sum(axis=0)
-    nz = np.nonzero(rg_marg > 0.0)[0]
-    baseline_rg_lo = float(rg_edges_lattice[nz[0]])
-    baseline_rg_hi = float(rg_edges_lattice[nz[-1] + 1])
+    # ---- support diagnostics (effective scale) -----------------------------
     target_in_support = bool(
         rg_target_lattice.min() >= baseline_rg_lo
         and rg_target_lattice.max() <= baseline_rg_hi
@@ -4736,13 +6165,15 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     if not target_in_support:
         warnings_list.append(
             f"Target Rg range [{rg_target_lattice.min():.4g}, {rg_target_lattice.max():.4g}] "
-            f"(lattice) is not contained in the baseline Rg support "
-            f"[{baseline_rg_lo:.4g}, {baseline_rg_hi:.4g}] (lattice)."
+            f"(lattice, at rg_scale_effective={rg_scale_effective:.6g}) is not contained "
+            f"in the baseline Rg support [{baseline_rg_lo:.4g}, {baseline_rg_hi:.4g}] "
+            f"(lattice)."
         )
     support_diagnostics: Dict[str, Any] = {
+        "rg_scale_used": float(rg_scale_effective),
         "baseline_rg_support_lattice": [baseline_rg_lo, baseline_rg_hi],
         "baseline_rg_support_observed": [
-            baseline_rg_lo * rg_scale, baseline_rg_hi * rg_scale
+            baseline_rg_lo * rg_scale_effective, baseline_rg_hi * rg_scale_effective
         ],
         "target_rg_range_lattice": [
             float(rg_target_lattice.min()), float(rg_target_lattice.max())
@@ -4753,9 +6184,15 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         "target_within_baseline_rg_support": target_in_support,
         "n_predictions_inside_input_range": int(np.sum(inside_range)),
         "n_temps": int(n_temps),
+        "nominal_scale_support_overlap": nominal_support,
+        "effective_scale_support_overlap": fitted_support,
         "inside_input_range_note": (
             "inside_input_range compares the fitted prediction against the supplied "
             "lower/upper columns. It is NOT confidence-interval coverage."
+        ),
+        "scale_note": (
+            "All lattice/observed conversions in this block use rg_scale_effective. "
+            "nominal_scale_support_overlap is the pre-fit check at rg_scale_initial."
         ),
     }
 
@@ -4775,22 +6212,38 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         rg_residual_target_units=rg_residual_target_units,
         rg_mod_mass=rg_mod_mass,
         rg_centers_lattice=rg_centers_lattice,
-        rg_centers_observed=rg_scale * rg_centers_lattice,
+        rg_centers_observed=rg_centers_observed,
         rg_edges_lattice=rg_edges_lattice,
-        rg_edges_observed=rg_scale * rg_edges_lattice,
+        rg_edges_observed=rg_edges_observed,
+        # Nominal-scale views are kept but must carry _nominal in the name so they
+        # can never be mistaken for the fitted mapping.
+        rg_centers_observed_nominal=rg_scale_initial * rg_centers_lattice,
+        rg_edges_observed_nominal=rg_scale_initial * rg_edges_lattice,
+        rg_target_lattice_nominal=rg_target_lattice_nominal,
+        rg_target_observed_nominal=rg_target_observed_nominal,
         rg_summary=str(args.rg_summary),
         rg_mean_loss=str(args.rg_mean_loss),
-        rg_scale=float(fitted_scale),
-        rg_scale_input=float(rg_scale),
+        rg_scale=float(rg_scale_effective),
+        rg_scale_input=float(rg_scale_initial),
+        rg_scale_initial=float(rg_scale_initial),
+        rg_scale_fitted=(
+            float(rg_scale_fitted) if rg_scale_fitted is not None else np.nan
+        ),
+        rg_scale_effective=float(rg_scale_effective),
         rg_scale_was_fitted=bool(args.fit_rg_scale),
         params=params_all,
         param_names=np.array(param_names),
         model_params=model_params,
-        model_param_names=np.array(pspec["model_param_names"]),
+        model_param_names=np.array(model_param_names),
         b_T=b_T,
         train_indices=train_idx,
         validation_indices=val_idx,
-        T_rg_max_slope=float(trans["T_rg_max_slope"]),
+        T_rg_max_slope=(
+            float(trans["T_rg_max_slope"])
+            if trans["T_rg_max_slope"] is not None else np.nan
+        ),
+        collapse_detected=bool(trans["collapse_detected"]),
+        slope_tolerance=float(trans["slope_tolerance"]),
         rg_max_negative_slope=float(trans["rg_max_negative_slope"]),
         T_rg_half=float(trans["T_rg_half"]),
         T_bias_zero=(
@@ -4817,6 +6270,15 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     val_set = set(val_idx.tolist())
     with open(per_temp_csv, "w", newline="") as fh:
         writer = csv.writer(fh)
+        # File-level scale provenance: every lattice/observed column below uses
+        # rg_scale_effective, so no column mixes nominal and fitted conversions.
+        writer.writerow([
+            f"# rg_scale_effective={rg_scale_effective:.10g}",
+            f"rg_scale_initial={rg_scale_initial:.10g}",
+            f"rg_scale_was_fitted={bool(args.fit_rg_scale)}",
+            f"rg_target_units={target_units}",
+            "mapping=Rg_observed = rg_scale_effective * Rg_lattice",
+        ])
         writer.writerow([
             "temp_index", "temperature", "split",
             "rg_target_input", "rg_lower_input", "rg_upper_input", "rg_target_units",
@@ -4893,17 +6355,26 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             ])
         if not args.fit_rg_scale:
             writer.writerow([
-                "rg_scale", f"{rg_scale:.8g}", "scale_fixed", "", "", "",
+                "rg_scale", f"{rg_scale_initial:.8g}", "scale_fixed", "", "", "",
                 param_descriptions["rg_scale"] + " [FIXED, not optimized]",
             ])
+        writer.writerow([
+            "rg_scale_effective", f"{rg_scale_effective:.8g}", "scale_effective",
+            "", "", "",
+            "scale used for every fitted-model lattice/observed conversion",
+        ])
         if trans["T_bias_zero"] is not None:
             writer.writerow([
                 "T_bias_zero", f"{trans['T_bias_zero']:.8g}", "derived", "", "", "",
                 "temperature where b(T)=0 inside the observed range (K)",
             ])
         writer.writerow([
-            "T_rg_max_slope", f"{trans['T_rg_max_slope']:.8g}", "derived", "", "", "",
-            "temperature of steepest fitted collapse, argmax of -dRg/dT (K)",
+            "T_rg_max_slope",
+            ("" if trans["T_rg_max_slope"] is None else f"{trans['T_rg_max_slope']:.8g}"),
+            "derived", "", "", "",
+            ("temperature of steepest fitted collapse, argmax of -dRg/dT (K)"
+             if trans["collapse_detected"]
+             else "no resolved collapse detected within the observed interval"),
         ])
         writer.writerow([
             "T_rg_half", f"{trans['T_rg_half']:.8g}", "derived", "", "", "",
@@ -4927,6 +6398,30 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             "bias": _finite_or_none(mt["bias"]),
         }
 
+    observed_unit_label = observed_units_label(target_units)
+
+    # The nominal/fixed-scale branch is the primary scientific test; the
+    # fitted-scale branch is a mapping-sensitivity diagnostic. They are classified
+    # separately so a fitted model is never judged by the nominal scan's verdict.
+    scientific_validity: Dict[str, Any] = {
+        "fixed_or_nominal_scale": classify_scientific_validity(
+            feasibility_nominal, nominal_support, is_fitted_scale=False
+        ),
+        "fitted_scale": (
+            classify_scientific_validity(
+                feasibility_fitted, fitted_support, is_fitted_scale=True
+            ) if args.fit_rg_scale else None
+        ),
+        "note": (
+            "fixed_or_nominal_scale is the primary scientific test, evaluated at "
+            "rg_scale_initial. fitted_scale is a mapping-sensitivity diagnostic at "
+            "rg_scale_effective and is null in fixed-scale mode. Optimizer "
+            "convergence is NOT evidence of validity: these statuses depend on "
+            "support overlap, reachability, the asymptotic limits, and contact-Rg "
+            "coupling."
+        ),
+    }
+
     summary_json: Dict[str, Any] = {
         "mode": "rg_scalar",
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -4935,12 +6430,27 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         "baseline_file": str(args.baseline),
         "model": str(args.model),
         "model_description": str(spec["description"]),
+        # --- backward-compatible contract for downstream lattice REMD scripts ---
+        # load_fit_summary_json() in remd_uniform_chain_2_new.py requires top-level
+        # model/params/Tref/Tscale and reads params by MODEL_REGISTRY name. These
+        # are THERMODYNAMIC parameters only: rg_scale is a mapping constant, not a
+        # b(T) parameter, and putting it here would corrupt the model vector.
+        "param_names": list(model_param_names),
+        "params": {
+            name: float(value)
+            for name, value in zip(model_param_names, model_params)
+        },
         "target_units": target_units,
         "rg_summary": str(args.rg_summary),
         "rg_loss": str(args.rg_mean_loss),
-        "rg_scale": float(fitted_scale),
-        "rg_scale_input": float(rg_scale),
+        "rg_scale": float(rg_scale_effective),
+        "rg_scale_initial": float(rg_scale_initial),
+        "rg_scale_fitted": (
+            float(rg_scale_fitted) if rg_scale_fitted is not None else None
+        ),
+        "rg_scale_effective": float(rg_scale_effective),
         "rg_scale_was_fitted": bool(args.fit_rg_scale),
+        "rg_scale_input": float(rg_scale_initial),
         "rg_scale_bounds": (
             [float(args.rg_scale_min), float(args.rg_scale_max)]
             if args.fit_rg_scale else None
@@ -4949,9 +6459,11 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         "rg_range_floor": (
             float(args.rg_range_floor) if args.rg_mean_loss == "range_weighted" else None
         ),
+        # Full optimization vector, INCLUDING rg_scale when it was fitted. Kept
+        # separate from the top-level "params" contract above on purpose.
         "parameters": {n: float(v) for n, v in zip(param_names, params_all)},
         "model_parameters": {
-            n: float(v) for n, v in zip(pspec["model_param_names"], model_params)
+            n: float(v) for n, v in zip(model_param_names, model_params)
         },
         "parameter_bounds": {
             n: [float(lo), float(hi)] for n, (lo, hi) in zip(param_names, bounds)
@@ -4981,11 +6493,21 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             "T_bias_zero": _finite_or_none(trans["T_bias_zero"]),
             "bias_zero_crossings": [float(t) for t in trans["bias_zero_crossings"]],
             "T_bias_zero_model_derived": trans["T_bias_zero_model_derived"],
-            "T_rg_max_slope": _finite_or_none(trans["T_rg_max_slope"]),
+            "T_rg_max_slope": (
+                _finite_or_none(trans["T_rg_max_slope"])
+                if trans["T_rg_max_slope"] is not None else None
+            ),
+            "collapse_detected": bool(trans["collapse_detected"]),
+            "slope_tolerance": _finite_or_none(trans["slope_tolerance"]),
             "rg_max_negative_slope": _finite_or_none(trans["rg_max_negative_slope"]),
             "T_rg_half": _finite_or_none(trans["T_rg_half"]),
             "rg_half_value": _finite_or_none(trans["rg_half_value"]),
             "dense_grid_points": int(cfg["dense_grid_points"]),
+            "collapse_note": (
+                "T_rg_max_slope is null when max(-dRg/dT) does not exceed "
+                "slope_tolerance, i.e. the fitted curve is flat or expands with "
+                "temperature. No transition temperature is invented in that case."
+            ),
         },
         "support_diagnostics": support_diagnostics,
         "definitions": {
@@ -5029,11 +6551,54 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
                 "Rg_lattice. With --rg-target-units lattice it is used only for "
                 "reporting and never enters the loss."
             ),
+            "rg_scale_initial": (
+                "The --rg-scale value as supplied: the physically motivated input "
+                "mapping. Never overwritten by the fit."
+            ),
+            "rg_scale_fitted": (
+                "The scale the optimizer chose, or null when --fit-rg-scale was not "
+                "given. It is NOT a thermodynamic parameter and never enters b(T)."
+            ),
+            "rg_scale_effective": (
+                "The scale used for every fitted-model quantity in this run: the "
+                "fitted scale when one exists, otherwise the initial scale."
+            ),
+            "params_vs_parameters": (
+                "'params' carries thermodynamic parameters only and is the "
+                "backward-compatible contract consumed by the lattice REMD scripts. "
+                "'parameters' carries the full optimization vector, which includes "
+                "rg_scale when it was fitted."
+            ),
+        },
+        "units": {
+            "target_input": target_units,
+            "lattice_rg": "lattice bond units",
+            "observed_rg": observed_unit_label,
+            "mapping": "Rg_observed = rg_scale_effective * Rg_lattice",
+            "note": (
+                "Fields suffixed _nominal use rg_scale_initial; every other "
+                "observed-unit field uses rg_scale_effective."
+            ),
         },
         "warnings": warnings_list,
     }
-    if feasibility is not None:
-        summary_json["feasibility_diagnostics"] = feasibility
+
+    # Nominal and fitted feasibility are DIFFERENT questions and are reported as
+    # such. For fixed-scale mode fitted_scale is null and nominal_scale is the
+    # production result.
+    summary_json["feasibility_diagnostics"] = {
+        "nominal_scale": feasibility_nominal,
+        "fitted_scale": feasibility_fitted,
+        "note": (
+            "nominal_scale answers: can the baseline reproduce the data using the "
+            "physically motivated input scale? It is the primary scientific test. "
+            "fitted_scale answers: can the fitted mapping reproduce the data after "
+            "allowing the scale to move? It is a mapping-sensitivity diagnostic. In "
+            "fixed-scale mode fitted_scale is null and nominal_scale is the "
+            "production result."
+        ),
+    }
+    summary_json["scientific_validity"] = scientific_validity
     if args.model == "heat_capacity":
         summary_json["T0"] = float(Tref)
 
@@ -5051,6 +6616,9 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         "Tmin": Tmin, "Tmax": Tmax, "trans": trans, "spec": spec,
         "restart_records": restart_records, "target_units": target_units,
         "make_plots": make_plots,
+        "rg_scale_initial": rg_scale_initial,
+        "rg_scale_fitted": rg_scale_fitted,
+        "rg_scale_effective": rg_scale_effective,
     }
     if args.bootstrap > 0:
         run_rg_scalar_bootstrap(args, ctx)
@@ -5065,17 +6633,31 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
                         rg_centers_lattice, b_T, all_metrics)
 
     # ---- final verdict ------------------------------------------------------
+    # Structured, per-scale, and never reduced to VALID/NOT VALID. Convergence of
+    # the optimizer is deliberately not part of this verdict.
     print("\n--- Scientific status ---")
-    if feasibility is None:
+    nv = scientific_validity["fixed_or_nominal_scale"]
+    print(f"  nominal_scale_validity (PRIMARY scientific test, "
+          f"rg_scale={rg_scale_initial:.6g}): {nv['status']}")
+    print(f"    support_overlap={nv['support_overlap']}  "
+          f"reachable_within_scan={nv['reachable_within_scan']}  "
+          f"within_asymptotic_range={nv['within_asymptotic_range']}")
+    fv = scientific_validity["fitted_scale"]
+    if fv is None:
+        print("  fitted_scale_validity: not applicable (fixed-scale mode; the "
+              "nominal result above is the production result).")
+    else:
+        print(f"  fitted_scale_validity (mapping-sensitivity diagnostic, "
+              f"rg_scale={rg_scale_effective:.6g}): {fv['status']}")
+        print(f"    support_overlap={fv['support_overlap']}  "
+              f"reachable_within_scan={fv['reachable_within_scan']}  "
+              f"within_asymptotic_range={fv['within_asymptotic_range']}")
+        print("    NOTE: a fitted-scale status describes the mapping's flexibility, "
+              "not an independent confirmation of the physical scale.")
+    if feasibility_nominal is None:
         print("  UNVERIFIED: run --rg-feasibility-scan to establish whether the "
               "baseline can reach the observed Rg range.")
-    elif feasibility["target_within_reachable_range"]:
-        print("  Feasibility scan: the joint baseline CAN reach the observed Rg "
-              "range over the scanned bias window.")
-    else:
-        print("  NOT VALID: the joint baseline CANNOT reach part of the observed Rg "
-              "range at ANY bias. The fitted parameters are a constrained best "
-              "effort, not a physically meaningful description of those points.")
+    print("  Optimizer convergence is NOT evidence of scientific validity.")
     for w in warnings_list:
         print(f"  WARNING: {w}")
 
@@ -5157,7 +6739,10 @@ def run_rg_scalar_bootstrap(args: argparse.Namespace, ctx: Dict[str, Any]) -> No
             "train_rmse": tr["rmse"], "validation_rmse": va["rmse"],
             "all_rmse": al["rmse"],
             "T_bias_zero": tm["T_bias_zero"],
+            # None when this replicate's curve shows no resolved collapse; the
+            # stats below are computed only over replicates that detected one.
             "T_rg_max_slope": tm["T_rg_max_slope"],
+            "collapse_detected": bool(tm["collapse_detected"]),
         })
         rows.append(rec)
 
@@ -5186,11 +6771,16 @@ def run_rg_scalar_bootstrap(args: argparse.Namespace, ctx: Dict[str, Any]) -> No
         )
         stats[key] = bootstrap_param_stats(vals, fitted_val, conf)
 
+    n_collapse = int(sum(1 for r in rows if r.get("collapse_detected")))
+    if n_collapse < n_ok:
+        print(f"  NOTE: {n_ok - n_collapse}/{n_ok} replicate(s) show no resolved "
+              f"collapse; T_rg_max_slope intervals use the {n_collapse} that do.")
+
     boot_csv = outdir / "rg_scalar_bootstrap.csv"
     header = ["replicate"] + list(param_names) + [
         "train_objective", "validation_objective", "all_objective",
         "train_rmse", "validation_rmse", "all_rmse",
-        "T_bias_zero", "T_rg_max_slope",
+        "T_bias_zero", "T_rg_max_slope", "collapse_detected",
     ]
     with open(boot_csv, "w", newline="") as fh:
         writer = csv.writer(fh)
@@ -5237,6 +6827,12 @@ def run_rg_scalar_bootstrap(args: argparse.Namespace, ctx: Dict[str, Any]) -> No
             "confidence": conf,
             "seed": seed,
             "method": "temperature",
+            "n_replicates_with_collapse": n_collapse,
+            "collapse_note": (
+                "T_rg_max_slope statistics are computed only over replicates whose "
+                "fitted curve showed a resolved collapse; replicates without one "
+                "contribute no transition temperature rather than a spurious value."
+            ),
             "statistics": stats,
             "bound_fractions": param_bound_fractions(param_matrix, bounds, param_names),
             "correlation_flags": (
@@ -5426,8 +7022,12 @@ def run_rg_scalar_split_sensitivity(
             "validation_indices": " ".join(str(int(i)) for i in va_i),
         })
         records.append(rec)
+        t_slope_str = (
+            f"{tm['T_rg_max_slope']:.5g}" if tm["T_rg_max_slope"] is not None
+            else "None (no collapse)"
+        )
         print(f"  {sp['name']:24s} : train_rmse={tr_m['rmse']:.5g}  "
-              f"val_rmse={va_m['rmse']:.5g}  T_rg_max_slope={tm['T_rg_max_slope']:.5g}")
+              f"val_rmse={va_m['rmse']:.5g}  T_rg_max_slope={t_slope_str}")
 
     if not records:
         print("  WARNING: no split produced a successful fit; skipping outputs.")
@@ -5493,6 +7093,18 @@ def _plot_rg_scalar(
     units = ctx["target_units"]
     figs: List[Any] = []
 
+    # Every plotted mapping states which scale it uses. For a free-scale
+    # production prediction the fitted scale appears in the title.
+    rg_scale_effective: float = float(ctx["rg_scale_effective"])
+    rg_scale_initial: float = float(ctx["rg_scale_initial"])
+    if ctx["cfg"]["fit_rg_scale"]:
+        scale_note = (
+            f"mapping: FITTED scale rg_scale_effective = {rg_scale_effective:.6g} "
+            f"(initial input scale was {rg_scale_initial:.6g})"
+        )
+    else:
+        scale_note = f"mapping: FIXED scale rg_scale = {rg_scale_effective:.6g}"
+
     # --- 1. main fit ---
     fig, ax = plt.subplots(figsize=(7, 4.5))
     yerr = np.vstack([target - lower, upper - target])
@@ -5510,14 +7122,20 @@ def _plot_rg_scalar(
         )
     ax.plot(trans["grid"], trans["curve"], "-", color="tab:blue", lw=1.8,
             label=f"fitted Rg(T) [{args.model}]")
-    ax.axvline(trans["T_rg_max_slope"], color="tab:green", lw=1.2, ls="--",
-               label=f"T_rg_max_slope = {trans['T_rg_max_slope']:.4g} K")
+    # No vertical transition line when no collapse was resolved: drawing one would
+    # assert a transition the curve does not show.
+    if trans["T_rg_max_slope"] is not None:
+        ax.axvline(trans["T_rg_max_slope"], color="tab:green", lw=1.2, ls="--",
+                   label=f"T_rg_max_slope = {trans['T_rg_max_slope']:.4g} K")
+    else:
+        ax.plot([], [], " ", label="no resolved collapse (T_rg_max_slope = None)")
     ax.set_xlabel("T (K)")
     ax.set_ylabel(f"Rg ({units} units)")
     rmse = all_metrics["rmse"]
     ax.set_title(
         f"Scalar Rg(T) fit — model {args.model}, summary {args.rg_summary}, "
         f"loss {args.rg_mean_loss}\n"
+        f"{scale_note}\n"
         f"all-point RMSE = {rmse:.4g} {units} units   "
         f"(error bars are supplied bounds, NOT standard errors)"
     )
@@ -5571,30 +7189,33 @@ def _plot_rg_scalar(
     figs.append(fig)
 
     # --- 4. predicted P(Rg|T) at a deterministic set of temperatures ---
-    pick = sorted({
-        0,
-        int(np.argmin(np.abs(temps - trans["T_rg_max_slope"]))),
-        temps.size - 1,
-    })
+    picks = {0, temps.size - 1}
+    if trans["T_rg_max_slope"] is not None:
+        picks.add(int(np.argmin(np.abs(temps - trans["T_rg_max_slope"]))))
+    else:
+        picks.add(int(temps.size // 2))
+    pick = sorted(picks)
+    # One scale for the axis: the effective one. The nominal scale never appears
+    # on a fitted-model plot.
     rg_axis = (
         rg_centers_lattice if units == "lattice"
-        else ctx["cfg"]["rg_scale"] * rg_centers_lattice
+        else rg_scale_effective * rg_centers_lattice
     )
-    if ctx["cfg"]["fit_rg_scale"] and units == "observed":
-        _, fitted_scale = split_rg_scalar_params(
-            ctx["params_fit"], ctx["cfg"]["n_model_params"], True, ctx["cfg"]["rg_scale"]
-        )
-        rg_axis = fitted_scale * rg_centers_lattice
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    labels = {0: "lowest T", temps.size - 1: "highest T"}
+    labels = {
+        0: "lowest T",
+        temps.size - 1: "highest T",
+    }
+    mid_label = "near T_rg_max_slope" if trans["T_rg_max_slope"] is not None else "mid T"
     for i in pick:
-        lab = labels.get(i, "near T_rg_max_slope")
+        lab = labels.get(i, mid_label)
         ax.plot(rg_axis, rg_mod_mass[i], "-", lw=1.6,
                 label=f"T = {temps[i]:.4g} K ({lab})")
     ax.set_xlabel(f"Rg ({units} units)")
     ax.set_ylabel("P(Rg | T)")
     ax.set_title(
         "PREDICTED Rg distributions from the fitted model (diagnostic only)\n"
+        f"{scale_note}\n"
         "these are model predictions, NOT observed data"
     )
     ax.legend(fontsize=8)
@@ -5615,7 +7236,13 @@ def _plot_rg_scalar(
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the CLI parser.
+
+    Split out of main() so the tests can build a fully-populated Namespace from
+    the real defaults instead of hand-listing them, which would silently drift
+    from the CLI. No argument name, default, or meaning is changed here.
+    """
     ap = argparse.ArgumentParser(
         description="Fit lattice polymer contact model to REMD histograms.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -5903,7 +7530,11 @@ def main() -> None:
         "--quick-test", action="store_true", dest="quick_test",
         help="Run synthetic split-sensitivity/determinism unit tests and exit.",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
 
     if args.quick_test:
         raise SystemExit(run_quick_test())
