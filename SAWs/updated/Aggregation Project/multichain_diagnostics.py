@@ -45,6 +45,10 @@ DEFAULT_MC_DIAG_N_BLOCKS = remd.DEFAULT_DIAG_N_BLOCKS
 DIAGNOSED_OBSERVABLES = (
     "u", "m_intra", "m_inter", "mean_chain_rg", "n_clusters",
     "largest_cluster_size", "largest_cluster_fraction",
+    # Dc/L is already dimensionless (divided by the box size), so rg_scale never
+    # applies.  An M < 2 run gives an all-NaN series, which
+    # integrated_autocorr_time reports as method="insufficient_samples".
+    "dc_over_L",
     # Intensive per-chain normalizations (linear transforms of the raw counts;
     # included for cross-M comparison of ESS/drift/means).
     "m_intra_per_chain", "m_inter_pairs_per_chain",
@@ -76,6 +80,7 @@ def _lane_series(rep, rg_scale: float) -> Dict[str, np.ndarray]:
         "n_clusters": np.asarray(rep.n_clusters_traj, dtype=float),
         "largest_cluster_size": np.asarray(rep.lcs_traj, dtype=float),
         "largest_cluster_fraction": np.asarray(rep.lcf_traj, dtype=float),
+        "dc_over_L": np.asarray(rep.dc_over_L_traj, dtype=float),
         "m_intra_per_chain": m_intra / M,
         "m_inter_pairs_per_chain": m_inter / M,
     }

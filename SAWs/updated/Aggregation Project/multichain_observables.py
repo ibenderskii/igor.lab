@@ -24,6 +24,7 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
+import remd_uniform_chain_2_new as remd  # integrated_autocorr_time (ESS for SEMs)
 from multichain_state import MultiChainState, per_chain_rg2
 from multichain_contacts import ContactCounts, interchain_pair_counts
 
@@ -56,23 +57,25 @@ def chain_geometry_summary(state: MultiChainState) -> dict:
     }
 
 
-def degree_of_cohesion(state: MultiChainState) -> dict:
-    """Mean interchain center-of-mass distance (the paper's Dc) and Dc/L.
+def mean_pair_com_distance_over_L(state: MultiChainState) -> float:
+    """Dimensionless mean interchain center-of-mass distance, Dc/L (paper eq. 3).
 
     Dc = < |r_c^alpha - r_c^beta| > over all unordered chain pairs (alpha < beta).
     Chain COMs come from the UNWRAPPED coordinates (each chain is internally
     contiguous there and is never wrapped for geometry, exactly as in
     :func:`multichain_state.per_chain_rg2`), so a COM may legitimately lie
     outside ``[0, L)^3``.  Pairwise separations then use the minimum-image
-    convention with L = ``state.box_size``.  ``Dc/L`` is the dimensionless form
+    convention with L = ``state.box_size``.  Dc/L is the dimensionless form
     reported by the paper (Dc for an ideal-gas arrangement scales with L).
-    With M < 2 there are no interchain pairs, so both outputs are NaN.
+    With M < 2 there are no interchain pairs, so the result is NaN.
+
+    Sanity bounds: the value lies in [0, sqrt(3)/2 = 0.866].  Uncorrelated
+    uniform COMs give 0.4803 (= E|u| for u uniform on [-L/2, L/2)^3);
+    aggregation drives Dc/L well below 0.48.
     """
     M = state.n_chains
     if M < 2:
-        nan = float("nan")
-        return {"degree_of_cohesion_lattice": nan,
-                "degree_of_cohesion_over_L": nan}
+        return float("nan")
     L = float(state.box_size)
     coms = state.coords_unwrapped.astype(np.float64).mean(axis=1)  # (M, 3)
     d = coms[:, None, :] - coms[None, :, :]                        # (M, M, 3)
@@ -84,10 +87,7 @@ def degree_of_cohesion(state: MultiChainState) -> dict:
     d -= L * np.round(d / L)
     dist = np.sqrt((d * d).sum(axis=-1))
     Dc = float(dist[np.triu_indices(M, k=1)].mean())
-    return {
-        "degree_of_cohesion_lattice": Dc,
-        "degree_of_cohesion_over_L": Dc / L,
-    }
+    return Dc / L
 
 
 def _cluster_components(n_chains: int, edges: Sequence[tuple]) -> List[int]:
@@ -181,7 +181,7 @@ def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
     """
     geo = chain_geometry_summary(state)
     clu = cluster_summary(state, cluster_contact_threshold)
-    coh = degree_of_cohesion(state)
+    dc_over_L = mean_pair_com_distance_over_L(state)
     counts = state.counts
     out = {
         "m_intra": int(counts.intra),
@@ -195,8 +195,11 @@ def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
         "largest_cluster_size": int(clu["largest_cluster_size"]),
         "largest_cluster_fraction": float(clu["largest_cluster_fraction"]),
         "n_clusters": int(clu["n_clusters"]),
-        "degree_of_cohesion_lattice": coh["degree_of_cohesion_lattice"],
-        "degree_of_cohesion_over_L": coh["degree_of_cohesion_over_L"],
+        # Dc/L is the primary (dimensionless) form; the lattice-unit Dc is
+        # recovered exactly by multiplying back, since L is a deterministic
+        # factor and NaN * L stays NaN for the M < 2 case.
+        "dc_over_L": dc_over_L,
+        "dc_lattice": dc_over_L * float(state.box_size),
     }
     out.update(per_chain_contacts(int(counts.intra), int(counts.inter),
                                   state.n_chains))
@@ -215,6 +218,32 @@ def _mean(arr) -> float:
 def _std(arr) -> float:
     a = np.asarray(arr, dtype=float)
     return float(np.nanstd(a, ddof=0)) if a.size else float("nan")
+
+
+def _sem(arr) -> float:
+    """Autocorrelation-corrected standard error of the mean: std / sqrt(ESS).
+
+    MC cycles are correlated, so the naive std/sqrt(n) understates the error on a
+    mean.  ESS comes from :func:`remd_uniform_chain_2_new.integrated_autocorr_time`
+    (Geyer initial-positive-sequence, ess = n / tau_int), which IS the effective
+    independent-sample count: Geyer's tau = 2*sum(Gamma_m) - 1 expands to
+    1 + 2*sum_{k>=1} rho_k, the usual definition, with a robust truncation.  So the
+    std/sqrt(ESS) formula is used as-is with no rescaling.  Because tau is clamped
+    to >= 1, this is always >= std/sqrt(n).
+
+    Non-finite entries are dropped first so std and ESS are computed over the same
+    samples (integrated_autocorr_time filters internally).  Returns NaN for an
+    empty series or when ESS is not >= 1 -- e.g. an all-NaN Dc lane at M < 2, which
+    yields method="insufficient_samples" rather than raising.
+    """
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return float("nan")
+    ess = remd.integrated_autocorr_time(a)["ess"]
+    if not np.isfinite(ess) or ess < 1.0:
+        return float("nan")
+    return float(np.std(a, ddof=0) / math.sqrt(ess))
 
 
 def _post_burnin(n: int, burnin_frac: float) -> int:
@@ -256,18 +285,25 @@ def compute_statistics(
         n_clusters = np.asarray(
             lane.get("n_clusters", []), dtype=float)[sl] \
             if lane.get("n_clusters") is not None else np.array([])
-        # Degree of cohesion (Dc, Dc/L).  NaN for M < 2 lanes; the nan-aware
-        # helpers below propagate that as NaN rather than raising.
+        # Mean interchain COM distance (Dc, Dc/L).  NaN for M < 2 lanes; the
+        # nan-aware helpers below propagate that as NaN rather than raising.
         dc_lat = np.asarray(
-            lane.get("degree_of_cohesion_lattice", []), dtype=float)[sl] \
-            if lane.get("degree_of_cohesion_lattice") is not None else np.array([])
+            lane.get("dc_lattice", []), dtype=float)[sl] \
+            if lane.get("dc_lattice") is not None else np.array([])
         dc_over_L = np.asarray(
-            lane.get("degree_of_cohesion_over_L", []), dtype=float)[sl] \
-            if lane.get("degree_of_cohesion_over_L") is not None else np.array([])
+            lane.get("dc_over_L", []), dtype=float)[sl] \
+            if lane.get("dc_over_L") is not None else np.array([])
+
+        lcf = np.asarray(lane["largest_cluster_fraction"], dtype=float)[sl]
 
         mi_mean, mi_std = _mean(m_intra), _std(m_intra)
         me_mean, me_std = _mean(m_inter), _std(m_inter)
         mt_mean = _mean(m_intra + m_inter)
+        # Error bars on the reported means.  These are standard errors
+        # (std/sqrt(ESS)) and are NOT the *_std ensemble fluctuation widths above,
+        # which stay untouched and must not be drawn as error bars.
+        rg_sem_lat = _sem(rg_lat)
+        rg_ac = remd.integrated_autocorr_time(rg_lat)
 
         r = {
             "T": float(T),
@@ -277,26 +313,37 @@ def compute_statistics(
                 np.asarray(lane["effective_energy"], dtype=float)[sl]),
             "m_intra_mean": mi_mean,
             "m_intra_std": mi_std,
+            "m_intra_sem": _sem(m_intra),
             "m_inter_mean": me_mean,
             "m_inter_std": me_std,
+            "m_inter_sem": _sem(m_inter),
             "m_total_mean": mt_mean,
             "Rg_mean_lattice": _mean(rg_lat),
             "Rg_std_lattice": _std(rg_lat),
+            "Rg_sem_lattice": rg_sem_lat,
             "Rg_mean": rg_scale * _mean(rg_lat),
             "Rg_std": rg_scale * _std(rg_lat),
+            # rg_scale is a deterministic linear rescale, so the SEM rescales
+            # exactly with it, just as Rg_std does.
+            "Rg_sem": rg_scale * rg_sem_lat,
+            "Rg_tau_int": float(rg_ac["tau_int"]),
+            "Rg_ess": float(rg_ac["ess"]),
             "Rg2_mean_lattice": _mean(rg2_lat),
             "Rg2_mean": (rg_scale ** 2) * _mean(rg2_lat),
             "f_inter_mean": _mean(np.asarray(lane["f_inter"], dtype=float)[sl]),
             "largest_cluster_size_mean": _mean(
                 np.asarray(lane["largest_cluster_size"], dtype=float)[sl]),
-            "largest_cluster_fraction_mean": _mean(
-                np.asarray(lane["largest_cluster_fraction"], dtype=float)[sl]),
-            # Degree of cohesion: raw Dc in lattice units and the dimensionless
-            # Dc/L reported by the paper.
-            "degree_of_cohesion_lattice_mean": _mean(dc_lat),
-            "degree_of_cohesion_lattice_std": _std(dc_lat),
-            "degree_of_cohesion_over_L_mean": _mean(dc_over_L),
-            "degree_of_cohesion_over_L_std": _std(dc_over_L),
+            "largest_cluster_fraction_mean": _mean(lcf),
+            "largest_cluster_fraction_sem": _sem(lcf),
+            # Mean interchain COM distance: raw Dc in lattice units and the
+            # dimensionless Dc/L reported by the paper.
+            "Dc_lattice_mean": _mean(dc_lat),
+            "Dc_lattice_std": _std(dc_lat),
+            "Dc_over_L_mean": _mean(dc_over_L),
+            "Dc_over_L_std": _std(dc_over_L),
+            "Dc_over_L_sem": _sem(dc_over_L),
+            "Dc_over_L_ess": float(
+                remd.integrated_autocorr_time(dc_over_L)["ess"]),
             "std_chain_rg_mean_lattice": _mean(std_rg_lat),
             "std_chain_rg_mean": rg_scale * _mean(std_rg_lat),
             "n_clusters_mean": _mean(n_clusters),

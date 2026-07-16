@@ -40,7 +40,10 @@ MULTICHAIN_SNAPSHOT_SCHEMA_VERSION = 1
 # v2: added reptation/rotation move types (extra move-acceptance CSV rows) and the
 # reptation_acceptance_rate / rotation_acceptance_rate results-CSV columns.
 # v3: added the degree-of-cohesion results-CSV columns (Dc and Dc/L, mean/std).
-MULTICHAIN_OUTPUT_SCHEMA_VERSION = 3
+# v4: renamed the degree_of_cohesion_* results-CSV columns to Dc_* (BREAKING: a v3
+# CSV header will not match), and added standard-error-of-the-mean columns (*_sem,
+# std/sqrt(ESS)) plus the Rg/Dc autocorrelation diagnostics (Rg_tau_int, *_ess).
+MULTICHAIN_OUTPUT_SCHEMA_VERSION = 4
 
 _INT16_MIN, _INT16_MAX = -32768, 32767
 _INT16_SAFE = 30000
@@ -307,7 +310,11 @@ class MultiChainSnapshotWriter:
 
 RESULTS_CSV_COLUMNS = [
     "T", "u_mean", "u_std", "effective_energy_mean",
-    "m_intra_mean", "m_intra_std", "m_inter_mean", "m_inter_std", "m_total_mean",
+    # *_std are ensemble fluctuation widths (the physical spread); *_sem are the
+    # autocorrelation-corrected standard errors of the mean (std/sqrt(ESS)) and are
+    # the quantities plotted as error bars.  The two are not interchangeable.
+    "m_intra_mean", "m_intra_std", "m_intra_sem",
+    "m_inter_mean", "m_inter_std", "m_inter_sem", "m_total_mean",
     # Intensive per-chain contact normalizations (analysis only; raw columns
     # above remain authoritative).  "pairs" = globally-unique interchain pairs / M;
     # "incidences" = 2 * pairs / M (contact endpoints per chain).
@@ -315,15 +322,18 @@ RESULTS_CSV_COLUMNS = [
     "m_inter_pairs_per_chain_mean", "m_inter_pairs_per_chain_std",
     "m_inter_incidences_per_chain_mean", "m_inter_incidences_per_chain_std",
     "m_total_pairs_per_chain_mean",
-    "Rg_mean", "Rg_std", "Rg_mean_lattice", "Rg_std_lattice",
+    "Rg_mean", "Rg_std", "Rg_sem", "Rg_mean_lattice", "Rg_std_lattice",
+    "Rg_sem_lattice", "Rg_tau_int", "Rg_ess",
     "Rg2_mean", "Rg2_mean_lattice",
     "f_inter_mean",
     "largest_cluster_size_mean", "largest_cluster_fraction_mean",
-    # Degree of cohesion (Komatsu, Koga & Berx, JCP 163, 191101 (2025)): the mean
-    # interchain center-of-mass distance Dc in lattice units, and its
-    # dimensionless form Dc/L (Dc for an ideal-gas arrangement scales with L).
-    "degree_of_cohesion_lattice_mean", "degree_of_cohesion_lattice_std",
-    "degree_of_cohesion_over_L_mean", "degree_of_cohesion_over_L_std",
+    "largest_cluster_fraction_sem",
+    # Mean interchain center-of-mass distance (Komatsu, Koga & Berx, JCP 163,
+    # 191101 (2025), eq. 3): Dc in lattice units, and its dimensionless form Dc/L
+    # (Dc for an ideal-gas arrangement scales with L).  Uncorrelated uniform COMs
+    # give Dc/L = 0.4803; aggregation drives it well below that.
+    "Dc_lattice_mean", "Dc_lattice_std",
+    "Dc_over_L_mean", "Dc_over_L_std", "Dc_over_L_sem", "Dc_over_L_ess",
     # Per-chain Rg heterogeneity and chain-cluster count (chain-collapse vs
     # mixed expanded/collapsed discrimination).  std_chain_rg_mean is a length
     # (rg_scale applied); std_chain_rg_mean_lattice is the raw-lattice value.

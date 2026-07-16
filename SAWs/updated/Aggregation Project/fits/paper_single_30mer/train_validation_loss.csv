@@ -1,0 +1,4 @@
+split,n_temps,loss_name,objective_mean,rmse,mae,max_abs_error,units
+train,8,mse,0.0099331606,0.099665242,0.081209321,0.1963598,observed
+validation,5,mse,0.008727365,0.093420367,0.089532921,0.13010973,observed
+all,13,mse,0.009469393,0.097310806,0.084410705,0.1963598,observed

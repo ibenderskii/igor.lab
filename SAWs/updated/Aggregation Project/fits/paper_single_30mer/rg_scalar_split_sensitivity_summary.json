@@ -1,0 +1,61 @@
+{
+  "mode": "rg_scalar",
+  "n_splits": 16,
+  "schemes": [
+    "every_third_phase",
+    "kfold",
+    "blocked_low",
+    "blocked_mid",
+    "blocked_high",
+    "random"
+  ],
+  "split_seed": 123,
+  "stability": {
+    "A": {
+      "mean": 8.810109021725953,
+      "std": 0.9230276552466893,
+      "min": 6.979008141265773,
+      "max": 10.308163858164116,
+      "range": 3.3291557168983434,
+      "cv": 0.10476915245548944,
+      "n": 16
+    },
+    "Tc": {
+      "mean": 305.2797323433433,
+      "std": 1.465727319488031,
+      "min": 301.722970009573,
+      "max": 307.467021394692,
+      "range": 5.744051385119008,
+      "cv": 0.004801259842037435,
+      "n": 16
+    },
+    "T_rg_max_slope": {
+      "mean": 323.355,
+      "std": 1.67080070624835,
+      "min": 320.4,
+      "max": 326.64,
+      "range": 6.240000000000009,
+      "cv": 0.005167078617149418,
+      "n": 16
+    },
+    "validation_rmse": {
+      "mean": 0.10334522654384043,
+      "std": 0.03835661802062931,
+      "min": 0.047698298275948306,
+      "max": 0.18981343324073996,
+      "range": 0.14211513496479167,
+      "cv": 0.37115035985099826,
+      "n": 16
+    },
+    "train_rmse": {
+      "mean": 0.09270747019556208,
+      "std": 0.01045810374660374,
+      "min": 0.07080372838105965,
+      "max": 0.1042972953122069,
+      "range": 0.033493566931147245,
+      "cv": 0.11280756258953954,
+      "n": 16
+    }
+  },
+  "note": "Supplementary analysis. Spread across splits indicates how strongly the fitted parameters depend on which temperatures are used."
+}

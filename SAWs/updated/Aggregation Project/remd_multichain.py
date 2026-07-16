@@ -478,8 +478,8 @@ def run_remd_multichain(
                 rep.lcs_traj.append(cyc["largest_cluster_size"])
                 rep.lcf_traj.append(cyc["largest_cluster_fraction"])
                 rep.n_clusters_traj.append(cyc["n_clusters"])
-                rep.dc_lattice_traj.append(cyc["degree_of_cohesion_lattice"])
-                rep.dc_over_L_traj.append(cyc["degree_of_cohesion_over_L"])
+                rep.dc_lattice_traj.append(cyc["dc_lattice"])
+                rep.dc_over_L_traj.append(cyc["dc_over_L"])
                 if do_snapshot:
                     snap_coords[k] = rep.state.coords_unwrapped
                     snap_mi[k] = cyc["m_intra"]
@@ -522,8 +522,8 @@ def _traj_dicts(replicas: List[MultiReplica]) -> List[dict]:
         "largest_cluster_size": rep.lcs_traj,
         "largest_cluster_fraction": rep.lcf_traj,
         "n_clusters": rep.n_clusters_traj,
-        "degree_of_cohesion_lattice": rep.dc_lattice_traj,
-        "degree_of_cohesion_over_L": rep.dc_over_L_traj,
+        "dc_lattice": rep.dc_lattice_traj,
+        "dc_over_L": rep.dc_over_L_traj,
         # M carried per lane so contact normalization uses an explicit chain
         # count (never inferred from cluster sizes).
         "n_chains": rep.state.n_chains,
@@ -602,14 +602,29 @@ def make_plots(results, dist, out_prefix: str) -> None:
         print("  [plot] matplotlib unavailable; skipping plots")
         return
     Ts = [r["T"] for r in results]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(Ts, [r["Rg_mean"] for r in results], "o-")
+
+    def col(key):
+        return [r.get(key, float("nan")) for r in results]
+
+    # Error bars are standard errors of the mean (std/sqrt(ESS), autocorrelation
+    # corrected) -- NOT the *_std ensemble fluctuation widths, which measure the
+    # physical spread of the distribution rather than the uncertainty on its mean.
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    axes[0].errorbar(Ts, col("Rg_mean"), yerr=col("Rg_sem"), fmt="o-", capsize=3)
     axes[0].set_xlabel("T"); axes[0].set_ylabel("mean per-chain Rg")
-    axes[1].plot(Ts, [r["m_intra_mean"] for r in results], "o-", label="m_intra")
-    axes[1].plot(Ts, [r["m_inter_mean"] for r in results], "s-", label="m_inter")
+    axes[1].errorbar(Ts, col("m_intra_mean"), yerr=col("m_intra_sem"),
+                     fmt="o-", capsize=3, label="m_intra")
+    axes[1].errorbar(Ts, col("m_inter_mean"), yerr=col("m_inter_sem"),
+                     fmt="s-", capsize=3, label="m_inter")
     axes[1].set_xlabel("T"); axes[1].set_ylabel("mean contacts"); axes[1].legend()
-    axes[2].plot(Ts, [r["largest_cluster_fraction_mean"] for r in results], "o-")
+    axes[2].errorbar(Ts, col("largest_cluster_fraction_mean"),
+                     yerr=col("largest_cluster_fraction_sem"), fmt="o-", capsize=3)
     axes[2].set_xlabel("T"); axes[2].set_ylabel("largest cluster fraction")
+    axes[3].errorbar(Ts, col("Dc_over_L_mean"), yerr=col("Dc_over_L_sem"),
+                     fmt="o-", capsize=3)
+    # Uncorrelated uniform chain COMs give Dc/L = 0.4803; aggregation falls below it.
+    axes[3].axhline(0.4803, ls="--", color="gray", label="uncorrelated")
+    axes[3].set_xlabel("T"); axes[3].set_ylabel("Dc / L"); axes[3].legend()
     fig.tight_layout()
     path = f"{out_prefix}_observables.png"
     fig.savefig(path, dpi=110)
@@ -1350,61 +1365,60 @@ def _qt_athermal_move_baseline() -> None:
           f"(rel={rel:.2%}): PASSED")
 
 
-def _qt_degree_of_cohesion() -> None:
+def _qt_dc_over_L() -> None:
     # (a) Hand-built COMs, no boundary crossing: two 2-bead chains whose COMs are
     # (0, 0.5, 0) and (3, 0.5, 0) in a box of L = 10 -> Dc = 3, Dc/L = 0.3.
     L = 10
     chain_a = np.array([(0, 0, 0), (0, 1, 0)], dtype=np.int64)
     chain_near = np.array([(3, 0, 0), (3, 1, 0)], dtype=np.int64)
-    coh = obs.degree_of_cohesion(mcs.make_state(np.stack([chain_a, chain_near]), L))
-    assert abs(coh["degree_of_cohesion_lattice"] - 3.0) < 1e-12
-    assert abs(coh["degree_of_cohesion_over_L"] - 0.3) < 1e-12
+    dc = obs.mean_pair_com_distance_over_L(
+        mcs.make_state(np.stack([chain_a, chain_near]), L))
+    assert abs(dc - 0.3) < 1e-12
 
     # (b) Minimum-image check: the second chain sits at the FAR boundary, COM
     # (9, 0.5, 0).  The raw separation is 9, but the nearest periodic image is 1.
-    # A missing min-image term would report 9.0 / 0.9 here.
+    # A missing min-image term would report 0.9 here.
     chain_far = np.array([(9, 0, 0), (9, 1, 0)], dtype=np.int64)
-    coh_far = obs.degree_of_cohesion(mcs.make_state(np.stack([chain_a, chain_far]), L))
-    assert abs(coh_far["degree_of_cohesion_lattice"] - 1.0) < 1e-12, (
-        f"Dc={coh_far['degree_of_cohesion_lattice']} != 1.0: minimum-image "
-        f"convention not applied to the COM separation")
-    assert abs(coh_far["degree_of_cohesion_over_L"] - 0.1) < 1e-12
+    dc_far = obs.mean_pair_com_distance_over_L(
+        mcs.make_state(np.stack([chain_a, chain_far]), L))
+    assert abs(dc_far - 0.1) < 1e-12, (
+        f"Dc/L={dc_far} != 0.1: minimum-image convention not applied to the "
+        f"COM separation")
 
     # (c) The same physical configuration with the far chain shifted one box in
     # -x: its unwrapped COM is now (-1, 0.5, 0), OUTSIDE the primary box.  Dc is
     # unchanged, confirming COMs are never wrapped and only the separation is
     # min-imaged.
-    coh_out = obs.degree_of_cohesion(
+    dc_out = obs.mean_pair_com_distance_over_L(
         mcs.make_state(np.stack([chain_a, chain_far - np.array([L, 0, 0])]), L))
-    assert abs(coh_out["degree_of_cohesion_lattice"] - 1.0) < 1e-12
+    assert abs(dc_out - 0.1) < 1e-12
 
-    # (d) M = 1: no interchain pairs -> both outputs NaN.
+    # (d) M = 1: no interchain pairs -> NaN.
     solo = mcs.make_state(np.stack([mcs.generate_saw(8, np.random.RandomState(3))]), 20)
-    coh1 = obs.degree_of_cohesion(solo)
-    assert math.isnan(coh1["degree_of_cohesion_lattice"])
-    assert math.isnan(coh1["degree_of_cohesion_over_L"])
+    assert math.isnan(obs.mean_pair_com_distance_over_L(solo))
 
-    # (e) cycle_observables agrees with a direct recomputation.
+    # (e) cycle_observables agrees with a direct recomputation, and the lattice
+    # form is exactly L * (Dc/L).
     state = mcs.initialize_dispersed_state(4, 6, 12, seed=17)
     cyc = obs.cycle_observables(state, 1)
-    direct = obs.degree_of_cohesion(state)
-    for key in ("degree_of_cohesion_lattice", "degree_of_cohesion_over_L"):
-        assert abs(cyc[key] - direct[key]) < 1e-12, f"{key} mismatch"
+    direct = obs.mean_pair_com_distance_over_L(state)
+    assert abs(cyc["dc_over_L"] - direct) < 1e-12, "dc_over_L mismatch"
+    assert abs(cyc["dc_lattice"] - direct * 12.0) < 1e-12, "dc_lattice mismatch"
 
     # (f) Smoke: for dispersed athermal states Dc/L is O(1) and roughly box-size
     # insensitive (Dc itself scales with L, which is why the paper reports Dc/L).
     # The min-image distance is bounded by L*sqrt(3)/2, so Dc/L < 0.867 always.
     def mean_dc_over_L(box):
         return float(np.mean([
-            obs.degree_of_cohesion(
-                mcs.initialize_dispersed_state(6, 6, box, seed=100 + s)
-            )["degree_of_cohesion_over_L"] for s in range(12)]))
+            obs.mean_pair_com_distance_over_L(
+                mcs.initialize_dispersed_state(6, 6, box, seed=100 + s))
+            for s in range(12)]))
     d12, d16 = mean_dc_over_L(12), mean_dc_over_L(16)
     for box, d in ((12, d12), (16, d16)):
         assert 0.25 < d < 0.75, f"dispersed Dc/L={d:.3f} at L={box} is not O(1)"
     assert abs(d12 - d16) < 0.15, (
         f"dispersed Dc/L varies strongly with box size ({d12:.3f} vs {d16:.3f})")
-    print(f"  quick-test degree of cohesion (Dc, Dc/L; min-image, M=1 NaN, "
+    print(f"  quick-test Dc/L (min-image, M=1 NaN, "
           f"dispersed Dc/L~{0.5 * (d12 + d16):.2f}): PASSED")
 
 
@@ -1438,7 +1452,7 @@ def run_quick_test() -> None:
     _qt_canonicalization()
     _qt_reptation_regression()
     _qt_rotation_regression()
-    _qt_degree_of_cohesion()
+    _qt_dc_over_L()
     with tempfile.TemporaryDirectory() as tmp:
         _qt_serial_vs_workers(tmp)
         _qt_output_roundtrip(tmp)

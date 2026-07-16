@@ -1,0 +1,7 @@
+parameter,value,kind,bound_low,bound_high,at_boundary,units_or_description
+A,6.0703709,thermodynamic,0.01,200,,amplitude of b(T) = A*(Tc/T - 1) (reduced units)
+Tc,283.02003,thermodynamic,10,5000,,bias zero-crossing temperature of b(T) = A*(Tc/T - 1) (K)
+rg_scale,0.39997362,scale,0.25,0.55,,observed Rg units per lattice unit (Rg_obs = rg_scale*Rg_lattice)
+T_bias_zero,283.02003,derived,,,,temperature where b(T)=0 inside the observed range (K)
+T_rg_max_slope,306.96,derived,,,,"temperature of steepest fitted collapse, argmax of -dRg/dT (K)"
+T_rg_half,301.8,derived,,,,temperature nearest the midpoint Rg between the interval ends (K)

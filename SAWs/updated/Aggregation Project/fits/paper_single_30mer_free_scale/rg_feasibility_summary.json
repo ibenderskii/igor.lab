@@ -1,0 +1,43 @@
+{
+  "rg_summary": "rms",
+  "rg_scale": 0.345,
+  "bias_min": -10.0,
+  "bias_max": 10.0,
+  "bias_points": 401,
+  "baseline_contact_rg_covariance": -0.8933481390177693,
+  "baseline_contact_rg_correlation": -0.5631882004547394,
+  "baseline_mean_contacts": 5.022330694444445,
+  "baseline_rg_min": 1.5808913875521715,
+  "baseline_rg_max": 6.292536656964074,
+  "baseline_rg_min_observed": 0.5454075287054991,
+  "baseline_rg_max_observed": 2.1709251466526056,
+  "baseline_rg_scalar_lattice": 3.095956781497893,
+  "baseline_rg_scalar_observed": 1.068105089616773,
+  "target_rg_min": 2.0434782608695654,
+  "target_rg_max": 4.223188405797102,
+  "target_rg_min_observed": 0.705,
+  "target_rg_max_observed": 1.457,
+  "reachable_rg_min": 1.6215165802734859,
+  "reachable_rg_max": 3.7353629093719145,
+  "reachable_rg_min_observed": 0.5594232201943525,
+  "reachable_rg_max_observed": 1.2887002037333104,
+  "n_targets": 13,
+  "n_targets_outside_reachable": 4,
+  "target_within_reachable_range": false,
+  "target_reached_only_at_bias_boundary": false,
+  "max_abs_d_rg_db": 1.734082067349597,
+  "derivative_check": {
+    "identity": "d<Rg>_b/db = -Cov_b(Rg, m)  (lattice units)",
+    "applies_to_summary": "mean",
+    "checked": false,
+    "max_abs_difference": null,
+    "max_abs_relative_difference": null,
+    "agrees": null,
+    "note": "For summary='rms' this identity does NOT hold: d/db sqrt(<Rg^2>_b) = -Cov_b(Rg^2, m) / (2 sqrt(<Rg^2>_b)). Only the numerical derivative and the reported moments are used for rms."
+  },
+  "warnings": [
+    "4 of 13 target Rg value(s) fall outside the reachable scalar-rms range [1.622, 3.735] (lattice) = [0.5594, 1.289] (observed) over bias in [-10, 10]. NO value of b(T) can reproduce those points: the fit cannot be scientifically valid for them without changing the baseline, the chain length, or rg_scale."
+  ],
+  "units_note": "Fields without an explicit _observed suffix are in LATTICE units. Observed units = rg_scale * lattice units.",
+  "definition_note": "reachable_rg_* is the range of the scalar Rg summary over the scanned bias window, i.e. what P0(m,Rg) can produce for ANY constant bias b. A target outside it cannot be fit by any b(T)."
+}
