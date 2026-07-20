@@ -2406,6 +2406,63 @@ def _run_rg_regression_tests(
                 f"[{summ}, {label}] monotonic baseline sets is_exact_extremal_bound",
             )
 
+    # -------------------------------------------------------------- test J2 --
+    # BUGFIX 1: the exact global outer bound must include EVERY strictly-positive-
+    # mass contact bin, with no probability threshold. A bin with mass 1e-16
+    # dominates under strong exponential reweighting, so dropping it below a 1e-15
+    # threshold would shrink the bound and manufacture a false impossibility.
+    print("Scalar-Rg test 13d: outer bound includes every positive-mass contact bin")
+    ce_tiny = np.array([-0.5, 0.5, 1.5])
+    re_tiny = np.array([0.5, 1.5, 8.5, 9.5])          # centers 1.0, 5.0, 9.0
+    crg_tiny = np.zeros((2, 3))
+    crg_tiny[0, 0] = 1.0 - 1e-16                        # m=0 -> Rg=1, almost all mass
+    crg_tiny[1, 2] = 1e-16                              # m=1 -> Rg=9, vanishing mass
+    for summ in ("mean", "rms"):
+        gob_tiny = global_rg_outer_bounds(
+            crg_tiny, ce_tiny, re_tiny, summary=summ, rg_scale=1.0,
+            rg_target_lattice=np.array([9.0]),
+        )
+        rcheck(
+            abs(gob_tiny["global_outer_rg_min_lattice"] - 1.0) < 1e-9
+            and abs(gob_tiny["global_outer_rg_max_lattice"] - 9.0) < 1e-9,
+            f"[{summ}] outer bound is [1, 9] despite the 1e-16 bin "
+            f"(got [{gob_tiny['global_outer_rg_min_lattice']:.4g}, "
+            f"{gob_tiny['global_outer_rg_max_lattice']:.4g}])",
+        )
+        rcheck(
+            gob_tiny["target_within_global_outer_bound"] is True,
+            f"[{summ}] a target of 9 is NOT classified as impossible",
+        )
+        rcheck(
+            gob_tiny["probability_tolerance"] == 0.0,
+            f"[{summ}] the bound reports a zero probability threshold "
+            f"(got {gob_tiny['probability_tolerance']!r})",
+        )
+        # The default 1e-15 argument must NOT be able to drop the bin either.
+        gob_dflt = global_rg_outer_bounds(
+            crg_tiny, ce_tiny, re_tiny, summary=summ, rg_scale=1.0,
+            probability_tolerance=1e-15, rg_target_lattice=np.array([9.0]),
+        )
+        rcheck(
+            abs(gob_dflt["global_outer_rg_max_lattice"] - 9.0) < 1e-9
+            and gob_dflt["target_within_global_outer_bound"] is True,
+            f"[{summ}] an explicit 1e-15 threshold still cannot drop the 1e-16 bin",
+        )
+    # And through the full scan: status must not be outside_global_outer_bound.
+    with tempfile.TemporaryDirectory() as td_tiny:
+        fs_tiny = run_rg_feasibility_scan(
+            crg_tiny, ce_tiny, re_tiny,
+            np.array([9.0, 9.0]), np.array([9.0, 9.0]),
+            rg_scale=1.0, summary="mean", bias_min=-50.0, bias_max=50.0,
+            bias_points=201, outdir=Path(td_tiny), make_plots=False,
+        )
+        rcheck(
+            fs_tiny["global_outer_bound"]["target_within_global_outer_bound"] is True
+            and fs_tiny["reachability_status"] != "outside_global_outer_bound",
+            f"a target of 9 is not called all-b impossible via the scan "
+            f"(status={fs_tiny['reachability_status']})",
+        )
+
     # ---------------------------------------------------------------- test K --
     # §8: the counterexample that breaks the endpoint-only reasoning. Both b->+/-inf
     # limits are 1, yet b=0 gives ~8.84 (mean) / ~8.91 (rms). An implementation that
@@ -2632,6 +2689,40 @@ def _run_rg_regression_tests(
                     for w in fs_int["warnings"]),
             "a scan-scoped miss inside the outer bound makes no all-b claim",
         )
+
+        # BUGFIX 3: a target attained at BOTH a boundary bias and an interior bias
+        # must be reachable_within_scan, not boundary_limited. The nonmonotonic
+        # baseline's Rg(b) is symmetric about b=0, so on the asymmetric window
+        # [-2, +10] the left-boundary value Rg(-2) equals the interior value
+        # Rg(+2). An argmin-over-the-whole-grid boundary test picks the boundary
+        # index and wrongly flags boundary_limited; the interior-envelope test
+        # resolves it as reachable.
+        b_left = -2.0
+        tgt_val = float(
+            joint_reweight_stats(crg_nm, m_nm, r_nm, b_left, "mean")["pred_rg_lattice"]
+        )
+        tgt_sym = np.array([tgt_val] * 3)
+        fs_sym = run_rg_feasibility_scan(
+            crg_nm, ce_nm, re_nm, tgt_sym, tgt_sym,
+            rg_scale=1.0, summary="mean", bias_min=b_left, bias_max=10.0,
+            bias_points=241, outdir=tdp, make_plots=False,
+        )
+        rcheck(
+            fs_sym["reachability_status"] == "reachable_within_scan",
+            f"a target attained at BOTH a boundary and an interior bias is "
+            f"reachable_within_scan, not boundary_limited "
+            f"(got {fs_sym['reachability_status']})",
+        )
+        rcheck(
+            fs_sym["target_reached_only_at_bias_boundary"] is False,
+            "such a target is not flagged as reached only at a bias boundary",
+        )
+        rcheck(
+            not any("not conclusive" in w or "wider interval" in w
+                    for w in fs_sym["warnings"]),
+            "an interior-reachable target emits no boundary/inconclusive warning",
+        )
+
         rcheck(
             fs_scan["reachability_status"] in (
                 "unreachable_within_scan", "boundary_limited"
@@ -3235,6 +3326,17 @@ def _run_rg_regression_tests(
         got == [],
         f"a strictly positive b(T) yields NO root (minimum of |b| is not a zero): "
         f"got {got}",
+    )
+    # (e2) BUGFIX 2: a LARGE-DYNAMIC-RANGE b(T) whose minimum is 0.5 must yield no
+    # root. A tolerance proportional to 1e-8*max|b| would be ~1 here (max|b|~1e8)
+    # and wrongly accept the 0.5 minimum; the floating-point-scale tolerance plus
+    # the final |b(T_root)| verification must reject it.
+    fn_bigrange = lambda p, T: 1e8 * ((T - 315.0) / 45.0) ** 2 + 0.5
+    got = bias_zero_crossings(fn_bigrange, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        got == [],
+        f"a large-dynamic-range b(T) with minimum 0.5 yields NO root "
+        f"(the 0.5 minimum is not a zero): got {got}",
     )
     # (f) two distinct tangential roots are both found and not deduplicated away
     fn_two = lambda p, T: ((T - 300.0) ** 2) * ((T - 340.0) ** 2) / 1e6
@@ -5290,9 +5392,15 @@ def bias_zero_crossings(
     vals = np.array([b_fn(params, float(T)) for T in grid], dtype=float)
 
     if root_tolerance is None:
+        # A floating-point-scale tolerance, NOT a fraction of the dynamic range: a
+        # tolerance like 1e-8 * max|b| accepts a genuinely nonzero local minimum as
+        # a "root" whenever b(T) has a large dynamic range (e.g. 1e8*(...)^2 + 0.5,
+        # whose minimum 0.5 is far from zero yet below 1e-8*1e8). Scaling only by
+        # eps keeps the acceptance band at the level of round-trip round-off.
         finite = vals[np.isfinite(vals)]
         b_ref = float(np.max(np.abs(finite))) if finite.size else 1.0
-        root_tolerance = max(1e-10, 1e-8 * max(1.0, b_ref))
+        scale = max(1.0, b_ref)
+        root_tolerance = max(1e-10, 100.0 * float(np.finfo(float).eps) * scale)
     root_tolerance = float(root_tolerance)
 
     out: List[float] = []
@@ -5357,7 +5465,16 @@ def bias_zero_crossings(
     for t in sorted(out):
         if not any(abs(t - u) < 1e-6 * max(1.0, abs(u)) for u in uniq):
             uniq.append(float(t))
-    return uniq
+
+    # Final verification: keep only points that genuinely satisfy b(T) ~ 0. A
+    # bisection endpoint or a refined local minimum is a candidate, not a proof;
+    # this discards any that do not actually reach zero to tolerance, so a large-
+    # dynamic-range function with a strictly positive minimum yields no roots.
+    verified = [
+        t for t in uniq
+        if np.isfinite(b_fn(params, t)) and abs(float(b_fn(params, t))) <= root_tolerance
+    ]
+    return verified
 
 
 def rg_curve_transition_metrics(
@@ -5703,10 +5820,18 @@ def global_rg_outer_bounds(
     Unlike the two endpoint limits (see endpoint_rg_limits), this bound holds
     whether or not mu_i is monotonic in contact count, and is therefore the only
     quantity here that may license an all-real-b impossibility claim.
+
+    The bound is computed over EVERY contact bin carrying strictly positive mass,
+    with no probability threshold. Any positive-mass bin, however small, dominates
+    the reweighted marginal under sufficiently strong exponential bias exp[-b m],
+    so excluding it could shrink the bound and manufacture a false
+    ``outside_global_outer_bound`` verdict. The ``probability_tolerance`` argument
+    is therefore NOT used to select bins for the bound; it is retained only as
+    provenance in the returned dict and must never gate scientific validity.
     """
     cond = _conditional_rg_by_contact(
         crg_prob, c_edges, rg_edges,
-        summary=summary, probability_tolerance=probability_tolerance,
+        summary=summary, probability_tolerance=0.0,
     )
     bins = cond["supported_contact_bins"]
     centers = cond["supported_contact_centers"]
@@ -5739,7 +5864,11 @@ def global_rg_outer_bounds(
         "contact_value_at_global_max": float(centers[k_max]),
         "target_within_global_outer_bound": None,
         "n_targets_outside_global_outer_bound": None,
-        "probability_tolerance": float(probability_tolerance),
+        # 0.0: the bound uses every strictly-positive-mass contact bin. The
+        # incoming probability_tolerance is echoed separately for provenance but
+        # does NOT gate the bound.
+        "probability_tolerance": 0.0,
+        "probability_tolerance_requested": float(probability_tolerance),
         "rg_scale_used": scale,
         "is_exact_reachable_range": False,
         "note": (
@@ -6059,20 +6188,41 @@ def run_rg_feasibility_scan(
     rg_span_lat = reach_hi_lat - reach_lo_lat
     max_abs_dg = float(np.max(np.abs(d_rg_db))) if d_rg_db.size else 0.0
 
-    # Target matched or approached only at a bias-grid boundary: the finite-scan
-    # verdict is then inconclusive in either direction, so it is detected whether
-    # or not the target looked reachable.
+    # Boundary handling. A target that is reachable at an INTERIOR scan point is
+    # settled: because Rg(b) is continuous, any value inside the interior min/max
+    # envelope is attained at some interior bias, so widening the scan cannot
+    # overturn it. Only a target that is NOT resolved in the interior, yet is
+    # approached at a scan boundary, makes the finite-scan verdict inconclusive.
+    # Using argmin over the WHOLE grid (as before) could pick a boundary index for
+    # a value that is also attained in the interior, wrongly flagging a reachable
+    # target as boundary_limited.
     edge_frac = 0.02
     n_edge = max(1, int(np.ceil(edge_frac * bias_grid.size)))
+    if bias_grid.size > 2 * n_edge:
+        interior_pred = pred_lat[n_edge:bias_grid.size - n_edge]
+    else:
+        interior_pred = pred_lat  # too few points to define an interior band
+    reach_lo_int = float(interior_pred.min())
+    reach_hi_int = float(interior_pred.max())
+
     boundary_reached = False
     if rg_span_lat > 0:
-        # Which bias index comes closest to each target?
-        idx = np.array(
-            [int(np.argmin(np.abs(pred_lat - t))) for t in rg_target_lattice], dtype=int
+        # Targets not resolvable within the interior envelope (same tolerance as
+        # the full-range reachability test).
+        int_tol = RG_REACH_RTOL * max(abs(reach_lo_int), abs(reach_hi_int), 1.0)
+        unresolved_interior = (
+            (rg_target_lattice < reach_lo_int - int_tol)
+            | (rg_target_lattice > reach_hi_int + int_tol)
         )
-        boundary_reached = bool(
-            np.any(idx < n_edge) or np.any(idx >= bias_grid.size - n_edge)
-        )
+        if np.any(unresolved_interior):
+            # For those unresolved targets only, is the closest achievable
+            # prediction at a boundary band (so a wider scan could resolve it)?
+            idx = np.array(
+                [int(np.argmin(np.abs(pred_lat - t))) for t in rg_target_lattice],
+                dtype=int,
+            )
+            at_edge = (idx < n_edge) | (idx >= bias_grid.size - n_edge)
+            boundary_reached = bool(np.any(unresolved_interior & at_edge))
 
     # THE authoritative status. classify_scientific_validity() consumes this rather
     # than re-deriving its own ordering from the raw flags.
