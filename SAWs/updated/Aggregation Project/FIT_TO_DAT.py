@@ -155,6 +155,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+# Aliased: several functions here build a local list literally named `warnings`
+# (the diagnostic messages they emit), which would shadow a bare `import warnings`.
+import warnings as _warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -170,6 +173,11 @@ try:
     from scipy.optimize import minimize
 except Exception:
     minimize = None
+
+try:  # only used to refine tangential bias roots; the grid search still works
+    from scipy.optimize import minimize_scalar
+except Exception:
+    minimize_scalar = None
 
 
 # ---------------------------------------------------------------------------
@@ -2112,8 +2120,15 @@ def _run_rg_scalar_tests(check: Callable[[bool, str], None]) -> List[str]:
                   "unreachable target sets target_within_reachable_range=False")
         sub_check(fs["n_targets_outside_reachable"] == 3,
                   "all 3 unreachable targets are counted")
-        sub_check(any("outside" in w for w in fs["warnings"]),
+        sub_check(bool(fs["warnings"]),
                   "unreachable target produces an explicit warning")
+        # This target sits 3x above the whole baseline Rg support, so the strongest
+        # correct objection is the support failure, not a scan-scoped one.
+        sub_check(fs["reachability_status"] == "zero_support_overlap",
+                  "a target far outside the baseline Rg support is reported as a "
+                  "support failure, the strongest correct objection")
+        sub_check(any("does not intersect" in w for w in fs["warnings"]),
+                  "the support failure is stated explicitly")
         sub_check((tdp / "rg_feasibility.csv").exists()
                   and (tdp / "rg_feasibility_summary.json").exists(),
                   "feasibility CSV and JSON are written")
@@ -2292,9 +2307,9 @@ def _run_rg_regression_tests(
     )
 
     # ---------------------------------------------------------------- test E --
-    print("Scalar-Rg test 13: asymptotic b -> +/-inf limits match the limiting slices")
+    print("Scalar-Rg test 13: endpoint b -> +/-inf limits match the limiting slices")
     for summ in ("mean", "rms"):
-        lim = asymptotic_rg_limits(
+        lim = endpoint_rg_limits(
             crg_s, ce_s, re_s, summary=summ, rg_scale=0.345
         )
         rg_centers_s = 0.5 * (re_s[:-1] + re_s[1:])
@@ -2314,20 +2329,20 @@ def _run_rg_regression_tests(
             f"[{summ}] b->-inf limit equals the max-contact conditional slice summary",
         )
         rcheck(
-            lim["asymptotic_reachable_rg_min"] == min(exp_pos, exp_neg)
-            and lim["asymptotic_reachable_rg_max"] == max(exp_pos, exp_neg),
-            f"[{summ}] asymptotic range uses min()/max(), not an assumed ordering",
+            lim["endpoint_limit_min_lattice"] == min(exp_pos, exp_neg)
+            and lim["endpoint_limit_max_lattice"] == max(exp_pos, exp_neg),
+            f"[{summ}] endpoint interval uses min()/max(), not an assumed ordering",
         )
         rcheck(
             abs(lim["rg_limit_b_pos_inf_observed"]
                 - 0.345 * lim["rg_limit_b_pos_inf_lattice"]) < 1e-12,
-            f"[{summ}] observed asymptotic limit = rg_scale * lattice limit",
+            f"[{summ}] observed endpoint limit = rg_scale * lattice limit",
         )
 
-    # A large finite bias must approach the asymptotic limit.
+    # A large finite bias must approach the endpoint limit.
     m_c = 0.5 * (ce_s[:-1] + ce_s[1:])
     r_c = 0.5 * (re_s[:-1] + re_s[1:])
-    lim_rms = asymptotic_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
+    lim_rms = endpoint_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
     big_pos = joint_reweight_stats(crg_s, m_c, r_c, 200.0, "rms")["pred_rg_lattice"]
     big_neg = joint_reweight_stats(crg_s, m_c, r_c, -200.0, "rms")["pred_rg_lattice"]
     rcheck(
@@ -2341,13 +2356,161 @@ def _run_rg_regression_tests(
     # The ordering of the two limits flips with the sign of the contact-Rg coupling,
     # which is exactly why min()/max() is required.
     crg_anti, ce_a, re_a = _make_synthetic_joint(coupling=-1.0)
-    lim_anti = asymptotic_rg_limits(crg_anti, ce_a, re_a, summary="rms", rg_scale=1.0)
+    lim_anti = endpoint_rg_limits(crg_anti, ce_a, re_a, summary="rms", rg_scale=1.0)
     rcheck(
         (lim_rms["rg_limit_b_pos_inf_lattice"] > lim_rms["rg_limit_b_neg_inf_lattice"])
         != (lim_anti["rg_limit_b_pos_inf_lattice"]
             > lim_anti["rg_limit_b_neg_inf_lattice"]),
         "limit ordering flips with the sign of the contact-Rg coupling",
     )
+    # The deprecated alias must keep working and keep mirroring the endpoints.
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        lim_dep = asymptotic_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
+    rcheck(
+        any(issubclass(w.category, DeprecationWarning) for w in caught)
+        and lim_dep["asymptotic_reachable_rg_min"]
+        == lim_rms["endpoint_limit_min_lattice"]
+        and lim_dep["deprecated"] is True,
+        "asymptotic_rg_limits() still works, warns DeprecationWarning, mirrors endpoints",
+    )
+
+    # ---------------------------------------------------------------- test J --
+    # §9: on a MONOTONIC baseline the endpoint limits must coincide with the
+    # extrema of the global outer bound -- but that is a property of this
+    # baseline, established by test, not an assumption about baselines generally
+    # (test K below exhibits one where it fails).
+    print("Scalar-Rg test 13b: monotonic baseline -> endpoints == global outer bound")
+    for summ in ("mean", "rms"):
+        for label, (cj, cej, rej) in (
+            ("coupling=+1", (crg_s, ce_s, re_s)),
+            ("coupling=-1", (crg_anti, ce_a, re_a)),
+        ):
+            ep_j = endpoint_rg_limits(cj, cej, rej, summary=summ, rg_scale=1.0)
+            gob_j = global_rg_outer_bounds(cj, cej, rej, summary=summ, rg_scale=1.0)
+            rcheck(
+                ep_j["conditional_moment_monotonic"] is True,
+                f"[{summ}, {label}] synthetic coupled baseline has a monotonic "
+                f"conditional moment ({ep_j['conditional_moment_direction']})",
+            )
+            rcheck(
+                abs(ep_j["endpoint_limit_min_lattice"]
+                    - gob_j["global_outer_rg_min_lattice"]) < 1e-12
+                and abs(ep_j["endpoint_limit_max_lattice"]
+                        - gob_j["global_outer_rg_max_lattice"]) < 1e-12,
+                f"[{summ}, {label}] monotonic -> endpoint limits ARE the outer-bound "
+                f"extrema",
+            )
+            rcheck(
+                ep_j["is_exact_extremal_bound"] is True,
+                f"[{summ}, {label}] monotonic baseline sets is_exact_extremal_bound",
+            )
+
+    # ---------------------------------------------------------------- test K --
+    # §8: the counterexample that breaks the endpoint-only reasoning. Both b->+/-inf
+    # limits are 1, yet b=0 gives ~8.84 (mean) / ~8.91 (rms). An implementation that
+    # treats the endpoint interval as the all-b reachable range calls a target of 8.5
+    # impossible when it is in fact reached at b=0.
+    print("Scalar-Rg test 13c: nonmonotonic baseline -> no false all-b impossibility")
+    ce_nm = np.array([-0.5, 0.5, 1.5, 2.5])
+    re_nm = np.array([0.5, 1.5, 8.5, 9.5])          # centers 1.0, 5.0, 9.0
+    crg_nm = np.zeros((3, 3))
+    crg_nm[0, 0] = 0.01                              # m=0 -> Rg=1
+    crg_nm[1, 2] = 0.98                              # m=1 -> Rg=9
+    crg_nm[2, 0] = 0.01                              # m=2 -> Rg=1
+    m_nm = 0.5 * (ce_nm[:-1] + ce_nm[1:])
+    r_nm = 0.5 * (re_nm[:-1] + re_nm[1:])
+
+    for summ, expect_at0 in (("mean", 8.84), ("rms", 8.910667)):
+        ep_nm = endpoint_rg_limits(crg_nm, ce_nm, re_nm, summary=summ, rg_scale=1.0)
+        gob_nm = global_rg_outer_bounds(
+            crg_nm, ce_nm, re_nm, summary=summ, rg_scale=1.0
+        )
+        at0 = joint_reweight_stats(crg_nm, m_nm, r_nm, 0.0, summ)["pred_rg_lattice"]
+
+        rcheck(
+            abs(ep_nm["endpoint_limit_min_lattice"] - 1.0) < 1e-12
+            and abs(ep_nm["endpoint_limit_max_lattice"] - 1.0) < 1e-12,
+            f"[{summ}] both endpoint limits equal 1 on the counterexample",
+        )
+        rcheck(
+            abs(at0 - expect_at0) < 1e-4,
+            f"[{summ}] finite-b prediction at b=0 is {expect_at0:.4g}, not the "
+            f"endpoint value (got {at0:.6g})",
+        )
+        rcheck(at0 > 8.0, f"[{summ}] b=0 prediction exceeds 8 while endpoints are 1")
+        rcheck(
+            ep_nm["conditional_moment_monotonic"] is False
+            and ep_nm["conditional_moment_direction"] == "nonmonotonic",
+            f"[{summ}] conditional moment is detected as nonmonotonic",
+        )
+        rcheck(
+            ep_nm["is_exact_extremal_bound"] is False,
+            f"[{summ}] nonmonotonic -> endpoints NOT advertised as extremal",
+        )
+        rcheck(
+            abs(gob_nm["global_outer_rg_max_lattice"] - 9.0) < 1e-9,
+            f"[{summ}] global outer max is ~9 (the m=1 conditional slice), got "
+            f"{gob_nm['global_outer_rg_max_lattice']:.6g}",
+        )
+        rcheck(
+            gob_nm["global_outer_rg_min_lattice"] <= at0
+            <= gob_nm["global_outer_rg_max_lattice"],
+            f"[{summ}] the true b=0 value lies INSIDE the global outer bound",
+        )
+        rcheck(
+            gob_nm["is_exact_reachable_range"] is False
+            and "does not prove" in gob_nm["note"],
+            f"[{summ}] outer bound is labelled necessary-only, not exact",
+        )
+
+        # A target of ~8.5 is genuinely reachable near b=0. The scan must not call
+        # it impossible, and validity must not report an all-b objection.
+        tgt_nm = np.array([8.5, 8.5, 8.5])
+        gob_t = global_rg_outer_bounds(
+            crg_nm, ce_nm, re_nm, summary=summ, rg_scale=1.0,
+            rg_target_lattice=tgt_nm,
+        )
+        rcheck(
+            gob_t["target_within_global_outer_bound"] is True,
+            f"[{summ}] target 8.5 is inside the global outer bound",
+        )
+        with tempfile.TemporaryDirectory() as td_nm:
+            fs_nm = run_rg_feasibility_scan(
+                crg_nm, ce_nm, re_nm, tgt_nm, tgt_nm,
+                rg_scale=1.0, summary=summ, bias_min=-10.0, bias_max=10.0,
+                bias_points=201, outdir=Path(td_nm), make_plots=False,
+            )
+            rcheck(
+                fs_nm["reachability_status"] != "outside_global_outer_bound",
+                f"[{summ}] target reachable at b=0 is NOT called all-b impossible "
+                f"(status={fs_nm['reachability_status']})",
+            )
+            rcheck(
+                fs_nm["target_within_reachable_range"] is True,
+                f"[{summ}] target 8.5 is reached within a scan containing b=0",
+            )
+            rcheck(
+                fs_nm["endpoint_limits"]["conditional_moment_monotonic"] is False
+                and fs_nm["global_outer_bound"]["target_within_global_outer_bound"]
+                is True,
+                f"[{summ}] scan reports nonmonotonic moment and in-bound target",
+            )
+            val_nm = classify_scientific_validity(
+                fs_nm,
+                rg_support_overlap(tgt_nm, tgt_nm, 0.5, 9.5),
+                is_fitted_scale=False,
+            )
+            rcheck(
+                val_nm["status"] != "outside_global_outer_bound",
+                f"[{summ}] validity does not place a b=0-reachable target outside "
+                f"the all-b model range (status={val_nm['status']})",
+            )
+            rcheck(
+                not any("cannot be reproduced by any real contact bias" in w
+                        for w in fs_nm["warnings"]),
+                f"[{summ}] no false all-b impossibility warning is emitted",
+            )
 
     # ---------------------------------------------------------------- test H --
     print("Scalar-Rg test 14: a no-collapse curve reports no transition temperature")
@@ -2395,10 +2558,13 @@ def _run_rg_regression_tests(
             joint_reweight_stats(crg_s, m_c, r_c, float(b), "rms")["pred_rg_lattice"]
             for b in np.linspace(-10, 10, 401)
         ])
-        # Just outside the scanned range but still inside the asymptotic range, so
+        # Just outside the scanned range but still inside the global outer bound, so
         # only the finite-scan warning fires and its wording can be checked alone.
-        lim_scan = asymptotic_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
-        gap_lo = float(lim_scan["asymptotic_reachable_rg_min"])
+        lim_scan = endpoint_rg_limits(crg_s, ce_s, re_s, summary="rms", rg_scale=1.0)
+        gob_scan = global_rg_outer_bounds(
+            crg_s, ce_s, re_s, summary="rms", rg_scale=1.0
+        )
+        gap_lo = float(gob_scan["global_outer_rg_min_lattice"])
         just_out = float(reach.min()) - 0.25 * (float(reach.min()) - gap_lo)
         tgt_scan = np.array([just_out] * 3)
         fs_scan = run_rg_feasibility_scan(
@@ -2407,17 +2573,64 @@ def _run_rg_regression_tests(
             bias_points=401, outdir=tdp, make_plots=False,
         )
         joined = " ".join(fs_scan["warnings"])
+        # This baseline's Rg(b) is monotonic, so a target below the scanned minimum
+        # is necessarily closest to a bias at the scan BOUNDARY: the honest verdict
+        # is "inconclusive, widen it", not a settled miss. A settled
+        # unreachable_within_scan needs an interior extremum -- checked below with
+        # the nonmonotonic baseline.
         rcheck(
-            "within the scanned bias interval" in joined,
-            "the unreachable warning says 'within the scanned bias interval'",
+            fs_scan["reachability_status"] == "boundary_limited",
+            f"a monotonic-curve target below the scanned range is boundary_limited "
+            f"(got {fs_scan['reachability_status']})",
+        )
+        rcheck(
+            "scanned bias interval" in joined,
+            "the warning scopes itself to the scanned bias interval",
         )
         rcheck(
             "[-10, 10]" in joined,
-            f"the unreachable warning states the actual interval: {joined[:0] or '[-10, 10]'}",
+            f"the warning states the actual interval: {joined[:0] or '[-10, 10]'}",
         )
         rcheck(
             "any bias" not in joined and "NO value of b(T)" not in joined,
             "no warning claims 'any bias' or 'NO value of b(T)' from a finite scan",
+        )
+
+        # A genuine settled unreachable_within_scan: the nonmonotonic baseline's
+        # Rg(b) peaks at ~8.84 in the scan INTERIOR, so a target just above the peak
+        # but below the outer bound (9) is missed away from the boundary.
+        reach_nm = np.array([
+            joint_reweight_stats(crg_nm, m_nm, r_nm, float(b), "mean")["pred_rg_lattice"]
+            for b in np.linspace(-10, 10, 401)
+        ])
+        peak_nm = float(reach_nm.max())
+        tgt_int = np.array([peak_nm + 0.25 * (9.0 - peak_nm)] * 3)
+        fs_int = run_rg_feasibility_scan(
+            crg_nm, ce_nm, re_nm, tgt_int, tgt_int,
+            rg_scale=1.0, summary="mean", bias_min=-10.0, bias_max=10.0,
+            bias_points=401, outdir=tdp, make_plots=False,
+        )
+        rcheck(
+            fs_int["reachability_status"] == "unreachable_within_scan",
+            f"a target missed at an INTERIOR extremum is unreachable_within_scan "
+            f"(got {fs_int['reachability_status']})",
+        )
+        int_join = " ".join(fs_int["warnings"])
+        rcheck(
+            "were not reached within the scanned bias interval" in int_join,
+            "the unreachable warning says 'not reached within the scanned bias "
+            "interval'",
+        )
+        rcheck(
+            "remain inside the rigorous global outer bound" in int_join
+            and "does not prove impossibility" in int_join,
+            "the unreachable warning states the target is still inside the outer "
+            "bound and disclaims impossibility",
+        )
+        rcheck(
+            not any("cannot be reproduced by any real contact bias" in w
+                    for w in fs_int["warnings"]),
+            "a scan-scoped miss inside the outer bound makes no all-b claim",
         )
         rcheck(
             fs_scan["reachability_status"] in (
@@ -2427,32 +2640,102 @@ def _run_rg_regression_tests(
             f"{fs_scan['reachability_status']}",
         )
         rcheck(
-            "asymptotic" in fs_scan["definition_note"].lower()
-            and "not proof" in fs_scan["definition_note"].lower(),
+            "global_outer_bound" in fs_scan["definition_note"].lower()
+            and "never a proof" in fs_scan["reachability_status_note"].lower(),
             "definition_note disclaims proof-of-impossibility for the finite scan",
         )
+        # §7: the finite-scan message and an all-b impossibility claim are mutually
+        # exclusive conclusions and must never be printed about the same target.
+        rcheck(
+            not any("cannot be reproduced by any real contact bias" in w
+                    for w in fs_scan["warnings"]),
+            "a scan-scoped miss emits no all-b impossibility warning",
+        )
+        rcheck(
+            sum(1 for w in fs_scan["warnings"]
+                if "widen the bias interval" in w or "wider interval" in w) <= 1,
+            "at most one inconclusive/widen-the-scan warning is emitted",
+        )
 
-        # A target outside the ASYMPTOTIC range may make the stronger claim.
-        far = float(lim_scan["asymptotic_reachable_rg_max"]) * 3.0
+        # A target outside the GLOBAL OUTER BOUND may make the stronger claim.
+        # It is placed strictly INSIDE the baseline Rg support, between the outer
+        # bound and the top of the support: support overlap therefore exists and
+        # cannot pre-empt the verdict, isolating the all-b impossibility claim.
+        # This is the scientifically interesting case -- the baseline has mass at
+        # this Rg, yet no bias can move the SUMMARY there, because every biased
+        # summary is a convex combination of the per-contact conditional moments.
+        base_lo_k, base_hi_k = baseline_rg_support(crg_s, re_s)
+        gob_hi_k = float(gob_scan["global_outer_rg_max_lattice"])
+        far = gob_hi_k + 0.5 * (base_hi_k - gob_hi_k)
+        rcheck(
+            base_lo_k < far < base_hi_k and far > gob_hi_k,
+            f"the out-of-bound test target {far:.4g} is inside the baseline support "
+            f"[{base_lo_k:.4g}, {base_hi_k:.4g}] but above the outer bound "
+            f"{gob_hi_k:.4g}",
+        )
         tgt_far = np.array([far] * 3)
         fs_far = run_rg_feasibility_scan(
             crg_s, ce_s, re_s, tgt_far, 0.345 * tgt_far,
             rg_scale=0.345, summary="rms", bias_min=-10.0, bias_max=10.0,
             bias_points=401, outdir=tdp, make_plots=False,
         )
-        asym_w = [w for w in fs_far["warnings"] if "asymptotic" in w.lower()]
+        gob_w = [w for w in fs_far["warnings"]
+                 if "global scalar-Rg outer bound" in w]
         rcheck(
-            bool(asym_w) and any("b -> +/-inf" in w for w in asym_w),
-            "an out-of-asymptotic-range target gets the stronger model-range warning",
+            bool(gob_w)
+            and any("cannot be reproduced by any real contact bias b" in w
+                    for w in gob_w),
+            "an out-of-outer-bound target gets the stronger all-b impossibility claim",
         )
         rcheck(
-            fs_far["target_within_asymptotic_reachable_range"] is False,
-            "target_within_asymptotic_reachable_range=False for an impossible target",
+            fs_far["global_outer_bound"]["target_within_global_outer_bound"] is False,
+            "target_within_global_outer_bound=False for an impossible target",
         )
         rcheck(
-            any("any real bias" in w for w in asym_w),
-            "only the asymptotic warning is allowed to speak about all real bias",
+            fs_far["reachability_status"] == "outside_global_outer_bound",
+            f"an impossible target is classified outside_global_outer_bound, got "
+            f"{fs_far['reachability_status']}",
         )
+        # §7: the impossibility claim must not be accompanied by "widen the scan".
+        rcheck(
+            not any("widen the bias interval" in w or "wider interval" in w
+                    for w in fs_far["warnings"]),
+            "an all-b impossibility claim is NOT paired with a widen-the-scan warning",
+        )
+        rcheck(
+            all("any real bias" not in w and "any real contact bias" not in w
+                for w in fs_far["warnings"] if w not in gob_w
+                and "support" not in w.lower()),
+            "only the outer-bound warning speaks about all real bias",
+        )
+
+        # §6/§17.6: the scan's status and the validity status must never contradict.
+        for fs_case in (fs_scan, fs_far):
+            val_case = classify_scientific_validity(
+                fs_case,
+                rg_support_overlap(
+                    np.array([fs_case["target_rg_min"]]),
+                    np.array([fs_case["target_rg_max"]]),
+                    fs_case["baseline_rg_min"], fs_case["baseline_rg_max"],
+                ),
+                is_fitted_scale=False,
+            )
+            consistent = {
+                "zero_support_overlap": {"zero_support_overlap"},
+                "outside_global_outer_bound": {"outside_global_outer_bound"},
+                "boundary_limited": {"boundary_limited"},
+                "unreachable_within_scan": {"outside_scanned_range"},
+                "reachable_within_scan": {
+                    "supported", "supported_as_mapping_diagnostic",
+                    "weak_contact_rg_coupling",
+                },
+            }[fs_case["reachability_status"]]
+            rcheck(
+                val_case["status"] in consistent
+                or val_case["status"] == "zero_support_overlap",
+                f"validity status {val_case['status']!r} is consistent with "
+                f"reachability_status {fs_case['reachability_status']!r}",
+            )
 
     # -------------------------------------------- unreachability vs roundoff --
     print("Scalar-Rg test 15b: float noise never manufactures an unreachability claim")
@@ -2495,8 +2778,8 @@ def _run_rg_regression_tests(
         tdp = Path(td)
         # A genuinely unreachable target must still be reported as such.
         crg0, ce0, re0 = _make_synthetic_joint(coupling=0.0)
-        lim0 = asymptotic_rg_limits(crg0, ce0, re0, summary="rms", rg_scale=0.345)
-        far0 = float(lim0["asymptotic_reachable_rg_max"]) * 2.0
+        gob0 = global_rg_outer_bounds(crg0, ce0, re0, summary="rms", rg_scale=0.345)
+        far0 = float(gob0["global_outer_rg_max_lattice"]) * 2.0
         fs0_far = run_rg_feasibility_scan(
             crg0, ce0, re0, np.array([far0] * 3), np.array([0.345 * far0] * 3),
             rg_scale=0.345, summary="rms", bias_min=-10.0, bias_max=10.0,
@@ -2504,7 +2787,8 @@ def _run_rg_regression_tests(
         )
         rcheck(
             fs0_far["n_targets_outside_reachable"] == 3
-            and fs0_far["target_within_asymptotic_reachable_range"] is False,
+            and fs0_far["global_outer_bound"]["target_within_global_outer_bound"]
+            is False,
             "the tolerance still detects a genuinely unreachable target",
         )
         # A zero-coupling baseline is non-identifiable and must say so regardless.
@@ -2664,7 +2948,7 @@ def _run_rg_regression_tests(
             f"{sv['fitted_scale']['status'] if sv['fitted_scale'] else None}",
         )
         rcheck(
-            sv["fitted_scale"]["within_asymptotic_range"] is True
+            sv["fitted_scale"]["within_global_outer_bound"] is True
             and sv["fitted_scale"]["reachable_within_scan"] is True,
             "the fitted-scale branch reports its own reachability, not the nominal's",
         )
@@ -2874,6 +3158,266 @@ def _run_rg_regression_tests(
                 summ_z["scientific_validity"]["fitted_scale"]["status"]
                 != "zero_support_overlap",
                 "the fitted result is NOT classified by the nominal support failure",
+            )
+
+    # --------------------------------------------------------------- test L --
+    # §10: all four root topologies. The tangential root is placed OFF the
+    # sampling grid on purpose: b(T) = ((T-Tref)/Tscale - 0.2)^2 has its root at
+    # exactly T=324, where (324-315)/45 == 0.2 in exact float arithmetic, so
+    # b(T) == 0.0 lands on the `a == 0.0` branch and even a pure sign-change
+    # search "finds" it. That would make this test vacuous. Nudging the root off
+    # the grid removes the coincidence and tests real tangency detection.
+    print("Scalar-Rg test 21: zero crossings cover sign-change, exact, tangential, edge")
+    Tref_r, Tscale_r = 315.0, 45.0
+    t_lo_r, t_hi_r = 270.0, 360.0
+
+    # (a) ordinary sign-changing root
+    root_sign = 315.0
+    fn_sign = lambda p, T: (T - root_sign) / Tscale_r
+    got = bias_zero_crossings(fn_sign, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        len(got) == 1 and abs(got[0] - root_sign) < 1e-6,
+        f"sign-changing root found at {root_sign}: got {got}",
+    )
+
+    # (b) exactly sampled zero that does NOT change sign is still a root
+    #     (verified below by (c); here: an exactly sampled sign-changing zero)
+    fn_exact = lambda p, T: (T - 324.0) / Tscale_r
+    got = bias_zero_crossings(fn_exact, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        len(got) == 1 and abs(got[0] - 324.0) < 1e-9,
+        f"exactly sampled zero found at 324.0: got {got}",
+    )
+
+    # (c) TANGENTIAL root, off-grid: touches zero, never changes sign
+    r_tan = 0.2005
+    root_tan = Tref_r + r_tan * Tscale_r          # 324.0225
+    grid_r = np.linspace(t_lo_r, t_hi_r, 2001)
+    rcheck(
+        not np.any(np.abs(grid_r - root_tan) < 1e-12),
+        f"the tangential test root {root_tan:g} is genuinely OFF the sampling grid "
+        f"(otherwise this test would pass without tangency detection)",
+    )
+    fn_tan = lambda p, T: ((T - Tref_r) / Tscale_r - r_tan) ** 2
+    vals_tan = np.array([fn_tan(None, float(T)) for T in grid_r])
+    rcheck(
+        np.all(vals_tan >= 0.0) and not np.any(vals_tan == 0.0),
+        "the tangential b(T) never changes sign and is never exactly zero on the grid",
+    )
+    got_tan = bias_zero_crossings(fn_tan, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        len(got_tan) == 1 and abs(got_tan[0] - root_tan) < 1e-4,
+        f"tangential root at {root_tan:g} is found: got {got_tan}",
+    )
+    rcheck(
+        abs(fn_tan(None, got_tan[0])) <= 1e-8 if got_tan else False,
+        "the tangential root actually satisfies |b(T_root)| <= tolerance",
+    )
+
+    # (d) root sitting on an interval endpoint
+    fn_edge = lambda p, T: (T - t_hi_r) / Tscale_r
+    got = bias_zero_crossings(fn_edge, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        len(got) == 1 and abs(got[0] - t_hi_r) < 1e-6,
+        f"a root on the interval endpoint {t_hi_r:g} is found: got {got}",
+    )
+    fn_edge_lo = lambda p, T: (T - t_lo_r) / Tscale_r
+    got = bias_zero_crossings(fn_edge_lo, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        len(got) == 1 and abs(got[0] - t_lo_r) < 1e-6,
+        f"a root on the interval endpoint {t_lo_r:g} is found: got {got}",
+    )
+
+    # (e) a strictly positive b(T) with a non-zero minimum must NOT be a root
+    fn_nonroot = lambda p, T: ((T - Tref_r) / Tscale_r - r_tan) ** 2 + 0.5
+    got = bias_zero_crossings(fn_nonroot, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        got == [],
+        f"a strictly positive b(T) yields NO root (minimum of |b| is not a zero): "
+        f"got {got}",
+    )
+    # (f) two distinct tangential roots are both found and not deduplicated away
+    fn_two = lambda p, T: ((T - 300.0) ** 2) * ((T - 340.0) ** 2) / 1e6
+    got = bias_zero_crossings(fn_two, np.array([0.0]), t_lo_r, t_hi_r)
+    rcheck(
+        len(got) == 2
+        and abs(got[0] - 300.0) < 1e-3 and abs(got[1] - 340.0) < 1e-3,
+        f"two distinct tangential roots are both found: got {got}",
+    )
+
+    # --------------------------------------------------------------- test M --
+    # §11: T_rg_half must be null for a flat curve and for an ambiguous one.
+    print("Scalar-Rg test 22: T_rg_half is null for flat and ambiguous curves")
+    tm_flat_h = rg_curve_transition_metrics(
+        crg_flat, ce_f, re_f, true_p, bfn_s, 270.0, 360.0,
+        rg_scale=0.345, summary="rms", target_units="observed", n_grid=1001,
+    )
+    rcheck(
+        tm_flat_h["T_rg_half"] is None and tm_flat_h["rg_half_defined"] is False,
+        f"a flat curve reports T_rg_half=None (got {tm_flat_h['T_rg_half']!r})",
+    )
+    rcheck(
+        tm_flat_h["rg_half_ambiguous"] is False,
+        "a flat curve is not 'ambiguous' -- it is undefined for a different reason",
+    )
+    rcheck(
+        tm_flat_h["rg_curve_span"] <= tm_flat_h["rg_half_tolerance"],
+        "the flat verdict is justified by span <= tolerance, not by eyeball",
+    )
+    # A genuine monotonic collapse must still yield exactly one crossing.
+    rcheck(
+        tm_real["rg_half_defined"] is True
+        and tm_real["T_rg_half"] is not None
+        and len(tm_real["T_rg_half_crossings"]) == 1,
+        f"a genuine collapse still defines T_rg_half "
+        f"(got {tm_real['T_rg_half']!r}, "
+        f"{len(tm_real['T_rg_half_crossings'])} crossing(s))",
+    )
+    # And the crossing must be interpolated, not snapped to a grid point.
+    grid_real = tm_real["grid"]
+    on_grid_real = bool(
+        np.any(np.abs(grid_real - tm_real["T_rg_half"]) < 1e-12)
+    )
+    rcheck(
+        not on_grid_real
+        or abs(tm_real["curve"][int(np.argmin(np.abs(grid_real - tm_real["T_rg_half"])))]
+               - tm_real["rg_half_value"]) < 1e-9,
+        "T_rg_half is an interpolated crossing, not the nearest sampled point",
+    )
+    # Ambiguity, from a REAL Rg(T) curve rather than a hand-drawn array. The
+    # nonmonotonic baseline's Rg(b) is single-peaked at b=0; a poly2 b(T) with a
+    # turning point sweeps ACROSS that peak twice, so Rg(T) is bimodal and crosses
+    # its endpoint midpoint several times. (A unimodal curve always crosses the
+    # endpoint average exactly once, which is why a turning-point b(T) is needed
+    # to exhibit ambiguity at all.)
+    bfn_poly2 = make_b_fn("poly2", 315.0, 90.0)
+    p_amb = np.array([-2.0, -6.0, 25.0 / 3.0])
+    tm_amb = rg_curve_transition_metrics(
+        crg_nm, ce_nm, re_nm, p_amb, bfn_poly2, 270.0, 360.0,
+        rg_scale=1.0, summary="mean", target_units="lattice", n_grid=1001,
+    )
+    rcheck(
+        len(tm_amb["T_rg_half_crossings"]) > 1,
+        f"the bimodal Rg(T) curve genuinely crosses its endpoint midpoint "
+        f"more than once (got {len(tm_amb['T_rg_half_crossings'])} crossings at "
+        f"{[round(t, 2) for t in tm_amb['T_rg_half_crossings']]})",
+    )
+    rcheck(
+        tm_amb["T_rg_half"] is None and tm_amb["rg_half_ambiguous"] is True
+        and tm_amb["rg_half_defined"] is False,
+        f"several midpoint crossings -> T_rg_half=None and rg_half_ambiguous=True "
+        f"(got T_rg_half={tm_amb['T_rg_half']!r}, "
+        f"ambiguous={tm_amb['rg_half_ambiguous']})",
+    )
+    rcheck(
+        all(270.0 <= t <= 360.0 for t in tm_amb["T_rg_half_crossings"]),
+        "every reported crossing lies inside the observed temperature interval",
+    )
+
+    # --------------------------------------------------------------- test N --
+    # §12: the CSVs must be readable by ordinary tools with no special arguments.
+    print("Scalar-Rg test 23: CSV outputs are rectangular with a real header row")
+    try:
+        import pandas as _pd
+    except Exception:
+        _pd = None
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        run_rg_feasibility_scan(
+            crg_s, ce_s, re_s, np.array([1.4, 1.5]), np.array([0.48, 0.52]),
+            rg_scale=0.345, summary="rms", bias_min=-5.0, bias_max=5.0,
+            bias_points=11, outdir=tdp, make_plots=False,
+        )
+        csv_p = tdp / "rg_feasibility.csv"
+        with open(csv_p, newline="") as fh:
+            rows = list(csv.reader(fh))
+        rcheck(
+            rows[0][0] == "bias",
+            f"row 0 IS the header, not a metadata banner (got {rows[0][0]!r})",
+        )
+        widths = {len(r) for r in rows}
+        rcheck(
+            len(widths) == 1,
+            f"every CSV row has the same field count (widths seen: {sorted(widths)})",
+        )
+        with open(csv_p, newline="") as fh:
+            recs = list(csv.DictReader(fh))
+        rcheck(
+            len(recs) == 11
+            and "bias" in recs[0] and "pred_rg_lattice" in recs[0]
+            and "rg_scale_used" in recs[0],
+            "csv.DictReader recognizes the real data columns with no skiprows",
+        )
+        rcheck(
+            all(abs(float(r["rg_scale_used"]) - 0.345) < 1e-12 for r in recs),
+            "scale provenance rides along as a repeated column on every row",
+        )
+        if _pd is not None:
+            df = _pd.read_csv(csv_p)
+            rcheck(
+                list(df.columns)[:2] == ["bias", "pred_rg_lattice"]
+                and len(df) == 11
+                and _pd.api.types.is_numeric_dtype(df["bias"]),
+                f"pandas.read_csv() parses it with no skiprows/comment args and "
+                f"keeps numeric dtypes (columns={list(df.columns)[:3]}, n={len(df)})",
+            )
+
+    # --------------------------------------------------------------- test O --
+    # §13: the driver validates its own arguments, even when called directly.
+    print("Scalar-Rg test 24: run_rg_scalar_mode() validates its own arguments")
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        # Argument validation runs before any file is opened, so a well-formed
+        # baseline is enough; its scientific content is irrelevant here.
+        pred_lat_v, _, _ = predict_rg_summary_from_joint(
+            crg_s, ce_s, re_s, temps_s, true_p, bfn_s,
+            rg_scale=0.345, summary="rms", target_units="observed",
+        )
+        dat_p, npz_p = _write_scalar_inputs(
+            tdp, temps_s, 0.345 * pred_lat_v, crg_s, ce_s, re_s
+        )
+        bad_cases = [
+            ("rg_scale=0", dict(rg_scale=0.0), "rg-scale"),
+            ("rg_scale=-1", dict(rg_scale=-1.0), "rg-scale"),
+            ("rg_scale=nan", dict(rg_scale=float("nan")), "rg-scale"),
+            ("rg_bias_min>=max", dict(rg_bias_min=5.0, rg_bias_max=-5.0), "rg-bias-min"),
+            ("rg_bias_points=2", dict(rg_bias_points=2), "rg-bias-points"),
+            ("n_restarts=0", dict(n_restarts=0), "n_restarts"),
+            ("bootstrap=-1", dict(bootstrap=-1), "bootstrap"),
+            ("huber_delta=0", dict(rg_huber_delta=0.0), "rg-huber-delta"),
+            ("range_floor=0", dict(rg_range_floor=0.0), "rg-range-floor"),
+            (
+                "scale_min>=scale_max while fitting",
+                dict(fit_rg_scale=True, rg_scale_min=0.9, rg_scale_max=0.2),
+                "rg-scale-min",
+            ),
+        ]
+        for label, over, expect_token in bad_cases:
+            outd = tdp / f"never_{abs(hash(label)) % 10000}"
+            a_bad = _scalar_args(
+                rg_means_file=str(dat_p), baseline=str(npz_p), outdir=str(outd),
+                model="tc_scale", rg_summary="rms", rg_target_units="observed",
+                no_plots=True, **over,
+            )
+            try:
+                run_rg_scalar_mode(a_bad)
+                rcheck(False, f"direct call with {label} must raise ValueError")
+            except ValueError as exc:
+                rcheck(
+                    expect_token in str(exc),
+                    f"direct call with {label} raises a clear ValueError naming "
+                    f"{expect_token!r}: {str(exc)[:70]}",
+                )
+            except Exception as exc:  # pragma: no cover - failure path
+                rcheck(
+                    False,
+                    f"direct call with {label} raised {type(exc).__name__}, not a "
+                    f"clear ValueError: {str(exc)[:70]}",
+                )
+            rcheck(
+                not outd.exists(),
+                f"an invalid {label} call creates no output directory (no "
+                f"half-written run is left behind)",
             )
 
     return local_failures
@@ -4721,16 +5265,39 @@ def bias_zero_crossings(
     t_hi: float,
     *,
     n_grid: int = 2001,
+    root_tolerance: Optional[float] = None,
 ) -> List[float]:
-    """Temperatures in [t_lo, t_hi] where b(T) = 0, found by sign change + bisection.
+    """Temperatures in [t_lo, t_hi] where b(T) = 0.
 
     This is the BIAS zero-crossing: the temperature at which the contact bias
-    changes sign.  For a finite chain it is not generally the temperature at
-    which Rg(T) changes fastest — see rg_curve_transition_metrics().
+    vanishes.  For a finite chain it is not generally the temperature at which
+    Rg(T) changes fastest — see rg_curve_transition_metrics().
+
+    Roots are found by two complementary passes, because a sign change is not the
+    only way a function reaches zero:
+
+      sign change   bracketed and refined by bisection (odd-multiplicity roots)
+      tangency      local minima of |b(T)| refined by bounded minimization, then
+                    accepted only if |b(T_root)| <= root_tolerance
+                    (even-multiplicity roots, e.g. b(T) = ((T-Tref)/Tscale - r)^2,
+                    which touches zero without ever changing sign and which a
+                    sign-change search misses entirely)
+
+    Exactly-sampled zeros and roots sitting on the interval endpoints are handled
+    by both passes; results are deduplicated.
     """
     grid = np.linspace(float(t_lo), float(t_hi), int(n_grid))
     vals = np.array([b_fn(params, float(T)) for T in grid], dtype=float)
+
+    if root_tolerance is None:
+        finite = vals[np.isfinite(vals)]
+        b_ref = float(np.max(np.abs(finite))) if finite.size else 1.0
+        root_tolerance = max(1e-10, 1e-8 * max(1.0, b_ref))
+    root_tolerance = float(root_tolerance)
+
     out: List[float] = []
+
+    # --- pass 1: sign-changing roots (and exactly sampled zeros) --------------
     for i in range(grid.size - 1):
         a, c = vals[i], vals[i + 1]
         if not (np.isfinite(a) and np.isfinite(c)):
@@ -4753,9 +5320,41 @@ def bias_zero_crossings(
             out.append(0.5 * (lo + hi))
     if vals.size and vals[-1] == 0.0:
         out.append(float(grid[-1]))
-    # Deduplicate crossings that bisected to the same temperature.
+
+    # --- pass 2: tangential roots (local minima of |b| that reach zero) -------
+    absv = np.abs(vals)
+    cand: List[int] = []
+    for i in range(absv.size):
+        if not np.isfinite(absv[i]):
+            continue
+        left = absv[i - 1] if i > 0 else np.inf
+        right = absv[i + 1] if i < absv.size - 1 else np.inf
+        # <= on one side so a flat-bottomed sampled minimum still registers.
+        if absv[i] <= left and absv[i] <= right:
+            cand.append(i)
+
+    for i in cand:
+        lo = float(grid[max(i - 1, 0)])
+        hi = float(grid[min(i + 1, grid.size - 1)])
+        t_root = float(grid[i])
+        b_root = float(absv[i])
+        if hi > lo and minimize_scalar is not None:
+            try:
+                res = minimize_scalar(
+                    lambda T: abs(float(b_fn(params, float(T)))),
+                    bounds=(lo, hi), method="bounded",
+                    options={"xatol": 1e-12 * max(1.0, abs(hi))},
+                )
+                if res.success and np.isfinite(res.fun) and float(res.fun) <= b_root:
+                    t_root, b_root = float(res.x), float(res.fun)
+            except Exception:
+                pass  # fall back to the sampled candidate
+        if b_root <= root_tolerance:
+            out.append(t_root)
+
+    # Deduplicate roots found by more than one pass or bisected to the same point.
     uniq: List[float] = []
-    for t in out:
+    for t in sorted(out):
         if not any(abs(t - u) < 1e-6 * max(1.0, abs(u)) for u in uniq):
             uniq.append(float(t))
     return uniq
@@ -4784,12 +5383,25 @@ def rg_curve_transition_metrics(
                               resolved collapse (flat or expanding with T)
     ``rg_max_negative_slope`` the value of -dRg/dT there (target units per K)
     ``collapse_detected``     whether a collapse was resolved at all
-    ``T_rg_half``             the temperature nearest the midpoint between the
-                              fitted Rg at the low and high ends of the interval
+    ``T_rg_half``             the temperature at which the curve crosses the
+                              midpoint of its endpoint values, by interpolation --
+                              but ONLY when exactly one such crossing exists
+    ``T_rg_half_crossings``   every midpoint crossing found
+    ``rg_half_defined``       whether T_rg_half is meaningful
+    ``rg_half_ambiguous``     whether the midpoint is crossed more than once
 
     A curve that is flat or expands with temperature has no collapse temperature;
     reporting the argmax of numerical noise as one would be a fabricated
     transition, so T_rg_max_slope is None in that case.
+
+    T_rg_half is subject to two separate failure modes, both of which return None
+    rather than a fabricated number:
+
+      flat curve       every temperature is equally close to the midpoint, so an
+                       argmin over |curve - mid| returns the first grid point --
+                       a meaningless answer that looks like a measurement.
+      nonmonotonic     the midpoint can be crossed several times; no single one
+                       of them is "the" half-height temperature.
 
     T_rg_max_slope is the primary finite-chain transition descriptor and is a
     DIFFERENT quantity from the bias zero-crossing b(T) = 0.
@@ -4817,15 +5429,64 @@ def rg_curve_transition_metrics(
 
     rg_start, rg_end = float(curve[0]), float(curve[-1])
     mid = 0.5 * (rg_start + rg_end)
-    j = int(np.argmin(np.abs(curve - mid)))
+    curve_span = abs(rg_end - rg_start)
+
+    # Scale-aware floor: below this the endpoints are indistinguishable and the
+    # "midpoint" is not a level the curve meaningfully crosses.
+    half_tolerance = max(1e-12, 1e-6 * max(float(np.ptp(curve)), 1.0))
+    rg_half_flat = bool(curve_span <= half_tolerance)
+
+    # Locate midpoint crossings by linear interpolation between adjacent grid
+    # points, never by snapping to the nearest sampled point.
+    crossings: List[float] = []
+    if not rg_half_flat:
+        dev = curve - mid
+        for i in range(dev.size - 1):
+            a, c = float(dev[i]), float(dev[i + 1])
+            if a == 0.0:
+                crossings.append(float(grid[i]))
+                continue
+            if a * c < 0.0:
+                frac = a / (a - c)  # a + frac*(c-a) == 0
+                crossings.append(float(grid[i] + frac * (grid[i + 1] - grid[i])))
+        if dev.size and float(dev[-1]) == 0.0:
+            crossings.append(float(grid[-1]))
+        uniq: List[float] = []
+        for t in crossings:
+            if not any(abs(t - u) <= 1e-9 * max(1.0, abs(u)) for u in uniq):
+                uniq.append(t)
+        crossings = uniq
+
+    if rg_half_flat:
+        T_rg_half: Optional[float] = None
+        rg_half_value: Optional[float] = float(0.5 * (rg_start + rg_end))
+        rg_half_defined = False
+        rg_half_ambiguous = False
+    elif len(crossings) == 1:
+        T_rg_half = float(crossings[0])
+        rg_half_value = float(mid)
+        rg_half_defined = True
+        rg_half_ambiguous = False
+    else:
+        # Zero crossings (endpoints differ but the midpoint level is never
+        # attained on the grid) or several: no single half-height temperature.
+        T_rg_half = None
+        rg_half_value = float(mid)
+        rg_half_defined = False
+        rg_half_ambiguous = len(crossings) > 1
 
     return {
         "T_rg_max_slope": T_rg_max_slope,
         "rg_max_negative_slope": max_negative_slope,
         "collapse_detected": collapse_detected,
         "slope_tolerance": float(slope_tolerance),
-        "T_rg_half": float(grid[j]),
-        "rg_half_value": float(curve[j]),
+        "T_rg_half": T_rg_half,
+        "T_rg_half_crossings": [float(t) for t in crossings],
+        "rg_half_value": rg_half_value,
+        "rg_half_defined": rg_half_defined,
+        "rg_half_ambiguous": rg_half_ambiguous,
+        "rg_half_tolerance": float(half_tolerance),
+        "rg_curve_span": float(curve_span),
         "rg_at_T_low": rg_start,
         "rg_at_T_high": rg_end,
         "grid": grid,
@@ -4887,6 +5548,319 @@ def joint_reweight_stats(
     }
 
 
+def _conditional_rg_by_contact(
+    crg_prob: np.ndarray,
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    *,
+    summary: str,
+    probability_tolerance: float,
+) -> Dict[str, Any]:
+    """Per-contact-bin conditional Rg moments, for the bins carrying baseline mass.
+
+    Returns, over the supported contact bins only (marginal mass strictly above
+    ``probability_tolerance``):
+
+    ``scalar``  the chosen scalar summary of the normalized P0(Rg | m_i):
+                E[Rg | m_i] for 'mean', sqrt(E[Rg^2 | m_i]) for 'rms'
+    ``moment``  the RAW moment that enters the convex combination linearly:
+                E[Rg | m_i] for 'mean', E[Rg^2 | m_i] for 'rms'
+
+    The distinction matters.  Only ``moment`` mixes linearly under reweighting, so
+    only ``moment`` may be used for bounding and monotonicity arguments; ``scalar``
+    is what the fit and the target are expressed in.
+    """
+    if summary not in RG_SUMMARY_CHOICES:
+        raise ValueError(
+            f"Unknown Rg summary {summary!r}. Choose from {RG_SUMMARY_CHOICES}."
+        )
+    validate_joint_baseline(c_edges, rg_edges, crg_prob)
+    crg_prob = np.asarray(crg_prob, dtype=float)
+    c_edges = np.asarray(c_edges, dtype=float)
+    rg_edges = np.asarray(rg_edges, dtype=float)
+    rg_centers = 0.5 * (rg_edges[:-1] + rg_edges[1:])
+    m_centers = 0.5 * (c_edges[:-1] + c_edges[1:])
+
+    contact_marginal = crg_prob.sum(axis=1)
+    nonzero_contact_bins = np.flatnonzero(contact_marginal > probability_tolerance)
+    if nonzero_contact_bins.size == 0:
+        raise ValueError(
+            "joint baseline has no contact bin with marginal mass above the "
+            "probability tolerance; conditional Rg moments are undefined"
+        )
+
+    scalars: List[float] = []
+    moments: List[float] = []
+    for i in nonzero_contact_bins:
+        row = crg_prob[int(i)]
+        z = float(row.sum())
+        if not np.isfinite(z) or z <= 0.0:
+            raise ValueError(
+                f"contact bin {int(i)} has non-positive conditional Rg mass"
+            )
+        cond = row / z
+        scalars.append(
+            float(rg_summary_from_mass(cond[None, :], rg_centers, summary)[0])
+        )
+        if summary == "mean":
+            moments.append(float(np.sum(cond * rg_centers)))
+        else:
+            moments.append(float(np.sum(cond * rg_centers ** 2)))
+
+    return {
+        "supported_contact_bins": nonzero_contact_bins.astype(int),
+        "supported_contact_centers": m_centers[nonzero_contact_bins],
+        "scalar": np.asarray(scalars, dtype=float),
+        "moment": np.asarray(moments, dtype=float),
+        "contact_marginal": contact_marginal,
+        "probability_tolerance": float(probability_tolerance),
+    }
+
+
+def conditional_moment_monotonicity(
+    moment: np.ndarray, *, rel_tolerance: float = 1e-9
+) -> Dict[str, Any]:
+    """Is the conditional Rg moment monotonic in supported contact count?
+
+    This is the exact condition under which the two endpoint (b -> +/-inf) limits
+    are the extrema of the scalar over ALL real b.  The biased scalar moment is the
+    convex combination sum_i w_i(b) mu_i with weights w_i(b) ∝ P0(m_i) exp[-b m_i].
+    A convex combination of a monotonic sequence is bounded by its first and last
+    terms, and the endpoint limits attain exactly those; if mu_i is NOT monotonic an
+    interior contact bin can carry the extremum and the endpoint limits then bound
+    nothing.
+
+    Differences below a scale-aware tolerance count as flat, so that floating-point
+    noise in a genuinely constant or monotonic sequence is not misread as structure.
+
+    Returns ``monotonic`` and ``direction`` in
+    {increasing, decreasing, constant, nonmonotonic}.
+    """
+    mu = np.asarray(moment, dtype=float)
+    if mu.size == 0:
+        raise ValueError("conditional moment array is empty")
+    scale_ref = max(float(np.max(np.abs(mu))), 1.0)
+    tol = float(rel_tolerance) * scale_ref
+    diffs = np.diff(mu)
+    up = bool(np.any(diffs > tol))
+    down = bool(np.any(diffs < -tol))
+    if up and down:
+        direction = "nonmonotonic"
+    elif up:
+        direction = "increasing"
+    elif down:
+        direction = "decreasing"
+    else:
+        direction = "constant"
+    return {
+        "conditional_moment_monotonic": direction != "nonmonotonic",
+        "conditional_moment_direction": direction,
+        "conditional_moment_tolerance": tol,
+        "conditional_moment_max_step": float(np.max(np.abs(diffs))) if diffs.size else 0.0,
+    }
+
+
+def global_rg_outer_bounds(
+    crg_prob: np.ndarray,
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    *,
+    summary: str,
+    rg_scale: float,
+    probability_tolerance: float = 1e-15,
+    rg_target_lattice: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Rigorous outer bound on the scalar Rg over ALL real contact biases b.
+
+    Contact-only reweighting factorizes: P_b(m, Rg) ∝ P0(m, Rg) exp[-b m] leaves
+    every conditional P0(Rg | m_i) untouched and only re-weights the contact
+    marginal.  So for every real b the biased raw moment is a convex combination
+    over the supported contact bins,
+
+        E_b[X] = sum_i w_i(b) mu_i,   w_i(b) ∝ P0(m_i) exp[-b m_i],  w_i >= 0,
+                                      sum_i w_i = 1,
+
+    with X = Rg (summary 'mean') or X = Rg^2 (summary 'rms').  A convex combination
+    is bounded by the extreme values it mixes, hence for every real b:
+
+        min_i mu_i <= E_b[X] <= max_i mu_i.
+
+    For 'mean' that bounds the scalar directly.  For 'rms' it bounds the second
+    moment, and since sqrt is monotone increasing,
+
+        sqrt(min_i q_i) <= sqrt(E_b[Rg^2]) <= sqrt(max_i q_i),
+
+    which is why taking min/max of the per-bin conditional SCALARS is equivalent
+    and is what is reported here.
+
+    This is a NECESSARY bound, not a sufficient one:
+
+      * a target outside it is impossible for every real b
+      * a target inside it is NOT thereby proven reachable -- the weights w_i(b)
+        form a one-parameter exponential family, not the full simplex, so most
+        convex combinations are never realized by any single b
+
+    Unlike the two endpoint limits (see endpoint_rg_limits), this bound holds
+    whether or not mu_i is monotonic in contact count, and is therefore the only
+    quantity here that may license an all-real-b impossibility claim.
+    """
+    cond = _conditional_rg_by_contact(
+        crg_prob, c_edges, rg_edges,
+        summary=summary, probability_tolerance=probability_tolerance,
+    )
+    bins = cond["supported_contact_bins"]
+    centers = cond["supported_contact_centers"]
+    scalar = cond["scalar"]
+    scale = float(rg_scale)
+
+    k_min = int(np.argmin(scalar))
+    k_max = int(np.argmax(scalar))
+    lo = float(scalar[k_min])
+    hi = float(scalar[k_max])
+
+    mono = conditional_moment_monotonicity(cond["moment"])
+
+    out: Dict[str, Any] = {
+        "supported_contact_bins": bins,
+        "supported_contact_centers": centers,
+        "conditional_rg_scalar_by_contact_lattice": scalar,
+        "conditional_rg_scalar_by_contact_observed": scalar * scale,
+        "conditional_rg_moment_by_contact": cond["moment"],
+        "conditional_moment_quantity": (
+            "E[Rg | m]" if summary == "mean" else "E[Rg^2 | m]"
+        ),
+        "global_outer_rg_min_lattice": lo,
+        "global_outer_rg_max_lattice": hi,
+        "global_outer_rg_min_observed": lo * scale,
+        "global_outer_rg_max_observed": hi * scale,
+        "contact_bin_at_global_min": int(bins[k_min]),
+        "contact_bin_at_global_max": int(bins[k_max]),
+        "contact_value_at_global_min": float(centers[k_min]),
+        "contact_value_at_global_max": float(centers[k_max]),
+        "target_within_global_outer_bound": None,
+        "n_targets_outside_global_outer_bound": None,
+        "probability_tolerance": float(probability_tolerance),
+        "rg_scale_used": scale,
+        "is_exact_reachable_range": False,
+        "note": (
+            "Necessary outer bound; being inside does not prove finite-b "
+            "reachability."
+        ),
+        "interpretation": (
+            "Rigorous outer bound on the scalar Rg summary over ALL real contact "
+            "biases b, from the convex-combination structure of contact-only "
+            "reweighting over the supported contact bins. A target outside this "
+            "bound cannot be reproduced by any real b for this fixed joint "
+            "baseline. A target inside it is NOT thereby reachable: the bound is "
+            "necessary, not sufficient. It constrains the SCALAR SUMMARY only and "
+            "is not a statement about full-distribution support."
+        ),
+    }
+    out.update(mono)
+    if rg_target_lattice is not None:
+        n_out = _count_outside_range(rg_target_lattice, lo, hi)
+        out["n_targets_outside_global_outer_bound"] = n_out
+        out["target_within_global_outer_bound"] = bool(n_out == 0)
+    return out
+
+
+def endpoint_rg_limits(
+    crg_prob: np.ndarray,
+    c_edges: np.ndarray,
+    rg_edges: np.ndarray,
+    *,
+    summary: str,
+    rg_scale: float,
+    tolerance: float = 0.0,
+) -> Dict[str, Any]:
+    """Exact scalar Rg limits of contact-only reweighting in the limits b -> +/-inf.
+
+    Because P_b(m, Rg) ∝ P0(m, Rg) exp[-b m], the weight becomes infinitely peaked
+    on one contact bin in each limit:
+
+        b -> +inf  concentrates on the MINIMUM contact value carrying baseline mass
+        b -> -inf  concentrates on the MAXIMUM contact value carrying baseline mass
+
+    so each limiting scalar is the chosen summary of the normalized conditional
+    P0(Rg | m) at that single bin.  Both limits are exact.
+
+    These are ONLY two points of the b-trajectory, NOT its range.  They bound the
+    finite-b curve exactly when the conditional moment is monotonic in supported
+    contact count (then the trajectory is a convex combination of a monotonic
+    sequence and cannot leave the interval its endpoints span).  When it is not
+    monotonic an interior contact slice can carry a scalar outside BOTH endpoint
+    values, and the endpoint interval bounds nothing:
+
+        m=0: Rg=1, mass=0.01 | m=1: Rg=9, mass=0.98 | m=2: Rg=1, mass=0.01
+
+    has both endpoint limits equal to 1 while b=0 gives mean Rg = 8.84.  Use
+    global_rg_outer_bounds() for all-b impossibility tests; ``monotonicity_note``
+    records whether these endpoints happen to coincide with that bound here.
+
+    Which endpoint is the compact one depends on the sign of the contact-Rg
+    relationship, so the interval is built with min()/max() rather than by assuming
+    an ordering.
+    """
+    cond = _conditional_rg_by_contact(
+        crg_prob, c_edges, rg_edges,
+        summary=summary, probability_tolerance=tolerance,
+    )
+    bins = cond["supported_contact_bins"]
+    centers = cond["supported_contact_centers"]
+    scalar = cond["scalar"]
+    scale = float(rg_scale)
+
+    min_bin = int(bins[0])    # fewest contacts carrying mass
+    max_bin = int(bins[-1])   # most contacts carrying mass
+    rg_pos_inf = float(scalar[0])    # b -> +inf  -> fewest contacts
+    rg_neg_inf = float(scalar[-1])   # b -> -inf  -> most contacts
+
+    lo = min(rg_pos_inf, rg_neg_inf)
+    hi = max(rg_pos_inf, rg_neg_inf)
+
+    mono = conditional_moment_monotonicity(cond["moment"])
+    monotonic = bool(mono["conditional_moment_monotonic"])
+
+    return {
+        "min_supported_contact_bin": min_bin,
+        "max_supported_contact_bin": max_bin,
+        "min_supported_contact_value": float(centers[0]),
+        "max_supported_contact_value": float(centers[-1]),
+        "contact_support_tolerance": float(tolerance),
+        "rg_limit_b_pos_inf_lattice": rg_pos_inf,
+        "rg_limit_b_neg_inf_lattice": rg_neg_inf,
+        "rg_limit_b_pos_inf_observed": rg_pos_inf * scale,
+        "rg_limit_b_neg_inf_observed": rg_neg_inf * scale,
+        "endpoint_limit_min_lattice": lo,
+        "endpoint_limit_max_lattice": hi,
+        "endpoint_limit_min_observed": lo * scale,
+        "endpoint_limit_max_observed": hi * scale,
+        "conditional_moment_monotonic": monotonic,
+        "conditional_moment_direction": mono["conditional_moment_direction"],
+        "conditional_moment_tolerance": mono["conditional_moment_tolerance"],
+        "is_exact_extremal_bound": monotonic,
+        "rg_scale_used": scale,
+        "monotonicity_note": (
+            "The conditional moment is monotonic in supported contact count, so "
+            "these two endpoint limits ARE the exact extrema of the scalar Rg over "
+            "all real b. Values strictly between them are not thereby all attained."
+            if monotonic else
+            "The conditional moment is NOT monotonic in supported contact count, so "
+            "these endpoint limits do NOT bound the finite-b trajectory: an interior "
+            "contact slice can carry a scalar outside both. Use global_outer_bound "
+            "for any all-b claim."
+        ),
+        "interpretation": (
+            "Exact scalar-Rg values of this fixed joint baseline under contact-only "
+            "reweighting in the limits b -> +/-inf, assuming the baseline support is "
+            "exact. b -> +inf concentrates on the minimum-contact slice and b -> -inf "
+            "on the maximum-contact slice. These are two points of the trajectory; "
+            "they are its extrema only when the conditional moment is monotonic. This "
+            "concerns the SCALAR SUMMARY only, not full-distribution support."
+        ),
+    }
+
+
 def asymptotic_rg_limits(
     crg_prob: np.ndarray,
     c_edges: np.ndarray,
@@ -4896,85 +5870,32 @@ def asymptotic_rg_limits(
     rg_scale: float,
     tolerance: float = 0.0,
 ) -> Dict[str, Any]:
-    """Exact scalar Rg limits of the contact-only reweighting model as b -> +/-inf.
+    """Deprecated alias for endpoint_rg_limits(); see that function.
 
-    Because P_b(m, Rg) ∝ P0(m, Rg) exp[-b m], the weight exp[-b m] becomes
-    infinitely peaked on one contact bin in each limit:
-
-        b -> +inf  concentrates on the MINIMUM contact value carrying baseline mass
-        b -> -inf  concentrates on the MAXIMUM contact value carrying baseline mass
-
-    The limiting scalar is therefore the chosen summary of the normalized
-    conditional P0(Rg | m) at that single contact bin.  Unlike a finite bias scan
-    this is an exact statement about the model (given an exact baseline support),
-    so it can support the stronger claim that a target is outside the model's
-    asymptotic scalar range.
-
-    Which limit is the compact one depends on the sign of the contact-Rg
-    relationship, so the reachable interval is built with min()/max() rather than
-    by assuming an ordering.
+    The former name and its ``asymptotic_reachable_rg_min/max`` keys asserted that
+    the two b -> +/-inf endpoints were the all-b reachable range.  That is false for
+    a non-monotonic conditional moment.  Retained only so existing callers keep
+    working; the legacy keys are mirrored but must not drive scientific validity.
+    Use endpoint_rg_limits() plus global_rg_outer_bounds() instead.
     """
-    if summary not in RG_SUMMARY_CHOICES:
-        raise ValueError(
-            f"Unknown Rg summary {summary!r}. Choose from {RG_SUMMARY_CHOICES}."
-        )
-    validate_joint_baseline(c_edges, rg_edges, crg_prob)
-    crg_prob = np.asarray(crg_prob, dtype=float)
-    rg_edges = np.asarray(rg_edges, dtype=float)
-    rg_centers = 0.5 * (rg_edges[:-1] + rg_edges[1:])
-
-    contact_marginal = crg_prob.sum(axis=1)
-    nonzero_contact_bins = np.flatnonzero(contact_marginal > tolerance)
-    if nonzero_contact_bins.size == 0:
-        raise ValueError(
-            "joint baseline has no contact bin with mass above the tolerance; "
-            "asymptotic Rg limits are undefined"
-        )
-    min_bin = int(nonzero_contact_bins[0])
-    max_bin = int(nonzero_contact_bins[-1])
-
-    def _slice_summary(bin_index: int) -> float:
-        row = crg_prob[bin_index]
-        z = float(row.sum())
-        if not np.isfinite(z) or z <= 0.0:
-            raise ValueError(
-                f"contact bin {bin_index} has non-positive conditional Rg mass"
-            )
-        cond = row / z
-        return float(rg_summary_from_mass(cond[None, :], rg_centers, summary)[0])
-
-    rg_pos_inf = _slice_summary(min_bin)   # b -> +inf  -> fewest contacts
-    rg_neg_inf = _slice_summary(max_bin)   # b -> -inf  -> most contacts
-
-    lo = min(rg_pos_inf, rg_neg_inf)
-    hi = max(rg_pos_inf, rg_neg_inf)
-    scale = float(rg_scale)
-
-    m_centers = 0.5 * (np.asarray(c_edges, dtype=float)[:-1]
-                       + np.asarray(c_edges, dtype=float)[1:])
-    return {
-        "min_supported_contact_bin": min_bin,
-        "max_supported_contact_bin": max_bin,
-        "min_supported_contact_value": float(m_centers[min_bin]),
-        "max_supported_contact_value": float(m_centers[max_bin]),
-        "contact_support_tolerance": float(tolerance),
-        "rg_limit_b_pos_inf_lattice": rg_pos_inf,
-        "rg_limit_b_neg_inf_lattice": rg_neg_inf,
-        "rg_limit_b_pos_inf_observed": rg_pos_inf * scale,
-        "rg_limit_b_neg_inf_observed": rg_neg_inf * scale,
-        "asymptotic_reachable_rg_min": lo,
-        "asymptotic_reachable_rg_max": hi,
-        "asymptotic_reachable_rg_min_observed": lo * scale,
-        "asymptotic_reachable_rg_max_observed": hi * scale,
-        "rg_scale_used": scale,
-        "interpretation": (
-            "Exact scalar-Rg range of this fixed joint baseline under contact-only "
-            "reweighting, in the limits b -> +/-inf, assuming the baseline support is "
-            "exact. b -> +inf concentrates on the minimum-contact slice and b -> -inf "
-            "on the maximum-contact slice. This bounds the SCALAR SUMMARY only; it is "
-            "not a statement about full-distribution support."
-        ),
-    }
+    _warnings.warn(
+        "asymptotic_rg_limits() is deprecated: the b -> +/-inf endpoints are not "
+        "the all-b reachable range unless the conditional moment is monotonic. Use "
+        "endpoint_rg_limits() for the endpoints and global_rg_outer_bounds() for a "
+        "rigorous all-b bound.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    out = endpoint_rg_limits(
+        crg_prob, c_edges, rg_edges,
+        summary=summary, rg_scale=rg_scale, tolerance=tolerance,
+    )
+    out["asymptotic_reachable_rg_min"] = out["endpoint_limit_min_lattice"]
+    out["asymptotic_reachable_rg_max"] = out["endpoint_limit_max_lattice"]
+    out["asymptotic_reachable_rg_min_observed"] = out["endpoint_limit_min_observed"]
+    out["asymptotic_reachable_rg_max_observed"] = out["endpoint_limit_max_observed"]
+    out["deprecated"] = True
+    return out
 
 
 def run_rg_feasibility_scan(
@@ -5010,8 +5931,15 @@ def run_rg_feasibility_scan(
     reported.
 
     The scan covers only the FINITE interval [bias_min, bias_max], so it can never
-    prove that no real b reproduces a target.  For that stronger statement the
-    exact b -> +/-inf limits are computed alongside it by asymptotic_rg_limits().
+    prove that no real b reproduces a target.  Two further quantities are computed
+    alongside it and reported separately, because they mean different things:
+
+      endpoint_limits     the exact b -> +/-inf values (endpoint_rg_limits).  Two
+                          POINTS of the trajectory; they bound it only when the
+                          conditional moment is monotonic in contact count.
+      global_outer_bound  a rigorous NECESSARY bound over all real b
+                          (global_rg_outer_bounds).  The only quantity here that
+                          may license an all-b impossibility claim.
 
     Writes <file_prefix>.csv, <file_prefix>_summary.json, and (unless plots are
     disabled) <file_prefix>.png.  ``scale_label`` names the mapping being probed
@@ -5072,17 +6000,35 @@ def run_rg_feasibility_scan(
     reach_lo_lat, reach_hi_lat = float(pred_lat.min()), float(pred_lat.max())
     tgt_lo_lat, tgt_hi_lat = float(rg_target_lattice.min()), float(rg_target_lattice.max())
 
-    # Exact b -> +/-inf limits: the only basis on which this function may claim a
-    # target is unreachable by ANY bias rather than merely by the scanned ones.
-    asym = asymptotic_rg_limits(
+    # Exact b -> +/-inf endpoints. Two points of the trajectory, NOT its range:
+    # they bound it only when the conditional moment is monotonic in contact count.
+    endpoints = endpoint_rg_limits(
         crg_prob, c_edges, rg_edges, summary=summary, rg_scale=rg_scale
     )
-    asym_lo = float(asym["asymptotic_reachable_rg_min"])
-    asym_hi = float(asym["asymptotic_reachable_rg_max"])
-    n_outside_asym = _count_outside_range(rg_target_lattice, asym_lo, asym_hi)
-    target_within_asymptotic = bool(n_outside_asym == 0)
-    asym["n_targets_outside_asymptotic_range"] = n_outside_asym
-    asym["target_within_asymptotic_reachable_range"] = target_within_asymptotic
+    ep_pos = float(endpoints["rg_limit_b_pos_inf_lattice"])
+    ep_neg = float(endpoints["rg_limit_b_neg_inf_lattice"])
+    ep_lo = float(endpoints["endpoint_limit_min_lattice"])
+    ep_hi = float(endpoints["endpoint_limit_max_lattice"])
+    moment_monotonic = bool(endpoints["conditional_moment_monotonic"])
+
+    # The rigorous all-b bound: the ONLY basis on which this function may claim a
+    # target is unreachable by ANY real bias rather than merely by the scanned ones.
+    outer = global_rg_outer_bounds(
+        crg_prob, c_edges, rg_edges, summary=summary, rg_scale=rg_scale,
+        rg_target_lattice=rg_target_lattice,
+    )
+    outer_lo = float(outer["global_outer_rg_min_lattice"])
+    outer_hi = float(outer["global_outer_rg_max_lattice"])
+    n_outside_outer = int(outer["n_targets_outside_global_outer_bound"])
+    target_within_outer = bool(outer["target_within_global_outer_bound"])
+    # When the moment is monotonic the endpoints coincide with the outer bound, so
+    # the endpoint interval is then genuinely extremal (recorded, not re-derived).
+    outer["is_exact_reachable_range"] = False
+    outer["endpoints_coincide_with_outer_bound"] = bool(
+        moment_monotonic
+        and abs(ep_lo - outer_lo) <= 1e-9 * max(1.0, abs(outer_lo))
+        and abs(ep_hi - outer_hi) <= 1e-9 * max(1.0, abs(outer_hi))
+    )
 
     # Support overlap between the target bounds and the baseline Rg support,
     # via the same helper the driver uses. The full lower/upper range is
@@ -5103,79 +6049,19 @@ def run_rg_feasibility_scan(
     support_overlap_hi = support_info["support_overlap_hi"]
     zero_support_overlap = support_info["zero_support_overlap"]
 
-    warnings: List[str] = []
-
-    # 1. Target outside the baseline Rg support.
-    if tgt_lo_lat < baseline_rg_min or tgt_hi_lat > baseline_rg_max:
-        warnings.append(
-            f"Target Rg range [{tgt_lo_lat:.4g}, {tgt_hi_lat:.4g}] (lattice) is not "
-            f"fully inside the baseline Rg support [{baseline_rg_min:.4g}, "
-            f"{baseline_rg_max:.4g}] (lattice). Reweighting rescales P0(m, Rg) "
-            f"bin-by-bin and cannot create mass where the baseline has none, so the "
-            f"out-of-support values are unreachable for every real bias. This is an "
-            f"exact support statement, not a finite-scan conclusion."
-        )
-    if zero_support_overlap:
-        warnings.append(
-            f"ZERO Rg support overlap at this scale: the target support "
-            f"[{target_support_min:.4g}, {target_support_max:.4g}] (lattice, from "
-            f"{support_basis}) does not intersect the joint baseline Rg support "
-            f"[{baseline_rg_min:.4g}, {baseline_rg_max:.4g}] (lattice). The scalar "
-            f"fit is meaningless at this scale."
-        )
-
-    # 2. Target outside the reachable scalar range over the SCANNED bias interval.
-    #    A finite scan cannot license a claim about all real b; the asymptotic
-    #    limits below carry that claim instead.
+    # ---- classification ------------------------------------------------------
+    # Computed BEFORE any warning is emitted, so that exactly one reachability
+    # verdict exists and the warnings are a rendering of it. Deriving warnings
+    # independently is what previously allowed "impossible for any real bias" and
+    # "inconclusive, widen the scan" to be printed about the same target.
     n_unreach = _count_outside_range(rg_target_lattice, reach_lo_lat, reach_hi_lat)
     target_within_reachable = bool(n_unreach == 0)
-    if not target_within_reachable:
-        warnings.append(
-            f"{n_unreach} of {rg_target_lattice.size} target Rg value(s) fall outside "
-            f"the reachable scalar-{summary} range [{reach_lo_lat:.4g}, {reach_hi_lat:.4g}] "
-            f"(lattice) = [{reach_lo_lat * rg_scale:.4g}, {reach_hi_lat * rg_scale:.4g}] "
-            f"(observed) within the scanned bias interval [{bias_min:g}, {bias_max:g}]. "
-            f"This is a statement about the scanned interval only, not about all real "
-            f"b: widen it with --rg-bias-min/--rg-bias-max to test further."
-        )
-
-    # 2b. Target outside the EXACT asymptotic range: a defensible model-level claim.
-    if not target_within_asymptotic:
-        warnings.append(
-            f"{n_outside_asym} of {rg_target_lattice.size} target Rg value(s) fall "
-            f"outside the asymptotic scalar-Rg range [{asym_lo:.4g}, {asym_hi:.4g}] "
-            f"(lattice) = [{asym_lo * rg_scale:.4g}, {asym_hi * rg_scale:.4g}] "
-            f"(observed) of this fixed joint baseline and contact-only reweighting "
-            f"model, evaluated exactly in the limits b -> +/-inf. Those points are "
-            f"outside the asymptotic scalar-Rg range of this model and cannot be "
-            f"reproduced by any real bias without changing the baseline, the chain "
-            f"length, or rg_scale."
-        )
-
-    # 3. Weak contact-Rg coupling at the baseline.
-    weak_corr_threshold = 0.1
-    baseline_corr = base["corr_contact_rg"]
-    if np.isfinite(baseline_corr) and abs(baseline_corr) < weak_corr_threshold:
-        warnings.append(
-            f"Baseline contact-Rg correlation is weak (|corr| = {abs(baseline_corr):.3g} "
-            f"< {weak_corr_threshold}). Contacts barely constrain Rg, so the scalar-Rg "
-            f"fit is close to non-identifiable."
-        )
-
-    # 4. Rg nearly insensitive to bias.
     rg_span_lat = reach_hi_lat - reach_lo_lat
     max_abs_dg = float(np.max(np.abs(d_rg_db))) if d_rg_db.size else 0.0
-    insensitive_threshold = 1e-3
-    if max_abs_dg < insensitive_threshold:
-        warnings.append(
-            f"Rg is nearly insensitive to contact bias (max |dRg/db| = {max_abs_dg:.3g} "
-            f"< {insensitive_threshold} lattice units per unit bias) over the scanned "
-            f"window; the bias cannot drive a collapse transition."
-        )
 
-    # 5. Target range matched or approached only at a bias-grid boundary. This
-    #    makes the finite-scan reachability verdict inconclusive in either
-    #    direction, so it is detected whether or not the target looked reachable.
+    # Target matched or approached only at a bias-grid boundary: the finite-scan
+    # verdict is then inconclusive in either direction, so it is detected whether
+    # or not the target looked reachable.
     edge_frac = 0.02
     n_edge = max(1, int(np.ceil(edge_frac * bias_grid.size)))
     boundary_reached = False
@@ -5187,24 +6073,107 @@ def run_rg_feasibility_scan(
         boundary_reached = bool(
             np.any(idx < n_edge) or np.any(idx >= bias_grid.size - n_edge)
         )
-        if boundary_reached:
-            warnings.append(
-                f"The reachability conclusion is not conclusive because at least one "
-                f"target is matched or approached at the boundary of the scanned bias "
-                f"interval [{bias_min:g}, {bias_max:g}]. Repeat with a wider interval "
-                f"using --rg-bias-min/--rg-bias-max, or treat the implied bias as a "
-                f"lower bound in magnitude."
-            )
 
-    # ---- reachability classification ---------------------------------------
+    # THE authoritative status. classify_scientific_validity() consumes this rather
+    # than re-deriving its own ordering from the raw flags.
     if zero_support_overlap:
         reachability_status = "zero_support_overlap"
+    elif not target_within_outer:
+        reachability_status = "outside_global_outer_bound"
     elif boundary_reached:
         reachability_status = "boundary_limited"
-    elif n_unreach > 0:
+    elif not target_within_reachable:
         reachability_status = "unreachable_within_scan"
     else:
         reachability_status = "reachable_within_scan"
+
+    # ---- warnings ------------------------------------------------------------
+    warnings: List[str] = []
+
+    # Out-of-support values are unreachable for every real bias regardless of the
+    # status ladder below, so this is reported independently of it.
+    if tgt_lo_lat < baseline_rg_min or tgt_hi_lat > baseline_rg_max:
+        warnings.append(
+            f"Target Rg range [{tgt_lo_lat:.4g}, {tgt_hi_lat:.4g}] (lattice) is not "
+            f"fully inside the baseline Rg support [{baseline_rg_min:.4g}, "
+            f"{baseline_rg_max:.4g}] (lattice). Reweighting rescales P0(m, Rg) "
+            f"bin-by-bin and cannot create mass where the baseline has none, so the "
+            f"out-of-support values are unreachable for every real bias. This is an "
+            f"exact support statement, not a finite-scan conclusion."
+        )
+
+    # Exactly one reachability warning, selected by the authoritative status. These
+    # conclusions are mutually exclusive and must never be emitted together.
+    if reachability_status == "zero_support_overlap":
+        warnings.append(
+            f"ZERO Rg support overlap at this scale: the target support "
+            f"[{target_support_min:.4g}, {target_support_max:.4g}] (lattice, from "
+            f"{support_basis}) does not intersect the joint baseline Rg support "
+            f"[{baseline_rg_min:.4g}, {baseline_rg_max:.4g}] (lattice). The scalar "
+            f"fit is meaningless at this scale."
+        )
+    elif reachability_status == "outside_global_outer_bound":
+        warnings.append(
+            f"{n_outside_outer} of {rg_target_lattice.size} target Rg value(s) lie "
+            f"outside the global scalar-Rg outer bound [{outer_lo:.4g}, "
+            f"{outer_hi:.4g}] (lattice) = [{outer_lo * rg_scale:.4g}, "
+            f"{outer_hi * rg_scale:.4g}] (observed) of this fixed joint baseline and "
+            f"cannot be reproduced by any real contact bias b. The bound is the "
+            f"min/max of the conditional scalar-{summary} Rg over the supported "
+            f"contact bins; every biased prediction is a convex combination of those "
+            f"conditional moments, so no real b can leave it. Changing this requires "
+            f"a different baseline, chain length, or rg_scale -- not a wider scan."
+        )
+    elif reachability_status == "boundary_limited":
+        warnings.append(
+            f"The reachability conclusion is not conclusive because at least one "
+            f"target is matched or approached at the boundary of the scanned bias "
+            f"interval [{bias_min:g}, {bias_max:g}]. The target does lie inside the "
+            f"rigorous global outer bound [{outer_lo:.4g}, {outer_hi:.4g}] (lattice), "
+            f"so nothing here indicates impossibility. Repeat with a wider interval "
+            f"using --rg-bias-min/--rg-bias-max, or treat the implied bias as a lower "
+            f"bound in magnitude."
+        )
+    elif reachability_status == "unreachable_within_scan":
+        warnings.append(
+            f"{n_unreach} of {rg_target_lattice.size} target Rg value(s) were not "
+            f"reached within the scanned bias interval [{bias_min:g}, {bias_max:g}], "
+            f"whose reachable scalar-{summary} range is [{reach_lo_lat:.4g}, "
+            f"{reach_hi_lat:.4g}] (lattice) = [{reach_lo_lat * rg_scale:.4g}, "
+            f"{reach_hi_lat * rg_scale:.4g}] (observed). They remain inside the "
+            f"rigorous global outer bound [{outer_lo:.4g}, {outer_hi:.4g}] (lattice), "
+            f"so this finite scan does not prove impossibility; widen the bias "
+            f"interval with --rg-bias-min/--rg-bias-max."
+        )
+
+    # Independent of reachability: these describe identifiability, not possibility.
+    baseline_corr = base["corr_contact_rg"]
+    if np.isfinite(baseline_corr) and abs(baseline_corr) < WEAK_CORR_THRESHOLD:
+        warnings.append(
+            f"Baseline contact-Rg correlation is weak (|corr| = {abs(baseline_corr):.3g} "
+            f"< {WEAK_CORR_THRESHOLD}). Contacts barely constrain Rg, so the scalar-Rg "
+            f"fit is close to non-identifiable."
+        )
+
+    insensitive_threshold = 1e-3
+    if max_abs_dg < insensitive_threshold:
+        warnings.append(
+            f"Rg is nearly insensitive to contact bias (max |dRg/db| = {max_abs_dg:.3g} "
+            f"< {insensitive_threshold} lattice units per unit bias) over the scanned "
+            f"window; the bias cannot drive a collapse transition."
+        )
+
+    # Advisory: the endpoint limits are in the outputs, and for a non-monotonic
+    # conditional moment they must not be read as the trajectory's range.
+    if not moment_monotonic:
+        warnings.append(
+            f"The conditional {outer['conditional_moment_quantity']} is NOT monotonic "
+            f"in contact count, so the b -> +/-inf endpoint limits "
+            f"[{ep_lo:.4g}, {ep_hi:.4g}] (lattice) do NOT bound the finite-b "
+            f"trajectory: an interior contact slice carries a scalar outside them. "
+            f"All-b claims here use the global outer bound [{outer_lo:.4g}, "
+            f"{outer_hi:.4g}] (lattice) instead."
+        )
 
     # Theoretical derivative check (exact only for the 'mean' summary).
     deriv_check: Dict[str, Any] = {
@@ -5270,12 +6239,61 @@ def run_rg_feasibility_scan(
         "reachability_status": reachability_status,
         "max_abs_d_rg_db": float(max_abs_dg),
         "derivative_check": deriv_check,
-        "asymptotic_limits": asym,
-        "target_within_asymptotic_reachable_range": target_within_asymptotic,
-        "asymptotic_reachable_rg_min": asym_lo,
-        "asymptotic_reachable_rg_max": asym_hi,
-        "asymptotic_reachable_rg_min_observed": float(asym_lo * rg_scale),
-        "asymptotic_reachable_rg_max_observed": float(asym_hi * rg_scale),
+
+        # --- the three distinct reachability concepts, never conflated ---------
+        "finite_scan": {
+            "bias_min": float(bias_min),
+            "bias_max": float(bias_max),
+            "bias_points": int(bias_points),
+            "reachable_rg_min": float(reach_lo_lat),
+            "reachable_rg_max": float(reach_hi_lat),
+            "reachable_rg_min_observed": float(reach_lo_lat * rg_scale),
+            "reachable_rg_max_observed": float(reach_hi_lat * rg_scale),
+            "target_within_scan_range": target_within_reachable,
+            "n_targets_outside_scan_range": n_unreach,
+            "target_reached_only_at_bias_boundary": bool(boundary_reached),
+            "note": (
+                "Range of the scalar Rg summary over the SCANNED bias interval only. "
+                "A target outside it was not reached within that interval; because "
+                "the scan is finite this is NEVER proof that no real b reproduces it."
+            ),
+        },
+        "endpoint_limits": {
+            "b_pos_inf": float(ep_pos),
+            "b_neg_inf": float(ep_neg),
+            "b_pos_inf_observed": float(ep_pos * rg_scale),
+            "b_neg_inf_observed": float(ep_neg * rg_scale),
+            "endpoint_min": ep_lo,
+            "endpoint_max": ep_hi,
+            "endpoint_min_observed": float(ep_lo * rg_scale),
+            "endpoint_max_observed": float(ep_hi * rg_scale),
+            "conditional_moment_monotonic": moment_monotonic,
+            "conditional_moment_direction": endpoints["conditional_moment_direction"],
+            "is_exact_extremal_bound": moment_monotonic,
+            "detail": endpoints,
+            "note": (
+                "Two exact points of the b-trajectory (b -> +/-inf), not its range. "
+                "They are the extrema over all real b only when the conditional "
+                "moment is monotonic in contact count (is_exact_extremal_bound). "
+                "Even then, values strictly between them are not all necessarily "
+                "attained."
+            ),
+        },
+        "global_outer_bound": {
+            "min": outer_lo,
+            "max": outer_hi,
+            "min_observed": float(outer_lo * rg_scale),
+            "max_observed": float(outer_hi * rg_scale),
+            "rg_min_lattice": outer_lo,
+            "rg_max_lattice": outer_hi,
+            "target_within_global_outer_bound": target_within_outer,
+            "n_targets_outside_global_outer_bound": n_outside_outer,
+            "is_exact_reachable_range": False,
+            "detail": outer,
+            "note": (
+                "Necessary bound only; being inside does not prove reachability."
+            ),
+        },
         "support_overlap": support_info,
         "warnings": warnings,
         "units_note": (
@@ -5283,32 +6301,57 @@ def run_rg_feasibility_scan(
             "Observed units = rg_scale_used * lattice units."
         ),
         "definition_note": (
-            "reachable_rg_* is the range of the scalar Rg summary over the SCANNED "
-            "bias interval [bias_min, bias_max] only. A target outside it is not "
-            "reachable within that interval; because the scan is finite this is NOT "
-            "proof that no real b reproduces it. The exact all-b statement lives in "
-            "asymptotic_limits, which evaluates b -> +/-inf in closed form."
+            "Three distinct concepts: finite_scan is what the scanned bias interval "
+            "reached; endpoint_limits are the two exact b -> +/-inf points; "
+            "global_outer_bound is a rigorous NECESSARY bound over all real b, from "
+            "the convex-combination structure of contact-only reweighting. Only "
+            "global_outer_bound may license an all-b impossibility claim, and only "
+            "in the outward direction: outside it is impossible, inside it is not "
+            "thereby reachable."
         ),
         "reachability_status_note": (
-            "reachable_within_scan | unreachable_within_scan | boundary_limited | "
-            "zero_support_overlap. unreachable_within_scan is a statement about the "
-            "scanned interval, never a proof of impossibility over all real b."
+            "zero_support_overlap | outside_global_outer_bound | boundary_limited | "
+            "unreachable_within_scan | reachable_within_scan, in that precedence. "
+            "This is the single authoritative verdict; scientific_validity consumes "
+            "it rather than re-deriving one. unreachable_within_scan is a statement "
+            "about the scanned interval, never a proof of impossibility over all "
+            "real b; only outside_global_outer_bound is such a proof."
         ),
+
+        # --- deprecated: superseded by the three blocks above ------------------
+        "deprecated_fields": {
+            "deprecated": True,
+            "note": (
+                "asymptotic_reachable_rg_* and target_within_asymptotic_reachable_"
+                "range asserted that the two b -> +/-inf endpoints were the all-b "
+                "reachable range. That is FALSE when the conditional moment is not "
+                "monotonic in contact count. Mirrored from endpoint_limits for "
+                "backward compatibility only; they do not drive scientific validity. "
+                "Use global_outer_bound for all-b claims."
+            ),
+            "asymptotic_reachable_rg_min": ep_lo,
+            "asymptotic_reachable_rg_max": ep_hi,
+            "asymptotic_reachable_rg_min_observed": float(ep_lo * rg_scale),
+            "asymptotic_reachable_rg_max_observed": float(ep_hi * rg_scale),
+            "target_within_asymptotic_reachable_range": bool(
+                _count_outside_range(rg_target_lattice, ep_lo, ep_hi) == 0
+            ),
+        },
     }
 
     outdir.mkdir(parents=True, exist_ok=True)
     csv_path = outdir / f"{file_prefix}.csv"
     with open(csv_path, "w", newline="") as fh:
         writer = csv.writer(fh)
-        # Column-level provenance: every _observed column in this file uses this
-        # one scale, so a nominal and a fitted scan can never be read as one table.
-        writer.writerow([
-            f"# scale_label={scale_label}", f"rg_scale_used={rg_scale:.10g}",
-            f"rg_summary={summary}",
-        ])
+        # Rectangular: row 0 IS the header and every row has the same width, so
+        # pandas.read_csv(path) / csv.DictReader(fh) work with no skiprows= or
+        # comment= argument. Scale provenance rides along as repeated columns
+        # rather than a ragged banner row, so a nominal and a fitted scan can
+        # still never be read as one table.
         writer.writerow([
             "bias", "pred_rg_lattice", "pred_rg_observed", "mean_contacts",
             "cov_contact_rg", "corr_contact_rg", "d_rg_db",
+            "rg_scale_used", "scale_label", "rg_summary",
         ])
         for i, b in enumerate(bias_grid):
             writer.writerow([
@@ -5316,6 +6359,7 @@ def run_rg_feasibility_scan(
                 f"{mean_ct[i]:.8g}", f"{cov_arr[i]:.8g}",
                 ("" if not np.isfinite(corr_arr[i]) else f"{corr_arr[i]:.8g}"),
                 f"{d_rg_db[i]:.8g}",
+                f"{rg_scale:.10g}", scale_label, summary,
             ])
     print(f"Saved: {csv_path}")
 
@@ -5338,21 +6382,45 @@ def run_rg_feasibility_scan(
         ax.axhline(float(rg_target_observed.min()), color="tab:orange", lw=0.8, ls="--")
         ax.axhline(float(rg_target_observed.max()), color="tab:orange", lw=0.8, ls="--")
         ax.axvline(0.0, color="gray", lw=0.8, ls=":")
-        ax.axhline(asym_lo * rg_scale, color="tab:purple", lw=1.0, ls="-.",
-                   label="asymptotic b→±∞ scalar-Rg limits")
-        ax.axhline(asym_hi * rg_scale, color="tab:purple", lw=1.0, ls="-.")
+
+        # Global outer bound: the only lines here that carry an all-b meaning.
+        ax.axhline(outer_lo * rg_scale, color="tab:green", lw=1.2, ls="--",
+                   label="global outer bound (necessary, all real b)")
+        ax.axhline(outer_hi * rg_scale, color="tab:green", lw=1.2, ls="--")
+
+        # Endpoint limits: two POINTS of the trajectory. Marked distinctly, and
+        # never drawn as a spanning range when they do not bound it.
+        ax.plot(bias_grid[-1], ep_neg * rg_scale, marker=">", ms=9,
+                color="tab:purple", ls="none", label="endpoint limit b→−∞")
+        ax.plot(bias_grid[0], ep_pos * rg_scale, marker="<", ms=9,
+                color="tab:purple", ls="none", label="endpoint limit b→+∞")
+        if moment_monotonic:
+            # Only meaningful as an interval when the conditional moment is
+            # monotonic; then it coincides with the outer bound.
+            ax.axhline(ep_lo * rg_scale, color="tab:purple", lw=0.9, ls="-.",
+                       alpha=0.7, label="endpoint limits (extremal: moment monotonic)")
+            ax.axhline(ep_hi * rg_scale, color="tab:purple", lw=0.9, ls="-.",
+                       alpha=0.7)
+
         ax.set_xlabel("contact bias b  (P ∝ P0(m,Rg) exp[-b m])")
         ax.set_ylabel(f"scalar Rg, observed units (rg_scale={rg_scale:g})")
-        ax.set_title(
+        title = (
             f"Bias→Rg reachability [{summary}] — {scale_label}, "
             f"rg_scale={rg_scale:.6g}\n"
-            f"status: {reachability_status} over scanned bias "
-            f"[{bias_min:g}, {bias_max:g}]\n"
-            f"reachable [{reach_lo_lat * rg_scale:.4g}, {reach_hi_lat * rg_scale:.4g}], "
+            f"status: {reachability_status} (scanned bias "
+            f"[{bias_min:g}, {bias_max:g}])\n"
+            f"scanned [{reach_lo_lat * rg_scale:.4g}, {reach_hi_lat * rg_scale:.4g}], "
+            f"outer bound [{outer_lo * rg_scale:.4g}, {outer_hi * rg_scale:.4g}], "
             f"target [{float(rg_target_observed.min()):.4g}, "
             f"{float(rg_target_observed.max()):.4g}]"
         )
-        ax.legend(fontsize=8)
+        if not moment_monotonic:
+            title += (
+                "\nEndpoint limits do not bound the finite-b trajectory; "
+                "conditional moment is nonmonotonic."
+            )
+        ax.set_title(title, fontsize=9)
+        ax.legend(fontsize=7)
         fig.tight_layout()
         p = outdir / f"{file_prefix}.png"
         fig.savefig(p, dpi=150, bbox_inches="tight")
@@ -5627,13 +6695,20 @@ def classify_scientific_validity(
 ) -> Dict[str, Any]:
     """Structured validity for ONE scale, never a single overbroad Boolean.
 
-    Precedence, strongest objection first:
-      zero_support_overlap            target and baseline Rg supports are disjoint
-      outside_asymptotic_model_range  exact b -> +/-inf limits exclude the target
-      outside_scanned_range           unreachable within the scanned bias interval
-      boundary_limited                scan inconclusive at its own boundary
-      weak_contact_rg_coupling        contacts barely constrain Rg; near-unidentifiable
-      supported                       no objection survived
+    This CONSUMES the scan's authoritative ``reachability_status`` and maps it onto
+    the scientific vocabulary; it does not re-derive an ordering from the raw flags.
+    Two independent precedence ladders is exactly how the scan could report
+    ``boundary_limited`` while validity reported ``outside_scanned_range`` for the
+    same target.  The one mapping is:
+
+      zero_support_overlap        -> zero_support_overlap
+      outside_global_outer_bound  -> outside_global_outer_bound   (all-b impossible)
+      boundary_limited            -> boundary_limited
+      unreachable_within_scan     -> outside_scanned_range        (scan-scoped only)
+      reachable_within_scan       -> weak_contact_rg_coupling, else supported
+
+    Weak coupling is only consulted once no reachability objection stands: it is a
+    statement about identifiability, not about possibility.
 
     A clean fitted-scale result is reported as supported_as_mapping_diagnostic,
     never plain "supported": moving the scale to fit the data is a sensitivity
@@ -5643,8 +6718,9 @@ def classify_scientific_validity(
     out: Dict[str, Any] = {
         "support_overlap": has_overlap,
         "reachable_within_scan": None,
-        "within_asymptotic_range": None,
+        "within_global_outer_bound": None,
         "reachability_status": None,
+        "conditional_moment_monotonic": None,
         "contact_rg_correlation": None,
         "status": None,
     }
@@ -5659,32 +6735,45 @@ def classify_scientific_validity(
         )
         return out
 
-    reachable = bool(feasibility["target_within_reachable_range"])
-    within_asym = bool(feasibility["target_within_asymptotic_reachable_range"])
-    boundary = bool(feasibility["target_reached_only_at_bias_boundary"])
+    scan_status = str(feasibility["reachability_status"])
     corr = feasibility.get("baseline_contact_rg_correlation")
     out.update({
-        "reachable_within_scan": reachable,
-        "within_asymptotic_range": within_asym,
-        "reachability_status": feasibility["reachability_status"],
+        "reachable_within_scan": bool(feasibility["target_within_reachable_range"]),
+        "within_global_outer_bound": bool(
+            feasibility["global_outer_bound"]["target_within_global_outer_bound"]
+        ),
+        "reachability_status": scan_status,
+        "conditional_moment_monotonic": bool(
+            feasibility["endpoint_limits"]["conditional_moment_monotonic"]
+        ),
         "contact_rg_correlation": corr,
     })
 
     weak_coupling = corr is not None and abs(float(corr)) < WEAK_CORR_THRESHOLD
 
-    if not has_overlap or feasibility["reachability_status"] == "zero_support_overlap":
+    # The scan's status is authoritative. Support overlap is cross-checked because
+    # the caller may have computed it from bounds the scan never saw; the two agree
+    # by construction when the scan was given rg_lower/upper_lattice.
+    if not has_overlap or scan_status == "zero_support_overlap":
         status = "zero_support_overlap"
-    elif not within_asym:
-        status = "outside_asymptotic_model_range"
-    elif not reachable:
-        status = "outside_scanned_range"
-    elif boundary:
+    elif scan_status == "outside_global_outer_bound":
+        status = "outside_global_outer_bound"
+    elif scan_status == "boundary_limited":
         status = "boundary_limited"
+    elif scan_status == "unreachable_within_scan":
+        status = "outside_scanned_range"
     elif weak_coupling:
         status = "weak_contact_rg_coupling"
     else:
         status = "supported_as_mapping_diagnostic" if is_fitted_scale else "supported"
     out["status"] = status
+    out["status_note"] = (
+        "outside_global_outer_bound is the only status here that asserts "
+        "impossibility for all real b. outside_scanned_range and boundary_limited "
+        "are scoped to the scanned bias interval and are not impossibility claims. "
+        "supported means no objection survived -- it is not proof of correctness, "
+        "and optimizer convergence never contributes to it."
+    )
     return out
 
 
@@ -5722,6 +6811,48 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             "units, so the objective is flat in that parameter. Use "
             "--rg-target-units observed to fit the scale, or drop --fit-rg-scale."
         )
+
+    # The argument parser enforces most of this for CLI runs, but this driver is
+    # also called directly (tests, notebooks, other scripts), where argparse never
+    # runs. Validate here so a direct call with rg_scale=0 raises a clear error
+    # instead of dividing by zero deep in the fit -- and so it raises BEFORE the
+    # output directory below is created, leaving no half-written run behind.
+    if not np.isfinite(args.rg_scale) or args.rg_scale <= 0.0:
+        raise ValueError(
+            f"--rg-scale must be finite and strictly positive, got {args.rg_scale!r}. "
+            f"It is observed units per lattice unit and is divided by to map "
+            f"observed targets into lattice units."
+        )
+    if not np.isfinite(args.rg_scale_min) or args.rg_scale_min <= 0.0:
+        raise ValueError(
+            f"--rg-scale-min must be finite and strictly positive, got "
+            f"{args.rg_scale_min!r}"
+        )
+    if not np.isfinite(args.rg_scale_max) or args.rg_scale_max <= 0.0:
+        raise ValueError(
+            f"--rg-scale-max must be finite and strictly positive, got "
+            f"{args.rg_scale_max!r}"
+        )
+    if args.fit_rg_scale and not (args.rg_scale_min < args.rg_scale_max):
+        raise ValueError(
+            f"--rg-scale-min ({args.rg_scale_min}) must be strictly less than "
+            f"--rg-scale-max ({args.rg_scale_max}) when fitting the scale."
+        )
+    if not np.isfinite(args.rg_bias_min) or not np.isfinite(args.rg_bias_max):
+        raise ValueError("--rg-bias-min/--rg-bias-max must be finite")
+    if not (args.rg_bias_min < args.rg_bias_max):
+        raise ValueError(
+            f"--rg-bias-min ({args.rg_bias_min}) must be strictly less than "
+            f"--rg-bias-max ({args.rg_bias_max})"
+        )
+    if int(args.rg_bias_points) < 3:
+        raise ValueError(
+            f"--rg-bias-points must be >= 3, got {args.rg_bias_points}"
+        )
+    if int(args.n_restarts) < 1:
+        raise ValueError(f"--n_restarts must be >= 1, got {args.n_restarts}")
+    if int(args.bootstrap) < 0:
+        raise ValueError(f"--bootstrap must be >= 0, got {args.bootstrap}")
 
     # ---- output paths (same convention as the contact-histogram mode) -------
     if args.outdir is not None:
@@ -5919,9 +7050,16 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         print(f"  reachable scalar Rg (observed): "
               f"[{fs['reachable_rg_min_observed']:.4g}, "
               f"{fs['reachable_rg_max_observed']:.4g}]")
-        print(f"  asymptotic scalar Rg (lattice, b -> +/-inf): "
-              f"[{fs['asymptotic_reachable_rg_min']:.4g}, "
-              f"{fs['asymptotic_reachable_rg_max']:.4g}]")
+        ep = fs["endpoint_limits"]
+        gob = fs["global_outer_bound"]
+        print(f"  endpoint limits (lattice, b -> +inf / -inf): "
+              f"{ep['b_pos_inf']:.4g} / {ep['b_neg_inf']:.4g}"
+              f"   [conditional moment: {ep['conditional_moment_direction']}"
+              + ("; extremal over all b]" if ep["is_exact_extremal_bound"]
+                 else "; these do NOT bound the finite-b curve]"))
+        print(f"  global outer bound (lattice, all real b): "
+              f"[{gob['min']:.4g}, {gob['max']:.4g}]  "
+              f"(necessary bound, not proof of reachability)")
         print(f"  target scalar Rg (observed):    "
               f"[{fs['target_rg_min_observed']:.4g}, "
               f"{fs['target_rg_max_observed']:.4g}]")
@@ -6123,7 +7261,21 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         print(f"  T_rg_max_slope = None   (no resolved collapse: max -dRg/dT = "
               f"{trans['rg_max_negative_slope']:.6g} <= tolerance "
               f"{trans['slope_tolerance']:.3g} {target_units} units/K)")
-    print(f"  T_rg_half      = {trans['T_rg_half']:.6g} K")
+    if trans["rg_half_defined"]:
+        print(f"  T_rg_half      = {trans['T_rg_half']:.6g} K   "
+              f"(single crossing of the endpoint midpoint "
+              f"{trans['rg_half_value']:.6g})")
+    elif trans["rg_half_ambiguous"]:
+        print(f"  T_rg_half      = None   (AMBIGUOUS: the endpoint midpoint "
+              f"{trans['rg_half_value']:.6g} is crossed "
+              f"{len(trans['T_rg_half_crossings'])} times at "
+              + ", ".join(f"{t:.6g}" for t in trans["T_rg_half_crossings"])
+              + " K; no single half-height temperature exists)")
+    else:
+        print(f"  T_rg_half      = None   (curve endpoints differ by "
+              f"{trans['rg_curve_span']:.3g} <= tolerance "
+              f"{trans['rg_half_tolerance']:.3g} {target_units} units: the curve is "
+              f"flat, so no half-height temperature is defined)")
     print("  NOTE: T_bias_zero (bias sign change) and T_rg_max_slope (steepest "
           "finite-chain collapse) are distinct quantities.")
 
@@ -6196,6 +7348,68 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         ),
     }
 
+    # ---- reachability bounds at the effective scale -------------------------
+    # Closed-form and cheap, so they are reported whether or not --rg-feasibility-
+    # scan ran: the all-b outer bound is the single most important scientific check
+    # here and must not be contingent on an optional flag.
+    ep_eff = endpoint_rg_limits(
+        crg_prob, c_edges, rg_edges_lattice,
+        summary=args.rg_summary, rg_scale=rg_scale_effective,
+    )
+    gob_eff = global_rg_outer_bounds(
+        crg_prob, c_edges, rg_edges_lattice,
+        summary=args.rg_summary, rg_scale=rg_scale_effective,
+        rg_target_lattice=rg_target_lattice,
+    )
+    endpoint_limits_json: Dict[str, Any] = {
+        "rg_limit_b_pos_inf_lattice": _finite_or_none(
+            ep_eff["rg_limit_b_pos_inf_lattice"]),
+        "rg_limit_b_neg_inf_lattice": _finite_or_none(
+            ep_eff["rg_limit_b_neg_inf_lattice"]),
+        "rg_limit_b_pos_inf_observed": _finite_or_none(
+            ep_eff["rg_limit_b_pos_inf_observed"]),
+        "rg_limit_b_neg_inf_observed": _finite_or_none(
+            ep_eff["rg_limit_b_neg_inf_observed"]),
+        "endpoint_limit_min_lattice": _finite_or_none(
+            ep_eff["endpoint_limit_min_lattice"]),
+        "endpoint_limit_max_lattice": _finite_or_none(
+            ep_eff["endpoint_limit_max_lattice"]),
+        "conditional_moment_monotonic": bool(ep_eff["conditional_moment_monotonic"]),
+        "conditional_moment_direction": str(ep_eff["conditional_moment_direction"]),
+        "conditional_moment_quantity": str(gob_eff["conditional_moment_quantity"]),
+        "is_exact_extremal_bound": bool(ep_eff["is_exact_extremal_bound"]),
+        "rg_scale_used": float(rg_scale_effective),
+        "note": str(ep_eff["monotonicity_note"]),
+    }
+    global_outer_bound_json: Dict[str, Any] = {
+        "rg_min_lattice": _finite_or_none(gob_eff["global_outer_rg_min_lattice"]),
+        "rg_max_lattice": _finite_or_none(gob_eff["global_outer_rg_max_lattice"]),
+        "rg_min_observed": _finite_or_none(gob_eff["global_outer_rg_min_observed"]),
+        "rg_max_observed": _finite_or_none(gob_eff["global_outer_rg_max_observed"]),
+        "contact_bin_at_global_min": int(gob_eff["contact_bin_at_global_min"]),
+        "contact_bin_at_global_max": int(gob_eff["contact_bin_at_global_max"]),
+        "contact_value_at_global_min": _finite_or_none(
+            gob_eff["contact_value_at_global_min"]),
+        "contact_value_at_global_max": _finite_or_none(
+            gob_eff["contact_value_at_global_max"]),
+        "target_within_global_outer_bound": bool(
+            gob_eff["target_within_global_outer_bound"]),
+        "n_targets_outside_global_outer_bound": int(
+            gob_eff["n_targets_outside_global_outer_bound"]),
+        "is_exact_reachable_range": False,
+        "rg_scale_used": float(rg_scale_effective),
+        "note": (
+            "Necessary outer bound; being inside does not prove finite-b "
+            "reachability."
+        ),
+        "definition": (
+            "min/max over supported contact bins of the conditional scalar-Rg "
+            "summary of P0(Rg | m). Every contact-only-biased prediction is a convex "
+            "combination of the per-bin conditional moments, so no real b can leave "
+            "this interval."
+        ),
+    }
+
     # ---- fit_results.npz ----------------------------------------------------
     save_kwargs: Dict[str, Any] = dict(
         mode="rg_scalar",
@@ -6245,7 +7459,16 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
         collapse_detected=bool(trans["collapse_detected"]),
         slope_tolerance=float(trans["slope_tolerance"]),
         rg_max_negative_slope=float(trans["rg_max_negative_slope"]),
-        T_rg_half=float(trans["T_rg_half"]),
+        # NaN encodes "undefined", as for T_rg_max_slope above; the companion
+        # flags say which of the two reasons applies.
+        T_rg_half=(
+            float(trans["T_rg_half"]) if trans["T_rg_half"] is not None else np.nan
+        ),
+        T_rg_half_crossings=np.array(trans["T_rg_half_crossings"], dtype=float),
+        rg_half_defined=bool(trans["rg_half_defined"]),
+        rg_half_ambiguous=bool(trans["rg_half_ambiguous"]),
+        rg_half_tolerance=float(trans["rg_half_tolerance"]),
+        rg_curve_span=float(trans["rg_curve_span"]),
         T_bias_zero=(
             float(trans["T_bias_zero"]) if trans["T_bias_zero"] is not None else np.nan
         ),
@@ -6270,15 +7493,11 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
     val_set = set(val_idx.tolist())
     with open(per_temp_csv, "w", newline="") as fh:
         writer = csv.writer(fh)
-        # File-level scale provenance: every lattice/observed column below uses
+        # Rectangular: row 0 IS the header and every row has the same width, so
+        # pandas.read_csv(path) / csv.DictReader(fh) work with no skiprows= or
+        # comment= argument. Scale provenance rides along as repeated columns
+        # rather than a ragged banner row: every lattice/observed column below uses
         # rg_scale_effective, so no column mixes nominal and fitted conversions.
-        writer.writerow([
-            f"# rg_scale_effective={rg_scale_effective:.10g}",
-            f"rg_scale_initial={rg_scale_initial:.10g}",
-            f"rg_scale_was_fitted={bool(args.fit_rg_scale)}",
-            f"rg_target_units={target_units}",
-            "mapping=Rg_observed = rg_scale_effective * Rg_lattice",
-        ])
         writer.writerow([
             "temp_index", "temperature", "split",
             "rg_target_input", "rg_lower_input", "rg_upper_input", "rg_target_units",
@@ -6287,6 +7506,7 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             "residual_target_units", "absolute_error_target_units",
             "squared_error_target_units", "objective_contribution",
             "inside_input_range", "b_T",
+            "rg_scale_effective", "rg_scale_initial", "rg_scale_was_fitted",
         ])
         for i in range(n_temps):
             r = float(rg_residual_target_units[i])
@@ -6300,6 +7520,8 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
                 f"{r:.8g}", f"{abs(r):.8g}", f"{r * r:.8g}",
                 f"{per_temp_obj[i]:.8g}",
                 bool(inside_range[i]), f"{b_T[i]:.8g}",
+                f"{rg_scale_effective:.10g}", f"{rg_scale_initial:.10g}",
+                bool(args.fit_rg_scale),
             ])
     print(f"Saved: {per_temp_csv}")
 
@@ -6377,8 +7599,15 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
              else "no resolved collapse detected within the observed interval"),
         ])
         writer.writerow([
-            "T_rg_half", f"{trans['T_rg_half']:.8g}", "derived", "", "", "",
-            "temperature nearest the midpoint Rg between the interval ends (K)",
+            "T_rg_half",
+            ("" if trans["T_rg_half"] is None else f"{trans['T_rg_half']:.8g}"),
+            "derived", "", "", "",
+            ("temperature crossing the midpoint Rg between the interval ends (K)"
+             if trans["rg_half_defined"] else
+             f"undefined: the endpoint midpoint is crossed "
+             f"{len(trans['T_rg_half_crossings'])} times (ambiguous)"
+             if trans["rg_half_ambiguous"] else
+             "undefined: the fitted curve is flat between the interval ends"),
         ])
     print(f"Saved: {params_csv_path}")
 
@@ -6501,15 +7730,41 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
             "slope_tolerance": _finite_or_none(trans["slope_tolerance"]),
             "rg_max_negative_slope": _finite_or_none(trans["rg_max_negative_slope"]),
             "T_rg_half": _finite_or_none(trans["T_rg_half"]),
+            "T_rg_half_crossings": [float(t) for t in trans["T_rg_half_crossings"]],
             "rg_half_value": _finite_or_none(trans["rg_half_value"]),
+            "rg_half_defined": bool(trans["rg_half_defined"]),
+            "rg_half_ambiguous": bool(trans["rg_half_ambiguous"]),
+            "rg_half_tolerance": _finite_or_none(trans["rg_half_tolerance"]),
+            "rg_curve_span": _finite_or_none(trans["rg_curve_span"]),
             "dense_grid_points": int(cfg["dense_grid_points"]),
             "collapse_note": (
                 "T_rg_max_slope is null when max(-dRg/dT) does not exceed "
                 "slope_tolerance, i.e. the fitted curve is flat or expands with "
                 "temperature. No transition temperature is invented in that case."
             ),
+            "half_note": (
+                "T_rg_half is null unless the endpoint midpoint is crossed EXACTLY "
+                "once. rg_half_defined=false with rg_half_ambiguous=true means the "
+                "curve is nonmonotonic and crosses the midpoint several times (all "
+                "listed in T_rg_half_crossings); with rg_half_ambiguous=false it "
+                "means the curve is flat between its endpoints (span <= "
+                "rg_half_tolerance), where every temperature is equally close to the "
+                "midpoint and any single answer would be an artifact of the grid. "
+                "Crossings are interpolated between grid points, not snapped to the "
+                "nearest sampled temperature."
+            ),
         },
         "support_diagnostics": support_diagnostics,
+        "endpoint_limits": endpoint_limits_json,
+        "global_outer_bound": global_outer_bound_json,
+        "reachability_note": (
+            "endpoint_limits are the two exact b -> +/-inf points of the trajectory; "
+            "they are its extrema over all real b only when "
+            "conditional_moment_monotonic is true. global_outer_bound is a rigorous "
+            "NECESSARY bound over all real b: a target outside it is impossible for "
+            "every real b, a target inside it is NOT thereby reachable. Both are "
+            "evaluated at rg_scale_effective and constrain the scalar summary only."
+        ),
         "definitions": {
             "T_bias_zero": (
                 "Temperature at which the contact bias b(T) changes sign (b(T)=0), "
@@ -6528,9 +7783,12 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
                 "primary finite-chain transition descriptor."
             ),
             "T_rg_half": (
-                "Temperature on the dense grid whose fitted Rg is nearest the midpoint "
-                "between the fitted Rg at the low and high ends of the observed "
-                "temperature interval."
+                "Temperature at which the fitted Rg(T) curve crosses the midpoint "
+                "between its values at the low and high ends of the observed "
+                "temperature interval, located by linear interpolation between dense-"
+                "grid points. Reported ONLY when exactly one such crossing exists; "
+                "null for a flat curve (no defined midpoint level) or a nonmonotonic "
+                "one (several crossings, see T_rg_half_crossings)."
             ),
             "rg_summary": (
                 "mean: sum_j r_j P(r_j|T).  rms: sqrt(sum_j r_j^2 P(r_j|T)). "
@@ -6641,7 +7899,8 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
           f"rg_scale={rg_scale_initial:.6g}): {nv['status']}")
     print(f"    support_overlap={nv['support_overlap']}  "
           f"reachable_within_scan={nv['reachable_within_scan']}  "
-          f"within_asymptotic_range={nv['within_asymptotic_range']}")
+          f"within_global_outer_bound={nv['within_global_outer_bound']}  "
+          f"conditional_moment_monotonic={nv['conditional_moment_monotonic']}")
     fv = scientific_validity["fitted_scale"]
     if fv is None:
         print("  fitted_scale_validity: not applicable (fixed-scale mode; the "
@@ -6651,9 +7910,12 @@ def run_rg_scalar_mode(args: argparse.Namespace) -> None:
               f"rg_scale={rg_scale_effective:.6g}): {fv['status']}")
         print(f"    support_overlap={fv['support_overlap']}  "
               f"reachable_within_scan={fv['reachable_within_scan']}  "
-              f"within_asymptotic_range={fv['within_asymptotic_range']}")
+              f"within_global_outer_bound={fv['within_global_outer_bound']}  "
+              f"conditional_moment_monotonic={fv['conditional_moment_monotonic']}")
         print("    NOTE: a fitted-scale status describes the mapping's flexibility, "
               "not an independent confirmation of the physical scale.")
+    print("  Only 'outside_global_outer_bound' asserts impossibility for all real "
+          "b; scan-scoped statuses do not.")
     if feasibility_nominal is None:
         print("  UNVERIFIED: run --rg-feasibility-scan to establish whether the "
               "baseline can reach the observed Rg range.")
