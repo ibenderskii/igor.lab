@@ -33,6 +33,7 @@ from typing import Callable, Dict, Optional, Tuple
 import numpy as np
 
 import remd_uniform_chain_2_new as _remd  # ROT_MATS (proper cubic rotations)
+from lattice_bending import delta_bends as _delta_bends
 from multichain_state import (
     NN6, MultiChainState, wrap_coordinate, canonicalize_chain_coordinates)
 from multichain_contacts import delta_contacts, apply_moved_beads
@@ -355,8 +356,38 @@ def proposal_delta(state: MultiChainState, proposal: MoveProposal
     return delta_contacts(state, moved_ids, proposal.new_sites)
 
 
+def proposal_delta_bends(state: MultiChainState, proposal: MoveProposal) -> int:
+    """Change in the total 90-degree-turn count for a geometrically valid proposal.
+
+    Whole-chain translation and rigid whole-chain rotation are isometries of the
+    moved chain (a translation preserves every bond vector; a rigid cubic rotation
+    maps NN6 bonds to NN6 bonds and preserves every interior angle), so they never
+    change any bend and return exactly 0 without inspecting geometry.  Local bead
+    moves and reptation can change bends only WITHIN the single moved chain, so the
+    delta is evaluated from that one chain's old vs new UNWRAPPED coordinates over
+    the moved-bead angle centers (via :func:`lattice_bending.delta_bends`) -- never
+    a full recount over all chains.
+    """
+    if not proposal.ok:
+        return 0
+    if proposal.move_type in ("chain_translation", "rotation"):
+        return 0
+    N = state.chain_length
+    if N < 3 or not proposal.moved:
+        return 0
+    c = int(proposal.chain)
+    old = state.coords_unwrapped[c]
+    new = np.array(old, dtype=np.int64, copy=True)
+    changed = []
+    for gid, pos in proposal.moved.items():
+        i = int(gid) % N
+        new[i, 0], new[i, 1], new[i, 2] = int(pos[0]), int(pos[1]), int(pos[2])
+        changed.append(i)
+    return int(_delta_bends(old, new, changed))
+
+
 def apply_proposal(state: MultiChainState, proposal: MoveProposal,
-                   delta: Tuple[int, int]) -> None:
+                   delta: Tuple[int, int], delta_bends: int = None) -> None:
     """Apply an ACCEPTED proposal's new positions and update caches in place.
 
     After committing the moved beads, the proposal's chain is re-based into the
@@ -364,7 +395,16 @@ def apply_proposal(state: MultiChainState, proposal: MoveProposal,
     long sequence of accepted whole-chain translations cannot drive unwrapped
     coordinates off to infinity.  Canonicalization runs only here, on the
     accepted state -- never on trial coordinates before the contact-delta
-    evaluation -- and preserves wrapped sites, occupancy, contacts, and Rg.
+    evaluation -- and preserves wrapped sites, occupancy, contacts, Rg, and (being
+    a whole-chain box-multiple shift) the bend count too.
+
+    ``delta_bends`` is the change in the cached total 90-degree-turn count.  The
+    sampler passes the value it already computed for the Metropolis decision; when
+    omitted (direct callers / tests) it is recomputed from the pre-move state, so
+    ``state.n_bend`` stays in sync however the proposal is applied.
     """
+    if delta_bends is None:
+        delta_bends = proposal_delta_bends(state, proposal)
     apply_moved_beads(state, proposal.moved, delta)
     canonicalize_chain_coordinates(state, proposal.chain)
+    state.n_bend = int(state.n_bend) + int(delta_bends)

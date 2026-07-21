@@ -166,6 +166,9 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import isaw_contact_observables as ico  # noqa: E402
 import isaw_config_io as cio  # noqa: E402
 from isaw_config_io import SnapshotWriter  # noqa: E402,F401  (run_remd annotation)
+from lattice_bending import (  # noqa: E402
+    BEND_DEFINITION, count_bends, delta_bends,
+)
 
 # Matplotlib is imported LAZILY inside the plotting functions only.  Importing
 # it at module import time would initialize a GUI/Agg backend in every spawned
@@ -350,6 +353,32 @@ def reduced_potential(m, T, model_name, params, Tref, Tscale) -> float:
     return float(m) * reduced_bias(model_name, params, float(T), Tref, Tscale)
 
 
+def reduced_potential_bending(
+    m, T, model_name, params, Tref, Tscale, kappa_bend=0.0, n_bend=0
+) -> float:
+    """Full reduced potential u(X,T) = b(T)*m + kappa_bend*n_bend.
+
+    The optional fixed reduced bending penalty is temperature-independent.  With
+    ``kappa_bend == 0`` this equals :func:`reduced_potential` exactly, so the
+    athermal / no-bending behaviour is unchanged.
+    """
+    return (
+        reduced_potential(m, T, model_name, params, Tref, Tscale)
+        + float(kappa_bend) * float(n_bend)
+    )
+
+
+def _metropolis_accept(du: float) -> bool:
+    """Metropolis rule for a reduced-potential change ``du``.
+
+    Accept unconditionally when ``du <= 0``; otherwise accept with probability
+    exp(-du).  A single random number is drawn, and only when ``du > 0`` -- so a
+    proposal with ``du == 0`` (e.g. a neutral bend change at ``kappa_bend == 0``)
+    never perturbs the RNG stream, preserving seed reproducibility.
+    """
+    return du <= 0.0 or random.random() < math.exp(-du)
+
+
 def energy_from_contacts(m, T, model_name, params, Tref, Tscale) -> float:
     """Model-implied temperature-dependent energy H = T * u.
 
@@ -399,7 +428,11 @@ def radius_of_gyration(chain: List[Vec]) -> float:
 
 # --- MC move functions (must be top-level for pickling on Windows spawn) ---
 
-def attempt_pivot(chain, occ) -> Tuple[bool, list, set]:
+# Each move returns ``(ok, new_chain, new_occ, changed)`` where ``changed`` lists
+# the bead indices whose bend bookkeeping must be revisited; it is fed straight to
+# ``delta_bends``.  Rejected proposals return an empty ``changed``.
+
+def attempt_pivot(chain, occ) -> Tuple[bool, list, set, tuple]:
     """Global pivot move: rotate tail around a randomly chosen pivot monomer."""
     n = len(chain)
     i = random.randrange(1, n-1)
@@ -412,13 +445,20 @@ def attempt_pivot(chain, occ) -> Tuple[bool, list, set]:
     for r in tail:
         r2 = _add(pivot, _apply_rot(M, _sub(r, pivot)))
         if r2 in new_occ:
-            return False, chain, occ
+            return False, chain, occ, ()
         new_tail.append(r2)
         new_occ.add(r2)
-    return True, head + new_tail, new_occ
+    # A pivot rotates the whole tail RIGIDLY: every bond from index i onwards is
+    # rotated by the same matrix M, so all interior tail angles are preserved and
+    # only the angle at center i can change.  Reporting bead i+1 (the first bead
+    # that actually moved) makes delta_bends inspect centers {i, i+1, i+2}, which
+    # covers center i exactly; the other two contribute 0.  This keeps the pivot's
+    # bend bookkeeping O(1) instead of O(N), and ISAW_DEBUG_CONTACTS verifies it
+    # against a full count_bends recount.
+    return True, head + new_tail, new_occ, (i + 1,)
 
 
-def attempt_crankshaft(chain, occ) -> Tuple[bool, list, set]:
+def attempt_crankshaft(chain, occ) -> Tuple[bool, list, set, tuple]:
     """Local 90° kink flip (crankshaft move)."""
     n = len(chain)
     i = random.randrange(1, n-1)
@@ -426,22 +466,22 @@ def attempt_crankshaft(chain, occ) -> Tuple[bool, list, set]:
     u1 = _sub(b, a)
     u2 = _sub(c, b)
     if u1 not in NN_VECS or u2 not in NN_VECS:
-        return False, chain, occ
+        return False, chain, occ, ()
     if u1 == u2 or u1 == (-u2[0], -u2[1], -u2[2]):
-        return False, chain, occ
+        return False, chain, occ, ()
     if u1[0]*u2[0] + u1[1]*u2[1] + u1[2]*u2[2] != 0:
-        return False, chain, occ
+        return False, chain, occ, ()
     b_new = _add(a, u2)
     if b_new in occ:
-        return False, chain, occ
+        return False, chain, occ, ()
     if _sub(b_new, a) not in NN_VECS or _sub(c, b_new) not in NN_VECS:
-        return False, chain, occ
+        return False, chain, occ, ()
     new_chain = chain.copy()
     new_chain[i] = b_new
-    return True, new_chain, (occ - {b}) | {b_new}
+    return True, new_chain, (occ - {b}) | {b_new}, (i,)
 
 
-def attempt_end_move(chain, occ) -> Tuple[bool, list, set]:
+def attempt_end_move(chain, occ) -> Tuple[bool, list, set, tuple]:
     """Symmetric end move: move one end to a random empty neighbor of its anchor."""
     n = len(chain)
     end = 0 if random.random() < 0.5 else n - 1
@@ -454,14 +494,14 @@ def attempt_end_move(chain, occ) -> Tuple[bool, list, set]:
     r_new = _add(chain[anchor], v)
 
     if r_new == old:
-        return False, chain, occ
+        return False, chain, occ, ()
     if r_new in occ_without_old:
-        return False, chain, occ
+        return False, chain, occ, ()
 
     new_chain = chain.copy()
     new_chain[end] = r_new
     new_occ = occ_without_old | {r_new}
-    return True, new_chain, new_occ
+    return True, new_chain, new_occ, (end,)
 
 
 MOVE_FUNCS = [attempt_pivot, attempt_crankshaft, attempt_end_move]
@@ -524,11 +564,16 @@ class ChainState:
     ``m`` is the cached non-bonded contact count, kept in sync with ``chain``/
     ``occ`` so the MC hot loop never recounts the *old* configuration.  The
     independent :func:`contact_count` remains available for validation.
+
+    ``n_bend`` is the cached 90-degree-turn count, maintained the same way for
+    the optional bending penalty.  It defaults to 0 so states pickled by older
+    code (and every kappa_bend=0 run) behave exactly as before.
     """
     chain: List[Vec]
     occ:   set
     E:     float
     m:     int
+    n_bend: int = 0
 
     @classmethod
     def initial_straight(
@@ -541,6 +586,7 @@ class ChainState:
             chain=chain, occ=occ,
             E=energy_from_contacts(m, T, model_name, params, Tref, Tscale),
             m=m,
+            n_bend=0,  # straight chain => no bends
         )
 
 
@@ -558,6 +604,10 @@ def swap_log_accept(
     Log Metropolis ratio for swapping configs C_i (at T_i) and C_j (at T_j).
 
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)
+
+    The optional bending penalty kappa_bend*n_bend is temperature-INDEPENDENT, so
+    its contribution to this expression is kappa*(n_i + n_j - n_j - n_i) = 0.  It
+    cancels exactly and the swap criterion is unchanged for any kappa_bend.
     """
     return (
         reduced_potential(m_i, T_i, model_name, params, Tref, Tscale)
@@ -595,6 +645,10 @@ class Replica:
     # Scalar structural observables (every cycle).
     Rg2_traj:  list = dataclasses.field(default_factory=list)
     Ree2_traj: list = dataclasses.field(default_factory=list)
+    # Cached 90-degree-turn count, recorded every cycle (additive; only the
+    # optional bending penalty depends on it).  Left empty for replicas that
+    # never ran through the sampler, exactly like the structural traces below.
+    n_bend_traj: list = dataclasses.field(default_factory=list)
     # Contact-map-derived structural observables (every structural_stride cycle;
     # only populated when structural observables are explicitly enabled).
     # m_long_traj stores m_long_fixed (the fixed-scheme long count).
@@ -635,23 +689,28 @@ class Replica:
 def mc_sweep(
     replica: Replica, steps: int,
     model_name: str, params, Tref: float, Tscale: float,
+    kappa_bend: float = 0.0,
 ) -> None:
     """Run `steps` local Metropolis moves on `replica` in-place.
 
-    Acceptance uses the generic reduced potential u = m*b(T):
-        du = u_new - u_old,  accept if du <= 0 or rand < exp(-du).
-    For model hs with params (h, s) this is identical to the legacy
-    beta*dE criterion (du = beta*dE), preserving old sampling exactly.
+    Acceptance uses the generic reduced potential u = m*b(T) plus the optional
+    fixed reduced bending penalty kappa_bend*n_bend:
+        du = u_new - u_old + kappa_bend*dn_bend,
+        accept if du <= 0 or rand < exp(-du).
+    For model hs with params (h, s) and kappa_bend = 0 this is identical to the
+    legacy beta*dE criterion (du = beta*dE), preserving old sampling exactly:
+    the bend term contributes exactly 0.0 and draws no extra random numbers.
     """
     T     = replica.T
     state = replica.state
     counters = replica.move_counters
+    kappa_bend = float(kappa_bend)
 
     for _ in range(steps):
         replica.local_prop += 1
         move_idx = random.randrange(_N_MOVES)
         counters[move_idx, 0] += 1                       # proposed
-        ok, chain_new, occ_new = MOVE_FUNCS[move_idx](state.chain, state.occ)
+        ok, chain_new, occ_new, changed = MOVE_FUNCS[move_idx](state.chain, state.occ)
         if not ok:
             continue
         counters[move_idx, 1] += 1                       # geometrically valid
@@ -671,11 +730,16 @@ def mc_sweep(
         m_new = int(round(contact_count(chain_new, occ_new)))
         u_new = reduced_potential(m_new, T, model_name, params, Tref, Tscale)
 
-        du = u_new - u_old
-        if du <= 0 or random.random() < math.exp(-du):
+        # Bending penalty is a fixed reduced (dimensionless) term; it is NOT
+        # folded into state.E, which stays the contact energy in model units.
+        dn_bend = delta_bends(state.chain, chain_new, changed)
+
+        du = u_new - u_old + kappa_bend * dn_bend
+        if _metropolis_accept(du):
             state.chain = chain_new
             state.occ   = occ_new
             state.m     = m_new
+            state.n_bend = state.n_bend + dn_bend
             state.E     = energy_from_contacts(m_new, T, model_name, params, Tref, Tscale)
             replica.local_acc += 1
             if state_changing:
@@ -683,6 +747,9 @@ def mc_sweep(
             if _DEBUG_CONTACTS:
                 assert state.m == int(round(contact_count(state.chain, state.occ))), (
                     "state.m out of sync with contact_count after accepted move"
+                )
+                assert state.n_bend == count_bends(state.chain), (
+                    "state.n_bend out of sync with count_bends after accepted move"
                 )
 
 
@@ -707,6 +774,11 @@ def attempt_swap(
         rep_a.state.chain, rep_b.state.chain = rep_b.state.chain, rep_a.state.chain
         rep_a.state.occ,   rep_b.state.occ   = rep_b.state.occ,   rep_a.state.occ
         rep_a.state.m,     rep_b.state.m     = rep_b.state.m,     rep_a.state.m
+        # n_bend travels with the configuration, exactly like m.  (The bending
+        # term itself is temperature-independent and cancels in swap_log_accept,
+        # so it never enters the swap criterion -- but the cached count must
+        # follow its chain or the incremental bookkeeping desynchronizes.)
+        rep_a.state.n_bend, rep_b.state.n_bend = rep_b.state.n_bend, rep_a.state.n_bend
         # Recompute each lane's energy from the (now swapped) stored contact
         # number rather than recounting contacts.
         rep_a.state.E = energy_from_contacts(
@@ -734,6 +806,7 @@ def evolve_replica_worker(
     Tref: float,
     Tscale: float,
     seed: int,
+    kappa_bend: float = 0.0,
 ) -> tuple["ChainState", int, int, np.ndarray]:
     """Deterministically sweep one lane without transferring trajectories.
 
@@ -749,7 +822,7 @@ def evolve_replica_worker(
         local_acc=int(local_acc), local_prop=int(local_prop),
         move_counters=np.asarray(move_counters, dtype=np.int64).copy(),
     )
-    mc_sweep(replica, steps, model_name, params, Tref, Tscale)
+    mc_sweep(replica, steps, model_name, params, Tref, Tscale, kappa_bend)
     return (replica.state, replica.local_acc, replica.local_prop,
             replica.move_counters)
 
@@ -772,6 +845,8 @@ def _record_scalar_observables(rep: Replica) -> tuple[float, float]:
     rep.Rg_traj.append(math.sqrt(rg2))
     rep.Rg2_traj.append(rg2)
     rep.Ree2_traj.append(ree2)
+    # Cached bend count (O(1) read); additive, never alters sampling.
+    rep.n_bend_traj.append(int(rep.state.n_bend))
     return rg2, ree2
 
 
@@ -842,6 +917,7 @@ def run_remd(
     snapshot_writer: "SnapshotWriter | None" = None,
     snapshot_stride: int = 1,
     snapshot_start_cycle: int = 0,
+    kappa_bend: float = 0.0,
 ) -> tuple[list[Replica], np.ndarray, np.ndarray]:
     """
     Run REMD.
@@ -857,6 +933,11 @@ def run_remd(
       5. When a ``snapshot_writer`` is supplied, coordinates and per-lane scalars
          are streamed to disk every ``snapshot_stride`` cycles, starting at
          ``snapshot_start_cycle``.
+
+    ``kappa_bend`` adds the fixed reduced bending penalty kappa_bend*n_bend to the
+    LOCAL Metropolis rule only.  Being temperature-independent it cancels exactly
+    in the swap criterion (see :func:`swap_log_accept`), so swap acceptance is
+    unaffected.  At the default 0.0 the sampler is bit-for-bit the original.
 
     The target ensemble, local Metropolis rule, and swap criterion are
     unchanged by structural recording or snapshotting; all of that work happens
@@ -973,7 +1054,7 @@ def run_remd(
                         replicas[k].local_acc, replicas[k].local_prop,
                         replicas[k].move_counters,
                         steps_per_swap, model_name, params, Tref, Tscale,
-                        worker_seeds[k],
+                        worker_seeds[k], kappa_bend,
                     )
                     for k in range(nT)
                 ]
@@ -985,7 +1066,8 @@ def run_remd(
                     replicas[k].move_counters = move_counters
             else:
                 for rep in replicas:
-                    mc_sweep(rep, steps_per_swap, model_name, params, Tref, Tscale)
+                    mc_sweep(rep, steps_per_swap, model_name, params, Tref, Tscale,
+                             kappa_bend)
 
             t1 = time.perf_counter()
             t_sweep_total += t1 - t0
@@ -1257,6 +1339,28 @@ def build_distributions(
     }
 
 
+def _bend_fraction_by_temp(
+    replicas: list, N: int, burnin_frac: float = 0.0
+) -> np.ndarray:
+    """Post-burn-in mean bend fraction n_bend/(N-2) for each temperature lane.
+
+    Additive summary of the cached bend-count trajectory.  Returns NaN for lanes
+    with no post-burn-in samples and, for every lane, when the chain is too
+    short to bend (N <= 2).
+    """
+    denom = int(N) - 2
+    out = np.full(len(replicas), np.nan, dtype=float)
+    if denom <= 0:
+        return out
+    for i, rep in enumerate(replicas):
+        arr = np.asarray(rep.n_bend_traj, dtype=float)
+        s = int(math.floor(arr.size * float(burnin_frac)))
+        post = arr[s:]
+        if post.size:
+            out[i] = float(post.mean()) / denom
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Convergence and mixing diagnostics (optional; never alters canonical output)
 # ---------------------------------------------------------------------------
@@ -1498,6 +1602,9 @@ def compute_run_diagnostics(
         # lengths scale by rg_scale**2.
         Rg2 = np.asarray(rep.Rg2_traj[s:], dtype=float) * float(rg_scale) ** 2
         Ree2 = np.asarray(rep.Ree2_traj[s:], dtype=float) * float(rg_scale) ** 2
+        # Cached bend count (per-cycle, dimensionless -> never rescaled).  Empty
+        # for replicas that did not track bends; diagnosed but never warned on.
+        NB = np.asarray(rep.n_bend_traj[s:], dtype=float)
         # Contact-map structural observables use their own (coarser) sample
         # count and cycle spacing; never rescaled by rg_scale.
         ns = len(rep.m_long_traj)
@@ -1531,7 +1638,7 @@ def compute_run_diagnostics(
         # tau_int_cycles is expressed in REMD cycles, not in sample steps.
         for name, arr, spacing in (
             ("contacts", C, 1), ("rg", Rg, 1), ("rg2", Rg2, 1),
-            ("ree2", Ree2, 1), ("energy", E, 1),
+            ("ree2", Ree2, 1), ("energy", E, 1), ("n_bend", NB, 1),
             ("m_long_fixed", m_long, struct_spacing),
             ("m_global_scaled", m_global, struct_spacing),
             ("smax", Smax, struct_spacing),
@@ -1654,6 +1761,10 @@ def compute_run_diagnostics(
         "min_ess_key_structural": min_ess_key_structural,
         "min_structural_samples": min_struct_samples,
         "max_drift_m_long_fixed": float(max(struct_drift)) if struct_drift else float("nan"),
+        # Supplementary bending observable (informational only; drives no warning
+        # and shares the existing thresholds -- nothing new can fail because of it).
+        "min_ess_n_bend": float(min(_obs_esss("n_bend"))) if _obs_esss("n_bend") else float("nan"),
+        "median_ess_n_bend": float(np.median(_obs_esss("n_bend"))) if _obs_esss("n_bend") else float("nan"),
     }
 
     # --- threshold-driven warnings (structured + recorded) ---
@@ -2882,10 +2993,208 @@ def run_quick_test() -> None:
         )
     print("  quick-test summary api-version handling: PASSED")
 
+    run_bending_quick_test()
     run_diagnostics_quick_test()
     run_structural_quick_test()
 
     print("quick-test complete.")
+
+
+def run_bending_quick_test() -> None:
+    """Tests for the optional fixed reduced bending penalty kappa_bend*n_bend.
+
+    Covers: the full reduced potential, the Metropolis helper, kappa=0
+    reproducibility and RNG neutrality, cached-vs-recount bend bookkeeping,
+    exact cancellation of the bending term from replica exchange, fit-summary
+    metadata loading/validation, serial/multiprocessing equivalence, and the
+    physical expectation that a positive penalty straightens the chain.
+    """
+    import os
+    import tempfile
+
+    model = "hs"
+    params = [378.96, 1.39686]
+    Tref, Tscale = 330.0, 60.0
+
+    # -- Test 1: full reduced potential includes kappa_bend * n_bend -----------
+    u_contact = reduced_potential(5, 300.0, model, params, Tref, Tscale)
+    u_full = reduced_potential_bending(
+        5, 300.0, model, params, Tref, Tscale, kappa_bend=0.4, n_bend=3)
+    assert abs(u_full - (u_contact + 0.4 * 3)) < 1e-12, (u_full, u_contact)
+    # kappa_bend = 0 collapses exactly onto the contact-only reduced potential.
+    assert reduced_potential_bending(
+        5, 300.0, model, params, Tref, Tscale, kappa_bend=0.0, n_bend=3
+    ) == u_contact
+    print("  quick-test bending reduced-potential: PASSED")
+
+    # -- Test 2: Metropolis helper for favorable/neutral/unfavorable bends -----
+    kappa = 0.5
+    # Favorable: two fewer bends (du < 0) -> always accepted, no random draw.
+    random.seed(1); st = random.getstate()
+    assert _metropolis_accept(kappa * (-2)) is True
+    assert random.getstate() == st, "favorable move must not draw a random number"
+    # Neutral: no bend change (du == 0) -> always accepted, no random draw.
+    assert _metropolis_accept(kappa * 0) is True
+    assert random.getstate() == st, "neutral move must not draw a random number"
+    # Unfavorable: three extra bends (du = 1.5 > 0) -> probabilistic accept.
+    random.seed(1)
+    acc = sum(_metropolis_accept(kappa * 3) for _ in range(4000))
+    assert 500 < acc < 1400, acc            # exp(-1.5) ~ 0.223 -> ~892
+    print("  quick-test bending Metropolis helper: PASSED")
+
+    Ts = np.linspace(300.0, 360.0, 4)
+    run_kw = dict(
+        N=18, Ts=Ts, steps_per_swap=40, n_cycles=16,
+        model_name=model, params=params, Tref=Tref, Tscale=Tscale,
+        verbose=False,
+    )
+
+    # -- Test 3: kappa_bend = 0 is bit-for-bit reproducible for a fixed seed ---
+    repsA, spA, saA = run_remd(seed=2024, n_workers=1, kappa_bend=0.0, **run_kw)
+    repsB, spB, saB = run_remd(seed=2024, n_workers=1, kappa_bend=0.0, **run_kw)
+    for a, b in zip(repsA, repsB):
+        assert a.C_traj == b.C_traj, "kappa=0 contact trajectory not reproducible"
+        assert a.E_traj == b.E_traj
+        assert a.Rg_traj == b.Rg_traj
+        assert a.n_bend_traj == b.n_bend_traj
+    np.testing.assert_array_equal(spA, spB)
+    np.testing.assert_array_equal(saA, saB)
+    print("  quick-test bending kappa=0 reproducibility: PASSED")
+
+    # -- Test 4: the bending machinery draws no random number when kappa = 0 ---
+    # _metropolis_accept draws exactly one number iff du > 0, none otherwise, so
+    # with kappa_bend = 0 (du == contact-only du) the RNG stream is identical to
+    # the original contact-only sampler.
+    random.seed(0); st0 = random.getstate()
+    _metropolis_accept(0.0);  assert random.getstate() == st0
+    _metropolis_accept(-2.0); assert random.getstate() == st0
+    _metropolis_accept(1.0);  assert random.getstate() != st0
+    random.seed(0); _metropolis_accept(1.0); one = random.getstate()
+    random.seed(0); random.random()
+    assert random.getstate() == one, "du>0 must draw exactly one random number"
+    # delta_bends itself consumes no randomness.
+    straight = [(i, 0, 0) for i in range(6)]
+    kinked = straight[:3] + [(2, 1, 0)] + [(3, 1, 0), (4, 1, 0)]
+    random.seed(0); st_db = random.getstate()
+    _ = delta_bends(straight, kinked, (3,))
+    assert random.getstate() == st_db, "delta_bends must not draw random numbers"
+    print("  quick-test bending kappa=0 RNG neutrality: PASSED")
+
+    # -- Test 5: cached bend count == full recount (also under debug mode) -----
+    global _DEBUG_CONTACTS
+    saved_debug = _DEBUG_CONTACTS
+    try:
+        _DEBUG_CONTACTS = True   # exercises the in-loop count_bends cross-check
+        reps_dbg, _, _ = run_remd(seed=99, n_workers=1, kappa_bend=0.6, **run_kw)
+    finally:
+        _DEBUG_CONTACTS = saved_debug
+    for rep in reps_dbg:
+        assert rep.state.n_bend == count_bends(rep.state.chain), (
+            "cached n_bend disagrees with full recount")
+        assert 0 <= rep.state.n_bend <= run_kw["N"] - 2
+    print("  quick-test bending cached-count vs recount: PASSED")
+
+    # -- Test 6: the fixed bending term cancels exactly from replica exchange ---
+    # swap_log_accept is contact-only; adding kappa*n_bend to the full reduced
+    # potential of each participating configuration leaves the swap criterion
+    # unchanged for ANY kappa and ANY (different) bend counts.
+    for kap in (0.0, 0.3, 2.5):
+        for (m_i, m_j, n_i, n_j) in ((4, 9, 2, 11), (7, 7, 0, 5), (1, 12, 8, 3)):
+            Ti, Tj = 305.0, 345.0
+            u_ii = reduced_potential_bending(m_i, Ti, model, params, Tref, Tscale, kap, n_i)
+            u_jj = reduced_potential_bending(m_j, Tj, model, params, Tref, Tscale, kap, n_j)
+            u_ji = reduced_potential_bending(m_j, Ti, model, params, Tref, Tscale, kap, n_j)
+            u_ij = reduced_potential_bending(m_i, Tj, model, params, Tref, Tscale, kap, n_i)
+            log_acc_full = u_ii + u_jj - u_ji - u_ij
+            log_acc_contact = swap_log_accept(
+                m_i, m_j, Ti, Tj, model, params, Tref, Tscale)
+            assert abs(log_acc_full - log_acc_contact) < 1e-9, (
+                kap, m_i, m_j, n_i, n_j, log_acc_full, log_acc_contact)
+    print("  quick-test bending cancels from exchange: PASSED")
+
+    # -- Test 7: fit-summary kappa_bend metadata + resolution rules ------------
+    def _write_summary(dirpath, obj, name="fit_summary.json"):
+        path = os.path.join(dirpath, name)
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+        return path
+
+    def _expect_value_error(thunk, needle):
+        try:
+            thunk()
+        except ValueError as exc:
+            assert needle in str(exc), (needle, str(exc))
+            return
+        raise AssertionError(f"expected ValueError containing {needle!r}")
+
+    base_summary = {
+        "model": "hs", "params": {"h": 400.0, "s": 1.5},
+        "Tref": 320.0, "Tscale": 80.0,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        p_k = _write_summary(tmp, {**base_summary, "kappa_bend": 0.3})
+        assert load_fit_summary_json(p_k)["kappa_bend"] == 0.3
+        p_legacy = _write_summary(tmp, dict(base_summary), name="legacy.json")
+        assert load_fit_summary_json(p_legacy)["kappa_bend"] is None
+        p_neg = _write_summary(tmp, {**base_summary, "kappa_bend": -1.0}, name="neg.json")
+        _expect_value_error(lambda: load_fit_summary_json(p_neg), "kappa_bend must be >= 0")
+        p_nan = _write_summary(
+            tmp, {**base_summary, "kappa_bend": float("inf")}, name="nan.json")
+        _expect_value_error(lambda: load_fit_summary_json(p_nan), "kappa_bend must be finite")
+    # resolve_kappa_bend rule table:
+    assert resolve_kappa_bend(None, 0.3, True) == 0.3        # rule 1: summary value
+    assert resolve_kappa_bend(None, None, True) == 0.0       # rule 2: legacy -> 0
+    assert resolve_kappa_bend(0.3, 0.3, True) == 0.3         # rule 3: matching CLI ok
+    _expect_value_error(lambda: resolve_kappa_bend(0.5, 0.3, True), "does not match")
+    _expect_value_error(lambda: resolve_kappa_bend(0.5, None, True), "does not match")  # legacy=0
+    assert resolve_kappa_bend(0.6, None, False) == 0.6       # rule 4: CLI, no summary
+    assert resolve_kappa_bend(None, None, False) == 0.0      # rule 4: default 0
+    _expect_value_error(lambda: resolve_kappa_bend(-0.1, None, False), "must be >= 0")
+    _expect_value_error(
+        lambda: resolve_kappa_bend(float("nan"), None, False), "must be finite")
+    print("  quick-test bending fit-summary metadata: PASSED")
+
+    # -- Test 8: multiprocessing stays deterministic with bending enabled ------
+    # The parallel path seeds each lane/cycle deterministically, so runs with
+    # different worker counts are bit-identical; kappa_bend is threaded to every
+    # worker, so enabling bending does not break this.  The serial and parallel
+    # paths use distinct, each-reproducible RNG schemes that predate this patch
+    # (serial draws one continuous stream; workers reseed per lane/cycle), so the
+    # two modes are NOT mutually identical -- unchanged existing behaviour.  What
+    # this test guarantees is that bending preserves determinism within each mode.
+    reps_w2, sp2, sa2 = run_remd(seed=555, n_workers=2, kappa_bend=0.5, **run_kw)
+    reps_w3, sp3, sa3 = run_remd(seed=555, n_workers=3, kappa_bend=0.5, **run_kw)
+    for a, b in zip(reps_w2, reps_w3):
+        assert a.C_traj == b.C_traj, "worker-count changed the contact trajectory"
+        assert a.Rg_traj == b.Rg_traj
+        assert a.n_bend_traj == b.n_bend_traj
+        assert a.state.n_bend == b.state.n_bend
+    np.testing.assert_array_equal(sp2, sp3)
+    np.testing.assert_array_equal(sa2, sa3)
+    # Serial is itself reproducible run-to-run for a fixed seed.
+    reps_s1, _, _ = run_remd(seed=555, n_workers=1, kappa_bend=0.5, **run_kw)
+    reps_s2, _, _ = run_remd(seed=555, n_workers=1, kappa_bend=0.5, **run_kw)
+    for a, b in zip(reps_s1, reps_s2):
+        assert a.C_traj == b.C_traj and a.n_bend_traj == b.n_bend_traj
+    print("  quick-test bending multiprocessing determinism: PASSED")
+
+    # -- Test 9: a positive penalty yields fewer bends on average -------------
+    long_kw = dict(
+        N=24, Ts=Ts, steps_per_swap=60, n_cycles=80,
+        model_name=model, params=params, Tref=Tref, Tscale=Tscale,
+        verbose=False,
+    )
+    reps0, _, _ = run_remd(seed=321, n_workers=1, kappa_bend=0.0, **long_kw)
+    repsK, _, _ = run_remd(seed=321, n_workers=1, kappa_bend=1.0, **long_kw)
+    bf0 = _bend_fraction_by_temp(reps0, long_kw["N"], 0.5)
+    bfK = _bend_fraction_by_temp(repsK, long_kw["N"], 0.5)
+    mean0 = float(np.nanmean(bf0))
+    meanK = float(np.nanmean(bfK))
+    assert meanK < mean0, (
+        f"positive kappa did not reduce bends: mean bend fraction "
+        f"kappa=1.0 -> {meanK:.4f} vs kappa=0 -> {mean0:.4f}")
+    print(f"  quick-test bending positive-kappa straightens "
+          f"(bend fraction {meanK:.3f} < {mean0:.3f}): PASSED")
 
 
 def run_structural_quick_test() -> None:
@@ -3402,14 +3711,81 @@ def load_fit_summary_json(path: str) -> dict:
         model_name, Tref, Tscale, f"fit_summary.json {path!r}"
     )
 
+    # Optional fixed reduced bending penalty.  A bending-aware fitter records it;
+    # legacy summaries predate the field and read as None (resolved to 0.0 by
+    # resolve_kappa_bend, i.e. no bending penalty).
+    kappa_bend = summary.get("kappa_bend", None)
+    if kappa_bend is not None:
+        kappa_bend = float(kappa_bend)
+        if not math.isfinite(kappa_bend):
+            raise ValueError(
+                f"fit_summary.json {path!r} kappa_bend must be finite, "
+                f"got {kappa_bend!r}"
+            )
+        if kappa_bend < 0.0:
+            raise ValueError(
+                f"fit_summary.json {path!r} kappa_bend must be >= 0, "
+                f"got {kappa_bend!r}"
+            )
+
     return {
         "model_name": model_name,
         "param_names": list(param_names),
         "params": params,
         "Tref": Tref,
         "Tscale": Tscale,
+        "kappa_bend": kappa_bend,
         "source_path": str(path),
     }
+
+
+KAPPA_BEND_TOL = 1e-9
+
+
+def resolve_kappa_bend(
+    cli_kappa,
+    summary_kappa,
+    summary_loaded: bool,
+    *,
+    source: str = "",
+    tol: float = KAPPA_BEND_TOL,
+) -> float:
+    """Resolve the effective fixed reduced bending penalty kappa_bend.
+
+    Rules (mirroring the fitter's baseline reconciliation):
+
+    1. When a fit summary is loaded and carries ``kappa_bend`` (``summary_kappa``
+       is not None), that value is authoritative.
+    2. A legacy summary that lacks the key (``summary_kappa is None`` while
+       ``summary_loaded``) counts as 0.0 -- no bending penalty.
+    3. A CLI ``--kappa-bend`` supplied alongside a fit summary is a consistency
+       check: it must match the summary value within ``tol`` or this raises.
+    4. Without a fit summary the CLI value is used, defaulting to 0.0.
+    5. Negative or non-finite values are rejected wherever they appear.
+
+    ``kappa_bend`` is dimensionless; ``kappa_bend > 0`` means enabled, ``0``
+    disabled.  There is deliberately no separate enable flag.
+    """
+    if cli_kappa is not None:
+        cli_kappa = float(cli_kappa)
+        if not math.isfinite(cli_kappa):
+            raise ValueError(f"--kappa-bend must be finite, got {cli_kappa!r}")
+        if cli_kappa < 0.0:
+            raise ValueError(f"--kappa-bend must be >= 0, got {cli_kappa!r}")
+
+    if summary_loaded:
+        effective = 0.0 if summary_kappa is None else float(summary_kappa)
+        if cli_kappa is not None and abs(cli_kappa - effective) > tol:
+            where = f" ({source})" if source else ""
+            raise ValueError(
+                f"--kappa-bend {cli_kappa!r} does not match the fit summary"
+                f"{where} kappa_bend {effective!r} (tolerance {tol:g}). The "
+                "bending penalty is recorded in the fit summary; pass a matching "
+                "--kappa-bend or omit the flag."
+            )
+        return effective
+
+    return 0.0 if cli_kappa is None else cli_kappa
 
 
 def resolve_model_params(
@@ -3625,11 +4001,13 @@ def attach_run_metadata(
     n_cycles: int,
     burnin_frac: float,
     n_workers: int,
+    kappa_bend: float = 0.0,
 ) -> dict:
     """Inject simulation provenance into a distributions dict in place.
 
-    Adds run/seed metadata and the model API version without removing or
-    altering any existing canonical or model-metadata keys.
+    Adds run/seed metadata, the bending-penalty metadata, and the model API
+    version without removing or altering any existing canonical or
+    model-metadata keys.
     """
     dist["seed"] = int(seed)
     # N is preserved for backward compatibility and means the number of beads.
@@ -3642,6 +4020,9 @@ def attach_run_metadata(
     dist["n_workers"] = int(n_workers)
     dist["model_api_version"] = int(MODEL_API_VERSION)
     dist["schema_version"] = int(SCHEMA_VERSION)
+    dist["kappa_bend"] = float(kappa_bend)
+    dist["bending_enabled"] = bool(float(kappa_bend) != 0.0)
+    dist["bend_definition"] = BEND_DEFINITION
     return dist
 
 
@@ -3798,6 +4179,14 @@ def main() -> None:
     ap.add_argument("--seed",           type=int,   default=42,      help="RNG seed")
     ap.add_argument("--out-prefix",     type=str,   default="remd_out", help="prefix for all output files")
     ap.add_argument("--rg-bins",        type=int,   default=64,      help="bins for P(Rg) histograms")
+    ap.add_argument("--kappa-bend",     dest="kappa_bend", type=float, default=None,
+                    help="fixed reduced bending penalty: u_bend = kappa_bend * n_bend "
+                         "(n_bend = number of 90-degree turns). Applies to local moves "
+                         "only; it is temperature-independent and cancels in the swap "
+                         "criterion. When --fit-summary-json is used the penalty is "
+                         "taken from the summary (legacy summaries count as 0) and this "
+                         "flag, if given, must match it. Otherwise defaults to 0 = "
+                         "original behaviour.")
     ap.add_argument("--burnin-frac",    type=float, default=0.7,     help="fraction of trajectory to discard as burnin")
     ap.add_argument("--n-workers",      type=int,   default=6,       help="parallel workers for local sweeps (1 = serial)")
     ap.add_argument(
@@ -4057,6 +4446,8 @@ def main() -> None:
         raise ValueError("--burnin-frac must be in [0, 1)")
     if not math.isfinite(args.rg_scale) or args.rg_scale <= 0:
         raise ValueError("--rg-scale must be finite and positive")
+    # --kappa-bend (default None) is validated and reconciled against any fit
+    # summary by resolve_kappa_bend, after the model parameters are resolved.
     if args.diagnostic_trajectories and not args.diagnostics:
         raise ValueError("--diagnostic-trajectories requires --diagnostics")
     if args.diagnostics and args.diag_n_blocks < 1:
@@ -4146,6 +4537,19 @@ def main() -> None:
         parameter_source, fit_summary_json,
     ) = resolve_model_params(args, Ts)
 
+    # Resolve the fixed reduced bending penalty.  A fit summary (when used) is
+    # authoritative: re-read it for kappa_bend -- the file was already validated
+    # by resolve_model_params, so this second read only extracts the penalty and
+    # cross-checks any CLI --kappa-bend.  Without a summary the CLI value applies
+    # (default 0.0).  kappa_bend > 0 enables bending; there is no separate flag.
+    if fit_summary_json is not None:
+        summary_kappa = load_fit_summary_json(fit_summary_json)["kappa_bend"]
+        kappa_bend = resolve_kappa_bend(
+            args.kappa_bend, summary_kappa, True, source=fit_summary_json)
+    else:
+        kappa_bend = resolve_kappa_bend(args.kappa_bend, None, False)
+    bending_enabled = bool(kappa_bend != 0.0)
+
     print(
         f"REMD: {nT} replicas, T in [{Tmin_resolved:.6g}, {Tmax_resolved:.6g}], "
         f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
@@ -4154,6 +4558,8 @@ def main() -> None:
     print(f"Parameter source: {parameter_source}")
     if fit_summary_json is not None:
         print(f"Fit summary: {fit_summary_json}")
+    print(f"Bending penalty: kappa_bend = {kappa_bend:g} "
+          f"({'enabled' if bending_enabled else 'disabled'}; {BEND_DEFINITION})")
     print("Parameters:")
     for name, val in zip(param_names, model_params):
         print(f"  {name} = {val:.8g}")
@@ -4279,6 +4685,7 @@ def main() -> None:
             snapshot_writer=snapshot_writer,
             snapshot_stride=int(args.snapshot_stride),
             snapshot_start_cycle=int(args.snapshot_start_cycle),
+            kappa_bend=float(kappa_bend),
         )
         # Mark the snapshot file complete ONLY after run_remd returns normally.
         if snapshot_writer is not None:
@@ -4330,7 +4737,18 @@ def main() -> None:
         seed=args.seed, N=args.N,
         steps_per_swap=args.steps_per_swap, n_cycles=args.n_cycles,
         burnin_frac=args.burnin_frac, n_workers=args.n_workers,
+        kappa_bend=kappa_bend,
     )
+    # Additive bending observables (never touch canonical Pc/Prg).  n_bend_traj
+    # is the per-lane per-cycle 90-degree-turn count; bend_fraction is the
+    # post-burn-in mean n_bend/(N-2) per lane (NaN for N <= 2).
+    dist["n_bend_traj"] = np.array(
+        [np.asarray(r.n_bend_traj, dtype=np.int64) for r in replicas],
+        dtype=np.int64,
+    )
+    bend_fraction = _bend_fraction_by_temp(
+        replicas, int(args.N), float(args.burnin_frac))
+    dist["bend_fraction"] = bend_fraction
     attach_structural_metadata(
         dist,
         Ts=Ts, model_name=model_name, params=model_params,
@@ -4460,6 +4878,10 @@ def main() -> None:
         "burnin_frac": float(args.burnin_frac),
         "rg_bins": int(args.rg_bins),
         "rg_scale": float(args.rg_scale),
+        "kappa_bend": float(kappa_bend),
+        "bending_enabled": bool(bending_enabled),
+        "bend_definition": BEND_DEFINITION,
+        "bend_fraction": [float(v) for v in bend_fraction],
         "structural_observables_enabled": bool(structural_observables),
         "structural_stride": int(structural_stride_eff),
         "save_m_r_trajectories": bool(args.save_m_r_trajectories),

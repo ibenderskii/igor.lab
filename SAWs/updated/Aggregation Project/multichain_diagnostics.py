@@ -52,6 +52,10 @@ DIAGNOSED_OBSERVABLES = (
     # Intensive per-chain normalizations (linear transforms of the raw counts;
     # included for cross-M comparison of ESS/drift/means).
     "m_intra_per_chain", "m_inter_pairs_per_chain",
+    # Supplementary bending observable: the cached total 90-degree-turn count.
+    # Diagnosed for ESS/drift like the others but deliberately kept OUT of
+    # CENTRAL_OBSERVABLES, so it never drives a convergence warning.
+    "n_bend",
 )
 # Observables whose ESS / drift trigger convergence WARNINGS.  Kept to the raw
 # extensive counts so normalized series (deterministic transforms at fixed M) do
@@ -83,6 +87,7 @@ def _lane_series(rep, rg_scale: float) -> Dict[str, np.ndarray]:
         "dc_over_L": np.asarray(rep.dc_over_L_traj, dtype=float),
         "m_intra_per_chain": m_intra / M,
         "m_inter_pairs_per_chain": m_inter / M,
+        "n_bend": np.asarray(getattr(rep, "n_bend_traj", []), dtype=float),
     }
 
 
@@ -422,6 +427,8 @@ def save_diagnostic_trajectories_npz(
         "n_clusters_post": stack_scalar("n_clusters_traj", dtype=np.int32),
         "largest_cluster_size_post": stack_scalar("lcs_traj", dtype=np.int32),
         "largest_cluster_fraction_post": stack_scalar("lcf_traj"),
+        # Supplementary cached bend-count trajectory (additive; never rescaled).
+        "n_bend_post": stack_scalar("n_bend_traj", dtype=np.int32),
         "walker_temp_index_post": wti_post,
     }
     np.savez_compressed(path, **arrays)

@@ -8,6 +8,7 @@ energy from ``remd_uniform_chain_2_new.py`` WITHOUT refitting.  The reduced
 potential is
 
     u(X, T) = b(T) * [ lambda_intra * m_intra(X) + lambda_inter * m_inter(X) ]
+              + kappa_bend * n_bend_total(X)
 
 where b(T) is the fitted reduced contact bias loaded through the existing model
 registry / fit_summary.json interfaces.  Raw lattice contact counts m_intra and
@@ -59,6 +60,7 @@ import multichain_moves as mvs
 import multichain_observables as obs
 import multichain_config_io as mcio
 import multichain_diagnostics as mcd
+from lattice_bending import BEND_DEFINITION
 from multichain_state import MultiChainState, ContactCounts
 
 SCHEMA_VERSION = mcio.MULTICHAIN_OUTPUT_SCHEMA_VERSION
@@ -90,6 +92,23 @@ def reduced_potential_counts(
         + float(lambda_inter) * int(counts.inter))
 
 
+def reduced_potential_bending_counts(
+    counts: ContactCounts, temperature: float, model_name: str, params,
+    Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
+    kappa_bend: float = 0.0, n_bend: int = 0,
+) -> float:
+    """Full reduced potential u(X,T) = contact term + kappa_bend * n_bend_total.
+
+    Adds the optional fixed (temperature-independent) bending penalty to the
+    contact reduced potential.  With ``kappa_bend == 0`` this is exactly
+    :func:`reduced_potential_counts`, so the contacts-only behaviour is unchanged.
+    ``n_bend`` is the total 90-degree-turn count summed over all chains.
+    """
+    return reduced_potential_counts(
+        counts, temperature, model_name, params, Tref, Tscale,
+        lambda_intra, lambda_inter) + float(kappa_bend) * int(n_bend)
+
+
 def swap_log_accept_counts(
     counts_i: ContactCounts, counts_j: ContactCounts, T_i: float, T_j: float,
     model_name: str, params, Tref: float, Tscale: float,
@@ -98,6 +117,11 @@ def swap_log_accept_counts(
     """Generalized swap log-acceptance using BOTH intra/inter counts.
 
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j).
+
+    The optional fixed bending penalty kappa_bend * n_bend is the SAME reduced
+    (temperature-independent) parameter in every lane, so its contribution is
+    kappa_bend * (n_i + n_j - n_j - n_i) = 0: it cancels exactly and never enters
+    the swap criterion.  The swap therefore stays contacts-only for any kappa_bend.
     """
     def u(c, T):
         return reduced_potential_counts(
@@ -109,18 +133,23 @@ def swap_log_accept_counts(
 def metropolis_accept_delta(
     delta_intra: int, delta_inter: int, reduced_bias_value: float,
     lambda_intra: float, lambda_inter: float, random_value: float,
+    kappa_bend: float = 0.0, delta_bends: int = 0,
 ) -> bool:
-    """Metropolis decision for a proposed contact-count change.
+    """Metropolis decision for a proposed contact-count (and bend-count) change.
 
-    ``delta_u = b(T) * (lambda_intra * delta_intra + lambda_inter * delta_inter)``
-    where ``b(T)`` is the (precomputed) reduced contact bias.  Accept when
-    ``delta_u <= 0`` (favorable / neutral) or ``random_value < exp(-delta_u)``.
-    ``random_value`` is supplied by the caller so the decision is pure and
-    directly testable; the caller draws it only for unfavorable moves.
+    ``delta_u = b(T) * (lambda_intra * delta_intra + lambda_inter * delta_inter)
+    + kappa_bend * delta_bends`` where ``b(T)`` is the (precomputed) reduced
+    contact bias and ``kappa_bend * delta_bends`` is the optional fixed bending
+    penalty change.  Accept when ``delta_u <= 0`` (favorable / neutral) or
+    ``random_value < exp(-delta_u)``.  ``random_value`` is supplied by the caller
+    so the decision is pure and directly testable; the caller draws it only for
+    unfavorable moves.  ``kappa_bend`` and ``delta_bends`` default to 0, so
+    contacts-only callers keep the previous behaviour exactly.
     """
     delta_u = float(reduced_bias_value) * (
         float(lambda_intra) * int(delta_intra)
-        + float(lambda_inter) * int(delta_inter))
+        + float(lambda_inter) * int(delta_inter)) \
+        + float(kappa_bend) * int(delta_bends)
     if delta_u <= 0.0:
         return True
     return float(random_value) < math.exp(-delta_u)
@@ -162,22 +191,27 @@ def mc_sweep(
     lambda_intra: float, lambda_inter: float,
     n_local: int, n_translation: int, rng: random.Random,
     n_reptation: int = 1, n_rotation: int = 1,
-    debug_contacts: bool = False,
+    debug_contacts: bool = False, kappa_bend: float = 0.0,
 ) -> None:
     """Run one lane's local + translation + reptation + rotation proposals in place.
 
-    ``du = b(T) * (lambda_intra * d_intra + lambda_inter * d_inter)`` for the
-    proposed change; accept if ``du <= 0`` or ``random() < exp(-du)`` (via
-    :func:`metropolis_accept_delta`).  b(T) is
-    constant across the sweep and computed once.  Move counters are the shared
-    (n_moves, 4) block: proposed / geometrically_valid / state_changing /
-    metropolis_accepted (null proposals never count as state-changing).
+    ``du = b(T) * (lambda_intra * d_intra + lambda_inter * d_inter)
+    + kappa_bend * d_bends`` for the proposed change; accept if ``du <= 0`` or
+    ``random() < exp(-du)`` (via :func:`metropolis_accept_delta`).  b(T) and
+    kappa_bend are constant across the sweep.  The fixed bending penalty
+    ``kappa_bend * d_bends`` defaults off (``kappa_bend == 0``): the bend delta is
+    still cached, but it contributes exactly 0 to ``du`` and draws no random
+    number, so kappa_bend=0 runs are bit-for-bit identical to the contacts-only
+    sampler.  Move counters are the shared (n_moves, 4) block: proposed /
+    geometrically_valid / state_changing / metropolis_accepted (null proposals
+    never count as state-changing).
     """
     # Environment-controlled contact debugging works even without the CLI flag.
     debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
     b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
     li = float(lambda_intra)
     lin = float(lambda_inter)
+    kb = float(kappa_bend)
 
     def _attempt(prop):
         idx = mvs.MOVE_INDEX[prop.move_type]
@@ -188,17 +222,19 @@ def mc_sweep(
         if prop.state_changing:
             counters[idx, 2] += 1  # state changing
         d_intra, d_inter = mvs.proposal_delta(state, prop)
-        du = b * (li * d_intra + lin * d_inter)
+        d_bends = mvs.proposal_delta_bends(state, prop)
+        du = b * (li * d_intra + lin * d_inter) + kb * d_bends
         # Draw a random number only for an unfavorable move (du > 0); the pure
         # helper then makes the identical decision on that draw.
         accept = (du <= 0.0) or metropolis_accept_delta(
-            d_intra, d_inter, b, li, lin, rng.random())
+            d_intra, d_inter, b, li, lin, rng.random(), kb, d_bends)
         if accept:
-            mvs.apply_proposal(state, prop, (d_intra, d_inter))
+            mvs.apply_proposal(state, prop, (d_intra, d_inter), delta_bends=d_bends)
             if prop.state_changing:
                 counters[idx, 3] += 1  # accepted (state-changing)
             if debug_contacts:
                 mcc.assert_counts_match(state, f"after {prop.move_type}")
+                mcs.assert_bends_match(state, f"after {prop.move_type}")
 
     for _ in range(int(n_local)):
         _attempt(mvs.propose_local(state, rng))
@@ -234,6 +270,7 @@ class MultiReplica:
     n_clusters_traj: list = field(default_factory=list)  # number of chain clusters
     dc_lattice_traj: list = field(default_factory=list)  # degree of cohesion Dc (lattice)
     dc_over_L_traj: list = field(default_factory=list)   # dimensionless Dc / L
+    n_bend_traj: list = field(default_factory=list)      # cached total 90-degree turns/cycle
     # Independent-initialization provenance (recorded per lane; Change 2).
     init_seed: int = 0
     init_m_intra: int = 0
@@ -274,32 +311,35 @@ class MultiReplica:
 # ---------------------------------------------------------------------------
 
 def evolve_lane_worker(
-    coords_unwrapped: np.ndarray, counts_tuple: Tuple[int, int], box_size: int,
-    temperature: float, move_counters: np.ndarray,
+    coords_unwrapped: np.ndarray, counts_tuple: Tuple[int, int], n_bend: int,
+    box_size: int, temperature: float, move_counters: np.ndarray,
     n_local: int, n_translation: int, n_reptation: int, n_rotation: int,
     model_name: str, params, Tref: float, Tscale: float,
-    lambda_intra: float, lambda_inter: float, seed: int,
+    lambda_intra: float, lambda_inter: float, kappa_bend: float, seed: int,
     debug_contacts: bool,
-) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray]:
+) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int]:
     """Evolve one lane for a cycle without transferring trajectories.
 
     The occupancy map is rebuilt from coordinates inside the worker, so only the
-    bounded coordinate array, the two cached counts, and the small move-counter
-    block cross the process boundary (no growing trajectory lists, no shared
-    mutable occupancy).
+    bounded coordinate array, the two cached counts, the cached bend count, and
+    the small move-counter block cross the process boundary (no growing trajectory
+    lists, no shared mutable occupancy).  The bend count is carried exactly like
+    the contact counts so serial and multiprocessing runs stay bit-identical.
     """
     coords = np.asarray(coords_unwrapped, dtype=np.int64).copy()
     site_owner = mcs.build_site_owner(coords, box_size)
     state = MultiChainState(
         coords_unwrapped=coords, site_owner=site_owner,
-        counts=ContactCounts.from_tuple(counts_tuple), box_size=int(box_size))
+        counts=ContactCounts.from_tuple(counts_tuple), box_size=int(box_size),
+        n_bend=int(n_bend))
     counters = np.asarray(move_counters, dtype=np.int64).copy()
     rng = random.Random(int(seed))
     mc_sweep(state, counters, temperature, model_name, params, Tref, Tscale,
              lambda_intra, lambda_inter, n_local, n_translation, rng,
              n_reptation=n_reptation, n_rotation=n_rotation,
-             debug_contacts=debug_contacts)
-    return state.coords_unwrapped, state.counts.as_tuple(), counters
+             debug_contacts=debug_contacts, kappa_bend=kappa_bend)
+    return (state.coords_unwrapped, state.counts.as_tuple(), counters,
+            int(state.n_bend))
 
 
 def _lane_seed(base_seed: int, cycle: int, lane: int) -> int:
@@ -356,6 +396,7 @@ def run_remd_multichain(
     reptation_sweeps_per_swap: int = 1, rotation_sweeps_per_swap: int = 1,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float = 1.0, lambda_inter: float = 1.0,
+    kappa_bend: float = 0.0,
     cluster_contact_threshold: int = 1,
     seed: int | None = None, n_workers: int = 1, verbose: bool = True,
     debug_contacts: bool = False,
@@ -363,13 +404,18 @@ def run_remd_multichain(
 ) -> Tuple[List[MultiReplica], np.ndarray, np.ndarray, np.ndarray]:
     """Run multi-chain REMD.
 
-    Returns ``(replicas, swap_props, swap_accs, walker_lane_history)`` where the
-    last is ``(n_cycles, nT)`` giving each walker's lane index per cycle (for
-    round-trip diagnostics).
+    ``kappa_bend`` is the optional fixed reduced bending penalty applied to the
+    total 90-degree-turn count (``kappa_bend == 0`` reproduces the contacts-only
+    sampler exactly).  Returns ``(replicas, swap_props, swap_accs,
+    walker_lane_history)`` where the last is ``(n_cycles, nT)`` giving each
+    walker's lane index per cycle (for round-trip diagnostics).
     """
     if seed is None:
         seed = random.SystemRandom().randrange(1, 2 ** 31)
     base_seed = int(seed)
+    kappa_bend = float(kappa_bend)
+    if not math.isfinite(kappa_bend) or kappa_bend < 0.0:
+        raise ValueError(f"kappa_bend must be finite and >= 0, got {kappa_bend!r}")
     # Environment-controlled contact debugging works even without the CLI flag.
     debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
 
@@ -409,19 +455,21 @@ def run_remd_multichain(
                         evolve_lane_worker,
                         replicas[k].state.coords_unwrapped,
                         replicas[k].state.counts.as_tuple(),
+                        int(replicas[k].state.n_bend),
                         L, replicas[k].T, replicas[k].move_counters,
                         n_local, n_translation, n_reptation, n_rotation,
                         model_name, params, Tref, Tscale,
-                        lambda_intra, lambda_inter,
+                        lambda_intra, lambda_inter, kappa_bend,
                         _lane_seed(base_seed, cycle, k), debug_contacts)
                     for k in range(nT)]
                 for k, fut in enumerate(futures):
-                    coords, counts_tuple, counters = fut.result()
+                    coords, counts_tuple, counters, n_bend = fut.result()
                     rep = replicas[k]
                     rep.state = MultiChainState(
                         coords_unwrapped=np.asarray(coords, dtype=np.int64),
                         site_owner=mcs.build_site_owner(coords, L),
-                        counts=ContactCounts.from_tuple(counts_tuple), box_size=L)
+                        counts=ContactCounts.from_tuple(counts_tuple), box_size=L,
+                        n_bend=int(n_bend))
                     rep.move_counters = counters
             else:
                 for k, rep in enumerate(replicas):
@@ -430,7 +478,7 @@ def run_remd_multichain(
                              params, Tref, Tscale, lambda_intra, lambda_inter,
                              n_local, n_translation, rng,
                              n_reptation=n_reptation, n_rotation=n_rotation,
-                             debug_contacts=debug_contacts)
+                             debug_contacts=debug_contacts, kappa_bend=kappa_bend)
 
             # Even/odd adjacent swaps (temperatures fixed to lanes).  The actual
             # production swap operation is attempt_swap; the deterministic
@@ -480,6 +528,9 @@ def run_remd_multichain(
                 rep.n_clusters_traj.append(cyc["n_clusters"])
                 rep.dc_lattice_traj.append(cyc["dc_lattice"])
                 rep.dc_over_L_traj.append(cyc["dc_over_L"])
+                # Cached total bend count (O(1) read); additive supplementary
+                # observable, never alters sampling.
+                rep.n_bend_traj.append(int(rep.state.n_bend))
                 if do_snapshot:
                     snap_coords[k] = rep.state.coords_unwrapped
                     snap_mi[k] = cyc["m_intra"]
@@ -530,6 +581,29 @@ def _traj_dicts(replicas: List[MultiReplica]) -> List[dict]:
     } for rep in replicas]
 
 
+def _bend_fraction_by_temp(replicas, M: int, N: int, burnin_frac: float
+                           ) -> np.ndarray:
+    """Post-burn-in mean bend fraction n_bend_total / (M * (N - 2)) per lane.
+
+    ``n_bend_total`` is the total 90-degree-turn count summed over all M chains,
+    and each chain has ``N - 2`` interior angle centers, so the maximally-bent
+    reference is ``M * (N - 2)``.  Additive summary of the cached bend-count
+    trajectory; NaN for lanes with no post-burn-in samples and, for every lane,
+    when the chains are too short to bend (N <= 2).
+    """
+    denom = int(M) * (int(N) - 2)
+    out = np.full(len(replicas), np.nan, dtype=float)
+    if denom <= 0:
+        return out
+    for i, rep in enumerate(replicas):
+        arr = np.asarray(rep.n_bend_traj, dtype=float)
+        s = int(math.floor(arr.size * float(burnin_frac)))
+        post = arr[s:]
+        if post.size:
+            out[i] = float(post.mean()) / denom
+    return out
+
+
 def summarize_results(replicas, Ts, burnin_frac, rg_scale):
     traj = _traj_dicts(replicas)
     n_chains = replicas[0].state.n_chains if replicas else None
@@ -544,9 +618,20 @@ def summarize_results(replicas, Ts, burnin_frac, rg_scale):
 
 
 def build_run_distributions(replicas, Ts, *, burnin_frac, rg_bins, rg_scale):
-    return obs.build_distributions(
+    dist = obs.build_distributions(
         _traj_dicts(replicas), Ts, burnin_frac=burnin_frac, rg_bins=rg_bins,
         rg_scale=rg_scale)
+    # Additive bending trajectories/observables (never touch the canonical
+    # contact/Rg distributions).  ``n_bends`` is the per-lane per-cycle total
+    # 90-degree-turn count; ``bend_fraction`` is its post-burn-in mean divided by
+    # the maximally-bent reference M*(N-2) (NaN for N <= 2).
+    M = replicas[0].state.n_chains if replicas else 0
+    N = replicas[0].state.chain_length if replicas else 0
+    dist["n_bends"] = np.array(
+        [np.asarray(r.n_bend_traj, dtype=np.int64) for r in replicas],
+        dtype=np.int64) if replicas else np.zeros((0, 0), dtype=np.int64)
+    dist["bend_fraction"] = _bend_fraction_by_temp(replicas, M, N, burnin_frac)
+    return dist
 
 
 def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
@@ -554,7 +639,7 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
                     local_sweeps_per_swap, translation_sweeps_per_swap, n_cycles,
                     burnin_frac, cluster_contact_threshold, parameter_source,
                     fit_summary_json, reptation_sweeps_per_swap=1,
-                    rotation_sweeps_per_swap=1) -> dict:
+                    rotation_sweeps_per_swap=1, kappa_bend=0.0) -> dict:
     """Inject full model + run provenance into a distributions/summary dict."""
     dist["schema_version"] = int(SCHEMA_VERSION)
     dist["model_api_version"] = int(MODEL_API_VERSION)
@@ -565,6 +650,11 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["Tscale"] = float(Tscale)
     dist["lambda_intra"] = float(lambda_intra)
     dist["lambda_inter"] = float(lambda_inter)
+    # Additive bending-penalty provenance (metadata only; the trajectories
+    # ``n_bends`` / ``bend_fraction`` are attached in build_run_distributions).
+    dist["kappa_bend"] = float(kappa_bend)
+    dist["bending_enabled"] = bool(float(kappa_bend) != 0.0)
+    dist["bend_definition"] = BEND_DEFINITION
     dist["M"] = int(M)
     dist["N"] = int(N)
     dist["L"] = int(L)
@@ -669,6 +759,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--n-cycles", type=int, default=200, dest="n_cycles")
     ap.add_argument("--lambda-intra", type=float, default=1.0, dest="lambda_intra")
     ap.add_argument("--lambda-inter", type=float, default=1.0, dest="lambda_inter")
+    ap.add_argument("--kappa-bend", type=float, default=None, dest="kappa_bend",
+                    help="fixed reduced bending penalty: u_bend = kappa_bend * "
+                         "n_bend_total (n_bend_total = total 90-degree turns over "
+                         "all chains). Loaded from the fit summary when present "
+                         "(a supplied value must match it); kappa_bend > 0 enables "
+                         "bending, 0 (default) disables it.")
     ap.add_argument("--cluster-contact-threshold", type=int, default=1,
                     dest="cluster_contact_threshold")
     ap.add_argument("--seed", type=int, default=42)
@@ -784,6 +880,19 @@ def main(argv=None) -> None:
     (model_name, model_params, param_names, Tref, Tscale,
      parameter_source, fit_summary_json) = remd.resolve_model_params(args, Ts)
 
+    # Resolve the fixed reduced bending penalty AFTER the model, reusing the
+    # single-chain rules: a fit summary is authoritative (re-read for kappa_bend,
+    # already validated in resolve_model_params) and cross-checks any CLI value;
+    # without a summary the CLI value applies (default 0.0).  kappa_bend > 0
+    # enables bending; there is no separate flag.
+    if fit_summary_json:
+        summary_kappa = remd.load_fit_summary_json(fit_summary_json)["kappa_bend"]
+        kappa_bend = remd.resolve_kappa_bend(
+            args.kappa_bend, summary_kappa, True, source=fit_summary_json)
+    else:
+        kappa_bend = remd.resolve_kappa_bend(args.kappa_bend, None, False)
+    bending_enabled = bool(kappa_bend != 0.0)
+
     M, N, L = args.n_chains, args.N, args.box_size
     phi = M * N / L ** 3
     print(f"Multi-chain REMD: M={M} N={N} L={L} phi={phi:.4f}, {len(Ts)} lanes "
@@ -793,6 +902,8 @@ def main(argv=None) -> None:
           + (f" ({fit_summary_json})" if fit_summary_json else ""))
     print(f"lambda_intra={args.lambda_intra} lambda_inter={args.lambda_inter} "
           f"cluster_contact_threshold={args.cluster_contact_threshold}")
+    print(f"Bending penalty: kappa_bend = {kappa_bend:g} "
+          f"({'enabled' if bending_enabled else 'disabled'}; {BEND_DEFINITION})")
 
     Path(args.out_prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -805,7 +916,7 @@ def main(argv=None) -> None:
                               or f"{args.out_prefix}_configurations.h5")
         snap_meta = _snapshot_metadata(
             args, Ts, model_name, param_names, model_params, Tref, Tscale,
-            temp_source, phi, fit_summary_json)
+            temp_source, phi, fit_summary_json, kappa_bend, bending_enabled)
         snapshot_writer = mcio.MultiChainSnapshotWriter(
             configuration_path, n_chains=M, chain_length=N,
             n_temperatures=len(Ts), metadata=snap_meta,
@@ -822,6 +933,7 @@ def main(argv=None) -> None:
             n_cycles=args.n_cycles, model_name=model_name, params=model_params,
             Tref=Tref, Tscale=Tscale,
             lambda_intra=args.lambda_intra, lambda_inter=args.lambda_inter,
+            kappa_bend=kappa_bend,
             cluster_contact_threshold=args.cluster_contact_threshold,
             seed=args.seed, n_workers=args.n_workers, verbose=True,
             debug_contacts=args.debug_contacts,
@@ -849,7 +961,8 @@ def main(argv=None) -> None:
         rotation_sweeps_per_swap=args.rotation_sweeps_per_swap,
         n_cycles=args.n_cycles, burnin_frac=args.burnin_frac,
         cluster_contact_threshold=args.cluster_contact_threshold,
-        parameter_source=parameter_source, fit_summary_json=fit_summary_json)
+        parameter_source=parameter_source, fit_summary_json=fit_summary_json,
+        kappa_bend=kappa_bend)
 
     out_files = {
         "results_csv": mcio.save_results_csv(results, args.out_prefix),
@@ -887,14 +1000,15 @@ def main(argv=None) -> None:
         args, Ts, temp_source, model_name, param_names, model_params, Tref,
         Tscale, parameter_source, fit_summary_json, phi, swap_props, swap_accs,
         results, wall, out_files, replicas, diagnostics,
-        configuration_path is not None)
+        configuration_path is not None, kappa_bend, bending_enabled)
     summary_path = f"{args.out_prefix}_run_summary.json"
     out_files["run_summary_json"] = summary_path
     mcio.save_run_summary(run_summary, summary_path)
 
 
 def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
-                       Tscale, temp_source, phi, fit_summary_json) -> dict:
+                       Tscale, temp_source, phi, fit_summary_json,
+                       kappa_bend=0.0, bending_enabled=False) -> dict:
     return {
         "schema_version": int(mcio.MULTICHAIN_SNAPSHOT_SCHEMA_VERSION),
         "run_id": Path(args.out_prefix).name,
@@ -902,6 +1016,10 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         "volume_fraction": float(phi),
         "lambda_intra": float(args.lambda_intra),
         "lambda_inter": float(args.lambda_inter),
+        # Additive bending-penalty provenance (does not change coordinate storage).
+        "kappa_bend": float(kappa_bend),
+        "bending_enabled": bool(bending_enabled),
+        "bend_definition": BEND_DEFINITION,
         "cluster_contact_threshold": int(args.cluster_contact_threshold),
         "model_name": model_name, "param_names": list(param_names),
         "model_params": [float(v) for v in model_params],
@@ -942,9 +1060,13 @@ def _initial_states_metadata(replicas, rg_scale: float = 1.0) -> list:
 def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
                  Tref, Tscale, parameter_source, fit_summary_json, phi,
                  swap_props, swap_accs, results, wall, out_files, replicas,
-                 diagnostics, snapshots_saved) -> dict:
+                 diagnostics, snapshots_saved, kappa_bend=0.0,
+                 bending_enabled=False) -> dict:
     swap_rates = [float(swap_accs[k] / swap_props[k]) if swap_props[k] else float("nan")
                   for k in range(len(swap_props))]
+    M = int(args.n_chains)
+    N = int(args.N)
+    bend_fraction = _bend_fraction_by_temp(replicas, M, N, float(args.burnin_frac))
     summary = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "schema_version": int(SCHEMA_VERSION),
@@ -959,6 +1081,13 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "n_beads": int(args.n_chains * args.N), "volume_fraction": float(phi),
         "lambda_intra": float(args.lambda_intra),
         "lambda_inter": float(args.lambda_inter),
+        # Optional fixed reduced bending penalty (additive; kappa_bend == 0
+        # reproduces the contacts-only run exactly).  bend_fraction is the
+        # post-burn-in mean n_bend_total/(M*(N-2)) per temperature lane.
+        "kappa_bend": float(kappa_bend),
+        "bending_enabled": bool(bending_enabled),
+        "bend_definition": BEND_DEFINITION,
+        "bend_fraction": [float(v) for v in bend_fraction],
         "cluster_contact_threshold": int(args.cluster_contact_threshold),
         "temperatures": [float(t) for t in Ts], "temperature_count": int(len(Ts)),
         "temperature_source": temp_source,
@@ -1074,8 +1203,68 @@ def _qt_generalized_swap() -> None:
     print("  quick-test generalized swap (unequal intra/inter): PASSED")
 
 
+def _qt_bending() -> None:
+    # (1) Full reduced potential adds kappa_bend * n_bend; kappa=0 collapses onto
+    # the contacts-only reduced potential exactly.
+    c = ContactCounts(4, 2)
+    mp = ("hs", [400.0, 1.3], 320.0, 80.0)
+    u_full = reduced_potential_bending_counts(c, 330.0, *mp, 1.0, 1.0,
+                                              kappa_bend=0.5, n_bend=6)
+    u_contacts = reduced_potential_counts(c, 330.0, *mp, 1.0, 1.0)
+    assert abs(u_full - (u_contacts + 0.5 * 6)) < 1e-12
+    assert reduced_potential_bending_counts(
+        c, 330.0, *mp, 1.0, 1.0, kappa_bend=0.0, n_bend=6) == u_contacts
+
+    # (2) Metropolis helper includes the bending contribution.  Favorable bends
+    # (delta_bends < 0) always accept without a draw; an unfavorable pure bend
+    # change is probabilistic.
+    assert metropolis_accept_delta(0, 0, 1.0, 1.0, 1.0, 0.99,
+                                   kappa_bend=0.5, delta_bends=-2) is True
+    assert metropolis_accept_delta(0, 0, 1.0, 1.0, 1.0, 0.90,
+                                   kappa_bend=1.0, delta_bends=1) is False  # du=1
+    assert metropolis_accept_delta(0, 0, 1.0, 1.0, 1.0, 0.10,
+                                   kappa_bend=1.0, delta_bends=1) is True
+
+    # (3) Total bend count equals the sum of per-chain counts, and periodic chains
+    # crossing the box boundary are counted from contiguous unwrapped coordinates.
+    from lattice_bending import count_bends
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=5)
+    total = mcs.total_bend_count(state.coords_unwrapped)
+    per_chain = sum(count_bends(state.coords_unwrapped[k])
+                    for k in range(state.n_chains))
+    assert total == per_chain == state.n_bend
+
+    # (4) The fixed bending term cancels exactly from the REMD swap for any kappa
+    # and any (different) bend counts.
+    ci, cj = ContactCounts(3, 5), ContactCounts(7, 2)
+    base = swap_log_accept_counts(ci, cj, 300.0, 350.0, *mp, 1.0, 1.0)
+    for kap in (0.0, 0.7, 2.0):
+        for ni, nj in ((0, 5), (4, 4), (6, 1)):
+            def u(cc, T, n):
+                return reduced_potential_bending_counts(
+                    cc, T, *mp, 1.0, 1.0, kappa_bend=kap, n_bend=n)
+            la = (u(ci, 300.0, ni) + u(cj, 350.0, nj)
+                  - u(cj, 300.0, nj) - u(ci, 350.0, ni))
+            assert abs(la - base) < 1e-9
+
+    # (5) A positive penalty straightens the chains: mean bend fraction drops.
+    long_kw = dict(n_chains=3, chain_length=8, box_size=12,
+                   Ts=np.linspace(320, 340, 3), local_sweeps_per_swap=3,
+                   translation_sweeps_per_swap=1, n_cycles=160, model_name="hs",
+                   params=[0.0, 0.0], Tref=330.0, Tscale=40.0, seed=321,
+                   n_workers=1, verbose=False)
+    reps0, *_ = run_remd_multichain(kappa_bend=0.0, **long_kw)
+    repsK, *_ = run_remd_multichain(kappa_bend=1.5, **long_kw)
+    bf0 = np.nanmean(_bend_fraction_by_temp(reps0, 3, 8, 0.5))
+    bfK = np.nanmean(_bend_fraction_by_temp(repsK, 3, 8, 0.5))
+    assert bfK < bf0, (
+        f"positive kappa did not reduce bend fraction: {bfK:.3f} !< {bf0:.3f}")
+    print(f"  quick-test bending (potential/Metropolis/total/swap-cancel/"
+          f"straightens {bfK:.3f}<{bf0:.3f}): PASSED")
+
+
 def _qt_short_run(n_workers, tmp, tag, lambda_intra=1.0, lambda_inter=1.0,
-                  debug=True):
+                  debug=True, kappa_bend=0.0):
     import os as _os
     Ts = np.linspace(305, 350, 4)
     reps, sp, sa, wh = run_remd_multichain(
@@ -1083,6 +1272,7 @@ def _qt_short_run(n_workers, tmp, tag, lambda_intra=1.0, lambda_inter=1.0,
         local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=12,
         model_name="hs", params=[400.0, 1.3], Tref=320.0, Tscale=80.0,
         lambda_intra=lambda_intra, lambda_inter=lambda_inter,
+        kappa_bend=kappa_bend,
         seed=13, n_workers=n_workers, verbose=False, debug_contacts=debug)
     # Walker identities always a permutation.
     assert wh.shape == (12, len(Ts))
@@ -1095,14 +1285,18 @@ def _qt_short_run(n_workers, tmp, tag, lambda_intra=1.0, lambda_inter=1.0,
 
 
 def _qt_serial_vs_workers(tmp) -> None:
-    r1 = _qt_short_run(1, tmp, "serial")
-    r2 = _qt_short_run(2, tmp, "workers")
-    # Deterministic per-lane seeding => identical results across worker counts.
-    for a, b in zip(r1[0], r2[0]):
-        assert a.state.counts.as_tuple() == b.state.counts.as_tuple(), (
-            "serial and 2-worker runs diverged despite identical seeds")
-        assert np.array_equal(a.state.coords_unwrapped, b.state.coords_unwrapped)
-    print("  quick-test serial vs 2-worker determinism: PASSED")
+    # Determinism must hold both with bending off and with a nonzero penalty.
+    for kappa in (0.0, 0.6):
+        r1 = _qt_short_run(1, tmp, "serial", kappa_bend=kappa)
+        r2 = _qt_short_run(2, tmp, "workers", kappa_bend=kappa)
+        # Deterministic per-lane seeding => identical results across worker counts.
+        for a, b in zip(r1[0], r2[0]):
+            assert a.state.counts.as_tuple() == b.state.counts.as_tuple(), (
+                "serial and 2-worker runs diverged despite identical seeds")
+            assert np.array_equal(a.state.coords_unwrapped, b.state.coords_unwrapped)
+            assert a.state.n_bend == b.state.n_bend
+            assert a.n_bend_traj == b.n_bend_traj
+    print("  quick-test serial vs 2-worker determinism (kappa 0 and 0.6): PASSED")
 
 
 def _qt_output_roundtrip(tmp) -> None:
@@ -1448,6 +1642,7 @@ def run_quick_test() -> None:
     _qt_m1_regression()
     _qt_lambda_modes()
     _qt_generalized_swap()
+    _qt_bending()
     _qt_independent_init()
     _qt_canonicalization()
     _qt_reptation_regression()

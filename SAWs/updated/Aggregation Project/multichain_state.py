@@ -36,6 +36,7 @@ from typing import Tuple
 import numpy as np
 
 import isaw_contact_observables as ico  # radius_of_gyration_squared (unwrapped)
+from lattice_bending import BEND_DEFINITION, count_bends_multichain
 
 # Six nearest-neighbour displacement vectors on the simple-cubic lattice.
 NN6: Tuple[Tuple[int, int, int], ...] = (
@@ -164,11 +165,17 @@ class MultiChainState:
         Cached raw lattice contact counts (intra, inter).
     box_size : int
         Periodic cubic box side length L.
+    n_bend : int
+        Cached total number of 90-degree turns summed over ALL chains (the
+        optional fixed bending penalty depends on it).  Maintained incrementally
+        by the moves exactly like ``counts``; defaults to 0 so states built by
+        older code or a straight chain keep their previous behaviour.
     """
     coords_unwrapped: np.ndarray
     site_owner: dict
     counts: ContactCounts
     box_size: int
+    n_bend: int = 0
 
     # -- shape helpers ------------------------------------------------------
     @property
@@ -205,6 +212,7 @@ class MultiChainState:
             site_owner=dict(self.site_owner),
             counts=self.counts.copy(),
             box_size=int(self.box_size),
+            n_bend=int(self.n_bend),
         )
 
 
@@ -224,8 +232,29 @@ def make_state(coords_unwrapped: np.ndarray, box_size: int) -> MultiChainState:
     counts = full_contact_counts_from_map(coords, site_owner, L)
     return MultiChainState(
         coords_unwrapped=coords, site_owner=site_owner, counts=counts,
-        box_size=L,
+        box_size=L, n_bend=total_bend_count(coords),
     )
+
+
+def total_bend_count(coords_unwrapped: np.ndarray) -> int:
+    """Total 90-degree turns over all chains (authoritative full recount).
+
+    Uses the UNWRAPPED coordinates, where every chain is a contiguous unit-bond
+    walk, so a chain crossing a periodic boundary is still counted correctly
+    (its unwrapped bonds never wrap).  This is the multi-chain analogue of
+    ``count_bends`` and the initializer for :attr:`MultiChainState.n_bend`.
+    """
+    coords = _validate_coords_array(coords_unwrapped)
+    return int(count_bends_multichain(coords))
+
+
+def assert_bends_match(state: MultiChainState, context: str = "") -> None:
+    """Assert the cached ``n_bend`` equals a full recount (used under debug mode)."""
+    recount = total_bend_count(state.coords_unwrapped)
+    if int(state.n_bend) != int(recount):
+        raise AssertionError(
+            f"cached n_bend={state.n_bend} != full recount {recount}"
+            f"{' ' + context if context else ''}")
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +379,14 @@ def validate_state(state: MultiChainState, *, check_contacts: bool = True) -> No
                 f"cached contact counts (intra={state.counts.intra}, "
                 f"inter={state.counts.inter}) disagree with full recount "
                 f"(intra={recount.intra}, inter={recount.inter})")
+        # The cached bending count is maintained the same way as the contacts and
+        # is verified against a full recount here.  It tracks pure geometry, so it
+        # is checked for every run regardless of the (sampling-only) kappa_bend.
+        recount_bends = total_bend_count(coords)
+        if int(state.n_bend) != int(recount_bends):
+            raise MultiChainStateError(
+                f"cached bend count n_bend={state.n_bend} disagrees with full "
+                f"recount {recount_bends}")
 
 
 # ---------------------------------------------------------------------------

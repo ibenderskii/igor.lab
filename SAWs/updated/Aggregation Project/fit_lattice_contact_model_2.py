@@ -278,6 +278,69 @@ def _validated_integer_contacts(values, label: str) -> np.ndarray:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Baseline bending penalty (metadata only; never fitted)
+# ---------------------------------------------------------------------------
+# The bending penalty enters through the BASELINE distribution:
+#     P_kappa,0(m, Rg) ~ P_0(m, Rg) * exp[-kappa_bend * n_bend]
+# and is therefore already baked into the baseline NPZ produced by
+# single_uniform_chain2_athermal_dists_joint.py.  The fitted model stays
+#     P(m, Rg | T) ~ P_kappa,0(m, Rg) * exp[-b(T) * m]
+# so kappa_bend must NOT be applied again during reweighting and is never
+# optimized here.  The CLI value, when given, is a consistency check only.
+BEND_DEFINITION = "90-degree turns; straight=0, right-angle turn=1"
+KAPPA_BEND_TOL = 1e-9
+
+
+def read_baseline_kappa_bend(b_data) -> float:
+    """Return the bending penalty recorded in a baseline NPZ.
+
+    Legacy baselines predate the bending penalty and carry no ``kappa_bend``
+    key; they are athermal in the bending sense and read as 0.0.
+    """
+    if "kappa_bend" not in b_data.files:
+        return 0.0
+    kappa = float(np.asarray(b_data["kappa_bend"]).reshape(()))
+    if not np.isfinite(kappa):
+        raise ValueError(f"baseline kappa_bend must be finite, got {kappa!r}")
+    if kappa < 0.0:
+        raise ValueError(f"baseline kappa_bend must be >= 0, got {kappa!r}")
+    return kappa
+
+
+def resolve_kappa_bend(
+    baseline_kappa: float,
+    cli_kappa,
+    baseline_path: str = "",
+    tol: float = KAPPA_BEND_TOL,
+) -> float:
+    """Reconcile a CLI --kappa-bend with the value stored in the baseline.
+
+    The baseline is authoritative.  When the CLI value is supplied it must match
+    the baseline within ``tol``; a mismatch means the baseline does not encode
+    the stiffness the caller believes it does, which would silently corrupt the
+    fit, so it raises.
+    """
+    baseline_kappa = float(baseline_kappa)
+    if cli_kappa is None:
+        return baseline_kappa
+    cli_kappa = float(cli_kappa)
+    if not np.isfinite(cli_kappa):
+        raise ValueError(f"--kappa-bend must be finite, got {cli_kappa!r}")
+    if cli_kappa < 0.0:
+        raise ValueError(f"--kappa-bend must be >= 0, got {cli_kappa!r}")
+    if abs(cli_kappa - baseline_kappa) > tol:
+        where = f" ({baseline_path})" if baseline_path else ""
+        raise ValueError(
+            f"--kappa-bend {cli_kappa!r} does not match the baseline"
+            f"{where} kappa_bend {baseline_kappa!r} "
+            f"(tolerance {tol:g}). The bending penalty is baked into the "
+            "baseline distribution and is not refitted; regenerate the baseline "
+            "with the intended --kappa-bend, or drop the CLI flag."
+        )
+    return baseline_kappa
+
+
 def build_baseline_mass_on_integer(
     m_centers_int: np.ndarray, baseline_npz: str
 ) -> np.ndarray:
@@ -2978,6 +3041,15 @@ def main() -> None:
         "--contact_offset", type=float, default=43,
         help="Constant subtracted from ct_centers in the REMD file before binning.",
     )
+    ap.add_argument(
+        "--kappa-bend", dest="kappa_bend", type=float, default=None,
+        help=(
+            "Consistency check only: assert the baseline was generated with this "
+            "bending penalty. The penalty is already baked into the baseline "
+            "distribution and is never fitted here. Default: take whatever the "
+            "baseline records (legacy baselines count as 0)."
+        ),
+    )
     # output
     ap.add_argument(
         "--outdir", type=str, default=None,
@@ -3290,6 +3362,13 @@ def main() -> None:
     b_data = np.load(args.baseline)
     has_joint_baseline = all(k in b_data.files for k in ("c_edges", "rg_edges", "crg_prob"))
 
+    # Bending penalty: read from the baseline, optionally cross-checked against
+    # the CLI. Never fitted, never re-applied during reweighting.
+    kappa_bend = resolve_kappa_bend(
+        read_baseline_kappa_bend(b_data), args.kappa_bend, str(args.baseline)
+    )
+    bending_enabled = bool(kappa_bend != 0.0)
+
     # -----------------------------------------------------------------------
     # Input validation
     # -----------------------------------------------------------------------
@@ -3325,6 +3404,9 @@ def main() -> None:
     print(f"Baseline NPZ: {args.baseline}")
     print(f"  keys:        {list(b_data.files)}")
     print(f"  Joint P0(m,Rg): {'available (c_edges, rg_edges, crg_prob)' if has_joint_baseline else 'NOT FOUND'}")
+    print(f"  kappa_bend:  {kappa_bend:g} "
+          f"({'bending enabled' if bending_enabled else 'no bending penalty'}; "
+          f"{BEND_DEFINITION})")
 
     print(f"Contact offset: {args.contact_offset}")
     print(f"  Native range  (before offset):  [{ct_centers_raw.min():.4g}, {ct_centers_raw.max():.4g}]")
@@ -3740,6 +3822,9 @@ def main() -> None:
         rg_train_loss=rg_train_loss,
         rg_val_loss=rg_val_loss,
         rg_all_loss=rg_all_loss,
+        kappa_bend=float(kappa_bend),
+        bending_enabled=bool(bending_enabled),
+        bend_definition=BEND_DEFINITION,
     )
     # Rg arrays
     if rg_centers_model is not None:
@@ -3863,6 +3948,9 @@ def main() -> None:
         "rg_train_loss": None if not has_rg_scoring else float(rg_train_loss),
         "rg_val_loss": None if (not has_rg_scoring or not has_val) else float(rg_val_loss),
         "rg_all_loss": None if not has_rg_scoring else float(rg_all_loss),
+        "kappa_bend": float(kappa_bend),
+        "bending_enabled": bool(bending_enabled),
+        "bend_definition": BEND_DEFINITION,
     }
     # For heat_capacity, persist the thermodynamic reference temperature as T0
     # (stored in Tref by this fitter). Keep Tref for backward compatibility.

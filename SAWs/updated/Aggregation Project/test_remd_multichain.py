@@ -20,6 +20,7 @@ import multichain_diagnostics as mcd
 import remd_uniform_chain_2_new as remd
 import remd_multichain as rmc
 from multichain_state import ContactCounts
+from lattice_bending import BEND_DEFINITION, count_bends, count_bends_multichain
 
 MP = ("hs", [400.0, 1.3], 320.0, 80.0)  # model_name, params, Tref, Tscale
 
@@ -716,6 +717,264 @@ def test_strong_interchain_attraction_raises_inter():
         return float(np.mean([np.asarray(getattr(r, attr))[60:].mean() for r in reps]))
     assert tail(reps_att, "m_inter_traj") >= tail(reps_ath, "m_inter_traj")
     assert tail(reps_att, "lcf_traj") >= tail(reps_ath, "lcf_traj")
+
+
+# ---------------------------------------------------------------------------
+# Optional fixed reduced bending penalty  u += kappa_bend * n_bend_total
+# ---------------------------------------------------------------------------
+
+def _run_kappa(kappa_bend, n_workers=1, seed=13, debug=True, n_cycles=15):
+    Ts = np.linspace(305, 350, 4)
+    return rmc.run_remd_multichain(
+        n_chains=2, chain_length=8, box_size=10, Ts=Ts,
+        local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=n_cycles,
+        model_name="hs", params=[400.0, 1.3], Tref=320.0, Tscale=80.0,
+        lambda_intra=1.0, lambda_inter=1.0, kappa_bend=kappa_bend,
+        seed=seed, n_workers=n_workers, verbose=False, debug_contacts=debug), Ts
+
+
+def test_bend_total_equals_sum_of_per_chain_counts():
+    # (1) The cached / recounted total equals the sum of independent per-chain
+    # counts, for several dispersed multi-chain states.
+    for seed in (1, 5, 9, 17):
+        state = mcs.initialize_dispersed_state(4, 8, 12, seed=seed)
+        per_chain = [count_bends(state.coords_unwrapped[c])
+                     for c in range(state.n_chains)]
+        total = mcs.total_bend_count(state.coords_unwrapped)
+        assert total == sum(per_chain)
+        assert total == count_bends_multichain(state.coords_unwrapped)
+        assert state.n_bend == total  # cache initialized from the full count
+
+
+def test_bend_count_periodic_boundary_crossing():
+    # (2) An L-shaped chain with exactly one 90-degree turn, placed so it wraps
+    # across the periodic boundary in x, must still count as one bend because the
+    # UNWRAPPED coordinates stay contiguous.
+    L = 8
+    lshape = np.array([(6, 0, 0), (7, 0, 0), (8, 0, 0), (8, 1, 0), (8, 2, 0)],
+                      dtype=np.int64)  # x=8 wraps to 0; turn at index 2
+    partner = straight_chain(5, axis=1, start=(3, 0, 3))
+    crossing = mcs.make_state(np.stack([lshape, partner]), L)
+    assert crossing.n_bend == 1
+    assert mcs.total_bend_count(crossing.coords_unwrapped) == 1
+    # Same shape entirely inside the box must give the identical count.
+    inside = mcs.make_state(
+        np.stack([lshape - np.array([4, 0, 0]), partner]), L)
+    assert inside.n_bend == crossing.n_bend == 1
+    # A straight partner chain contributes no bends.
+    assert count_bends(crossing.coords_unwrapped[1]) == 0
+
+
+def test_local_and_reptation_bend_deltas_match_full_recount():
+    # (3) proposal_delta_bends for local and reptation moves equals the change in
+    # the full recount, and the cached n_bend stays exact after applying.
+    for proposer in (mvs.propose_local, mvs.propose_reptation):
+        state = mcs.initialize_dispersed_state(3, 10, 12, seed=23)
+        rng = random.Random(7)
+        n_changing = 0
+        for _ in range(1500):
+            prop = proposer(state, rng)
+            if not prop.ok:
+                continue
+            d_bends = mvs.proposal_delta_bends(state, prop)
+            n_before = mcs.total_bend_count(state.coords_unwrapped)
+            delta = mvs.proposal_delta(state, prop)
+            mvs.apply_proposal(state, prop, delta, delta_bends=d_bends)
+            n_after = mcs.total_bend_count(state.coords_unwrapped)
+            assert d_bends == n_after - n_before
+            assert state.n_bend == n_after
+            if d_bends != 0:
+                n_changing += 1
+        mcs.validate_state(state)
+        assert n_changing > 0, f"{proposer.__name__} never changed a bend"
+
+
+def test_translation_and_rotation_have_zero_bend_delta():
+    # (4) Whole-chain translation and rigid whole-chain rotation are isometries of
+    # the moved chain: proposal_delta_bends is exactly 0 and the count is unchanged.
+    for proposer in (mvs.propose_translation, mvs.propose_chain_rotation):
+        state = mcs.initialize_dispersed_state(3, 8, 12, seed=31)
+        rng = random.Random(3)
+        n_applied = 0
+        for _ in range(1200):
+            prop = proposer(state, rng)
+            if not prop.ok:
+                continue
+            assert mvs.proposal_delta_bends(state, prop) == 0
+            n_before = state.n_bend
+            delta = mvs.proposal_delta(state, prop)
+            mvs.apply_proposal(state, prop, delta)  # recomputes delta_bends -> 0
+            assert state.n_bend == n_before
+            assert mcs.total_bend_count(state.coords_unwrapped) == n_before
+            n_applied += 1
+        assert n_applied > 0, f"{proposer.__name__} produced no valid moves"
+
+
+def test_cached_bend_count_correct_after_long_debug_run():
+    # (5) A long mixed-move athermal sweep in debug mode keeps the cached bend
+    # count in sync with the full recount (mc_sweep asserts it every accepted
+    # move; validate_state re-checks it at the end).
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=42)
+    counters = mvs.new_move_counters()
+    rng = random.Random(2024)
+    rmc.mc_sweep(state, counters, 330.0, "hs", [0.0, 0.0], 330.0, 40.0,
+                 lambda_intra=0.0, lambda_inter=0.0,
+                 n_local=1500, n_translation=300, rng=rng,
+                 n_reptation=300, n_rotation=300, debug_contacts=True,
+                 kappa_bend=0.7)
+    mcs.validate_state(state)
+    assert state.n_bend == mcs.total_bend_count(state.coords_unwrapped)
+
+
+def test_metropolis_helper_includes_bending():
+    # (6) The Metropolis helper folds kappa_bend * delta_bends into delta_u.
+    b, li, lin = 1.0, 1.0, 1.0
+    # Pure bend change, no contact change.  Favorable (du<0) always accepts w/o draw.
+    assert rmc.metropolis_accept_delta(0, 0, b, li, lin, 0.999,
+                                       kappa_bend=0.5, delta_bends=-3) is True
+    # Neutral (du=0) always accepts.
+    assert rmc.metropolis_accept_delta(0, 0, b, li, lin, 0.999,
+                                       kappa_bend=0.5, delta_bends=0) is True
+    # Unfavorable du = kappa*delta_bends = 1.0 -> exp(-1)=0.3679 threshold.
+    assert rmc.metropolis_accept_delta(0, 0, b, li, lin, 0.10,
+                                       kappa_bend=1.0, delta_bends=1) is True
+    assert rmc.metropolis_accept_delta(0, 0, b, li, lin, 0.90,
+                                       kappa_bend=1.0, delta_bends=1) is False
+    # Contact and bend contributions add: d_intra=+1 (du_c=1) and delta_bends=-1
+    # with kappa=1 exactly cancel -> du=0 -> accept without consulting the draw.
+    stub = _StubRng(0.0)
+    assert rmc.metropolis_accept_delta(1, 0, b, li, lin, stub.random(),
+                                       kappa_bend=1.0, delta_bends=-1) is True
+    # Full reduced potential helper is consistent with the contact-only one.
+    c = ContactCounts(4, 2)
+    u_c = rmc.reduced_potential_counts(c, 330.0, *MP, 1.0, 1.0)
+    u_b = rmc.reduced_potential_bending_counts(c, 330.0, *MP, 1.0, 1.0,
+                                               kappa_bend=0.5, n_bend=6)
+    assert abs(u_b - (u_c + 0.5 * 6)) < 1e-12
+
+
+def test_kappa_zero_preserves_sampling_exactly():
+    # (7) With kappa_bend = 0 the bend term is multiplied by zero, so the sampler
+    # must be completely insensitive to the bend delta.  Monkeypatching
+    # proposal_delta_bends to return a huge constant leaves every coordinate,
+    # count, move counter and contact trajectory unchanged (only n_bend, which is
+    # not consulted for sampling, diverges) -- proving kappa=0 reproduces the
+    # original contacts-only output bit-for-bit.
+    (base, *_), _ = _run_kappa(0.0, debug=False)
+    real = mvs.proposal_delta_bends
+    try:
+        mvs.proposal_delta_bends = lambda state, proposal: 1000
+        (patched, *_), _ = _run_kappa(0.0, debug=False)
+    finally:
+        mvs.proposal_delta_bends = real
+    for a, b in zip(base, patched):
+        assert np.array_equal(a.state.coords_unwrapped, b.state.coords_unwrapped)
+        assert a.state.counts.as_tuple() == b.state.counts.as_tuple()
+        assert np.array_equal(a.move_counters, b.move_counters)
+        assert np.allclose(a.u_traj, b.u_traj)
+        assert a.m_intra_traj == b.m_intra_traj
+        assert a.m_inter_traj == b.m_inter_traj
+    # And a plain kappa=0 run is reproducible for a fixed seed.
+    (r1, *_), _ = _run_kappa(0.0)
+    (r2, *_), _ = _run_kappa(0.0)
+    for a, b in zip(r1, r2):
+        assert np.array_equal(a.state.coords_unwrapped, b.state.coords_unwrapped)
+        assert a.n_bend_traj == b.n_bend_traj
+
+
+def test_fixed_kappa_cancels_from_swap_rule():
+    # (8) The swap log-acceptance is invariant to bend counts at fixed kappa: the
+    # temperature-independent penalty cancels exactly.  The production swap helper
+    # is contacts-only; the full-potential form reproduces it for any kappa and
+    # any (different) bend counts.
+    ci, cj = ContactCounts(3, 7), ContactCounts(8, 1)
+    Ti, Tj = 300.0, 350.0
+    contact_only = rmc.swap_log_accept_counts(ci, cj, Ti, Tj, *MP, 1.0, 1.0)
+    for kappa in (0.0, 0.4, 1.7):
+        for ni, nj in ((0, 6), (5, 5), (6, 1)):
+            def u(cc, T, n):
+                return rmc.reduced_potential_bending_counts(
+                    cc, T, *MP, 1.0, 1.0, kappa_bend=kappa, n_bend=n)
+            full = (u(ci, Ti, ni) + u(cj, Tj, nj)
+                    - u(cj, Ti, nj) - u(ci, Tj, ni))
+            assert abs(full - contact_only) < 1e-9
+
+
+def test_m1_full_potential_matches_single_chain_with_bending():
+    # (9) For M = 1 the multichain full reduced potential (contacts + bending)
+    # equals the single-chain reduced_potential_bending for the same coordinates,
+    # contact count, bend count, temperature and kappa.
+    rng = np.random.RandomState(11)
+    for _ in range(8):
+        saw = mcs.generate_saw(18, rng)
+        state = mcs.make_state(np.stack([saw]), 60)
+        m = int(state.counts.intra)
+        assert state.counts.inter == 0
+        n_bend = state.n_bend
+        assert n_bend == count_bends(saw)
+        for T in (300.0, 342.0):
+            for kappa in (0.0, 0.8):
+                u_mc = rmc.reduced_potential_bending_counts(
+                    state.counts, T, *MP, 1.0, 1.0, kappa_bend=kappa, n_bend=n_bend)
+                u_ref = remd.reduced_potential_bending(
+                    m, T, *MP, kappa_bend=kappa, n_bend=n_bend)
+                assert abs(u_mc - u_ref) < 1e-9
+
+
+def test_serial_and_two_workers_identical_with_nonzero_kappa():
+    # (10) Deterministic per-lane seeding keeps serial and multiprocessing runs
+    # bit-identical even with the bending penalty enabled (kappa is threaded to
+    # every worker and the bend count is carried across the process boundary).
+    (r1, sp1, sa1, wh1), _ = _run_kappa(0.6, n_workers=1)
+    (r2, sp2, sa2, wh2), _ = _run_kappa(0.6, n_workers=2)
+    assert np.array_equal(sp1, sp2) and np.array_equal(sa1, sa2)
+    assert np.array_equal(wh1, wh2)
+    for a, b in zip(r1, r2):
+        assert np.array_equal(a.state.coords_unwrapped, b.state.coords_unwrapped)
+        assert a.state.counts.as_tuple() == b.state.counts.as_tuple()
+        assert a.state.n_bend == b.state.n_bend
+        assert a.n_bend_traj == b.n_bend_traj
+        assert np.array_equal(a.move_counters, b.move_counters)
+
+
+def test_positive_kappa_reduces_mean_bend_fraction():
+    # (11) A positive penalty straightens the chains: the post-burn-in mean bend
+    # fraction drops relative to the athermal (kappa=0) control in a short run.
+    common = dict(n_chains=3, chain_length=8, box_size=12,
+                  Ts=np.linspace(320, 340, 3), local_sweeps_per_swap=3,
+                  translation_sweeps_per_swap=1, n_cycles=180, model_name="hs",
+                  params=[0.0, 0.0], Tref=330.0, Tscale=40.0, seed=321,
+                  n_workers=1, verbose=False)
+    reps0, *_ = rmc.run_remd_multichain(kappa_bend=0.0, **common)
+    repsK, *_ = rmc.run_remd_multichain(kappa_bend=1.5, **common)
+    bf0 = np.nanmean(rmc._bend_fraction_by_temp(reps0, 3, 8, 0.5))
+    bfK = np.nanmean(rmc._bend_fraction_by_temp(repsK, 3, 8, 0.5))
+    assert 0.0 <= bfK < bf0 <= 1.0, f"kappa did not reduce bends: {bfK} !< {bf0}"
+
+
+def test_kappa_metadata_propagates_into_summary_and_distributions(tmp_path):
+    # (12) The CLI kappa value flows through resolution into both the run-summary
+    # JSON and the distributions NPZ (metadata + additive trajectories).
+    prefix = str(tmp_path / "kb")
+    rmc.main([
+        "--n-chains", "2", "--N", "6", "--box-size", "8", "--n-cycles", "8",
+        "--nT", "3", "--Tmin", "320", "--Tmax", "340", "--model", "hs",
+        "--params", "0,4", "--Tref", "330", "--Tscale", "40",
+        "--kappa-bend", "0.5", "--seed", "1", "--no-plots",
+        "--out-prefix", prefix])
+    import json as _json
+    with open(f"{prefix}_run_summary.json") as f:
+        summary = _json.load(f)
+    assert summary["kappa_bend"] == 0.5
+    assert summary["bending_enabled"] is True
+    assert summary["bend_definition"] == BEND_DEFINITION
+    assert len(summary["bend_fraction"]) == 3
+    with np.load(f"{prefix}_distributions.npz", allow_pickle=True) as d:
+        assert float(d["kappa_bend"]) == 0.5
+        assert bool(d["bending_enabled"]) is True
+        assert str(d["bend_definition"]) == BEND_DEFINITION
+        assert "n_bends" in d and d["n_bends"].shape == (3, 8)
+        assert "bend_fraction" in d and d["bend_fraction"].shape == (3,)
 
 
 if __name__ == "__main__":
