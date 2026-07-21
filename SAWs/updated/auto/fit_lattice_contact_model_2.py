@@ -3,9 +3,14 @@
 
 Model
 -----
-P_model(m|T) ∝ P0(m) * exp[-b(T) * m]
+P_model(m|T) ∝ P0(m) * exp[-u_contact(m, T; N)]
 
-where P0(m) is the athermal (T→∞) baseline from a SAW / lattice simulation
+where P0(m) is the athermal (T→∞) baseline from a SAW / lattice simulation.
+For every model below except the two contact-quadratic ones the contact
+potential is linear in m,
+
+    u_contact(m, T; N) = b(T) * m
+
 and b(T) is the reduced bias (contact coupling), chosen via --model.
 
 Supported b(T) models
@@ -34,6 +39,26 @@ heat_capacity b(T) = [dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0))] / T
                 to set the reference temperature T0 (default: midpoint of
                 temperature range).  dCp > 0 creates a cold-denaturation
                 branch; dCp < 0 sharpens the transition.
+
+Contact-quadratic models
+------------------------
+These two do NOT change b(T)'s meaning; they add a curvature term in the
+CONTACT NUMBER m, normalized by the chain length N:
+
+hs_m2_const   u_contact(m,T;N) = (h1/T - s1)*m + kappa2 * m^2/(2N)
+                Temperature-independent contact-number curvature.
+                Parameters: h1, s1, kappa2.
+
+hs_m2_hs      u_contact(m,T;N) = (h1/T - s1)*m + (h2/T - s2) * m^2/(2N)
+                Enthalpy/entropy decomposition of the curvature term.
+                Parameters: h1, s1, h2, s2.
+
+Both nest the hs model exactly: with the quadratic parameters at zero the
+potential is identically (h1/T - s1)*m, which is why the first optimizer
+restart starts there.  N is the number of beads; it is read from the baseline
+(n_beads, else N) and may be supplied with --N when the baseline predates that
+metadata.  hs_quadratic is unrelated: it is a quadratic in TEMPERATURE and
+leaves the potential linear in m.
 
 Why validation loss matters
 ---------------------------
@@ -341,6 +366,83 @@ def resolve_kappa_bend(
     return baseline_kappa
 
 
+# ---------------------------------------------------------------------------
+# Baseline chain length (metadata only; never fitted)
+# ---------------------------------------------------------------------------
+# The contact-quadratic models normalize their curvature term by the chain
+# length N (number of beads): kappa(T) * m^2 / (2N).  N is a property of the
+# simulated chain, so the baseline is authoritative; --N exists only for legacy
+# baselines that predate the metadata.  Linear models never need it, which is
+# why a missing chain length is not an error for them.
+
+def read_baseline_chain_length(b_data) -> Optional[int]:
+    """Return the chain length (number of beads) recorded in a baseline NPZ.
+
+    ``n_beads`` is preferred; ``N`` is the older spelling of the same quantity.
+    Returns None for legacy baselines that record neither.  Raises when the two
+    keys disagree, because then the file does not identify one chain.
+    """
+    found: Dict[str, int] = {}
+    for key in ("n_beads", "N"):
+        if key not in b_data.files:
+            continue
+        raw = np.asarray(b_data[key]).reshape(())
+        value = float(raw)
+        if not np.isfinite(value):
+            raise ValueError(f"baseline {key} must be finite, got {value!r}")
+        if abs(value - round(value)) > 1e-9:
+            raise ValueError(f"baseline {key} must be an integer, got {value!r}")
+        if round(value) < 2:
+            raise ValueError(f"baseline {key} must be >= 2, got {value!r}")
+        found[key] = int(round(value))
+    if len(found) == 2 and found["n_beads"] != found["N"]:
+        raise ValueError(
+            f"baseline records conflicting chain lengths: n_beads="
+            f"{found['n_beads']} but N={found['N']}. Regenerate the baseline; the "
+            f"contact-quadratic normalization m^2/(2N) is ambiguous otherwise."
+        )
+    if "n_beads" in found:
+        return found["n_beads"]
+    return found.get("N")
+
+
+def resolve_chain_length(
+    baseline_n: Optional[int],
+    cli_n: Optional[int],
+    *,
+    model_name: str,
+    baseline_path: str = "",
+) -> Optional[int]:
+    """Reconcile the baseline chain length with an optional --N override.
+
+    The baseline wins when both are present and they agree; a disagreement
+    raises rather than silently rescaling the quadratic term.  Models whose
+    ``requires_chain_length`` flag is set fail when no chain length is available;
+    legacy linear fits against a baseline without the metadata keep working.
+    """
+    if cli_n is not None:
+        cli_n = int(cli_n)
+        if cli_n < 2:
+            raise ValueError(f"--N must be >= 2, got {cli_n}")
+    if baseline_n is not None and cli_n is not None and baseline_n != cli_n:
+        where = f" ({baseline_path})" if baseline_path else ""
+        raise ValueError(
+            f"--N {cli_n} conflicts with the chain length recorded in the "
+            f"baseline{where}: {baseline_n}. The baseline is authoritative; drop "
+            f"--N or point at the matching baseline."
+        )
+    resolved = baseline_n if baseline_n is not None else cli_n
+    if resolved is None and MODEL_REGISTRY[model_name].get("requires_chain_length"):
+        where = f" ({baseline_path})" if baseline_path else ""
+        raise ValueError(
+            f"model {model_name!r} normalizes its contact-quadratic term by the "
+            f"chain length ({QUADRATIC_NORMALIZATION}), but the baseline{where} "
+            f"records neither 'n_beads' nor 'N'. Pass --N with the number of "
+            f"beads, or regenerate the baseline."
+        )
+    return resolved
+
+
 def build_baseline_mass_on_integer(
     m_centers_int: np.ndarray, baseline_npz: str
 ) -> np.ndarray:
@@ -537,11 +639,31 @@ def _rg_loss_sum(
 # ---------------------------------------------------------------------------
 # Model registry
 # ---------------------------------------------------------------------------
-# Each entry defines b(T) = the reduced bias (contact coupling).
-# P_model(m|T) ∝ P0(m) * exp[-b(T) * m]
+# Each entry defines the reduced contact potential
+#
+#     u_contact(m, T; N) = b(T) * m + kappa(T) * m^2 / (2N)
+#     P_model(m|T) ∝ P0(m) * exp[-u_contact(m, T; N)]
+#
+# b(T) is the reduced bias (linear contact coupling) and kappa(T) the quadratic
+# coefficient, which is identically zero for every model whose potential_kind is
+# "linear" -- there u_contact reduces to exactly b(T)*m.
 #
 # raw_b_fn(params, T, Tref, Tscale) -> float
+# raw_q_fn(params, T, Tref, Tscale) -> float   (0.0 for linear models)
 # derived_Tc(params) -> float | None  (or None if not meaningful for that model)
+# potential_kind: "linear" | "contact_quadratic"
+# quadratic_normalization: None for linear models, else QUADRATIC_NORMALIZATION
+# requires_chain_length: True when the normalization needs N
+
+# Exact normalization of the contact-quadratic term.  Recorded in every output
+# so a fitted kappa can never be reinterpreted against a different convention.
+QUADRATIC_NORMALIZATION = "m^2/(2N)"
+
+
+def _q_zero(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
+    """Quadratic coefficient of a purely linear contact potential: exactly 0."""
+    return 0.0
+
 
 def _b_hs(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
     return float(params[0]) / T - float(params[1])
@@ -580,6 +702,16 @@ def _b_heat_capacity(params: np.ndarray, T: float, Tref: float, Tscale: float) -
     dh0, ds0, dCp = float(params[0]), float(params[1]), float(params[2])
     dg = dh0 - T * ds0 + dCp * ((T - T0) - T * np.log(T / T0))
     return dg / T
+
+
+def _q_hs_m2_const(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
+    """Temperature-independent contact-number curvature kappa2."""
+    return float(params[2])
+
+
+def _q_hs_m2_hs(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
+    """Enthalpy/entropy decomposition of the contact-number curvature."""
+    return float(params[2]) / T - float(params[3])
 
 
 def _tc_hs(params: np.ndarray) -> Optional[float]:
@@ -646,19 +778,69 @@ MODEL_REGISTRY: Dict[str, Dict] = {
             "(set T0 via --T0; defaults to midpoint of temperature range)"
         ),
     },
+    # --- contact-number-quadratic models -----------------------------------
+    # These leave b(T) alone and add curvature in m.  Their quadratic parameters
+    # default to zero so the first restart begins at the nested hs solution.
+    "hs_m2_const": {
+        "param_names": ["h1", "s1", "kappa2"],
+        "x0": [750.0, 2.8, 0.0],
+        "bounds": [(-2000.0, 2000.0), (-10.0, 10.0), (-50.0, 50.0)],
+        "raw_b_fn": _b_hs,
+        "raw_q_fn": _q_hs_m2_const,
+        "derived_Tc": None,
+        "potential_kind": "contact_quadratic",
+        "quadratic_normalization": QUADRATIC_NORMALIZATION,
+        "requires_chain_length": True,
+        "description": (
+            "u(m,T;N) = (h1/T - s1)*m + kappa2*m^2/(2N)  "
+            "(temperature-independent contact-number curvature)"
+        ),
+    },
+    "hs_m2_hs": {
+        "param_names": ["h1", "s1", "h2", "s2"],
+        "x0": [750.0, 2.8, 0.0, 0.0],
+        "bounds": [
+            (-2000.0, 2000.0), (-10.0, 10.0), (-2000.0, 2000.0), (-10.0, 10.0),
+        ],
+        "raw_b_fn": _b_hs,
+        "raw_q_fn": _q_hs_m2_hs,
+        "derived_Tc": None,
+        "potential_kind": "contact_quadratic",
+        "quadratic_normalization": QUADRATIC_NORMALIZATION,
+        "requires_chain_length": True,
+        "description": (
+            "u(m,T;N) = (h1/T - s1)*m + (h2/T - s2)*m^2/(2N)  "
+            "(enthalpy/entropy decomposition of the curvature)"
+        ),
+    },
 }
+
+# Linear models carry no curvature in m and need no chain length.  Filling the
+# defaults here keeps the six historical entries textually unchanged.
+for _spec in MODEL_REGISTRY.values():
+    _spec.setdefault("raw_q_fn", _q_zero)
+    _spec.setdefault("potential_kind", "linear")
+    _spec.setdefault("quadratic_normalization", None)
+    _spec.setdefault("requires_chain_length", False)
+del _spec
 
 
 # Shared model-contract version.  Bump only when the model set, parameter names,
-# or b(T) semantics change in a way that breaks cross-script compatibility.
-MODEL_API_VERSION = 1
+# or contact-potential semantics change in a way that breaks cross-script
+# compatibility.
+#   v2: registry gains raw_q_fn / potential_kind / quadratic_normalization and
+#       the contact-number-quadratic models hs_m2_const and hs_m2_hs; the
+#       reweighting weight is exp[-u_contact(m,T;N)] rather than exp[-b(T)*m]
+#       (identical for every v1 model, all of which are potential_kind linear).
+MODEL_API_VERSION = 2
 
 
 def get_model_contract() -> dict:
     """Return a callable-free description of the supported contact-bias models.
 
     Used to verify that this script and remd_uniform_chain_new.py agree on the
-    model API version, model names, and parameter ordering.
+    model API version, model names, parameter ordering, and which models carry a
+    contact-number-quadratic term.
     """
     return {
         "model_api_version": MODEL_API_VERSION,
@@ -666,10 +848,33 @@ def get_model_contract() -> dict:
             name: {
                 "param_names": list(spec["param_names"]),
                 "description": str(spec["description"]),
+                "potential_kind": str(spec["potential_kind"]),
+                "quadratic_normalization": spec["quadratic_normalization"],
             }
             for name, spec in MODEL_REGISTRY.items()
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Contact-potential accessors
+# ---------------------------------------------------------------------------
+# reduced_bias/make_b_fn return the LINEAR coefficient only and are kept for
+# backward compatibility; make_contact_u_fn returns the full potential used for
+# reweighting.  For every linear model the two agree exactly: u = b(T)*m.
+
+def reduced_bias(
+    model_name: str, params: np.ndarray, T: float, Tref: float, Tscale: float
+) -> float:
+    """b(T), the linear contact coefficient of the selected model."""
+    return float(MODEL_REGISTRY[model_name]["raw_b_fn"](params, float(T), Tref, Tscale))
+
+
+def quadratic_bias(
+    model_name: str, params: np.ndarray, T: float, Tref: float, Tscale: float
+) -> float:
+    """kappa(T), the coefficient of m^2/(2N); exactly 0 for linear models."""
+    return float(MODEL_REGISTRY[model_name]["raw_q_fn"](params, float(T), Tref, Tscale))
 
 
 def make_b_fn(
@@ -684,22 +889,131 @@ def make_b_fn(
     return b_fn
 
 
+def make_q_fn(
+    model_name: str, Tref: float, Tscale: float
+) -> Callable[[np.ndarray, float], float]:
+    """Return kappa(params, T) with Tref and Tscale captured by closure."""
+    raw = MODEL_REGISTRY[model_name]["raw_q_fn"]
+
+    def q_fn(params: np.ndarray, T: float) -> float:
+        return raw(params, T, Tref, Tscale)
+
+    return q_fn
+
+
+def validate_chain_length(model_name: str, n_beads: Optional[int]) -> Optional[int]:
+    """Return a usable chain length, or raise if the model requires one and it is absent."""
+    if not MODEL_REGISTRY[model_name].get("requires_chain_length"):
+        return None if n_beads is None else int(n_beads)
+    if n_beads is None:
+        raise ValueError(
+            f"model {model_name!r} needs a chain length for its "
+            f"{QUADRATIC_NORMALIZATION} normalization; none was resolved."
+        )
+    n = int(n_beads)
+    if n < 2:
+        raise ValueError(f"chain length must be >= 2, got {n_beads!r}")
+    return n
+
+
+def reduced_contact_potential(
+    m,
+    T: float,
+    model_name: str,
+    params: np.ndarray,
+    Tref: float,
+    Tscale: float,
+    n_beads: Optional[int] = None,
+):
+    """u_contact(m, T; N) for the selected model, elementwise in m.
+
+    Linear models return exactly ``b(T) * m`` -- the same floating-point value
+    the pre-quadratic code computed.  Contact-quadratic models add
+    ``kappa(T) * m^2 / (2N)``, which vanishes identically when kappa(T) is zero,
+    so those models nest the linear ones exactly.
+    """
+    spec = MODEL_REGISTRY[model_name]
+    m_arr = np.asarray(m, dtype=float)
+    b = reduced_bias(model_name, params, T, Tref, Tscale)
+    if spec["potential_kind"] == "linear":
+        return b * m_arr
+    n = validate_chain_length(model_name, n_beads)
+    q = quadratic_bias(model_name, params, T, Tref, Tscale)
+    return b * m_arr + q * (m_arr * m_arr) / (2.0 * float(n))
+
+
+def make_contact_u_fn(
+    model_name: str,
+    Tref: float,
+    Tscale: float,
+    n_beads: Optional[int] = None,
+) -> Callable[[np.ndarray, float, np.ndarray], np.ndarray]:
+    """Return u(params, T, m) with Tref, Tscale and N captured by closure.
+
+    The chain length is validated once here rather than inside the reweighting
+    loop, so a missing N for a contact-quadratic model fails before any fitting
+    starts.
+    """
+    spec = MODEL_REGISTRY[model_name]
+    raw_b = spec["raw_b_fn"]
+    if spec["potential_kind"] == "linear":
+        def u_fn_linear(params: np.ndarray, T: float, m: np.ndarray) -> np.ndarray:
+            return raw_b(params, T, Tref, Tscale) * np.asarray(m, dtype=float)
+        return u_fn_linear
+
+    raw_q = spec["raw_q_fn"]
+    n = float(validate_chain_length(model_name, n_beads))
+
+    def u_fn_quadratic(params: np.ndarray, T: float, m: np.ndarray) -> np.ndarray:
+        m_arr = np.asarray(m, dtype=float)
+        b = raw_b(params, T, Tref, Tscale)
+        q = raw_q(params, T, Tref, Tscale)
+        return b * m_arr + q * (m_arr * m_arr) / (2.0 * n)
+
+    return u_fn_quadratic
+
+
 # ---------------------------------------------------------------------------
 # Generic model probability
 # ---------------------------------------------------------------------------
+
+def _stabilized_exponent(x: np.ndarray, support: np.ndarray) -> np.ndarray:
+    """Shift x so its maximum OVER THE SUPPORTED BINS is 0; mask the rest.
+
+    Bins with zero baseline mass contribute nothing to the partition function,
+    so letting one of them set the stabilization constant would deflate every
+    surviving weight -- harmless for a linear potential over a narrow m range,
+    but able to underflow the whole distribution once u grows quadratically in
+    m.  Unsupported bins are then set to -inf rather than left at a large
+    positive exponent, which would otherwise overflow exp() and turn the
+    0 * inf product into NaN.
+
+    When every bin is supported this is exactly ``x - x.max()``, so linear
+    models reproduce their previous weights bit for bit.  Falls back to the
+    global maximum when nothing is supported.
+    """
+    x = np.asarray(x, dtype=float)
+    if not np.any(support):
+        return x - np.max(x)
+    shifted = x - float(np.max(x[support]))
+    if np.all(support):
+        return shifted
+    return np.where(support, shifted, -np.inf)
+
 
 def model_contact_mass(
     p0_mass: np.ndarray,
     m_centers: np.ndarray,
     T: float,
     params: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
 ) -> np.ndarray:
-    """P_model(m|T) ∝ P0(m) * exp[-b(T)*m], with max-subtraction stabilization."""
+    """P_model(m|T) ∝ P0(m) * exp[-u_contact(m,T;N)], stabilized on the support."""
     m_centers = np.asarray(m_centers, dtype=float)
-    b = b_fn(params, float(T))
-    x = -b * m_centers
-    x = x - np.max(x)
+    x = _stabilized_exponent(
+        -np.asarray(u_fn(params, float(T), m_centers), dtype=float),
+        np.asarray(p0_mass, dtype=float) > 0.0,
+    )
     w = p0_mass * np.exp(x)
     Z = w.sum()
     if not np.isfinite(Z) or Z <= 0:
@@ -713,13 +1027,13 @@ def objective(
     m_centers: np.ndarray,
     p_obs_mass: np.ndarray,
     p0_mass: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
     loss_fn: Callable[[np.ndarray, np.ndarray], float],
 ) -> float:
     """Sum of per-temperature contact loss over the provided temperatures."""
     total = 0.0
     for i, T in enumerate(temps):
-        p_mod = model_contact_mass(p0_mass, m_centers, float(T), params, b_fn)
+        p_mod = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
         total += loss_fn(p_obs_mass[i], p_mod)
     return total
 
@@ -733,21 +1047,22 @@ def objective_combined(
     crg_prob: np.ndarray,
     c_edges_joint: np.ndarray,
     p_obs_rg_train: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
     loss_fn: Callable[[np.ndarray, np.ndarray], float],
     rg_weight: float,
 ) -> float:
     """Contact loss + rg_weight * Rg loss, summed over training temperatures."""
     m_joint = 0.5 * (c_edges_joint[:-1] + c_edges_joint[1:])
+    joint_support = np.asarray(crg_prob, dtype=float).sum(axis=1) > 0.0
     total = 0.0
     for i, T in enumerate(train_temps):
         # contact term
-        p_mod_ct = model_contact_mass(p0_mass, m_centers, float(T), params, b_fn)
+        p_mod_ct = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
         total += loss_fn(p_obs_ct_train[i], p_mod_ct)
-        # Rg term: reweight joint baseline by exp[-b*m], marginalize over m
-        b = b_fn(params, float(T))
-        x = -b * m_joint
-        x -= x.max()
+        # Rg term: reweight joint baseline by exp[-u(m,T;N)], marginalize over m
+        x = _stabilized_exponent(
+            -np.asarray(u_fn(params, float(T), m_joint), dtype=float), joint_support
+        )
         w_m = np.exp(x)
         rg_mass = (crg_prob.T * w_m).T.sum(axis=0)
         Z = rg_mass.sum()
@@ -767,7 +1082,7 @@ def predict_rg_from_joint(
     rg_edges: np.ndarray,
     temps: np.ndarray,
     params: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Predict P(Rg|T) for all temps by reweighting P0(m,Rg) in m.
 
@@ -778,12 +1093,13 @@ def predict_rg_from_joint(
     crg_prob = np.asarray(crg_prob, dtype=float)
 
     m_centers = 0.5 * (c_edges[:-1] + c_edges[1:])
+    joint_support = crg_prob.sum(axis=1) > 0.0
     rg_mass_T = np.zeros((temps.size, rg_edges.size - 1), dtype=float)
 
     for i, T in enumerate(temps):
-        b = b_fn(params, float(T))
-        x = -b * m_centers
-        x = x - np.max(x)
+        x = _stabilized_exponent(
+            -np.asarray(u_fn(params, float(T), m_centers), dtype=float), joint_support
+        )
         w_m = np.exp(x)
         rg_mass = (crg_prob.T * w_m).T.sum(axis=0)
         Z = rg_mass.sum()
@@ -905,7 +1221,7 @@ def build_objective(
     m_centers: np.ndarray,
     p_obs_ct_train: np.ndarray,
     p0_mass: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
     loss_fn: Callable[[np.ndarray, np.ndarray], float],
     *,
     crg_prob: Optional[np.ndarray] = None,
@@ -922,10 +1238,10 @@ def build_objective(
         obj_args = (
             train_temps, m_centers, p_obs_ct_train, p0_mass,
             crg_prob, c_edges_joint, p_obs_rg_train,
-            b_fn, loss_fn, float(rg_weight),
+            u_fn, loss_fn, float(rg_weight),
         )
         return objective_combined, obj_args
-    return objective, (train_temps, m_centers, p_obs_ct_train, p0_mass, b_fn, loss_fn)
+    return objective, (train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn)
 
 
 def fit_restarts(
@@ -1002,13 +1318,13 @@ def per_temp_contact_losses(
     p_obs_mass: np.ndarray,
     p0_mass: np.ndarray,
     params: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
     loss_fn: Callable[[np.ndarray, np.ndarray], float],
 ) -> np.ndarray:
     """Per-temperature contact loss; summing over a subset reproduces objective()."""
     out = np.empty(len(temps), dtype=float)
     for i, T in enumerate(temps):
-        p_mod = model_contact_mass(p0_mass, m_centers, float(T), params, b_fn)
+        p_mod = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
         out[i] = loss_fn(p_obs_mass[i], p_mod)
     return out
 
@@ -1213,6 +1529,7 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
     p_obs_mass = ctx["p_obs_mass"]
     p0_mass = ctx["p0_mass"]
     b_fn = ctx["b_fn"]
+    u_fn = ctx["u_fn"]
     loss_fn = ctx["loss_fn"]
     spec = ctx["spec"]
     param_names = ctx["param_names"]
@@ -1270,7 +1587,7 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
         )
 
         obj_fn, obj_args = build_objective(
-            fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, b_fn, loss_fn,
+            fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
             crg_prob=crg_prob, c_edges_joint=c_edges_joint,
             p_obs_rg_train=p_obs_rg_train, rg_weight=rg_weight,
         )
@@ -1310,12 +1627,12 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
 
         # Per-temperature losses (all temps), then slice by split.
         ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params, b_fn, loss_fn
+            temps, m_centers, p_obs_mass, p0_mass, params, u_fn, loss_fn
         )
         rg_pt = None
         if can_fit_rg:
             _, rg_mod_mass = predict_rg_from_joint(
-                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, b_fn
+                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, u_fn
             )
             rg_pt = per_temp_rg_losses(rg_mod_mass, p_obs_rg_model_grid, loss_fn)
 
@@ -1610,11 +1927,13 @@ def run_quick_test() -> int:
     p0_mass = np.exp(-0.5 * ((m_centers - 8.0) / 5.0) ** 2)
     p0_mass /= p0_mass.sum()
     h_true, s_true = 800.0, 2.6
+    N_QUICK = 30                      # chain length for the contact-quadratic models
     Tref, Tscale = float(temps.mean()), float(temps.max() - temps.min())
     b_hs = make_b_fn("hs", Tref, Tscale)
+    u_hs = make_contact_u_fn("hs", Tref, Tscale)
     p_obs_mass = np.zeros((temps.size, m_centers.size), dtype=float)
     for i, T in enumerate(temps):
-        p = model_contact_mass(p0_mass, m_centers, float(T), np.array([h_true, s_true]), b_hs)
+        p = model_contact_mass(p0_mass, m_centers, float(T), np.array([h_true, s_true]), u_hs)
         p_obs_mass[i] = p
     loss_fn = _get_loss_fn("js")
 
@@ -1629,9 +1948,9 @@ def run_quick_test() -> int:
 
     def fit_model_on(model: str, train_idx: np.ndarray, seed: int) -> np.ndarray:
         spec = MODEL_REGISTRY[model]
-        b_fn = make_b_fn(model, Tref, Tscale)
+        u_fn = make_contact_u_fn(model, Tref, Tscale, n_beads=N_QUICK)
         obj_fn, obj_args = build_objective(
-            False, temps[train_idx], m_centers, p_obs_mass[train_idx], p0_mass, b_fn, loss_fn
+            False, temps[train_idx], m_centers, p_obs_mass[train_idx], p0_mass, u_fn, loss_fn
         )
         best, _ = fit_one_split(obj_fn, obj_args, make_x0s(model, seed), spec["bounds"])
         return best.x
@@ -1739,10 +2058,10 @@ def run_quick_test() -> int:
     p0 = np.exp(-0.5 * ((mc - 7.0) / 4.0) ** 2); p0 /= p0.sum()
     t2 = np.linspace(280.0, 360.0, 8)
     Tref2, Tscale2 = float(t2.mean()), float(t2.max() - t2.min())
-    bfn2 = make_b_fn("hs", Tref2, Tscale2)
+    ufn2 = make_contact_u_fn("hs", Tref2, Tscale2)
     A = np.array([900.0, 3.0]); R = np.array([500.0, 1.5])  # conflicting truths
-    obs_ct = np.array([model_contact_mass(p0, mc, float(T), A, bfn2) for T in t2])
-    obs_rg = np.array([model_contact_mass(p0, mc, float(T), R, bfn2) for T in t2])
+    obs_ct = np.array([model_contact_mass(p0, mc, float(T), A, ufn2) for T in t2])
+    obs_rg = np.array([model_contact_mass(p0, mc, float(T), R, ufn2) for T in t2])
     c_edges2 = np.arange(-0.5, M + 0.5, 1.0)       # identity Rg = contact mapping
     rg_edges2 = np.arange(-0.5, M + 0.5, 1.0)
     crg2 = np.zeros((M, M)); crg2[np.arange(M), np.arange(M)] = p0
@@ -1752,13 +2071,13 @@ def run_quick_test() -> int:
     def fit_and_score(w: float):
         use_rg = w > 0
         of, oa = build_objective(
-            use_rg, t2, mc, obs_ct, p0, bfn2, lfn,
+            use_rg, t2, mc, obs_ct, p0, ufn2, lfn,
             crg_prob=crg2, c_edges_joint=c_edges2, p_obs_rg_train=obs_rg, rg_weight=w,
         )
         best, _ = fit_one_split(of, oa, make_x0s("hs", 0), spec_hs["bounds"])
         pr = best.x
-        ct = float(per_temp_contact_losses(t2, mc, obs_ct, p0, pr, bfn2, lfn).sum())
-        _, rgm = predict_rg_from_joint(crg2, c_edges2, rg_edges2, t2, pr, bfn2)
+        ct = float(per_temp_contact_losses(t2, mc, obs_ct, p0, pr, ufn2, lfn).sum())
+        _, rgm = predict_rg_from_joint(crg2, c_edges2, rg_edges2, t2, pr, ufn2)
         rg = float(per_temp_rg_losses(rgm, obs_rg, lfn).sum())
         return ct, rg
 
@@ -1767,6 +2086,66 @@ def run_quick_test() -> int:
     print(f"    w=0: contact={c0:.4g} rg={r0:.4g}  |  w=6: contact={c1:.4g} rg={r1:.4g}")
     check(r1 < r0, "higher Rg weight reduces Rg loss")
     check(c1 > c0, "higher Rg weight worsens contact loss (genuine trade-off)")
+
+    print("Quick test 11: contact-quadratic models nest and normalize as specified")
+    # (a) every legacy model still reduces to exactly b(T)*m
+    legacy_exact = True
+    for model in ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3", "heat_capacity"):
+        pars = np.array(MODEL_REGISTRY[model]["x0"], dtype=float)
+        for T in (285.0, 320.0, 355.0):
+            u = reduced_contact_potential(
+                m_centers, T, model, pars, Tref, Tscale, n_beads=N_QUICK
+            )
+            b = reduced_bias(model, pars, T, Tref, Tscale)
+            legacy_exact &= bool(np.array_equal(u, b * m_centers))
+            legacy_exact &= quadratic_bias(model, pars, T, Tref, Tscale) == 0.0
+    check(legacy_exact, "legacy models: quadratic_bias == 0 and u == b(T)*m exactly")
+
+    # (b) zero curvature reproduces hs bit-for-bit
+    u_const0 = make_contact_u_fn("hs_m2_const", Tref, Tscale, n_beads=N_QUICK)
+    u_hshs0 = make_contact_u_fn("hs_m2_hs", Tref, Tscale, n_beads=N_QUICK)
+    nested = all(
+        np.array_equal(
+            u_const0(np.array([h_true, s_true, 0.0]), T, m_centers),
+            u_hs(np.array([h_true, s_true]), T, m_centers),
+        )
+        and np.array_equal(
+            u_hshs0(np.array([h_true, s_true, 0.0, 0.0]), T, m_centers),
+            u_hs(np.array([h_true, s_true]), T, m_centers),
+        )
+        for T in (285.0, 320.0, 355.0)
+    )
+    check(nested, "zero quadratic parameters reproduce the hs potential exactly")
+
+    # (c) the normalization is exactly m^2/(2N)
+    kap = 0.7
+    u_k = u_const0(np.array([h_true, s_true, kap]), 320.0, m_centers)
+    u_0 = u_const0(np.array([h_true, s_true, 0.0]), 320.0, m_centers)
+    check(
+        np.allclose(u_k - u_0, kap * m_centers ** 2 / (2.0 * N_QUICK), rtol=0, atol=1e-12),
+        f"contact-quadratic term equals kappa*{QUADRATIC_NORMALIZATION}",
+    )
+
+    # (d) synthetic recovery: data generated with a known kappa2 is recovered
+    kap_true = 0.9
+    u_true = make_contact_u_fn("hs_m2_const", Tref, Tscale, n_beads=N_QUICK)
+    p_obs_q = np.array([
+        model_contact_mass(
+            p0_mass, m_centers, float(T), np.array([h_true, s_true, kap_true]), u_true
+        )
+        for T in temps
+    ])
+    obj_q, args_q = build_objective(
+        False, temps, m_centers, p_obs_q, p0_mass, u_true, loss_fn
+    )
+    best_q, _ = fit_one_split(
+        obj_q, args_q, make_x0s("hs_m2_const", 5), MODEL_REGISTRY["hs_m2_const"]["bounds"]
+    )
+    check(
+        abs(best_q.x[2] - kap_true) < 0.05 and abs(best_q.x[0] - h_true) < 20.0,
+        f"hs_m2_const recovers kappa2~{kap_true}: got {best_q.x[2]:.4f} "
+        f"(h1={best_q.x[0]:.2f})",
+    )
 
     print()
     if failures:
@@ -1973,12 +2352,12 @@ def _predicted_means(
     m_centers: np.ndarray,
     p0_mass: np.ndarray,
     params: np.ndarray,
-    b_fn: Callable[[np.ndarray, float], float],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
 ) -> np.ndarray:
     """Predicted mean contacts at every temperature for one parameter set."""
     out = np.empty(temps.size, dtype=float)
     for i, T in enumerate(temps):
-        p = model_contact_mass(p0_mass, m_centers, float(T), params, b_fn)
+        p = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
         out[i] = float((m_centers * p).sum())
     return out
 
@@ -1994,6 +2373,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     p_obs_mass = ctx["p_obs_mass"]
     p0_mass = ctx["p0_mass"]
     b_fn = ctx["b_fn"]
+    u_fn = ctx["u_fn"]
     loss_fn = ctx["loss_fn"]
     spec = ctx["spec"]
     param_names = ctx["param_names"]
@@ -2056,7 +2436,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
         boot_rg_b = p_obs_rg_train[local_idx] if (fit_rg and can_fit_rg) else None
 
         obj_fn_b, obj_args_b = build_objective(
-            fit_rg, boot_temps_b, m_centers, boot_ct_b, p0_mass, b_fn, loss_fn,
+            fit_rg, boot_temps_b, m_centers, boot_ct_b, p0_mass, u_fn, loss_fn,
             crg_prob=crg_prob, c_edges_joint=c_edges_joint,
             p_obs_rg_train=boot_rg_b, rg_weight=rg_weight,
         )
@@ -2072,7 +2452,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
 
         # Contact losses on ORIGINAL (non-resampled) temperature sets.
         ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params_b, b_fn, loss_fn
+            temps, m_centers, p_obs_mass, p0_mass, params_b, u_fn, loss_fn
         )
         train_loss_b = float(ct_pt[train_idx].sum())
         val_loss_b = float(ct_pt[val_idx].sum()) if has_val else float("nan")
@@ -2081,7 +2461,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
         rg_train_b = rg_val_b = rg_all_b = float("nan")
         if can_fit_rg:
             _, rg_mod_b = predict_rg_from_joint(
-                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params_b, b_fn
+                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params_b, u_fn
             )
             rg_pt = per_temp_rg_losses(rg_mod_b, p_obs_rg_model_grid, loss_fn)
             rg_train_b = float(rg_pt[train_idx].sum())
@@ -2126,7 +2506,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
 
         # Prediction bands on the full temperature ladder.
         b_T_list.append(np.array([b_fn(params_b, float(T)) for T in temps]))
-        meanC_list.append(_predicted_means(temps, m_centers, p0_mass, params_b, b_fn))
+        meanC_list.append(_predicted_means(temps, m_centers, p0_mass, params_b, u_fn))
 
         interval = max(1, args.bootstrap // 5)
         if (bi + 1) % interval == 0 or bi == args.bootstrap - 1:
@@ -2480,7 +2860,7 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
 
     obj_fn, obj_args = build_objective(
         ctx["fit_rg"], ctx["train_temps"], ctx["m_centers"], ctx["p_obs_ct_train"],
-        ctx["p0_mass"], ctx["b_fn"], ctx["loss_fn"],
+        ctx["p0_mass"], ctx["u_fn"], ctx["loss_fn"],
         crg_prob=ctx["crg_prob"], c_edges_joint=ctx["c_edges_joint"],
         p_obs_rg_train=ctx["p_obs_rg_train"], rg_weight=float(ctx["rg_weight"]),
     )
@@ -2637,6 +3017,7 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     p_obs_mass = ctx["p_obs_mass"]
     p0_mass = ctx["p0_mass"]
     b_fn = ctx["b_fn"]
+    u_fn = ctx["u_fn"]
     loss_fn = ctx["loss_fn"]
     spec = ctx["spec"]
     param_names = ctx["param_names"]
@@ -2685,7 +3066,7 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     for w in weights:
         use_rg = w > 0.0
         obj_fn, obj_args = build_objective(
-            use_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, b_fn, loss_fn,
+            use_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
             crg_prob=crg_prob, c_edges_joint=c_edges_joint,
             p_obs_rg_train=p_obs_rg_train, rg_weight=w,
         )
@@ -2694,10 +3075,10 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
         param_path.append(np.asarray(params, dtype=float))
 
         ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params, b_fn, loss_fn
+            temps, m_centers, p_obs_mass, p0_mass, params, u_fn, loss_fn
         )
         _, rg_mod = predict_rg_from_joint(
-            crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, b_fn
+            crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, u_fn
         )
         rg_pt = per_temp_rg_losses(rg_mod, p_obs_rg_model_grid, loss_fn)
 
@@ -2741,7 +3122,7 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
                 rec["Tc"] = float(tc)
 
         bT = np.array([b_fn(params, float(T)) for T in temps])
-        predC = _predicted_means(temps, m_centers, p0_mass, params, b_fn)
+        predC = _predicted_means(temps, m_centers, p0_mass, params, u_fn)
         predRg = rg_scale * (rg_centers_lat[None, :] * rg_mod).sum(axis=1)
         bT_curves.append(bT)
         predC_curves.append(predC)
@@ -3040,6 +3421,15 @@ def main() -> None:
     ap.add_argument(
         "--contact_offset", type=float, default=43,
         help="Constant subtracted from ct_centers in the REMD file before binning.",
+    )
+    ap.add_argument(
+        "--N", dest="chain_length", type=int, default=None,
+        help=(
+            "Chain length (number of beads) used to normalize the "
+            "contact-quadratic term as kappa*m^2/(2N). Fallback only: the "
+            "baseline's n_beads (or N) wins and a mismatch is an error. Required "
+            "by hs_m2_const/hs_m2_hs when the baseline predates that metadata."
+        ),
     )
     ap.add_argument(
         "--kappa-bend", dest="kappa_bend", type=float, default=None,
@@ -3369,6 +3759,16 @@ def main() -> None:
     )
     bending_enabled = bool(kappa_bend != 0.0)
 
+    # Chain length: needed only by the contact-quadratic models, whose curvature
+    # term is normalized by it. Resolved before any fitting so a missing or
+    # conflicting N fails immediately.
+    fit_chain_length = resolve_chain_length(
+        read_baseline_chain_length(b_data), args.chain_length,
+        model_name=args.model, baseline_path=str(args.baseline),
+    )
+    potential_kind = str(MODEL_REGISTRY[args.model]["potential_kind"])
+    quadratic_normalization = MODEL_REGISTRY[args.model]["quadratic_normalization"]
+
     # -----------------------------------------------------------------------
     # Input validation
     # -----------------------------------------------------------------------
@@ -3407,6 +3807,10 @@ def main() -> None:
     print(f"  kappa_bend:  {kappa_bend:g} "
           f"({'bending enabled' if bending_enabled else 'no bending penalty'}; "
           f"{BEND_DEFINITION})")
+    print(f"  chain length: "
+          + ("not recorded" if fit_chain_length is None else f"{fit_chain_length}")
+          + (f"  (used for {quadratic_normalization})"
+             if quadratic_normalization else "  (not needed by this model)"))
 
     print(f"Contact offset: {args.contact_offset}")
     print(f"  Native range  (before offset):  [{ct_centers_raw.min():.4g}, {ct_centers_raw.max():.4g}]")
@@ -3628,6 +4032,10 @@ def main() -> None:
         raise ValueError(f"heat_capacity T0 must be positive, got {Tref!r}")
 
     b_fn = make_b_fn(args.model, Tref, Tscale)
+    q_fn = make_q_fn(args.model, Tref, Tscale)
+    # u_fn is what every reweighting path uses. For linear models it evaluates to
+    # exactly b(T)*m, so their numerical results are unchanged.
+    u_fn = make_contact_u_fn(args.model, Tref, Tscale, n_beads=fit_chain_length)
     loss_fn = _get_loss_fn(args.loss)
 
     # -----------------------------------------------------------------------
@@ -3678,7 +4086,7 @@ def main() -> None:
     # p_obs_rg_train is also reused by the bootstrap block below.
     p_obs_rg_train = p_obs_rg_model_grid[train_idx] if args.fit_rg else None  # type: ignore[index]
     obj_fn, obj_args = build_objective(
-        args.fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, b_fn, loss_fn,
+        args.fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
         crg_prob=crg_prob, c_edges_joint=c_edges_joint,
         p_obs_rg_train=p_obs_rg_train, rg_weight=float(args.rg_weight),
     )
@@ -3704,24 +4112,24 @@ def main() -> None:
     p_mod_mass = np.zeros_like(p_obs_mass)
     for i, T in enumerate(temps):
         p_mod_mass[i] = model_contact_mass(
-            p0_mass, m_centers, float(T), params_fit, b_fn
+            p0_mass, m_centers, float(T), params_fit, u_fn
         )
 
     # -----------------------------------------------------------------------
     # Post-fit contact loss breakdown
     # -----------------------------------------------------------------------
     train_loss = objective(
-        params_fit, train_temps, m_centers, p_obs_ct_train, p0_mass, b_fn, loss_fn
+        params_fit, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn
     )
     val_loss = (
         objective(
             params_fit, temps[val_idx], m_centers, p_obs_mass[val_idx],
-            p0_mass, b_fn, loss_fn,
+            p0_mass, u_fn, loss_fn,
         )
         if has_val else float("nan")
     )
     all_loss = objective(
-        params_fit, temps, m_centers, p_obs_mass, p0_mass, b_fn, loss_fn
+        params_fit, temps, m_centers, p_obs_mass, p0_mass, u_fn, loss_fn
     )
 
     print(f"\nContact loss ({args.loss}):")
@@ -3744,7 +4152,7 @@ def main() -> None:
             rg_edges=rg_edges_model_lattice,  # type: ignore[arg-type]
             temps=temps,
             params=params_fit,
-            b_fn=b_fn,
+            u_fn=u_fn,
         )
         rg_centers_model = args.rg_scale * rg_centers_lattice_pred
 
@@ -3795,6 +4203,18 @@ def main() -> None:
         print("\nRg scoring: skipped (no joint baseline P0(m,Rg)).")
 
     # -----------------------------------------------------------------------
+    # Per-temperature contact-potential coefficients
+    # -----------------------------------------------------------------------
+    # b(T) is the LINEAR coefficient and kappa(T) the coefficient of
+    # m^2/(2N). Neither zero-crossing is by itself the transition temperature.
+    linear_coefficient_by_temperature = np.array(
+        [b_fn(params_fit, float(T)) for T in temps], dtype=float
+    )
+    quadratic_coefficient_by_temperature = np.array(
+        [q_fn(params_fit, float(T)) for T in temps], dtype=float
+    )
+
+    # -----------------------------------------------------------------------
     # Save fit_results.npz
     # -----------------------------------------------------------------------
     save_kwargs: Dict = dict(
@@ -3825,6 +4245,18 @@ def main() -> None:
         kappa_bend=float(kappa_bend),
         bending_enabled=bool(bending_enabled),
         bend_definition=BEND_DEFINITION,
+        potential_kind=potential_kind,
+        quadratic_normalization=(
+            "" if quadratic_normalization is None else str(quadratic_normalization)
+        ),
+        fit_chain_length=(
+            -1 if fit_chain_length is None else int(fit_chain_length)
+        ),
+        # reduced_bias_by_temperature is retained as the linear-coefficient
+        # compatibility field; the two explicit names below are the ones to read.
+        reduced_bias_by_temperature=linear_coefficient_by_temperature,
+        linear_coefficient_by_temperature=linear_coefficient_by_temperature,
+        quadratic_coefficient_by_temperature=quadratic_coefficient_by_temperature,
     )
     # Rg arrays
     if rg_centers_model is not None:
@@ -3951,6 +4383,21 @@ def main() -> None:
         "kappa_bend": float(kappa_bend),
         "bending_enabled": bool(bending_enabled),
         "bend_definition": BEND_DEFINITION,
+        "potential_kind": potential_kind,
+        "quadratic_normalization": quadratic_normalization,
+        "fit_chain_length": (
+            None if fit_chain_length is None else int(fit_chain_length)
+        ),
+        "reduced_bias_by_temperature": linear_coefficient_by_temperature.tolist(),
+        "linear_coefficient_by_temperature": linear_coefficient_by_temperature.tolist(),
+        "quadratic_coefficient_by_temperature": (
+            quadratic_coefficient_by_temperature.tolist()
+        ),
+        "coefficient_note": (
+            "reduced_bias_by_temperature is kept as an alias of "
+            "linear_coefficient_by_temperature. Neither coefficient's zero "
+            "crossing is by itself the transition temperature."
+        ),
     }
     # For heat_capacity, persist the thermodynamic reference temperature as T0
     # (stored in Tref by this fitter). Keep Tref for backward compatibility.
@@ -3977,7 +4424,7 @@ def main() -> None:
     # -----------------------------------------------------------------------
     uncertainty_ctx: Dict[str, Any] = {
         "temps": temps, "m_centers": m_centers, "p_obs_mass": p_obs_mass,
-        "p0_mass": p0_mass, "b_fn": b_fn, "loss_fn": loss_fn, "spec": spec,
+        "p0_mass": p0_mass, "b_fn": b_fn, "u_fn": u_fn, "loss_fn": loss_fn, "spec": spec,
         "param_names": param_names, "bounds": bounds, "x0s": x0s,
         "fit_rg": bool(args.fit_rg), "rg_weight": float(args.rg_weight),
         "can_fit_rg": can_fit_rg, "crg_prob": crg_prob,
@@ -4008,7 +4455,8 @@ def main() -> None:
     if args.split_sensitivity:
         ctx: Dict[str, Any] = {
             "temps": temps, "m_centers": m_centers, "p_obs_mass": p_obs_mass,
-            "p0_mass": p0_mass, "b_fn": b_fn, "loss_fn": loss_fn, "spec": spec,
+            "p0_mass": p0_mass, "b_fn": b_fn, "u_fn": u_fn, "loss_fn": loss_fn,
+            "spec": spec,
             "param_names": param_names, "bounds": bounds, "x0s": x0s,
             "fit_rg": bool(args.fit_rg), "rg_weight": float(args.rg_weight),
             "can_fit_rg": can_fit_rg, "crg_prob": crg_prob,
@@ -4084,7 +4532,7 @@ def main() -> None:
     open_figs.append(fig2)
 
     # --- 3. Reduced bias b(T) vs T ---
-    b_vals = np.array([b_fn(params_fit, T) for T in temps])
+    b_vals = linear_coefficient_by_temperature
     fig3, ax3 = plt.subplots(figsize=(6, 4))
     ax3.plot(temps, b_vals, "k-", lw=1.8)
     ax3.axhline(0.0, color="gray", lw=0.8, ls="--")
@@ -4099,6 +4547,29 @@ def main() -> None:
     fig3.savefig(p3, dpi=150, bbox_inches="tight")
     print(f"Saved: {p3}")
     open_figs.append(fig3)
+
+    # --- 3b. Quadratic coefficient kappa(T) vs T (contact-quadratic models) ---
+    if potential_kind != "linear":
+        fig3q, ax3q = plt.subplots(figsize=(6, 4))
+        ax3q.plot(temps, quadratic_coefficient_by_temperature, "k-", lw=1.8)
+        ax3q.axhline(0.0, color="gray", lw=0.8, ls="--")
+        if has_val:
+            ax3q.scatter(
+                temps[val_idx], quadratic_coefficient_by_temperature[val_idx],
+                color="red", zorder=3, s=25, label="held-out",
+            )
+            ax3q.legend(fontsize=8)
+        ax3q.set_xlabel("T")
+        ax3q.set_ylabel(f"kappa(T)   [coefficient of {quadratic_normalization}]")
+        ax3q.set_title(
+            f"Contact-quadratic coefficient  [{args.model}, N={fit_chain_length}]\n"
+            "kappa(T)=0 is not by itself the transition temperature"
+        )
+        fig3q.tight_layout()
+        p3q = plot_dir / "quadratic_coefficient_vs_T.png"
+        fig3q.savefig(p3q, dpi=150, bbox_inches="tight")
+        print(f"Saved: {p3q}")
+        open_figs.append(fig3q)
 
     # --- 4. Contact residual heatmap ---
     residuals_ct = p_obs_mass - p_mod_mass   # shape (n_temps, n_m)

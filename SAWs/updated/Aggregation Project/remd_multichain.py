@@ -880,6 +880,11 @@ def main(argv=None) -> None:
     (model_name, model_params, param_names, Tref, Tscale,
      parameter_source, fit_summary_json) = remd.resolve_model_params(args, Ts)
 
+    # This sampler's acceptance uses u = b(T)*(lambda_intra*m_intra +
+    # lambda_inter*m_inter); a contact-quadratic model would have its
+    # m^2/(2N) term silently dropped. Refuse it at setup.
+    remd.require_linear_contact_potential(model_name)
+
     # Resolve the fixed reduced bending penalty AFTER the model, reusing the
     # single-chain rules: a fit summary is authoritative (re-read for kappa_bend,
     # already validated in resolve_model_params) and cross-checks any CLI value;

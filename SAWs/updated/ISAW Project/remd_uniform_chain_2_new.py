@@ -273,6 +273,24 @@ def _b_heat_capacity(params, T, Tref, Tscale):
     dg = dh0 - T * ds0 + dCp * ((T - T0) - T * math.log(T / T0))
     return dg / T
 
+# Exact normalization of the contact-quadratic term.  Must match the fitters'
+# QUADRATIC_NORMALIZATION exactly: it defines what a fitted kappa means.
+QUADRATIC_NORMALIZATION = "m^2/(2N)"
+
+
+def _q_zero(params, T, Tref, Tscale):
+    """Quadratic coefficient of a purely linear contact potential: exactly 0."""
+    return 0.0
+
+
+def _q_hs_m2_const(params, T, Tref, Tscale):
+    return float(params[2])
+
+
+def _q_hs_m2_hs(params, T, Tref, Tscale):
+    return float(params[2]) / T - float(params[3])
+
+
 
 MODEL_REGISTRY = {
     "hs": {
@@ -305,12 +323,43 @@ MODEL_REGISTRY = {
         "raw_b_fn": _b_heat_capacity,
         "description": "b(T) = [dh0 - T*ds0 + dCp*((T-T0) - T*ln(T/T0))] / T",
     },
+    "hs_m2_const": {
+        "param_names": ["h1", "s1", "kappa2"],
+        "raw_b_fn": _b_hs,
+        "raw_q_fn": _q_hs_m2_const,
+        "potential_kind": "contact_quadratic",
+        "quadratic_normalization": QUADRATIC_NORMALIZATION,
+        "requires_chain_length": True,
+        "description": "u(m,T;N) = (h1/T - s1)*m + kappa2*m^2/(2N)",
+    },
+    "hs_m2_hs": {
+        "param_names": ["h1", "s1", "h2", "s2"],
+        "raw_b_fn": _b_hs,
+        "raw_q_fn": _q_hs_m2_hs,
+        "potential_kind": "contact_quadratic",
+        "quadratic_normalization": QUADRATIC_NORMALIZATION,
+        "requires_chain_length": True,
+        "description": "u(m,T;N) = (h1/T - s1)*m + (h2/T - s2)*m^2/(2N)",
+    },
 }
+
+# Linear models carry no curvature in m and need no chain length.
+for _spec in MODEL_REGISTRY.values():
+    _spec.setdefault("raw_q_fn", _q_zero)
+    _spec.setdefault("potential_kind", "linear")
+    _spec.setdefault("quadratic_normalization", None)
+    _spec.setdefault("requires_chain_length", False)
+del _spec
+
 
 
 # Shared model-contract version.  Bump only when the model set, parameter names,
-# or b(T) semantics change in a way that breaks cross-script compatibility.
-MODEL_API_VERSION = 1
+# or contact-potential semantics change in a way that breaks cross-script
+# compatibility.
+#   v2: registry gains raw_q_fn / potential_kind / quadratic_normalization and
+#       the contact-number-quadratic models hs_m2_const and hs_m2_hs. Every v1
+#       model is potential_kind "linear", so their sampling weight is unchanged.
+MODEL_API_VERSION = 2
 
 # Output-schema version for the distributions NPZ / run summary / snapshot files.
 # Bump when the set of stored keys or their semantics change.
@@ -337,6 +386,8 @@ def get_model_contract() -> dict:
             name: {
                 "param_names": list(spec["param_names"]),
                 "description": str(spec["description"]),
+                "potential_kind": str(spec["potential_kind"]),
+                "quadratic_normalization": spec["quadratic_normalization"],
             }
             for name, spec in MODEL_REGISTRY.items()
         },
@@ -346,6 +397,100 @@ def get_model_contract() -> dict:
 def reduced_bias(model_name, params, T, Tref, Tscale) -> float:
     """b(T) for the selected model."""
     return float(MODEL_REGISTRY[model_name]["raw_b_fn"](params, float(T), Tref, Tscale))
+
+
+def quadratic_bias(model_name, params, T, Tref, Tscale) -> float:
+    """kappa(T), the coefficient of m^2/(2N); exactly 0 for linear models."""
+    return float(MODEL_REGISTRY[model_name]["raw_q_fn"](params, float(T), Tref, Tscale))
+
+
+def make_b_fn(model_name, Tref, Tscale):
+    """Return b(params, T) with Tref and Tscale captured by closure."""
+    raw = MODEL_REGISTRY[model_name]["raw_b_fn"]
+
+    def b_fn(params, T):
+        return float(raw(params, float(T), Tref, Tscale))
+
+    return b_fn
+
+
+def make_q_fn(model_name, Tref, Tscale):
+    """Return kappa(params, T) with Tref and Tscale captured by closure."""
+    raw = MODEL_REGISTRY[model_name]["raw_q_fn"]
+
+    def q_fn(params, T):
+        return float(raw(params, float(T), Tref, Tscale))
+
+    return q_fn
+
+
+def validate_chain_length(model_name, n_beads):
+    """Return a usable chain length, or raise when the model requires one and it is absent."""
+    if not MODEL_REGISTRY[model_name].get("requires_chain_length"):
+        return None if n_beads is None else int(n_beads)
+    if n_beads is None:
+        raise ValueError(
+            f"model {model_name!r} needs a chain length for its "
+            f"{QUADRATIC_NORMALIZATION} normalization; none was supplied."
+        )
+    n = int(n_beads)
+    if n < 2:
+        raise ValueError(f"chain length must be >= 2, got {n_beads!r}")
+    return n
+
+
+def reduced_contact_potential(
+    m, T, model_name, params, Tref, Tscale, n_beads=None
+) -> float:
+    """u_contact(m, T; N) for the selected model.
+
+    Linear models return exactly ``b(T) * m``, i.e. :func:`reduced_potential`.
+    """
+    spec = MODEL_REGISTRY[model_name]
+    b = reduced_bias(model_name, params, float(T), Tref, Tscale)
+    if spec["potential_kind"] == "linear":
+        return b * float(m)
+    n = validate_chain_length(model_name, n_beads)
+    q = quadratic_bias(model_name, params, float(T), Tref, Tscale)
+    return b * float(m) + q * (float(m) * float(m)) / (2.0 * float(n))
+
+
+def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
+    """Return u(params, T, m) with Tref, Tscale and N captured by closure."""
+    spec = MODEL_REGISTRY[model_name]
+    raw_b = spec["raw_b_fn"]
+    if spec["potential_kind"] == "linear":
+        def u_fn_linear(params, T, m):
+            return float(raw_b(params, float(T), Tref, Tscale)) * float(m)
+        return u_fn_linear
+
+    raw_q = spec["raw_q_fn"]
+    n = float(validate_chain_length(model_name, n_beads))
+
+    def u_fn_quadratic(params, T, m):
+        b = float(raw_b(params, float(T), Tref, Tscale))
+        q = float(raw_q(params, float(T), Tref, Tscale))
+        return b * float(m) + q * (float(m) * float(m)) / (2.0 * n)
+
+    return u_fn_quadratic
+
+
+def require_linear_contact_potential(model_name: str) -> None:
+    """Reject models this sampler cannot yet represent.
+
+    Move acceptance uses u = b(T)*m (plus the fixed bending penalty).  A
+    contact-quadratic model would silently have its m^2 term dropped there,
+    sampling a DIFFERENT ensemble than the one named in the output metadata.
+    Fail loudly at setup instead of writing mislabelled distributions.
+    """
+    kind = str(MODEL_REGISTRY[model_name]["potential_kind"])
+    if kind != "linear":
+        raise NotImplementedError(
+            f"model {model_name!r} has a contact-quadratic potential "
+            f"(potential_kind={kind!r}); this sampler only implements the linear "
+            f"contact potential u = b(T)*m and would silently drop the "
+            f"{QUADRATIC_NORMALIZATION} term. Use it with the fitters, not here."
+        )
 
 
 def reduced_potential(m, T, model_name, params, Tref, Tscale) -> float:
@@ -4686,6 +4831,12 @@ def main() -> None:
             model_name, model_params, param_names, Tref, Tscale,
             parameter_source, fit_summary_json,
         ) = resolve_model_params(args, Ts)
+
+    # The sampler below implements u = b(T)*m (+ the fixed bending penalty). A
+    # contact-quadratic model would have its m^2/(2N) term silently dropped, so
+    # refuse it here rather than write distributions labelled with a model that
+    # was not the one sampled.
+    require_linear_contact_potential(model_name)
 
     nT = len(Ts)
 

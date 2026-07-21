@@ -821,24 +821,40 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
             raise ValueError(
                 f"param_names differ for {name!r}: fitter={fn} remd={rn}"
             )
+        # potential_kind and quadratic_normalization define WHAT is being
+        # reweighted, so a disagreement is as fatal as a parameter-order one:
+        # the two scripts would be exponentiating different potentials.
+        for key in ("potential_kind", "quadratic_normalization"):
+            fv = fit_contract["models"][name][key]
+            rv = remd_contract["models"][name][key]
+            if fv != rv:
+                raise ValueError(
+                    f"{key} differs for {name!r}: fitter={fv!r} remd={rv!r}"
+                )
 
-    # Numeric b(T) equality using the fitter's x0 for each model.
+    # Numeric b(T) and kappa(T) equality using the fitter's x0 for each model.
     fit_reg = fit_mod.MODEL_REGISTRY
     remd_reg = remd_mod.MODEL_REGISTRY
     for name in sorted(fit_models):
         x0 = list(fit_reg[name]["x0"])
-        fb = fit_reg[name]["raw_b_fn"]
-        rb = remd_reg[name]["raw_b_fn"]
-        for T in BFN_CHECK_T:
-            vf = float(fb(x0, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
-            vr = float(rb(x0, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
-            if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
-                raise ValueError(
-                    f"b(T) mismatch for {name!r} at T={T}: fitter={vf!r} "
-                    f"remd={vr!r}"
-                )
+        for coeff, key in (("b", "raw_b_fn"), ("kappa", "raw_q_fn")):
+            ff = fit_reg[name][key]
+            rf = remd_reg[name][key]
+            for T in BFN_CHECK_T:
+                vf = float(ff(x0, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
+                vr = float(rf(x0, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
+                if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
+                    raise ValueError(
+                        f"{coeff}(T) mismatch for {name!r} at T={T}: "
+                        f"fitter={vf!r} remd={vr!r}"
+                    )
+    n_quadratic = sum(
+        1 for name in fit_models
+        if fit_contract["models"][name]["potential_kind"] != "linear"
+    )
     log(f"Preflight: model contract OK (api v{fit_contract['model_api_version']}, "
-        f"{len(fit_models)} models, numeric b(T) equal).")
+        f"{len(fit_models)} models, {n_quadratic} contact-quadratic, "
+        f"numeric b(T) and kappa(T) equal).")
     return fit_contract
 
 

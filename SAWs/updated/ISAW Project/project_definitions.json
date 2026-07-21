@@ -119,6 +119,6 @@
     "feature_schema_version": 4,
     "diagnostic_trajectory_schema_version": 2,
     "calibration_report_schema_version": 2,
-    "model_api_version": 1
+    "model_api_version": 2
   }
 }
