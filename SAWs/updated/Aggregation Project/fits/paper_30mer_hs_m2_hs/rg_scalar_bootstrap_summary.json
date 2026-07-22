@@ -1,0 +1,181 @@
+{
+  "mode": "rg_scalar",
+  "n_requested": 200,
+  "n_successful": 200,
+  "n_failed": 0,
+  "confidence": 0.95,
+  "seed": 123,
+  "method": "temperature",
+  "n_replicates_with_collapse": 200,
+  "collapse_note": "T_rg_max_slope statistics are computed only over replicates whose fitted curve showed a resolved collapse; replicates without one contribute no transition temperature rather than a spurious value.",
+  "statistics": {
+    "h1": {
+      "fitted": 1142.2436132670632,
+      "mean": 629.5782277727527,
+      "median": 444.308431419053,
+      "std": 459.3474699736693,
+      "bias": -512.6653854943105,
+      "ci_low": 93.58468021500182,
+      "ci_high": 1846.153503955368,
+      "confidence": 0.95,
+      "cv": 0.7296114282711053,
+      "n": 200
+    },
+    "s1": {
+      "fitted": -2.985310462245468,
+      "mean": -2.469577015343717,
+      "median": -2.993406172583262,
+      "std": 1.6803965790271798,
+      "bias": 0.5157334469017507,
+      "ci_low": -3.2038373546699472,
+      "ci_high": 4.390618888379513,
+      "confidence": 0.95,
+      "cv": 0.6804390260302537,
+      "n": 200
+    },
+    "h2": {
+      "fitted": -2000.0,
+      "mean": -625.0419892051141,
+      "median": -283.91815005773356,
+      "std": 830.6716651961578,
+      "bias": 1374.958010794886,
+      "ci_low": -2000.0,
+      "ci_high": 353.0488784493576,
+      "confidence": 0.95,
+      "cv": 1.3289853794503463,
+      "n": 200
+    },
+    "s2": {
+      "fitted": 9.997869985507446,
+      "mean": 9.390766632588292,
+      "median": 10.0,
+      "std": 2.3466750187831926,
+      "bias": -0.6071033529191538,
+      "ci_low": 4.153033751932902,
+      "ci_high": 10.0,
+      "confidence": 0.95,
+      "cv": 0.24989174053582033,
+      "n": 200
+    },
+    "T_bias_zero": {
+      "fitted": null,
+      "mean": 333.753936888259,
+      "median": 331.59229936161074,
+      "std": 20.2609882783987,
+      "bias": null,
+      "ci_low": 309.3194475008523,
+      "ci_high": 358.20051808481725,
+      "confidence": 0.95,
+      "cv": 0.06070636489654979,
+      "n": 5
+    },
+    "T_rg_max_slope": {
+      "fitted": 311.4,
+      "mean": 313.0446,
+      "median": 311.4,
+      "std": 5.9234654417832155,
+      "bias": 1.6446000000000254,
+      "ci_low": 308.742,
+      "ci_high": 334.374,
+      "confidence": 0.95,
+      "cv": 0.01892211346812312,
+      "n": 200
+    },
+    "train_rmse": {
+      "fitted": null,
+      "mean": 0.08833216515578396,
+      "median": 0.07881324464000325,
+      "std": 0.02893289819294117,
+      "bias": null,
+      "ci_low": 0.07526123614658556,
+      "ci_high": 0.18888140810593915,
+      "confidence": 0.95,
+      "cv": 0.3275465753829838,
+      "n": 200
+    },
+    "validation_rmse": {
+      "fitted": null,
+      "mean": 0.07995330950874242,
+      "median": 0.06979305431156735,
+      "std": 0.03114174549843301,
+      "bias": null,
+      "ci_low": 0.06293452211220917,
+      "ci_high": 0.1725506260450465,
+      "confidence": 0.95,
+      "cv": 0.38949914255929385,
+      "n": 200
+    },
+    "all_rmse": {
+      "fitted": null,
+      "mean": 0.0852925291976045,
+      "median": 0.07516363521602379,
+      "std": 0.029556425934198896,
+      "bias": null,
+      "ci_low": 0.07151751930777334,
+      "ci_high": 0.17607014561281806,
+      "confidence": 0.95,
+      "cv": 0.346530067899886,
+      "n": 200
+    },
+    "train_objective": {
+      "fitted": null,
+      "mean": 0.00863968399895179,
+      "median": 0.006211527650527376,
+      "std": 0.00863009097839086,
+      "bias": null,
+      "ci_low": 0.005664253671147112,
+      "ci_high": 0.03567653183872791,
+      "confidence": 0.95,
+      "cv": 0.9988896560844015,
+      "n": 200
+    },
+    "validation_objective": {
+      "fitted": null,
+      "mean": 0.007362340014089934,
+      "median": 0.004871072398720584,
+      "std": 0.008516746442967758,
+      "bias": null,
+      "ci_low": 0.003960754125018949,
+      "ci_high": 0.029791255662351274,
+      "confidence": 0.95,
+      "cv": 1.1567988474681337,
+      "n": 200
+    },
+    "all_objective": {
+      "fitted": null,
+      "mean": 0.008148397850928,
+      "median": 0.005649572270539112,
+      "std": 0.008532337105320704,
+      "bias": null,
+      "ci_low": 0.005114755571364694,
+      "ci_high": 0.031015008556953286,
+      "confidence": 0.95,
+      "cv": 1.0471183736259244,
+      "n": 200
+    }
+  },
+  "bound_fractions": {
+    "h1": {
+      "at_lower": 0.0,
+      "at_upper": 0.025,
+      "at_any": 0.025
+    },
+    "s1": {
+      "at_lower": 0.0,
+      "at_upper": 0.0,
+      "at_any": 0.0
+    },
+    "h2": {
+      "at_lower": 0.12,
+      "at_upper": 0.0,
+      "at_any": 0.12
+    },
+    "s2": {
+      "at_lower": 0.0,
+      "at_upper": 0.85,
+      "at_any": 0.85
+    }
+  },
+  "correlation_flags": [],
+  "warning": "Empirical temperature-resampling bootstrap over a small temperature ladder. NOT a likelihood-based formal uncertainty: the scalar-Rg objective is not a log-likelihood."
+}

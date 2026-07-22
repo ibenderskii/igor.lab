@@ -1,0 +1,67 @@
+{
+  "mode": "rg_scalar",
+  "param_names": [
+    "h1",
+    "s1",
+    "h2",
+    "s2"
+  ],
+  "params": [
+    1142.2436132670632,
+    -2.985310462245468,
+    -2000.0,
+    9.997869985507446
+  ],
+  "rg_scale_was_fitted": false,
+  "hessian": [
+    [
+      0.00013089866418382852,
+      -0.0407264666478003,
+      5.672742516985644e-05,
+      -0.017649654082295425
+    ],
+    [
+      -0.0407264666478003,
+      12.703974698241296,
+      -0.017649772234494356,
+      5.505510105508947
+    ],
+    [
+      5.672742516985644e-05,
+      -0.017649772234494356,
+      2.458421775090001e-05,
+      -0.007648896115398185
+    ],
+    [
+      -0.017649654082295425,
+      5.505510105508947,
+      -0.007648896115398185,
+      2.3859631189869073
+    ]
+  ],
+  "hessian_diagnostics": {
+    "eigenvalues": [
+      2.59668966412504e-10,
+      4.0037626928843696e-07,
+      3.801037369547923e-05,
+      15.090054889100497
+    ],
+    "condition_number": 58112662046.52577,
+    "positive_definite": true,
+    "curvature_length_scales": [
+      24650.38108146125,
+      64.6728814599809,
+      56972.91769569106,
+      148.90893017193997
+    ],
+    "note": "Local objective-curvature diagnostics only. The scalar-Rg regression objective is NOT a log-likelihood; inverse-Hessian quantities are curvature length-scales, not statistical standard errors."
+  },
+  "restart_stability": {
+    "n_restarts": 32,
+    "n_success": 32,
+    "best_objective": 0.00574677096587276,
+    "distinct_minima": true,
+    "n_distinct_objectives": 28,
+    "max_param_spread": 5193.154856733554
+  }
+}
