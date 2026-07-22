@@ -453,8 +453,39 @@ def test_generic_interface_present_in_every_module():
             assert callable(getattr(mod, name)), (mod.__name__, name)
 
 
-def test_remd_sampler_refuses_contact_quadratic_models():
-    """The samplers must not silently drop the m^2 term (registry-only support)."""
+def test_remd_sampler_samples_contact_quadratic_models():
+    """The single-chain sampler now samples the full u = b*m + kappa*m^2/(2N).
+
+    The single-chain sampler no longer refuses contact-quadratic models; it
+    evaluates the generic potential through ``reduced_contact_potential`` at the
+    runtime chain length.  Zero curvature must still nest hs bit-for-bit, and a
+    nonzero curvature must change the acceptance criterion (proving the m^2 term
+    is not silently dropped).  The ``require_linear_contact_potential`` guard is
+    retained (linear-only samplers such as the multi-chain sampler import it) but
+    is no longer invoked by this sampler.
+    """
+    N = 24
+    Tref, Tscale = TREF, TSCALE
+    T = 330.0
+    hs_p = np.array([700.0, 2.4])
+    # Zero curvature nests hs exactly for both new models.
+    for model, p in (("hs_m2_const", [700.0, 2.4, 0.0]),
+                     ("hs_m2_hs", [700.0, 2.4, 0.0, 0.0])):
+        for m in (0.0, 5.0, 12.0):
+            assert remd.reduced_contact_potential(
+                m, T, model, np.array(p), Tref, Tscale, N
+            ) == remd.reduced_contact_potential(m, T, "hs", hs_p, Tref, Tscale, N)
+    # Nonzero curvature adds exactly kappa(T) * m^2 / (2N).
+    kappa = 0.75
+    p = np.array([700.0, 2.4, kappa])
+    for m in (3.0, 8.0, 15.0):
+        base = remd.reduced_contact_potential(m, T, "hs", hs_p, Tref, Tscale, N)
+        got = remd.reduced_contact_potential(m, T, "hs_m2_const", p, Tref, Tscale, N)
+        assert got == pytest.approx(base + kappa * m ** 2 / (2.0 * N), rel=1e-13)
+
+    # The linear-only guard is retained for samplers that still need it (the
+    # multi-chain sampler imports it): it passes linear models and refuses the
+    # contact-quadratic ones.
     for model in LEGACY_MODELS:
         remd.require_linear_contact_potential(model)   # no raise
     for model in NEW_MODELS:

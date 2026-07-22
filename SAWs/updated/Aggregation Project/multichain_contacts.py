@@ -101,6 +101,59 @@ def full_contact_counts(state: MultiChainState) -> ContactCounts:
         state.coords_unwrapped, state.site_owner, state.box_size)
 
 
+def full_contacts_split(
+    coords_unwrapped: np.ndarray, site_owner: Dict[Site, int], box_size: int,
+) -> Tuple[np.ndarray, int]:
+    """Authoritative (intra_by_chain, inter_total) from an occupancy map.
+
+    ``intra_by_chain`` is an ``(M,)`` int64 array whose entry ``alpha`` is the
+    number of unique nonbonded nearest-neighbour intrachain contacts on chain
+    ``alpha``; ``inter_total`` is the total interchain contact count.  By
+    construction ``int(intra_by_chain.sum()) == full_contact_counts_from_map(
+    ...).intra`` and the returned ``inter_total`` equals its ``.inter`` -- this
+    is the single per-chain-resolved pass that seeds
+    :attr:`MultiChainState.intra_contacts_by_chain`.
+    """
+    M = int(coords_unwrapped.shape[0])
+    N = int(coords_unwrapped.shape[1])
+    L = int(box_size)
+    intra_by_chain = np.zeros(M, dtype=np.int64)
+    inter = 0
+    for site, gid in site_owner.items():
+        gid = int(gid)
+        ci = gid // N
+        mi = gid % N
+        sx, sy, sz = site
+        for dx, dy, dz in NN6:
+            s2 = ((sx + dx) % L, (sy + dy) % L, (sz + dz) % L)
+            g2 = site_owner.get(s2)
+            if g2 is None:
+                continue
+            g2 = int(g2)
+            if g2 <= gid:
+                continue  # count each unordered pair exactly once
+            if ci == (g2 // N):
+                if abs(mi - (g2 % N)) == 1:
+                    continue  # covalently bonded: excluded from intrachain
+                intra_by_chain[ci] += 1
+            else:
+                inter += 1
+    return intra_by_chain, int(inter)
+
+
+def full_intra_contacts_by_chain(
+    coords_unwrapped: np.ndarray, site_owner: Dict[Site, int], box_size: int,
+) -> np.ndarray:
+    """Per-chain intrachain contact counts ``(M,)`` (see :func:`full_contacts_split`)."""
+    return full_contacts_split(coords_unwrapped, site_owner, box_size)[0]
+
+
+def full_intra_contacts_by_chain_state(state: MultiChainState) -> np.ndarray:
+    """Per-chain intrachain contact counts for a :class:`MultiChainState`."""
+    return full_intra_contacts_by_chain(
+        state.coords_unwrapped, state.site_owner, state.box_size)
+
+
 # ---------------------------------------------------------------------------
 # Local delta-contact algorithm (production path)
 # ---------------------------------------------------------------------------
@@ -199,7 +252,13 @@ def apply_moved_beads(
 
     ``moved`` maps each moved global ID to its NEW unwrapped coordinate.
     Updates ``coords_unwrapped``, ``site_owner`` (removing old wrapped sites and
-    inserting new ones), and the cached contact counts by ``delta``.
+    inserting new ones), the cached contact counts by ``delta``, and the
+    per-chain intrachain cache ``intra_contacts_by_chain``.
+
+    Every proposal moves beads of a SINGLE chain, so the whole intrachain delta
+    ``delta[0]`` is attributed to that chain (inferred from the moved beads'
+    global IDs).  The invariant ``intra_contacts_by_chain.sum() == counts.intra``
+    is therefore preserved by construction.
     """
     N = state.chain_length
     L = int(state.box_size)
@@ -207,8 +266,11 @@ def apply_moved_beads(
     # vacated site does not clobber it).
     for g in moved:
         state.site_owner.pop(_wrapped_site(state, g), None)
+    moved_chain = None
     for g, new_pos in moved.items():
         c = int(g) // N
+        if moved_chain is None:
+            moved_chain = c
         i = int(g) % N
         state.coords_unwrapped[c, i, 0] = int(new_pos[0])
         state.coords_unwrapped[c, i, 1] = int(new_pos[1])
@@ -217,6 +279,9 @@ def apply_moved_beads(
         state.site_owner[site] = int(g)
     state.counts.intra = int(state.counts.intra) + int(delta[0])
     state.counts.inter = int(state.counts.inter) + int(delta[1])
+    if moved_chain is not None:
+        state.intra_contacts_by_chain[moved_chain] = (
+            int(state.intra_contacts_by_chain[moved_chain]) + int(delta[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -258,11 +323,22 @@ def interchain_pair_counts(state: MultiChainState) -> Dict[Tuple[int, int], int]
 # ---------------------------------------------------------------------------
 
 def assert_counts_match(state: MultiChainState, context: str = "") -> None:
-    """Assert cached counts equal the full oracle (used under DEBUG_CONTACTS)."""
-    recount = full_contact_counts(state)
-    if (int(state.counts.intra) != int(recount.intra)
-            or int(state.counts.inter) != int(recount.inter)):
+    """Assert cached counts equal the full oracle (used under DEBUG_CONTACTS).
+
+    Also verifies the per-chain intrachain cache: it must equal a full per-chain
+    recount element-by-element (which implies ``sum == counts.intra``).
+    """
+    intra_by_chain, inter = full_contacts_split(
+        state.coords_unwrapped, state.site_owner, state.box_size)
+    recount_intra = int(intra_by_chain.sum())
+    if (int(state.counts.intra) != recount_intra
+            or int(state.counts.inter) != int(inter)):
         raise AssertionError(
             f"cached counts (intra={state.counts.intra}, "
             f"inter={state.counts.inter}) != full recount "
-            f"(intra={recount.intra}, inter={recount.inter}){' ' + context if context else ''}")
+            f"(intra={recount_intra}, inter={inter}){' ' + context if context else ''}")
+    cached = np.asarray(state.intra_contacts_by_chain, dtype=np.int64)
+    if not np.array_equal(cached, intra_by_chain):
+        raise AssertionError(
+            f"cached intra_contacts_by_chain {cached.tolist()} != full per-chain "
+            f"recount {intra_by_chain.tolist()}{' ' + context if context else ''}")

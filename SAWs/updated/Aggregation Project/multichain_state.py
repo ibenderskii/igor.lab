@@ -170,12 +170,35 @@ class MultiChainState:
         optional fixed bending penalty depends on it).  Maintained incrementally
         by the moves exactly like ``counts``; defaults to 0 so states built by
         older code or a straight chain keep their previous behaviour.
+    intra_contacts_by_chain : np.ndarray
+        Cached per-chain intrachain contact counts, shape ``(M,)`` int64, with
+        the invariant ``intra_contacts_by_chain.sum() == counts.intra``.  The
+        contact-quadratic contact potential applies ``kappa(T) * m_alpha^2/(2N)``
+        PER CHAIN, so the aggregate ``counts.intra`` is insufficient; this cache
+        supplies each chain's ``m_alpha``.  Maintained incrementally by the moves
+        exactly like ``counts``.  When constructed as ``None`` it is recomputed
+        from a full per-chain recount in :meth:`__post_init__`, so every
+        construction path is consistent.
     """
     coords_unwrapped: np.ndarray
     site_owner: dict
     counts: ContactCounts
     box_size: int
     n_bend: int = 0
+    intra_contacts_by_chain: np.ndarray = None
+
+    def __post_init__(self) -> None:
+        # Keep the per-chain intrachain cache authoritative for every constructor.
+        # Callers that already hold the vector (copy, worker reconstruction,
+        # make_state) pass it explicitly; direct constructions that omit it get a
+        # full per-chain recount here so the invariant always holds.
+        if self.intra_contacts_by_chain is None:
+            from multichain_contacts import full_intra_contacts_by_chain
+            self.intra_contacts_by_chain = full_intra_contacts_by_chain(
+                self.coords_unwrapped, self.site_owner, int(self.box_size))
+        else:
+            self.intra_contacts_by_chain = np.asarray(
+                self.intra_contacts_by_chain, dtype=np.int64)
 
     # -- shape helpers ------------------------------------------------------
     @property
@@ -213,6 +236,7 @@ class MultiChainState:
             counts=self.counts.copy(),
             box_size=int(self.box_size),
             n_bend=int(self.n_bend),
+            intra_contacts_by_chain=self.intra_contacts_by_chain.copy(),
         )
 
 
@@ -228,11 +252,13 @@ def make_state(coords_unwrapped: np.ndarray, box_size: int) -> MultiChainState:
     _check_box_size(L)
     site_owner = build_site_owner(coords, L)
     # Local import breaks the module-load cycle (contacts imports this module).
-    from multichain_contacts import full_contact_counts_from_map
-    counts = full_contact_counts_from_map(coords, site_owner, L)
+    from multichain_contacts import full_contacts_split
+    intra_by_chain, inter = full_contacts_split(coords, site_owner, L)
+    counts = ContactCounts(int(intra_by_chain.sum()), int(inter))
     return MultiChainState(
         coords_unwrapped=coords, site_owner=site_owner, counts=counts,
         box_size=L, n_bend=total_bend_count(coords),
+        intra_contacts_by_chain=intra_by_chain,
     )
 
 
@@ -370,15 +396,37 @@ def validate_state(state: MultiChainState, *, check_contacts: bool = True) -> No
         raise MultiChainStateError(
             "site_owner global IDs are not a permutation of 0..M*N-1")
 
+    # The per-chain intrachain cache must be an (M,) nonnegative integer array
+    # whose sum equals the aggregate intra count (checked always -- it is cheap
+    # and does not depend on ``check_contacts``).
+    ibc = np.asarray(state.intra_contacts_by_chain)
+    if ibc.shape != (M,) or ibc.dtype.kind not in ("i", "u"):
+        raise MultiChainStateError(
+            f"intra_contacts_by_chain must be an (M,) integer array; got shape "
+            f"{ibc.shape} dtype {ibc.dtype!r}")
+    if np.any(ibc < 0):
+        raise MultiChainStateError(
+            "intra_contacts_by_chain has a negative entry")
+    if int(ibc.sum()) != int(state.counts.intra):
+        raise MultiChainStateError(
+            f"intra_contacts_by_chain.sum()={int(ibc.sum())} disagrees with "
+            f"cached counts.intra={int(state.counts.intra)}")
+
     if check_contacts:
-        from multichain_contacts import full_contact_counts
-        recount = full_contact_counts(state)
-        if (int(state.counts.intra) != int(recount.intra)
-                or int(state.counts.inter) != int(recount.inter)):
+        from multichain_contacts import full_contacts_split
+        recount_intra_by_chain, recount_inter = full_contacts_split(
+            coords, state.site_owner, L)
+        recount_intra = int(recount_intra_by_chain.sum())
+        if (int(state.counts.intra) != recount_intra
+                or int(state.counts.inter) != int(recount_inter)):
             raise MultiChainStateError(
                 f"cached contact counts (intra={state.counts.intra}, "
                 f"inter={state.counts.inter}) disagree with full recount "
-                f"(intra={recount.intra}, inter={recount.inter})")
+                f"(intra={recount_intra}, inter={recount_inter})")
+        if not np.array_equal(ibc.astype(np.int64), recount_intra_by_chain):
+            raise MultiChainStateError(
+                f"cached intra_contacts_by_chain {ibc.tolist()} disagrees with "
+                f"full per-chain recount {recount_intra_by_chain.tolist()}")
         # The cached bending count is maintained the same way as the contacts and
         # is verified against a full recount here.  It tracks pure geometry, so it
         # is checked for every run regardless of the (sampling-only) kappa_bend.

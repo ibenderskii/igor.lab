@@ -1004,5 +1004,397 @@ def test_recorded_u_and_effective_energy_include_bending():
     assert saw_nonzero_bend, "test never exercised a nonzero bending contribution"
 
 
+# ---------------------------------------------------------------------------
+# Contact-quadratic models: per-chain intrachain m^2/(2N), linear interchain
+# ---------------------------------------------------------------------------
+
+CONST_P = [700.0, 2.4, 0.9]        # hs_m2_const: h1, s1, kappa2
+CONST_P0 = [700.0, 2.4, 0.0]       # hs_m2_const with zero curvature
+HSHS_P = [700.0, 2.4, 300.0, 0.8]  # hs_m2_hs: h1, s1, h2, s2
+HSHS_P0 = [700.0, 2.4, 0.0, 0.0]   # hs_m2_hs with zero curvature
+QTREF, QTSCALE = 320.0, 80.0
+
+
+def test_per_chain_cache_equals_full_recount():
+    # (1) The cached per-chain intrachain vector equals a full per-chain recount
+    # for several dispersed states, and stays exact after many accepted moves.
+    for seed in (1, 5, 9, 17):
+        state = mcs.initialize_dispersed_state(4, 8, 12, seed=seed)
+        recount = mcc.full_intra_contacts_by_chain_state(state)
+        assert np.array_equal(state.intra_contacts_by_chain, recount)
+    # After a long mixed athermal sweep the per-chain cache still matches.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=42)
+    counters = mvs.new_move_counters()
+    rmc.mc_sweep(state, counters, 330.0, "hs", [0.0, 0.0], 330.0, 40.0,
+                 lambda_intra=0.0, lambda_inter=0.0,
+                 n_local=1500, n_translation=300, rng=random.Random(7),
+                 n_reptation=300, n_rotation=300, debug_contacts=True)
+    assert np.array_equal(state.intra_contacts_by_chain,
+                          mcc.full_intra_contacts_by_chain_state(state))
+
+
+def test_per_chain_sum_equals_total_intra():
+    # (2) sum(intra_contacts_by_chain) == counts.intra for dispersed states and
+    # after moves (validate_state also enforces this invariant).
+    for seed in (2, 8, 14):
+        state = mcs.initialize_dispersed_state(4, 8, 12, seed=seed)
+        assert int(state.intra_contacts_by_chain.sum()) == int(state.counts.intra)
+        counters = mvs.new_move_counters()
+        rmc.mc_sweep(state, counters, 330.0, "hs_m2_const", CONST_P, QTREF, QTSCALE,
+                     lambda_intra=1.0, lambda_inter=1.0,
+                     n_local=400, n_translation=80, rng=random.Random(seed),
+                     n_reptation=80, n_rotation=80, debug_contacts=True)
+        assert int(state.intra_contacts_by_chain.sum()) == int(state.counts.intra)
+        mcs.validate_state(state)
+
+
+def test_legacy_linear_potential_equals_aggregate_formula():
+    # (3) For linear models the state-aware potential is bit-for-bit identical to
+    # the historical aggregate-count formula (reduced_potential_counts).
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=7)
+    for T in (300.0, 330.0, 345.0):
+        for li, lin in ((1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.7, 0.3)):
+            u_state = rmc.reduced_contact_potential_state(
+                state, T, *MP, li, lin)
+            u_agg = rmc.reduced_potential_counts(state.counts, T, *MP, li, lin)
+            assert u_state == u_agg
+            # And the full (bending) potential matches too.
+            u_full = rmc.reduced_potential_state(state, T, *MP, li, lin,
+                                                 kappa_bend=0.5)
+            u_full_agg = rmc.reduced_potential_bending_counts(
+                state.counts, T, *MP, li, lin, kappa_bend=0.5,
+                n_bend=state.n_bend)
+            assert u_full == u_full_agg
+
+
+def test_aggregate_helpers_reject_contact_quadratic():
+    # The aggregate-ContactCounts compatibility helpers cannot determine
+    # sum_alpha m_alpha^2 and must reject the contact-quadratic models loudly.
+    c = ContactCounts(4, 2)
+    for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
+        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+            rmc.reduced_potential_counts(c, 330.0, model, p, QTREF, QTSCALE, 1.0, 1.0)
+        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+            rmc.reduced_potential_bending_counts(
+                c, 330.0, model, p, QTREF, QTSCALE, 1.0, 1.0,
+                kappa_bend=0.3, n_bend=5)
+        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+            rmc.swap_log_accept_counts(c, c, 300.0, 350.0, model, p, QTREF,
+                                       QTSCALE, 1.0, 1.0)
+
+
+def test_m1_full_potential_matches_single_chain_quadratic():
+    # (4) For M = 1 the multichain full reduced potential (per-chain contacts +
+    # bending) equals the single-chain reduced_potential_bending for both new
+    # models, with bending off and on.
+    rng = np.random.RandomState(4)
+    for _ in range(6):
+        saw = mcs.generate_saw(18, rng)
+        state = mcs.make_state(np.stack([saw]), 60)
+        m = int(state.counts.intra)
+        assert state.counts.inter == 0
+        for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
+            for T in (300.0, 342.0):
+                for kappa in (0.0, 0.8):
+                    u_mc = rmc.reduced_potential_state(
+                        state, T, model, p, QTREF, QTSCALE, 1.0, 1.0,
+                        kappa_bend=kappa)
+                    u_ref = remd.reduced_potential_bending(
+                        m, T, model, p, QTREF, QTSCALE, kappa_bend=kappa,
+                        n_bend=state.n_bend, n_beads=state.chain_length)
+                    assert abs(u_mc - u_ref) < 1e-9
+
+
+def test_two_separated_chains_additive_intrachain_energy():
+    # (5) Two well-separated chains (m_inter = 0) have an intrachain contact
+    # potential equal to the sum of each chain's single-chain contact potential.
+    N, L = 8, 40
+    rng = np.random.RandomState(23)
+    A = mcs.generate_saw(N, rng)
+    B = mcs.generate_saw(N, rng) + np.array([0, 20, 0], dtype=np.int64)
+    state = mcs.make_state(np.stack([A, B]), L)
+    assert int(state.counts.inter) == 0
+    for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
+        for T in (305.0, 348.0):
+            u_total = rmc.reduced_contact_potential_state(
+                state, T, model, p, QTREF, QTSCALE, 1.0, 0.0)
+            u_a = remd.reduced_contact_potential(
+                int(state.intra_contacts_by_chain[0]), T, model, p, QTREF,
+                QTSCALE, N)
+            u_b = remd.reduced_contact_potential(
+                int(state.intra_contacts_by_chain[1]), T, model, p, QTREF,
+                QTSCALE, N)
+            assert abs(u_total - (u_a + u_b)) < 1e-9
+
+
+def test_interchain_only_change_leaves_quadratic_intra_unchanged():
+    # (6) A whole-chain translation changes only interchain contacts (intrachain
+    # counts are preserved), so the per-chain quadratic intra potential is
+    # unchanged while the linear interchain term absorbs the whole delta.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=17)
+    model, p, T = "hs_m2_const", CONST_P, 330.0
+
+    def intra_u(st):
+        N = st.chain_length
+        return sum(remd.reduced_contact_potential(int(m), T, model, p, QTREF,
+                                                  QTSCALE, N)
+                   for m in st.intra_contacts_by_chain)
+    before_intra_u = intra_u(state)
+    before_ibc = state.intra_contacts_by_chain.copy()
+    rng = random.Random(3)
+    n_trans = 0
+    for _ in range(400):
+        prop = mvs.propose_translation(state, rng)
+        if not prop.ok:
+            continue
+        d_intra, d_inter = mvs.proposal_delta(state, prop)
+        assert d_intra == 0, "translation must not change intrachain contacts"
+        mvs.apply_proposal(state, prop, (d_intra, d_inter))
+        n_trans += 1
+    assert n_trans > 0
+    assert np.array_equal(state.intra_contacts_by_chain, before_ibc)
+    assert abs(intra_u(state) - before_intra_u) < 1e-12
+
+
+def test_rigid_translation_preserves_intra_and_bending():
+    # (7) A rigid whole-chain translation preserves both the per-chain intrachain
+    # counts and the total bend count (isometry): the intra + bending
+    # contributions to the potential are unchanged.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=31)
+    ibc0 = state.intra_contacts_by_chain.copy()
+    n_bend0 = state.n_bend
+    rng = random.Random(5)
+    n_applied = 0
+    for _ in range(500):
+        prop = mvs.propose_translation(state, rng)
+        if not prop.ok:
+            continue
+        assert mvs.proposal_delta_bends(state, prop) == 0
+        d_intra, d_inter = mvs.proposal_delta(state, prop)
+        assert d_intra == 0
+        mvs.apply_proposal(state, prop, (d_intra, d_inter))
+        n_applied += 1
+    assert n_applied > 0
+    assert np.array_equal(state.intra_contacts_by_chain, ibc0)
+    assert state.n_bend == n_bend0
+
+
+def test_quadratic_lambda_control_modes():
+    # (8) The four lambda modes select the intended contributions for a
+    # contact-quadratic model.  Build a state with both intra and inter contacts.
+    state = mcs.initialize_dispersed_state(4, 8, 12, seed=6)
+    model, p, T = "hs_m2_hs", HSHS_P, 335.0
+    N = state.chain_length
+    b = remd.reduced_bias(model, p, T, QTREF, QTSCALE)
+    intra_u = sum(remd.reduced_contact_potential(int(m), T, model, p, QTREF,
+                                                 QTSCALE, N)
+                  for m in state.intra_contacts_by_chain)
+    inter = int(state.counts.inter)
+    assert inter > 0 and int(state.counts.intra) > 0
+    # (0,0): no contacts.
+    assert rmc.reduced_contact_potential_state(
+        state, T, model, p, QTREF, QTSCALE, 0.0, 0.0) == 0.0
+    # (1,0): per-chain quadratic intra only.
+    u10 = rmc.reduced_contact_potential_state(state, T, model, p, QTREF, QTSCALE,
+                                              1.0, 0.0)
+    assert abs(u10 - intra_u) < 1e-9
+    # (0,1): linear interchain only.
+    u01 = rmc.reduced_contact_potential_state(state, T, model, p, QTREF, QTSCALE,
+                                              0.0, 1.0)
+    assert abs(u01 - b * inter) < 1e-9
+    # (1,1): both.
+    u11 = rmc.reduced_contact_potential_state(state, T, model, p, QTREF, QTSCALE,
+                                              1.0, 1.0)
+    assert abs(u11 - (intra_u + b * inter)) < 1e-9
+    # (0,0) with bending stays nonzero when kappa_bend != 0 (contacts off does
+    # NOT disable bending).
+    u_bend = rmc.reduced_potential_state(state, T, model, p, QTREF, QTSCALE,
+                                         0.0, 0.0, kappa_bend=0.5)
+    assert abs(u_bend - 0.5 * state.n_bend) < 1e-12
+
+
+def test_full_state_swap_matches_manual_four_potential_quadratic():
+    # (9) The generalized full-state swap equals a manual four-potential
+    # calculation for the contact-quadratic models, and the fixed bending penalty
+    # cancels (it never enters the swap).
+    sa = mcs.initialize_dispersed_state(3, 8, 12, seed=21)
+    sb = mcs.initialize_dispersed_state(3, 8, 12, seed=22)
+    Ti, Tj = 305.0, 350.0
+    for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
+        def u(state, T):
+            return rmc.reduced_contact_potential_state(
+                state, T, model, p, QTREF, QTSCALE, 1.0, 0.6)
+        manual = u(sa, Ti) + u(sb, Tj) - u(sb, Ti) - u(sa, Tj)
+        got = rmc.swap_log_accept_state(sa, sb, Ti, Tj, model, p, QTREF, QTSCALE,
+                                        1.0, 0.6)
+        assert abs(got - manual) < 1e-9
+        # attempt_swap uses exactly this log-acceptance (favorable -> no draw).
+        ra = rmc.MultiReplica(T=Ti, state=sa.copy())
+        rb = rmc.MultiReplica(T=Tj, state=sb.copy())
+        if manual >= 0.0:
+            stub = _StubRng(1.0)
+            assert rmc.attempt_swap(ra, rb, model, p, QTREF, QTSCALE, 1.0, 0.6,
+                                    stub) is True
+            assert stub.calls == 0
+
+
+def _run_quadratic(model, p, n_workers, kappa=0.0, seed=13, n_cycles=12):
+    Ts = np.linspace(305, 350, 4)
+    return rmc.run_remd_multichain(
+        n_chains=2, chain_length=8, box_size=10, Ts=Ts,
+        local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=n_cycles,
+        model_name=model, params=p, Tref=QTREF, Tscale=QTSCALE,
+        lambda_intra=1.0, lambda_inter=1.0, kappa_bend=kappa,
+        seed=seed, n_workers=n_workers, verbose=False, debug_contacts=True), Ts
+
+
+def test_serial_vs_workers_determinism_quadratic():
+    # (10) Serial and multiprocessing runs are bit-identical for the
+    # contact-quadratic models (with bending off and on), including the per-chain
+    # cache carried across the process boundary.
+    for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
+        for kappa in (0.0, 0.5):
+            (r1, sp1, sa1, wh1), _ = _run_quadratic(model, p, 1, kappa)
+            (r2, sp2, sa2, wh2), _ = _run_quadratic(model, p, 2, kappa)
+            assert np.array_equal(sp1, sp2) and np.array_equal(sa1, sa2)
+            assert np.array_equal(wh1, wh2)
+            for a, b in zip(r1, r2):
+                assert np.array_equal(a.state.coords_unwrapped,
+                                      b.state.coords_unwrapped)
+                assert a.state.counts.as_tuple() == b.state.counts.as_tuple()
+                assert np.array_equal(a.state.intra_contacts_by_chain,
+                                      b.state.intra_contacts_by_chain)
+                assert a.state.n_bend == b.state.n_bend
+                assert np.allclose(a.u_traj, b.u_traj)
+                assert np.array_equal(a.move_counters, b.move_counters)
+                mcs.validate_state(a.state)
+
+
+def test_hs_m2_const_zero_curvature_matches_hs():
+    # hs_m2_const(kappa2=0) and hs_m2_hs(h2=s2=0) reduce to hs: equal potential
+    # for the same state, temperature and lambdas.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=11)
+    for T in (300.0, 340.0):
+        for li, lin in ((1.0, 1.0), (1.0, 0.0), (0.0, 1.0)):
+            u_hs = rmc.reduced_contact_potential_state(
+                state, T, "hs", [700.0, 2.4], QTREF, QTSCALE, li, lin)
+            u_c0 = rmc.reduced_contact_potential_state(
+                state, T, "hs_m2_const", CONST_P0, QTREF, QTSCALE, li, lin)
+            u_h0 = rmc.reduced_contact_potential_state(
+                state, T, "hs_m2_hs", HSHS_P0, QTREF, QTSCALE, li, lin)
+            assert abs(u_hs - u_c0) < 1e-9
+            assert abs(u_hs - u_h0) < 1e-9
+
+
+def test_m1_and_m2_smoke_runs_each_new_model():
+    # (13) Short M=1 and M=2 multichain runs for each new model complete with
+    # valid states, finite trajectories, and (debug) exact caches throughout.
+    for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
+        for M in (1, 2):
+            Ts = np.linspace(305, 350, 3)
+            reps, *_ = rmc.run_remd_multichain(
+                n_chains=M, chain_length=(18 if M == 1 else 8),
+                box_size=(60 if M == 1 else 12), Ts=Ts,
+                local_sweeps_per_swap=1, translation_sweeps_per_swap=1,
+                n_cycles=8, model_name=model, params=p, Tref=QTREF,
+                Tscale=QTSCALE, lambda_intra=1.0, lambda_inter=1.0,
+                kappa_bend=0.3, seed=5, n_workers=1, verbose=False,
+                debug_contacts=True)
+            for rep in reps:
+                mcs.validate_state(rep.state)
+                assert all(math.isfinite(x) for x in rep.u_traj)
+                assert int(rep.state.intra_contacts_by_chain.sum()) == \
+                    int(rep.state.counts.intra)
+
+
+def _write_fit_summary(path, model, params_dict, *, kappa_bend=None,
+                       fit_chain_length=None):
+    import json as _json
+    summary = {
+        "model_api_version": remd.MODEL_API_VERSION,
+        "model": model,
+        "param_names": list(params_dict.keys()),
+        "params": params_dict,
+        "Tref": QTREF,
+        "Tscale": QTSCALE,
+    }
+    if kappa_bend is not None:
+        summary["kappa_bend"] = kappa_bend
+    if fit_chain_length is not None:
+        summary["fit_chain_length"] = fit_chain_length
+    with open(path, "w") as fh:
+        _json.dump(summary, fh)
+    return path
+
+
+def test_fit_summary_roundtrip_drives_multichain_quadratic(tmp_path):
+    # (12) A fit_summary.json for each new model drives a multichain run through
+    # --fit-summary-json, including fit_chain_length transfer to a different
+    # runtime N.  The recorded metadata reflects the runtime N and fit length.
+    import json as _json
+    cases = [
+        ("hs_m2_const", {"h1": 700.0, "s1": 2.4, "kappa2": 0.9}, 30),
+        ("hs_m2_hs", {"h1": 700.0, "s1": 2.4, "h2": 300.0, "s2": 0.8}, 30),
+    ]
+    for model, params_dict, fit_N in cases:
+        summary_path = _write_fit_summary(
+            tmp_path / f"{model}_summary.json", model, params_dict,
+            kappa_bend=0.4, fit_chain_length=fit_N)
+        # The single-chain loader accepts the quadratic summary + fit length.
+        loaded = remd.load_fit_summary_json(str(summary_path))
+        assert loaded["model_name"] == model
+        assert loaded["fit_chain_length"] == fit_N
+        assert loaded["kappa_bend"] == 0.4
+        # Drive a short multichain run at a DIFFERENT runtime N (8 != 30).
+        prefix = str(tmp_path / f"{model}_run")
+        rmc.main([
+            "--n-chains", "2", "--N", "8", "--box-size", "12",
+            "--n-cycles", "6", "--nT", "3", "--Tmin", "310", "--Tmax", "345",
+            "--fit-summary-json", str(summary_path),
+            "--seed", "1", "--no-plots", "--out-prefix", prefix])
+        with open(f"{prefix}_run_summary.json") as fh:
+            s = _json.load(fh)
+        assert s["model"] == model
+        assert s["potential_kind"] == "contact_quadratic"
+        assert s["quadratic_contact_scope"] == "intra_per_chain"
+        assert s["interchain_contact_model"] == "linear_coefficient_only"
+        assert s["quadratic_normalization"] == "m_chain^2/(2*N)"
+        assert s["runtime_chain_length"] == 8
+        assert s["fit_chain_length"] == fit_N
+        assert s["kappa_bend"] == 0.4
+        with np.load(f"{prefix}_distributions.npz", allow_pickle=False) as d:
+            assert str(d["potential_kind"]) == "contact_quadratic"
+            assert str(d["quadratic_normalization"]) == "m_chain^2/(2*N)"
+            assert int(d["runtime_chain_length"]) == 8
+            assert int(d["fit_chain_length"]) == fit_N
+            assert np.any(d["quadratic_coefficient_by_temperature"] != 0.0)
+            assert np.array_equal(d["reduced_bias_by_temperature"],
+                                  d["linear_coefficient_by_temperature"])
+
+
+def test_output_roundtrip_quadratic_metadata(tmp_path):
+    # (11) The distributions NPZ round-trips (pickle-free) with the full
+    # contact-quadratic contract metadata for a directly-parameterized run.
+    prefix = str(tmp_path / "q")
+    rmc.main([
+        "--n-chains", "2", "--N", "8", "--box-size", "12", "--n-cycles", "6",
+        "--nT", "3", "--Tmin", "310", "--Tmax", "345",
+        "--model", "hs_m2_const", "--params", "700,2.4,0.9",
+        "--Tref", "320", "--Tscale", "80", "--kappa-bend", "0.3",
+        "--seed", "2", "--no-plots", "--out-prefix", prefix])
+    # allow_pickle=False proves no None/object arrays leaked into the NPZ.
+    with np.load(f"{prefix}_distributions.npz", allow_pickle=False) as d:
+        for key in ("potential_kind", "quadratic_contact_scope",
+                    "interchain_contact_model", "quadratic_normalization",
+                    "runtime_chain_length", "fit_chain_length",
+                    "linear_coefficient_by_temperature",
+                    "quadratic_coefficient_by_temperature",
+                    "reduced_bias_by_temperature", "kappa_bend",
+                    "bending_enabled", "n_bends", "bend_fraction"):
+            assert key in d, f"missing NPZ key {key}"
+        assert int(d["fit_chain_length"]) == -1  # not from a fit summary
+        assert int(d["runtime_chain_length"]) == 8
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([os.path.abspath(__file__), "-q"]))

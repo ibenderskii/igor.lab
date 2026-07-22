@@ -7,18 +7,29 @@ periodic cubic box of side L, reusing the validated single-chain contact free
 energy from ``remd_uniform_chain_2_new.py`` WITHOUT refitting.  The reduced
 potential is
 
-    u(X, T) = b(T) * [ lambda_intra * m_intra(X) + lambda_inter * m_inter(X) ]
+    u(X, T) = lambda_intra * sum_alpha u_contact(m_intra_alpha(X), T; N)
+              + lambda_inter * b(T) * m_inter(X)
               + kappa_bend * n_bend_total(X)
 
-where b(T) is the fitted reduced contact bias loaded through the existing model
-registry / fit_summary.json interfaces.  Raw lattice contact counts m_intra and
-m_inter are authoritative; the single molecular-to-lattice contact offset is NOT
-applied to the Hamiltonian.  Default (lambda_intra, lambda_inter) = (1, 1) (the
-full-transferability null model); (1,0), (0,1), (0,0) select the other control
-modes without changing the energy implementation.
+where ``u_contact(m, T; N)`` is the generic single-chain contact potential from
+the model API: exactly ``b(T)*m`` for linear models and
+``b(T)*m + kappa(T)*m^2/(2N)`` for the contact-quadratic models
+(``hs_m2_const``, ``hs_m2_hs``).  The fitted ``m^2/(2N)`` curvature applies PER
+CHAIN to intrachain contacts only; interchain contacts stay linear
+(``b(T) = reduced_bias``) because the single-chain fit does not identify an
+interchain quadratic term.  b(T) and kappa(T) are loaded through the existing
+model registry / fit_summary.json interfaces.  Raw lattice contact counts
+m_intra_alpha and m_inter are authoritative; the single molecular-to-lattice
+contact offset is NOT applied to the Hamiltonian.  Default
+(lambda_intra, lambda_inter) = (1, 1) (the full-transferability null model);
+(1,0), (0,1), (0,0) select the other control modes.  ``lambda_intra`` multiplies
+the COMPLETE per-chain intrachain contact potential and ``lambda_inter`` only the
+linear interchain term; the bending penalty is independent of both.  Note that
+(lambda_intra, lambda_inter) = (0, 0) disables the contact interactions but does
+NOT disable bending when kappa_bend != 0.
 
-Sampling weight P(X|T) ∝ exp(-u).  The REMD swap uses the generalized reduced-
-potential rule (both cached counts):
+Sampling weight P(X|T) ∝ exp(-u).  The REMD swap uses the generalized full-state
+reduced-potential rule (evaluated through the shared state-aware potential):
 
     log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j)
 
@@ -81,15 +92,96 @@ def _import_matplotlib():
 # Reduced potential and swap rule (both contact counts)
 # ---------------------------------------------------------------------------
 
+def _require_linear_for_aggregate(model_name: str, where: str) -> None:
+    """Reject nonlinear models for the aggregate-count compatibility helpers.
+
+    The aggregate ``ContactCounts`` carries only the TOTAL intrachain count and
+    cannot determine ``sum_alpha m_alpha^2``, which the contact-quadratic
+    potential needs.  These helpers therefore support linear models only; the
+    per-chain state-aware functions (:func:`reduced_contact_potential_state` and
+    friends) handle the contact-quadratic models.
+    """
+    kind = str(remd.MODEL_REGISTRY[model_name]["potential_kind"])
+    if kind != "linear":
+        raise NotImplementedError(
+            f"{where} received contact-quadratic model {model_name!r} "
+            f"(potential_kind={kind!r}); the aggregate ContactCounts cannot "
+            f"determine sum_alpha m_alpha^2. Use the per-chain state-aware "
+            f"potential (reduced_potential_state / reduced_contact_potential_state)."
+        )
+
+
 def reduced_potential_counts(
     counts: ContactCounts, temperature: float, model_name: str, params,
     Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
 ) -> float:
-    """u = reduced_bias(T) * (lambda_intra * m_intra + lambda_inter * m_inter)."""
+    """u = reduced_bias(T) * (lambda_intra * m_intra + lambda_inter * m_inter).
+
+    Aggregate-count compatibility helper for LINEAR models only (a contact-
+    quadratic model is rejected because aggregate totals cannot supply the
+    per-chain ``sum_alpha m_alpha^2``).
+    """
+    _require_linear_for_aggregate(model_name, "reduced_potential_counts")
     b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
     return float(b) * (
         float(lambda_intra) * int(counts.intra)
         + float(lambda_inter) * int(counts.inter))
+
+
+def reduced_contact_potential_state(
+    state: MultiChainState, temperature: float, model_name: str, params,
+    Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
+) -> float:
+    """State-aware contacts-only reduced potential (per-chain intra + linear inter).
+
+        u_contact = lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N)
+                    + lambda_inter * b(T) * m_inter
+
+    where ``u_contact(m, T; N)`` is the generic single-chain contact potential
+    (:func:`remd.reduced_contact_potential`): exactly ``b(T)*m`` for linear
+    models and ``b(T)*m + kappa(T)*m^2/(2N)`` for the contact-quadratic models,
+    applied PER CHAIN to the intrachain contacts using the runtime chain length
+    ``N``.  The fitted ``m^2/(2N)`` curvature is intrachain-only; the interchain
+    term keeps ONLY the linear coefficient ``b(T) = reduced_bias`` because the
+    single-chain fit does not identify an interchain quadratic term.
+
+    For linear models this is exactly :func:`reduced_potential_counts` (same
+    arithmetic on the aggregate totals), so legacy behaviour is bit-for-bit
+    unchanged.
+    """
+    spec = remd.MODEL_REGISTRY[model_name]
+    b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
+    if spec["potential_kind"] == "linear":
+        # Aggregate form: identical to the historical contacts-only potential.
+        return float(b) * (
+            float(lambda_intra) * int(state.counts.intra)
+            + float(lambda_inter) * int(state.counts.inter))
+    N = state.chain_length
+    intra_u = 0.0
+    for m_alpha in state.intra_contacts_by_chain:
+        intra_u += remd.reduced_contact_potential(
+            int(m_alpha), float(temperature), model_name, params, Tref, Tscale, N)
+    return (float(lambda_intra) * intra_u
+            + float(lambda_inter) * float(b) * int(state.counts.inter))
+
+
+def reduced_potential_state(
+    state: MultiChainState, temperature: float, model_name: str, params,
+    Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
+    kappa_bend: float = 0.0,
+) -> float:
+    """Full state-aware reduced potential: contacts + kappa_bend * n_bend_total.
+
+    ``u(state, T) = reduced_contact_potential_state(state, T, ...) + kappa_bend *
+    n_bend_total``.  This is the AUTHORITATIVE reduced potential used by the
+    production sampler for observables and (through :func:`swap_log_accept_state`)
+    the REMD swaps.  With ``kappa_bend == 0`` it is exactly the contacts-only
+    potential; for a linear model it additionally reduces to
+    :func:`reduced_potential_bending_counts` bit-for-bit.
+    """
+    return reduced_contact_potential_state(
+        state, temperature, model_name, params, Tref, Tscale,
+        lambda_intra, lambda_inter) + float(kappa_bend) * int(state.n_bend)
 
 
 def reduced_potential_bending_counts(
@@ -103,6 +195,11 @@ def reduced_potential_bending_counts(
     contact reduced potential.  With ``kappa_bend == 0`` this is exactly
     :func:`reduced_potential_counts`, so the contacts-only behaviour is unchanged.
     ``n_bend`` is the total 90-degree-turn count summed over all chains.
+
+    Aggregate-count compatibility helper for LINEAR models only (inherits the
+    contact-quadratic rejection from :func:`reduced_potential_counts`); the
+    per-chain :func:`reduced_potential_state` is authoritative for the
+    contact-quadratic models.
     """
     return reduced_potential_counts(
         counts, temperature, model_name, params, Tref, Tscale,
@@ -122,12 +219,41 @@ def swap_log_accept_counts(
     (temperature-independent) parameter in every lane, so its contribution is
     kappa_bend * (n_i + n_j - n_j - n_i) = 0: it cancels exactly and never enters
     the swap criterion.  The swap therefore stays contacts-only for any kappa_bend.
+
+    Aggregate-count compatibility helper for LINEAR models only (inherits the
+    contact-quadratic rejection from :func:`reduced_potential_counts`); the
+    production swap uses the per-chain :func:`swap_log_accept_state`.
     """
     def u(c, T):
         return reduced_potential_counts(
             c, T, model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
     return (u(counts_i, T_i) + u(counts_j, T_j)
             - u(counts_j, T_i) - u(counts_i, T_j))
+
+
+def swap_log_accept_state(
+    state_i: MultiChainState, state_j: MultiChainState, T_i: float, T_j: float,
+    model_name: str, params, Tref: float, Tscale: float,
+    lambda_intra: float, lambda_inter: float,
+) -> float:
+    """Generalized full-state swap log-acceptance (per-chain aware).
+
+    log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j)
+
+    evaluated through the shared state-aware contacts-only potential
+    :func:`reduced_contact_potential_state`, so the contact-quadratic
+    ``m^2/(2N)`` curvature is honoured per chain.  The fixed reduced bending
+    penalty is temperature-independent and identical within each state, so it
+    cancels exactly (kappa_bend * (n_i + n_j - n_j - n_i) = 0) and is omitted --
+    there is a single swap rule for both linear and contact-quadratic models.
+    For linear models every term is bit-for-bit identical to
+    :func:`swap_log_accept_counts`.
+    """
+    def u(state, T):
+        return reduced_contact_potential_state(
+            state, T, model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
+    return (u(state_i, T_i) + u(state_j, T_j)
+            - u(state_j, T_i) - u(state_i, T_j))
 
 
 def metropolis_accept_delta(
@@ -171,9 +297,14 @@ def attempt_swap(
     The favorable branch (``log_accept >= 0``) short-circuits WITHOUT drawing a
     random number, matching the sampler's lazy-draw convention so run
     reproducibility (serial vs multiprocessing) is preserved.
+
+    The generalized rule is evaluated through the shared state-aware potential
+    :func:`swap_log_accept_state`, so it is correct for both linear and
+    contact-quadratic models (for linear models it is bit-for-bit identical to
+    the historical aggregate-count swap).
     """
-    log_accept = swap_log_accept_counts(
-        replica_a.state.counts, replica_b.state.counts, replica_a.T, replica_b.T,
+    log_accept = swap_log_accept_state(
+        replica_a.state, replica_b.state, replica_a.T, replica_b.T,
         model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
     if log_accept >= 0.0 or rng.random() < math.exp(log_accept):
         replica_a.state, replica_b.state = replica_b.state, replica_a.state
@@ -212,6 +343,12 @@ def mc_sweep(
     li = float(lambda_intra)
     lin = float(lambda_inter)
     kb = float(kappa_bend)
+    # Runtime chain length for the per-chain m^2/(2N) normalization; invariant
+    # under every move, so it is read once per sweep.  The contact-quadratic
+    # models score the intra term from the moved chain's cached m_alpha; linear
+    # models keep the exact historical b*delta arithmetic (bit-for-bit).
+    N = state.chain_length
+    quadratic = remd.MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
 
     def _attempt(prop):
         idx = mvs.MOVE_INDEX[prop.move_type]
@@ -223,11 +360,27 @@ def mc_sweep(
             counters[idx, 2] += 1  # state changing
         d_intra, d_inter = mvs.proposal_delta(state, prop)
         d_bends = mvs.proposal_delta_bends(state, prop)
-        du = b * (li * d_intra + lin * d_inter) + kb * d_bends
-        # Draw a random number only for an unfavorable move (du > 0); the pure
-        # helper then makes the identical decision on that draw.
-        accept = (du <= 0.0) or metropolis_accept_delta(
-            d_intra, d_inter, b, li, lin, rng.random(), kb, d_bends)
+        if quadratic:
+            # Nonlinear intra term: evaluate the full per-chain contact potential
+            # at the moved chain's OLD and NEW intrachain count (never approximate
+            # it as b*delta).  The interchain term stays linear (b(T)*d_inter).
+            alpha = int(prop.chain)
+            m_old = int(state.intra_contacts_by_chain[alpha])
+            m_new = m_old + int(d_intra)
+            u_old = remd.reduced_contact_potential(
+                m_old, temperature, model_name, params, Tref, Tscale, N)
+            u_new = remd.reduced_contact_potential(
+                m_new, temperature, model_name, params, Tref, Tscale, N)
+            du = (li * (u_new - u_old) + lin * b * int(d_inter)
+                  + kb * int(d_bends))
+            # Draw a random number only for an unfavorable move (du > 0).
+            accept = (du <= 0.0) or (rng.random() < math.exp(-du))
+        else:
+            du = b * (li * d_intra + lin * d_inter) + kb * d_bends
+            # Draw a random number only for an unfavorable move (du > 0); the pure
+            # helper then makes the identical decision on that draw.
+            accept = (du <= 0.0) or metropolis_accept_delta(
+                d_intra, d_inter, b, li, lin, rng.random(), kb, d_bends)
         if accept:
             mvs.apply_proposal(state, prop, (d_intra, d_inter), delta_bends=d_bends)
             if prop.state_changing:
@@ -312,26 +465,29 @@ class MultiReplica:
 
 def evolve_lane_worker(
     coords_unwrapped: np.ndarray, counts_tuple: Tuple[int, int], n_bend: int,
+    intra_by_chain: np.ndarray,
     box_size: int, temperature: float, move_counters: np.ndarray,
     n_local: int, n_translation: int, n_reptation: int, n_rotation: int,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float, kappa_bend: float, seed: int,
     debug_contacts: bool,
-) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int]:
+) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int, np.ndarray]:
     """Evolve one lane for a cycle without transferring trajectories.
 
     The occupancy map is rebuilt from coordinates inside the worker, so only the
-    bounded coordinate array, the two cached counts, the cached bend count, and
-    the small move-counter block cross the process boundary (no growing trajectory
-    lists, no shared mutable occupancy).  The bend count is carried exactly like
-    the contact counts so serial and multiprocessing runs stay bit-identical.
+    bounded coordinate array, the two cached counts, the cached bend count, the
+    per-chain intrachain cache, and the small move-counter block cross the process
+    boundary (no growing trajectory lists, no shared mutable occupancy).  The bend
+    count and the per-chain contact cache are carried exactly like the aggregate
+    counts so serial and multiprocessing runs stay bit-identical.
     """
     coords = np.asarray(coords_unwrapped, dtype=np.int64).copy()
     site_owner = mcs.build_site_owner(coords, box_size)
     state = MultiChainState(
         coords_unwrapped=coords, site_owner=site_owner,
         counts=ContactCounts.from_tuple(counts_tuple), box_size=int(box_size),
-        n_bend=int(n_bend))
+        n_bend=int(n_bend),
+        intra_contacts_by_chain=np.asarray(intra_by_chain, dtype=np.int64).copy())
     counters = np.asarray(move_counters, dtype=np.int64).copy()
     rng = random.Random(int(seed))
     mc_sweep(state, counters, temperature, model_name, params, Tref, Tscale,
@@ -339,7 +495,7 @@ def evolve_lane_worker(
              n_reptation=n_reptation, n_rotation=n_rotation,
              debug_contacts=debug_contacts, kappa_bend=kappa_bend)
     return (state.coords_unwrapped, state.counts.as_tuple(), counters,
-            int(state.n_bend))
+            int(state.n_bend), state.intra_contacts_by_chain)
 
 
 def _lane_seed(base_seed: int, cycle: int, lane: int) -> int:
@@ -456,6 +612,7 @@ def run_remd_multichain(
                         replicas[k].state.coords_unwrapped,
                         replicas[k].state.counts.as_tuple(),
                         int(replicas[k].state.n_bend),
+                        replicas[k].state.intra_contacts_by_chain,
                         L, replicas[k].T, replicas[k].move_counters,
                         n_local, n_translation, n_reptation, n_rotation,
                         model_name, params, Tref, Tscale,
@@ -463,13 +620,16 @@ def run_remd_multichain(
                         _lane_seed(base_seed, cycle, k), debug_contacts)
                     for k in range(nT)]
                 for k, fut in enumerate(futures):
-                    coords, counts_tuple, counters, n_bend = fut.result()
+                    coords, counts_tuple, counters, n_bend, intra_by_chain = \
+                        fut.result()
                     rep = replicas[k]
                     rep.state = MultiChainState(
                         coords_unwrapped=np.asarray(coords, dtype=np.int64),
                         site_owner=mcs.build_site_owner(coords, L),
                         counts=ContactCounts.from_tuple(counts_tuple), box_size=L,
-                        n_bend=int(n_bend))
+                        n_bend=int(n_bend),
+                        intra_contacts_by_chain=np.asarray(
+                            intra_by_chain, dtype=np.int64))
                     rep.move_counters = counters
             else:
                 for k, rep in enumerate(replicas):
@@ -510,9 +670,9 @@ def run_remd_multichain(
 
             for k, rep in enumerate(replicas):
                 cyc = obs.cycle_observables(rep.state, cluster_contact_threshold)
-                u = reduced_potential_bending_counts(
-                    rep.state.counts, rep.T, model_name, params, Tref, Tscale,
-                    lambda_intra, lambda_inter, kappa_bend, rep.state.n_bend)
+                u = reduced_potential_state(
+                    rep.state, rep.T, model_name, params, Tref, Tscale,
+                    lambda_intra, lambda_inter, kappa_bend)
                 rep.u_traj.append(u)
                 rep.eeff_traj.append(rep.T * u)
                 rep.m_intra_traj.append(cyc["m_intra"])
@@ -639,7 +799,8 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
                     local_sweeps_per_swap, translation_sweeps_per_swap, n_cycles,
                     burnin_frac, cluster_contact_threshold, parameter_source,
                     fit_summary_json, reptation_sweeps_per_swap=1,
-                    rotation_sweeps_per_swap=1, kappa_bend=0.0) -> dict:
+                    rotation_sweeps_per_swap=1, kappa_bend=0.0,
+                    fit_chain_length=None) -> dict:
     """Inject full model + run provenance into a distributions/summary dict."""
     dist["schema_version"] = int(SCHEMA_VERSION)
     dist["model_api_version"] = int(MODEL_API_VERSION)
@@ -650,6 +811,20 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["Tscale"] = float(Tscale)
     dist["lambda_intra"] = float(lambda_intra)
     dist["lambda_inter"] = float(lambda_inter)
+    # Contact-potential contract (Change: contact-quadratic support).  The fitted
+    # m^2/(2N) curvature applies PER CHAIN to intrachain contacts; interchain
+    # contacts keep only the linear coefficient.  The runtime chain length N is
+    # authoritative for the normalization; fit_chain_length records the length the
+    # model was fitted at (-1 = not recorded / legacy, keeps the NPZ pickle-free).
+    spec = remd.MODEL_REGISTRY[model_name]
+    dist["potential_kind"] = str(spec["potential_kind"])
+    dist["quadratic_contact_scope"] = "intra_per_chain"
+    dist["interchain_contact_model"] = "linear_coefficient_only"
+    dist["quadratic_normalization"] = (
+        "m_chain^2/(2*N)" if spec["potential_kind"] != "linear" else "")
+    dist["runtime_chain_length"] = int(N)
+    dist["fit_chain_length"] = int(-1 if fit_chain_length is None
+                                   else fit_chain_length)
     # Additive bending-penalty provenance (metadata only; the trajectories
     # ``n_bends`` / ``bend_fraction`` are attached in build_run_distributions).
     dist["kappa_bend"] = float(kappa_bend)
@@ -675,10 +850,21 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["cluster_contact_threshold"] = int(cluster_contact_threshold)
     dist["parameter_source"] = str(parameter_source)
     dist["fit_summary_json"] = str(fit_summary_json) if fit_summary_json else ""
-    # Per-temperature reduced bias (model-independent bookkeeping).
-    dist["reduced_bias_by_temperature"] = np.array(
+    # Per-temperature reduced bias (model-independent bookkeeping).  The potential
+    # is no longer described by a single b(T) curve for the contact-quadratic
+    # models, so the linear coefficient b(T) and the quadratic coefficient
+    # kappa(T) (coefficient of m^2/(2N); exactly 0 for linear models) are stored
+    # separately.  reduced_bias_by_temperature is retained (== the linear
+    # coefficient) for backward compatibility.
+    linear_coeff = np.array(
         [remd.reduced_bias(model_name, model_params, float(T), Tref, Tscale)
          for T in Ts], dtype=float)
+    quadratic_coeff = np.array(
+        [remd.quadratic_bias(model_name, model_params, float(T), Tref, Tscale)
+         for T in Ts], dtype=float)
+    dist["reduced_bias_by_temperature"] = linear_coeff
+    dist["linear_coefficient_by_temperature"] = linear_coeff
+    dist["quadratic_coefficient_by_temperature"] = quadratic_coeff
     return dist
 
 
@@ -880,18 +1066,25 @@ def main(argv=None) -> None:
     (model_name, model_params, param_names, Tref, Tscale,
      parameter_source, fit_summary_json) = remd.resolve_model_params(args, Ts)
 
-    # This sampler's acceptance uses u = b(T)*(lambda_intra*m_intra +
-    # lambda_inter*m_inter); a contact-quadratic model would have its
-    # m^2/(2N) term silently dropped. Refuse it at setup.
-    remd.require_linear_contact_potential(model_name)
+    # This sampler now samples the full contact potential (linear and contact-
+    # quadratic alike): the fitted m^2/(2N) curvature is applied PER CHAIN to
+    # intrachain contacts and interchain contacts stay linear.  The runtime chain
+    # length N is required for the m^2/(2N) normalization of the contact-quadratic
+    # models (validate_chain_length is a no-op for linear models).
+    remd.validate_chain_length(model_name, args.N)
 
     # Resolve the fixed reduced bending penalty AFTER the model, reusing the
     # single-chain rules: a fit summary is authoritative (re-read for kappa_bend,
     # already validated in resolve_model_params) and cross-checks any CLI value;
     # without a summary the CLI value applies (default 0.0).  kappa_bend > 0
-    # enables bending; there is no separate flag.
+    # enables bending; there is no separate flag.  The fit summary also carries
+    # ``fit_chain_length`` for provenance; chain-length transfer is permitted (the
+    # sampler always uses the RUNTIME N in m^2/(2N)) with a note on mismatch.
+    fit_chain_length = None
     if fit_summary_json:
-        summary_kappa = remd.load_fit_summary_json(fit_summary_json)["kappa_bend"]
+        _summary = remd.load_fit_summary_json(fit_summary_json)
+        summary_kappa = _summary["kappa_bend"]
+        fit_chain_length = _summary["fit_chain_length"]
         kappa_bend = remd.resolve_kappa_bend(
             args.kappa_bend, summary_kappa, True, source=fit_summary_json)
     else:
@@ -899,6 +1092,11 @@ def main(argv=None) -> None:
     bending_enabled = bool(kappa_bend != 0.0)
 
     M, N, L = args.n_chains, args.N, args.box_size
+    if (remd.MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+            and fit_chain_length is not None and int(fit_chain_length) != int(N)):
+        print(f"Note: contact-quadratic model fit at chain length "
+              f"{int(fit_chain_length)} is being run at N={int(N)}; the m^2/(2N) "
+              f"normalization uses the runtime N (chain-length transfer).")
     phi = M * N / L ** 3
     print(f"Multi-chain REMD: M={M} N={N} L={L} phi={phi:.4f}, {len(Ts)} lanes "
           f"T in [{Ts.min():.4g}, {Ts.max():.4g}] ({temp_source})")
@@ -921,7 +1119,8 @@ def main(argv=None) -> None:
                               or f"{args.out_prefix}_configurations.h5")
         snap_meta = _snapshot_metadata(
             args, Ts, model_name, param_names, model_params, Tref, Tscale,
-            temp_source, phi, fit_summary_json, kappa_bend, bending_enabled)
+            temp_source, phi, fit_summary_json, kappa_bend, bending_enabled,
+            fit_chain_length)
         snapshot_writer = mcio.MultiChainSnapshotWriter(
             configuration_path, n_chains=M, chain_length=N,
             n_temperatures=len(Ts), metadata=snap_meta,
@@ -967,7 +1166,7 @@ def main(argv=None) -> None:
         n_cycles=args.n_cycles, burnin_frac=args.burnin_frac,
         cluster_contact_threshold=args.cluster_contact_threshold,
         parameter_source=parameter_source, fit_summary_json=fit_summary_json,
-        kappa_bend=kappa_bend)
+        kappa_bend=kappa_bend, fit_chain_length=fit_chain_length)
 
     out_files = {
         "results_csv": mcio.save_results_csv(results, args.out_prefix),
@@ -1005,7 +1204,8 @@ def main(argv=None) -> None:
         args, Ts, temp_source, model_name, param_names, model_params, Tref,
         Tscale, parameter_source, fit_summary_json, phi, swap_props, swap_accs,
         results, wall, out_files, replicas, diagnostics,
-        configuration_path is not None, kappa_bend, bending_enabled)
+        configuration_path is not None, kappa_bend, bending_enabled,
+        fit_chain_length)
     summary_path = f"{args.out_prefix}_run_summary.json"
     out_files["run_summary_json"] = summary_path
     mcio.save_run_summary(run_summary, summary_path)
@@ -1013,7 +1213,9 @@ def main(argv=None) -> None:
 
 def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
                        Tscale, temp_source, phi, fit_summary_json,
-                       kappa_bend=0.0, bending_enabled=False) -> dict:
+                       kappa_bend=0.0, bending_enabled=False,
+                       fit_chain_length=None) -> dict:
+    spec = remd.MODEL_REGISTRY[model_name]
     return {
         "schema_version": int(mcio.MULTICHAIN_SNAPSHOT_SCHEMA_VERSION),
         "run_id": Path(args.out_prefix).name,
@@ -1025,6 +1227,15 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         "kappa_bend": float(kappa_bend),
         "bending_enabled": bool(bending_enabled),
         "bend_definition": BEND_DEFINITION,
+        # Contact-potential contract (contact-quadratic support).
+        "potential_kind": str(spec["potential_kind"]),
+        "quadratic_contact_scope": "intra_per_chain",
+        "interchain_contact_model": "linear_coefficient_only",
+        "quadratic_normalization": (
+            "m_chain^2/(2*N)" if spec["potential_kind"] != "linear" else "null"),
+        "runtime_chain_length": int(args.N),
+        "fit_chain_length": (int(fit_chain_length)
+                             if fit_chain_length is not None else "null"),
         "cluster_contact_threshold": int(args.cluster_contact_threshold),
         "model_name": model_name, "param_names": list(param_names),
         "model_params": [float(v) for v in model_params],
@@ -1066,12 +1277,17 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
                  Tref, Tscale, parameter_source, fit_summary_json, phi,
                  swap_props, swap_accs, results, wall, out_files, replicas,
                  diagnostics, snapshots_saved, kappa_bend=0.0,
-                 bending_enabled=False) -> dict:
+                 bending_enabled=False, fit_chain_length=None) -> dict:
     swap_rates = [float(swap_accs[k] / swap_props[k]) if swap_props[k] else float("nan")
                   for k in range(len(swap_props))]
     M = int(args.n_chains)
     N = int(args.N)
     bend_fraction = _bend_fraction_by_temp(replicas, M, N, float(args.burnin_frac))
+    spec = remd.MODEL_REGISTRY[model_name]
+    linear_coeff = [remd.reduced_bias(model_name, model_params, float(T), Tref, Tscale)
+                    for T in Ts]
+    quadratic_coeff = [remd.quadratic_bias(model_name, model_params, float(T), Tref, Tscale)
+                       for T in Ts]
     summary = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "schema_version": int(SCHEMA_VERSION),
@@ -1093,6 +1309,23 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "bending_enabled": bool(bending_enabled),
         "bend_definition": BEND_DEFINITION,
         "bend_fraction": [float(v) for v in bend_fraction],
+        # Contact-potential contract (contact-quadratic support).  The fitted
+        # m^2/(2N) curvature applies per chain to intrachain contacts; interchain
+        # contacts stay linear.  The runtime N drives the normalization; the fit
+        # chain length is recorded for provenance (null when not recorded).  The
+        # potential is no longer one b(T) curve for the contact-quadratic models,
+        # so the linear coefficient b(T) and quadratic coefficient kappa(T) (0 for
+        # linear models) are listed separately.
+        "potential_kind": str(spec["potential_kind"]),
+        "quadratic_contact_scope": "intra_per_chain",
+        "interchain_contact_model": "linear_coefficient_only",
+        "quadratic_normalization": (
+            "m_chain^2/(2*N)" if spec["potential_kind"] != "linear" else None),
+        "runtime_chain_length": int(N),
+        "fit_chain_length": (int(fit_chain_length)
+                             if fit_chain_length is not None else None),
+        "linear_coefficient_by_temperature": [float(v) for v in linear_coeff],
+        "quadratic_coefficient_by_temperature": [float(v) for v in quadratic_coeff],
         "cluster_contact_threshold": int(args.cluster_contact_threshold),
         "temperatures": [float(t) for t in Ts], "temperature_count": int(len(Ts)),
         "temperature_source": temp_source,

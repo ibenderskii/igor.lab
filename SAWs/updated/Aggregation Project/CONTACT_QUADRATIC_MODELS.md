@@ -212,18 +212,41 @@ or docstrings — `T_rg_max_slope` remains the primary finite-chain descriptor.
 
 ## REMD / sampler scope
 
-Per the prompt, hot loops were not touched. What *was* added:
+The samplers now sample the full contact potential (linear and
+contact-quadratic alike); the `require_linear_contact_potential` guard is no
+longer called by either sampler (it is retained only as an unused helper for
+any strictly linear-only sampler that might import it).
 
-- registry + generic potential API ported to both copies of
-  `remd_uniform_chain_2_new.py` and used by `remd_multichain.py`
-- `require_linear_contact_potential(model_name)` — a single setup-time guard
-  (not a hot-loop check) that raises `NotImplementedError` if a
-  `contact_quadratic` model is selected. Without it, registering the new
-  models would let the sampler silently drop the `m²` term (acceptance is
-  hardcoded to `u = b(T)·m` + bending) and write output labelled with a model
-  that was never actually sampled. This guard was not explicitly requested
-  but follows directly from "do not break legacy" + "do not modify hot loops
-  yet" — remove it when the sampler side is implemented in the next prompt.
+**Single-chain (`remd_uniform_chain_2_new.py`).** Acceptance, swaps, effective
+energy, and observables route through the generic `reduced_contact_potential(m,
+T; N)` (linear → `b(T)·m`; contact-quadratic → `b(T)·m + κ(T)·m²/(2N)`) plus the
+fixed reduced bending penalty. The runtime chain length `N` drives the
+`m²/(2N)` normalization; linear models remain bit-for-bit identical.
+
+**Multi-chain (`remd_multichain.py`).** The reduced potential is
+
+```
+u(X, T) = lambda_intra · Σ_alpha u_contact(m_intra_alpha, T; N)
+        + lambda_inter · b(T) · m_inter
+        + kappa_bend · n_bend_total
+```
+
+The fitted `m²/(2N)` curvature applies **per chain** to intrachain contacts
+only; interchain contacts stay **linear** (`b(T) = reduced_bias`) because the
+single-chain fit does not identify an interchain quadratic term. To supply each
+chain's `m_alpha` the authoritative state gained a per-chain cache
+`intra_contacts_by_chain` (invariant `sum == counts.intra`), carried through
+initialization, moves, worker serialization, and reconstruction. Production
+code, observables, and swaps use the state-aware `reduced_potential_state` /
+`swap_log_accept_state`; the aggregate-`ContactCounts` helpers
+(`reduced_potential_counts`, …) remain for linear models and now **reject**
+contact-quadratic models (aggregate totals cannot determine `Σ_alpha m_alpha²`).
+Local moves on chain `alpha` score `du = lambda_intra·(u_contact(m_new) −
+u_contact(m_old)) + lambda_inter·b(T)·Δm_inter + kappa_bend·Δbends` (never the
+`b·Δm` approximation for nonlinear models); linear models keep their exact
+historical arithmetic. Note that `(lambda_intra, lambda_inter) = (0, 0)`
+disables the contact interactions but does **not** disable bending when
+`kappa_bend != 0`. Serial and multiprocessing runs stay bit-identical.
 
 ## Files changed
 
@@ -231,8 +254,11 @@ Per the prompt, hot loops were not touched. What *was* added:
 |---|---|
 | `fit_lattice_contact_model_2.py` (×3 identical copies: `Aggregation Project`, `ISAW Project`, `auto`) | Registry, generic potential API, chain-length resolver, `u_fn` reweighting throughout, `--N`, new outputs/plot, quick-test 11 |
 | `FIT_TO_DAT.py` | Same shared core (ported verbatim), plus bending metadata (previously absent in this file), scalar-Rg `u_fn` path, `run_rg_contact_slice_diagnostic`, feasibility dispatch, validity-ladder branch, `rg_scalar_qT.png` |
-| `remd_uniform_chain_2_new.py` (×2: `Aggregation Project`, `ISAW Project`) | Registry/API port + one setup-time guard |
-| `remd_multichain.py` | Same guard (one call site) |
+| `remd_uniform_chain_2_new.py` (`Aggregation Project`) | Full contact potential in acceptance/swaps/energy/observables/metadata (see single-chain section) |
+| `remd_multichain.py` | Per-chain intrachain quadratic + linear interchain: state-aware potentials, quadratic move/swap, `intra_contacts_by_chain` cache threaded through workers, contract metadata |
+| `multichain_state.py` | `intra_contacts_by_chain` field + `__post_init__`/`copy`/`make_state`/`validate_state` |
+| `multichain_contacts.py` | `full_contacts_split` / `full_intra_contacts_by_chain*`; per-chain cache maintained in `apply_moved_beads`; per-chain debug assert |
+| `test_remd_multichain.py` | +15 contact-quadratic tests (per-chain cache, additivity, per-chain swap, determinism, fit-summary round-trip, output metadata) |
 | `run_model_suite_2.py` (×2: `ISAW Project`, `auto`) | Contract check extended to `potential_kind` / `quadratic_normalization` / numeric `κ(T)` |
 | `ISAW Project/project_definitions.json` | `model_api_version` 1 → 2 |
 | `test_contact_quadratic_models.py` | **New** — 60 tests |
