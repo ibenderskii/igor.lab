@@ -476,39 +476,54 @@ def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
 
 
 def require_linear_contact_potential(model_name: str) -> None:
-    """Reject models this sampler cannot yet represent.
+    """Reject a contact-quadratic model on a genuinely linear-only code path.
 
-    Move acceptance uses u = b(T)*m (plus the fixed bending penalty).  A
-    contact-quadratic model would silently have its m^2 term dropped there,
-    sampling a DIFFERENT ensemble than the one named in the output metadata.
-    Fail loudly at setup instead of writing mislabelled distributions.
+    This single-chain sampler now samples the full contact potential (linear and
+    contact-quadratic alike) through :func:`reduced_contact_potential` and no
+    longer calls this guard.  The helper is retained as a generic validator for
+    callers that evaluate only u = b(T)*m and therefore cannot represent the
+    m^2/(2N) curvature: it lets such a path refuse a contact-quadratic model
+    loudly at setup instead of silently dropping the m^2 term and writing
+    distributions mislabelled with a model that was not the one sampled.
     """
     kind = str(MODEL_REGISTRY[model_name]["potential_kind"])
     if kind != "linear":
         raise NotImplementedError(
             f"model {model_name!r} has a contact-quadratic potential "
-            f"(potential_kind={kind!r}); this sampler only implements the linear "
-            f"contact potential u = b(T)*m and would silently drop the "
-            f"{QUADRATIC_NORMALIZATION} term. Use it with the fitters, not here."
+            f"(potential_kind={kind!r}); this code path implements only the "
+            f"linear contact potential u = b(T)*m and would silently drop the "
+            f"{QUADRATIC_NORMALIZATION} term. Evaluate it through a full contact "
+            f"potential that includes the m^2/(2N) term instead."
         )
 
 
 def reduced_potential(m, T, model_name, params, Tref, Tscale) -> float:
-    """u(C,T) = m(C) * b(T)."""
+    """Linear reduced potential u(C,T) = m(C) * b(T).
+
+    Retained as the exact linear-only form (no chain-length dependence) for
+    backward-compatible callers and tests.  Production sampling in this module
+    uses the generic :func:`reduced_contact_potential`, which reduces to this
+    bit-for-bit for every linear model and additionally carries the
+    contact-quadratic m^2/(2N) term.
+    """
     return float(m) * reduced_bias(model_name, params, float(T), Tref, Tscale)
 
 
 def reduced_potential_bending(
-    m, T, model_name, params, Tref, Tscale, kappa_bend=0.0, n_bend=0
+    m, T, model_name, params, Tref, Tscale, kappa_bend=0.0, n_bend=0, n_beads=None
 ) -> float:
-    """Full reduced potential u(X,T) = b(T)*m + kappa_bend*n_bend.
+    """Full reduced potential u(X,T) = u_contact(m,T;N) + kappa_bend*n_bend.
 
-    The optional fixed reduced bending penalty is temperature-independent.  With
-    ``kappa_bend == 0`` this equals :func:`reduced_potential` exactly, so the
-    athermal / no-bending behaviour is unchanged.
+    ``u_contact`` is the generic contact potential: exactly ``b(T)*m`` for linear
+    models and ``b(T)*m + kappa(T)*m^2/(2N)`` for the contact-quadratic models
+    (see :func:`reduced_contact_potential`).  The optional fixed reduced bending
+    penalty is temperature-independent.  With ``kappa_bend == 0`` and a linear
+    model this equals :func:`reduced_potential` exactly, so the athermal /
+    no-bending behaviour is unchanged.  ``n_beads`` (the runtime chain length) is
+    ignored by linear models and required by the contact-quadratic ones.
     """
     return (
-        reduced_potential(m, T, model_name, params, Tref, Tscale)
+        reduced_contact_potential(m, T, model_name, params, Tref, Tscale, n_beads)
         + float(kappa_bend) * float(n_bend)
     )
 
@@ -524,13 +539,19 @@ def _metropolis_accept(du: float) -> bool:
     return du <= 0.0 or random.random() < math.exp(-du)
 
 
-def energy_from_contacts(m, T, model_name, params, Tref, Tscale) -> float:
-    """Model-implied temperature-dependent energy H = T * u.
+def energy_from_contacts(m, T, model_name, params, Tref, Tscale, n_beads=None) -> float:
+    """Model-implied temperature-dependent energy H = T * u_contact(m,T;N).
 
-    For hs this is exactly H = m*(h - T*s), preserving old behavior.
-    For other models it is the effective H corresponding to u = m*b(T).
+    For hs this is exactly H = m*(h - T*s), preserving old behavior.  For linear
+    models it is the effective H corresponding to u = m*b(T); for the
+    contact-quadratic models it also carries the T*kappa(T)*m^2/(2N) term.
+    ``n_beads`` (runtime chain length) is ignored by linear models.  The fixed
+    reduced bending penalty is deliberately NOT part of H (it is dimensionless
+    and temperature-independent); H remains the contact energy in model units.
     """
-    return float(T) * reduced_potential(m, T, model_name, params, Tref, Tscale)
+    return float(T) * reduced_contact_potential(
+        m, T, model_name, params, Tref, Tscale, n_beads
+    )
 
 
 def energy(
@@ -542,14 +563,18 @@ def energy(
     Tref: float,
     Tscale: float,
 ) -> float:
-    """H(C;T) = m(C) * T * b(T), generic over the contact-bias model.
+    """H(C;T) = T * u_contact(m(C),T;N), generic over the contact-bias model.
 
     m(C) = number of unique non-bonded nearest-neighbour contacts.  The sampled
-    weight is exp(-u) = exp(-m*b(T)).  For model hs with params (h, s) this
-    reduces to H = m*(h - T*s), i.e. the legacy --dh/--ds behavior.
+    weight is exp(-u) = exp(-u_contact(m,T;N)).  For model hs with params (h, s)
+    this reduces to H = m*(h - T*s), i.e. the legacy --dh/--ds behavior; the
+    contact-quadratic models add the T*kappa(T)*m^2/(2N) term.  The runtime chain
+    length N is taken from ``chain`` for the m^2/(2N) normalization.
     """
     m = contact_count(chain, occ)
-    return energy_from_contacts(m, T, model_name, params, Tref, Tscale)
+    return energy_from_contacts(
+        m, T, model_name, params, Tref, Tscale, n_beads=len(chain)
+    )
 
 
 def contact_count(chain: List[Vec], occ: set) -> float:
@@ -729,7 +754,7 @@ class ChainState:
         m = int(round(contact_count(chain, occ)))  # straight chain => 0
         return cls(
             chain=chain, occ=occ,
-            E=energy_from_contacts(m, T, model_name, params, Tref, Tscale),
+            E=energy_from_contacts(m, T, model_name, params, Tref, Tscale, n_beads=N),
             m=m,
             n_bend=0,  # straight chain => no bends
         )
@@ -744,21 +769,28 @@ def swap_log_accept(
     T_i: float, T_j: float,
     model_name: str, params,
     Tref: float, Tscale: float,
+    n_beads=None,
 ) -> float:
     """
     Log Metropolis ratio for swapping configs C_i (at T_i) and C_j (at T_j).
 
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)
 
+    Uses the generalized full contact potential ``u_contact(m,T;N)`` (linear or
+    contact-quadratic).  ``n_beads`` (the runtime chain length) feeds the
+    m^2/(2N) normalization and is ignored by linear models; for linear models
+    every term is bit-identical to the historical ``b(T)*m`` criterion.
+
     The optional bending penalty kappa_bend*n_bend is temperature-INDEPENDENT, so
     its contribution to this expression is kappa*(n_i + n_j - n_j - n_i) = 0.  It
-    cancels exactly and the swap criterion is unchanged for any kappa_bend.
+    cancels exactly and the swap criterion is unchanged for any kappa_bend --
+    hence it never enters here and no separate bending-aware swap rule exists.
     """
     return (
-        reduced_potential(m_i, T_i, model_name, params, Tref, Tscale)
-        + reduced_potential(m_j, T_j, model_name, params, Tref, Tscale)
-        - reduced_potential(m_j, T_i, model_name, params, Tref, Tscale)
-        - reduced_potential(m_i, T_j, model_name, params, Tref, Tscale)
+        reduced_contact_potential(m_i, T_i, model_name, params, Tref, Tscale, n_beads)
+        + reduced_contact_potential(m_j, T_j, model_name, params, Tref, Tscale, n_beads)
+        - reduced_contact_potential(m_j, T_i, model_name, params, Tref, Tscale, n_beads)
+        - reduced_contact_potential(m_i, T_j, model_name, params, Tref, Tscale, n_beads)
     )
 
 
@@ -834,22 +866,33 @@ class Replica:
 def mc_sweep(
     replica: Replica, steps: int,
     model_name: str, params, Tref: float, Tscale: float,
-    kappa_bend: float = 0.0,
+    kappa_bend: float = 0.0, n_beads=None,
 ) -> None:
     """Run `steps` local Metropolis moves on `replica` in-place.
 
-    Acceptance uses the generic reduced potential u = m*b(T) plus the optional
-    fixed reduced bending penalty kappa_bend*n_bend:
-        du = u_new - u_old + kappa_bend*dn_bend,
+    Acceptance uses the generic reduced contact potential u_contact(m,T;N) plus
+    the optional fixed reduced bending penalty kappa_bend*n_bend:
+        du_contact = u_contact(m_new,T;N) - u_contact(m_old,T;N),
+        du_bend    = kappa_bend*dn_bend,
+        du         = du_contact + du_bend,
         accept if du <= 0 or rand < exp(-du).
-    For model hs with params (h, s) and kappa_bend = 0 this is identical to the
-    legacy beta*dE criterion (du = beta*dE), preserving old sampling exactly:
-    the bend term contributes exactly 0.0 and draws no extra random numbers.
+    The contact difference is evaluated through the full potential -- it is NOT
+    approximated as b(T)*dm -- so the m^2/(2N) curvature of the contact-quadratic
+    models is honoured exactly.  ``n_beads`` is the runtime chain length used in
+    that normalization; when omitted it defaults to the current chain length.
+    For linear models it is ignored and du is bit-identical to the historical
+    du = u_new - u_old criterion, so kappa_bend = 0 reproduces old seeded sampling
+    exactly (the bend term contributes 0.0 and draws no extra random numbers) and
+    kappa_bend > 0 preserves the existing bending-enabled behaviour.
     """
     T     = replica.T
     state = replica.state
     counters = replica.move_counters
     kappa_bend = float(kappa_bend)
+    # Runtime chain length for the m^2/(2N) normalization (contact-quadratic
+    # models); ignored by linear models.  The chain length is invariant under
+    # every local move, so the cached value is stable for the whole sweep.
+    N = int(n_beads) if n_beads is not None else len(state.chain)
 
     for _ in range(steps):
         replica.local_prop += 1
@@ -870,10 +913,12 @@ def mc_sweep(
 
         # state.m is the *old* contact count; recompute only the trial config.
         m_old = state.m
-        u_old = reduced_potential(m_old, T, model_name, params, Tref, Tscale)
+        u_old = reduced_contact_potential(
+            m_old, T, model_name, params, Tref, Tscale, N)
 
         m_new = int(round(contact_count(chain_new, occ_new)))
-        u_new = reduced_potential(m_new, T, model_name, params, Tref, Tscale)
+        u_new = reduced_contact_potential(
+            m_new, T, model_name, params, Tref, Tscale, N)
 
         # Bending penalty is a fixed reduced (dimensionless) term; it is NOT
         # folded into state.E, which stays the contact energy in model units.
@@ -885,7 +930,8 @@ def mc_sweep(
             state.occ   = occ_new
             state.m     = m_new
             state.n_bend = state.n_bend + dn_bend
-            state.E     = energy_from_contacts(m_new, T, model_name, params, Tref, Tscale)
+            state.E     = energy_from_contacts(
+                m_new, T, model_name, params, Tref, Tscale, N)
             replica.local_acc += 1
             if state_changing:
                 counters[move_idx, 3] += 1               # accepted (state-changing)
@@ -901,17 +947,21 @@ def mc_sweep(
 def attempt_swap(
     rep_a: Replica, rep_b: Replica,
     model_name: str, params, Tref: float, Tscale: float,
+    n_beads=None,
 ) -> bool:
     """
     Attempt a configuration swap between two adjacent replicas.
 
     Temperatures stay fixed; configurations (and energies) are exchanged.
-    Returns True if accepted.
+    ``n_beads`` (runtime chain length) feeds the generalized swap criterion's
+    m^2/(2N) normalization and is ignored by linear models.  Returns True if
+    accepted.
     """
+    N = int(n_beads) if n_beads is not None else len(rep_a.state.chain)
     m_a = rep_a.state.m
     m_b = rep_b.state.m
     log_acc = swap_log_accept(
-        m_a, m_b, rep_a.T, rep_b.T, model_name, params, Tref, Tscale
+        m_a, m_b, rep_a.T, rep_b.T, model_name, params, Tref, Tscale, N
     )
 
     accepted = log_acc >= 0 or random.random() < math.exp(log_acc)
@@ -927,10 +977,10 @@ def attempt_swap(
         # Recompute each lane's energy from the (now swapped) stored contact
         # number rather than recounting contacts.
         rep_a.state.E = energy_from_contacts(
-            rep_a.state.m, rep_a.T, model_name, params, Tref, Tscale
+            rep_a.state.m, rep_a.T, model_name, params, Tref, Tscale, N
         )
         rep_b.state.E = energy_from_contacts(
-            rep_b.state.m, rep_b.T, model_name, params, Tref, Tscale
+            rep_b.state.m, rep_b.T, model_name, params, Tref, Tscale, N
         )
     return accepted
 
@@ -952,6 +1002,7 @@ def evolve_replica_worker(
     Tscale: float,
     seed: int,
     kappa_bend: float = 0.0,
+    n_beads=None,
 ) -> tuple["ChainState", int, int, np.ndarray]:
     """Deterministically sweep one lane without transferring trajectories.
 
@@ -959,7 +1010,8 @@ def evolve_replica_worker(
     accept/propose totals plus the small fixed-size move-counter block) cross
     the process boundary.  Sending the full Replica would also pickle its
     ever-growing trajectories every cycle, causing O(n_cycles^2) serialization
-    overhead.
+    overhead.  ``n_beads`` (the runtime chain length) is forwarded to the sweep
+    for the contact-quadratic m^2/(2N) normalization; it matches ``len(chain)``.
     """
     _seed_all(seed)
     replica = Replica(
@@ -967,7 +1019,7 @@ def evolve_replica_worker(
         local_acc=int(local_acc), local_prop=int(local_prop),
         move_counters=np.asarray(move_counters, dtype=np.int64).copy(),
     )
-    mc_sweep(replica, steps, model_name, params, Tref, Tscale, kappa_bend)
+    mc_sweep(replica, steps, model_name, params, Tref, Tscale, kappa_bend, n_beads)
     return (replica.state, replica.local_acc, replica.local_prop,
             replica.move_counters)
 
@@ -1199,7 +1251,7 @@ def run_remd(
                         replicas[k].local_acc, replicas[k].local_prop,
                         replicas[k].move_counters,
                         steps_per_swap, model_name, params, Tref, Tscale,
-                        worker_seeds[k], kappa_bend,
+                        worker_seeds[k], kappa_bend, n_beads,
                     )
                     for k in range(nT)
                 ]
@@ -1212,7 +1264,7 @@ def run_remd(
             else:
                 for rep in replicas:
                     mc_sweep(rep, steps_per_swap, model_name, params, Tref, Tscale,
-                             kappa_bend)
+                             kappa_bend, n_beads)
 
             t1 = time.perf_counter()
             t_sweep_total += t1 - t0
@@ -1221,7 +1273,8 @@ def run_remd(
             for k in range(start, nT - 1, 2):
                 swap_props[k] += 1
                 if attempt_swap(
-                    replicas[k], replicas[k + 1], model_name, params, Tref, Tscale
+                    replicas[k], replicas[k + 1], model_name, params, Tref, Tscale,
+                    n_beads
                 ):
                     swap_accs[k] += 1
                     if track_walkers:
@@ -3179,8 +3232,224 @@ def run_quick_test() -> None:
     run_bending_quick_test()
     run_diagnostics_quick_test()
     run_structural_quick_test()
+    run_contact_quadratic_quick_test()
 
     print("quick-test complete.")
+
+
+def run_contact_quadratic_quick_test() -> None:
+    """Tests for sampling the contact-quadratic models hs_m2_const / hs_m2_hs.
+
+    The sampled contact potential is the full generic form
+        u_contact(m,T;N) = b(T)*m + kappa(T)*m^2/(2N)
+    (with the fixed bending penalty kappa_bend*n_bend added in local moves only).
+    Covers: direct potential values, incremental-vs-full energy agreement, the
+    manual generalized swap criterion, the exact zero-curvature regression onto
+    hs (seeded linear run unchanged), nonzero curvature combined with nonzero
+    bending, cached contact/bend consistency, serial/multiprocessing determinism,
+    a fit-summary round-trip carrying fit_chain_length, and additive metadata.
+    """
+    Tref, Tscale = 320.0, 80.0
+    N = 20
+    hs_p = [700.0, 2.4]
+    const_p = [700.0, 2.4, 0.9]          # hs_m2_const: h1, s1, kappa2
+    hshs_p = [700.0, 2.4, 300.0, 0.8]    # hs_m2_hs:    h1, s1, h2, s2
+
+    # -- Test 1: direct potential values (curvature is exactly kappa(T)*m^2/2N) --
+    for model, p in (("hs_m2_const", const_p), ("hs_m2_hs", hshs_p)):
+        for T in (300.0, 335.0, 360.0):
+            b = reduced_bias(model, p, T, Tref, Tscale)
+            kap = quadratic_bias(model, p, T, Tref, Tscale)
+            for m in (0, 3, 7, 12):
+                u = reduced_contact_potential(m, T, model, p, Tref, Tscale, N)
+                expect = b * m + kap * (m * m) / (2.0 * N)
+                assert abs(u - expect) < 1e-12, (model, T, m, u, expect)
+    # runtime N actually scales the curvature term: halving N doubles the excess.
+    m0 = 10
+    lin = reduced_contact_potential(m0, 330.0, "hs", hs_p, Tref, Tscale)
+    exc_N = reduced_contact_potential(m0, 330.0, "hs_m2_const", const_p, Tref, Tscale, N) - lin
+    exc_2N = reduced_contact_potential(m0, 330.0, "hs_m2_const", const_p, Tref, Tscale, 2 * N) - lin
+    assert abs(exc_N - 2.0 * exc_2N) < 1e-12, (exc_N, exc_2N)
+    print("  quick-test contact-quadratic direct potential values: PASSED")
+
+    # -- Test 2: incremental move difference uses the FULL potential ------------
+    # du_contact must be u(m_new) - u(m_old) through the quadratic form, NOT the
+    # linear b(T)*dm approximation; the two differ by kappa(T)*(m_new^2-m_old^2)/2N.
+    T = 330.0
+    m_old, m_new = 6, 9
+    kap = quadratic_bias("hs_m2_const", const_p, T, Tref, Tscale)
+    du_full = (
+        reduced_contact_potential(m_new, T, "hs_m2_const", const_p, Tref, Tscale, N)
+        - reduced_contact_potential(m_old, T, "hs_m2_const", const_p, Tref, Tscale, N)
+    )
+    b = reduced_bias("hs_m2_const", const_p, T, Tref, Tscale)
+    du_linear = b * (m_new - m_old)
+    assert abs((du_full - du_linear)
+               - kap * (m_new * m_new - m_old * m_old) / (2.0 * N)) < 1e-12
+    assert abs(du_full - du_linear) > 1e-6, "curvature term vanished from the move"
+    # With a fixed bending change the total move du adds kappa_bend*dn_bend exactly.
+    kb, dn = 0.5, 2
+    du_move = du_full + kb * dn
+    assert abs(du_move - (du_full + 1.0)) < 1e-12
+    print("  quick-test contact-quadratic incremental move difference: PASSED")
+
+    # -- Test 3: manual generalized swap through the shared potential helper -----
+    # swap_log_accept must equal the 4-term full-potential expression evaluated at
+    # the runtime N, and the fixed bending term still cancels exactly.
+    for model, p in (("hs_m2_const", const_p), ("hs_m2_hs", hshs_p)):
+        for (m_i, m_j) in ((4, 11), (7, 7), (2, 13)):
+            Ti, Tj = 305.0, 350.0
+            manual = (
+                reduced_contact_potential(m_i, Ti, model, p, Tref, Tscale, N)
+                + reduced_contact_potential(m_j, Tj, model, p, Tref, Tscale, N)
+                - reduced_contact_potential(m_j, Ti, model, p, Tref, Tscale, N)
+                - reduced_contact_potential(m_i, Tj, model, p, Tref, Tscale, N)
+            )
+            got = swap_log_accept(m_i, m_j, Ti, Tj, model, p, Tref, Tscale, N)
+            assert abs(manual - got) < 1e-12, (model, m_i, m_j, manual, got)
+            for (n_i, n_j, kap_b) in ((3, 9, 0.7), (0, 5, 2.1)):
+                full = (
+                    reduced_potential_bending(m_i, Ti, model, p, Tref, Tscale, kap_b, n_i, N)
+                    + reduced_potential_bending(m_j, Tj, model, p, Tref, Tscale, kap_b, n_j, N)
+                    - reduced_potential_bending(m_j, Ti, model, p, Tref, Tscale, kap_b, n_j, N)
+                    - reduced_potential_bending(m_i, Tj, model, p, Tref, Tscale, kap_b, n_i, N)
+                )
+                assert abs(full - got) < 1e-9, (model, n_i, n_j, kap_b, full, got)
+    print("  quick-test contact-quadratic manual generalized swap: PASSED")
+
+    Ts = np.linspace(300.0, 360.0, 4)
+    run_kw = dict(N=N, Ts=Ts, steps_per_swap=30, n_cycles=20,
+                  Tref=Tref, Tscale=Tscale, verbose=False)
+
+    # -- Test 4: zero curvature regresses EXACTLY onto hs (seeded linear run) ----
+    # Both new models run without raising NotImplementedError.
+    reps_hs, sp_hs, sa_hs = run_remd(model_name="hs", params=hs_p,
+                                     seed=4242, n_workers=1, **run_kw)
+    reps_c0, sp_c0, sa_c0 = run_remd(model_name="hs_m2_const",
+                                     params=[700.0, 2.4, 0.0],
+                                     seed=4242, n_workers=1, **run_kw)
+    reps_h0, _, _ = run_remd(model_name="hs_m2_hs", params=[700.0, 2.4, 0.0, 0.0],
+                             seed=4242, n_workers=1, **run_kw)
+    for a, c, h in zip(reps_hs, reps_c0, reps_h0):
+        assert a.C_traj == c.C_traj == h.C_traj, "zero-curvature diverged from hs"
+        assert a.Rg_traj == c.Rg_traj == h.Rg_traj
+        assert a.n_bend_traj == c.n_bend_traj == h.n_bend_traj
+    np.testing.assert_array_equal(sp_hs, sp_c0)
+    np.testing.assert_array_equal(sa_hs, sa_c0)
+    reps_cur, _, _ = run_remd(model_name="hs_m2_const", params=[700.0, 2.4, 6.0],
+                              seed=4242, n_workers=1, **run_kw)
+    assert any(a.C_traj != b.C_traj for a, b in zip(reps_hs, reps_cur)), (
+        "nonzero curvature left the sampling identical to hs")
+    print("  quick-test contact-quadratic zero-curvature regression: PASSED")
+
+    # -- Test 5 & 6: nonzero curvature + bending; incremental E vs full recompute -
+    global _DEBUG_CONTACTS
+    saved_debug = _DEBUG_CONTACTS
+    try:
+        _DEBUG_CONTACTS = True
+        reps_q, _, _ = run_remd(model_name="hs_m2_hs", params=hshs_p,
+                                kappa_bend=0.6, seed=77, n_workers=1, **run_kw)
+    finally:
+        _DEBUG_CONTACTS = saved_debug
+    for rep in reps_q:
+        assert rep.state.m == int(round(contact_count(rep.state.chain, rep.state.occ)))
+        assert rep.state.n_bend == count_bends(rep.state.chain)
+        assert 0 <= rep.state.n_bend <= N - 2
+        # incrementally maintained energy equals a full from-scratch recomputation
+        # (which recounts contacts) -- proving the m^2/(2N) term rides along.
+        full_E = energy(rep.state.chain, rep.state.occ, rep.T,
+                        "hs_m2_hs", hshs_p, Tref, Tscale)
+        assert abs(rep.state.E - full_E) < 1e-9, (rep.state.E, full_E)
+        for m_c, e_c in zip(rep.C_traj, rep.E_traj):
+            assert abs(e_c - energy_from_contacts(
+                m_c, rep.T, "hs_m2_hs", hshs_p, Tref, Tscale, N)) < 1e-9
+    print("  quick-test contact-quadratic curvature+bending consistency: PASSED")
+
+    # -- Test 7: serial/multiprocessing determinism (matches linear guarantees) -
+    det_kw = dict(model_name="hs_m2_const", params=const_p, kappa_bend=0.4,
+                  seed=808, **run_kw)
+    reps_w2, sp2, sa2 = run_remd(n_workers=2, **det_kw)
+    reps_w3, sp3, sa3 = run_remd(n_workers=3, **det_kw)
+    for a, b in zip(reps_w2, reps_w3):
+        assert a.C_traj == b.C_traj and a.n_bend_traj == b.n_bend_traj
+        assert a.state.n_bend == b.state.n_bend
+    np.testing.assert_array_equal(sp2, sp3)
+    np.testing.assert_array_equal(sa2, sa3)
+    # Serial runs are reproducible against themselves (serial and mp use
+    # different RNG streams by design, so serial != mp is expected).
+    reps_s1, _, _ = run_remd(n_workers=1, **det_kw)
+    reps_s2, _, _ = run_remd(n_workers=1, **det_kw)
+    for a, b in zip(reps_s1, reps_s2):
+        assert a.C_traj == b.C_traj and a.n_bend_traj == b.n_bend_traj
+    print("  quick-test contact-quadratic serial/mp determinism: PASSED")
+
+    # -- Test 8: fit-summary round-trip carrying fit_chain_length --------------
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        summ = {
+            "model_api_version": MODEL_API_VERSION,
+            "model": "hs_m2_const",
+            "params": {"kappa2": 0.5, "h1": 700.0, "s1": 2.4},  # scrambled order
+            "Tref": Tref, "Tscale": Tscale,
+            "kappa_bend": 0.25,
+            "fit_chain_length": 30,
+        }
+        path = os.path.join(tmp, "fit_summary.json")
+        with open(path, "w") as fh:
+            json.dump(summ, fh)
+        loaded = load_fit_summary_json(path)
+        assert loaded["model_name"] == "hs_m2_const"
+        assert list(loaded["param_names"]) == ["h1", "s1", "kappa2"]
+        assert np.allclose(loaded["params"], [700.0, 2.4, 0.5])
+        assert loaded["kappa_bend"] == 0.25
+        assert loaded["fit_chain_length"] == 30
+        # -1 sentinel and legacy (absent) both normalize to None.
+        for override in ({**summ, "fit_chain_length": -1},
+                         {k: v for k, v in summ.items() if k != "fit_chain_length"}):
+            p2 = os.path.join(tmp, "other.json")
+            with open(p2, "w") as fh:
+                json.dump(override, fh)
+            assert load_fit_summary_json(p2)["fit_chain_length"] is None
+        # attach_run_metadata records BOTH the runtime N and the fit chain length.
+        dist = {}
+        attach_run_metadata(
+            dist, seed=1, N=N, steps_per_swap=1, n_cycles=1,
+            burnin_frac=0.5, n_workers=1, kappa_bend=0.25,
+            fit_chain_length=loaded["fit_chain_length"],
+        )
+        assert dist["N"] == N and dist["n_beads"] == N
+        assert dist["fit_chain_length"] == 30
+        # Chain-length transfer: run at runtime N (20) != fit_chain_length (30).
+        reps_xfer, _, _ = run_remd(
+            model_name="hs_m2_const", params=loaded["params"], kappa_bend=0.25,
+            seed=5, n_workers=1, **run_kw)
+        assert len(reps_xfer) == len(Ts)
+    print("  quick-test contact-quadratic fit-summary round-trip: PASSED")
+
+    # -- Test 9: additive metadata (linear compatibility + curvature array) -----
+    for model, p in (("hs", hs_p), ("poly2", [0.1, -0.5, 0.03])):
+        for T in Ts:
+            for m in (0, 1, 5, 13):
+                assert (reduced_contact_potential(m, float(T), model, p, Tref, Tscale, N)
+                        == reduced_potential(m, float(T), model, p, Tref, Tscale))
+    dist = {}
+    attach_model_metadata(dist, "hs", ["h", "s"], hs_p, Tref, Tscale)
+    dist.update(temperature_bias_arrays(Ts, "hs", hs_p, Tref, Tscale))
+    assert dist["potential_kind"] == "linear"
+    assert dist["quadratic_normalization"] == ""  # npz-safe sentinel for linear
+    assert np.all(dist["quadratic_coefficient_by_temperature"] == 0.0)
+    distq = {}
+    attach_model_metadata(distq, "hs_m2_const", ["h1", "s1", "kappa2"], const_p,
+                          Tref, Tscale)
+    distq.update(temperature_bias_arrays(Ts, "hs_m2_const", const_p, Tref, Tscale))
+    assert distq["potential_kind"] == "contact_quadratic"
+    assert distq["quadratic_normalization"] == QUADRATIC_NORMALIZATION
+    assert np.allclose(
+        distq["quadratic_coefficient_by_temperature"],
+        [quadratic_bias("hs_m2_const", const_p, float(T), Tref, Tscale) for T in Ts])
+    assert np.all(distq["quadratic_coefficient_by_temperature"] != 0.0)
+    print("  quick-test contact-quadratic additive metadata: PASSED")
 
 
 def run_bending_quick_test() -> None:
@@ -4003,6 +4272,23 @@ def load_fit_summary_json(path: str) -> dict:
                 f"got {kappa_bend!r}"
             )
 
+    # Optional chain length the model was FIT at.  The bending-/quadratic-aware
+    # fitter records ``fit_chain_length`` so a contact-quadratic model can be
+    # transferred to a run at a different chain length: the sampler always uses
+    # the RUNTIME N in m^2/(2N) but records the fit-time value for provenance.
+    # Legacy summaries lack the field and read as None.  A value of -1 is the
+    # fitter's "not recorded" sentinel and is normalized back to None.
+    fit_chain_length = summary.get("fit_chain_length", None)
+    if fit_chain_length is not None:
+        fit_chain_length = int(fit_chain_length)
+        if fit_chain_length < 0:
+            fit_chain_length = None
+        elif fit_chain_length < 2:
+            raise ValueError(
+                f"fit_summary.json {path!r} fit_chain_length must be >= 2 "
+                f"(or absent), got {fit_chain_length!r}"
+            )
+
     return {
         "model_name": model_name,
         "param_names": list(param_names),
@@ -4010,6 +4296,7 @@ def load_fit_summary_json(path: str) -> dict:
         "Tref": Tref,
         "Tscale": Tscale,
         "kappa_bend": kappa_bend,
+        "fit_chain_length": fit_chain_length,
         "source_path": str(path),
     }
 
@@ -4253,13 +4540,22 @@ def attach_model_metadata(
 
     The existing metadata keys (model_name, param_names, model_params, Tref,
     Tscale) are preserved unchanged.  Optional provenance keys parameter_source
-    and fit_summary_json are added when supplied.
+    and fit_summary_json are added when supplied.  The model's potential class
+    (``potential_kind``) and, for contact-quadratic models, the curvature
+    normalization (``quadratic_normalization``) are recorded so consumers can
+    tell whether the m^2/(2N) term was part of the sampled potential.
     """
     dist["model_name"] = model_name
     dist["param_names"] = np.array(param_names)
     dist["model_params"] = np.array(model_params, dtype=float)
     dist["Tref"] = float(Tref)
     dist["Tscale"] = float(Tscale)
+    spec = MODEL_REGISTRY[model_name]
+    dist["potential_kind"] = str(spec["potential_kind"])
+    # Stored as a string ("" for linear models, which have no curvature
+    # normalization) so the distributions .npz never needs allow_pickle; the
+    # run summary JSON keeps the human-readable null.
+    dist["quadratic_normalization"] = str(spec["quadratic_normalization"] or "")
     if parameter_source is not None:
         dist["parameter_source"] = str(parameter_source)
     if fit_summary_json is not None:
@@ -4277,12 +4573,17 @@ def attach_run_metadata(
     burnin_frac: float,
     n_workers: int,
     kappa_bend: float = 0.0,
+    fit_chain_length: int | None = None,
 ) -> dict:
     """Inject simulation provenance into a distributions dict in place.
 
     Adds run/seed metadata, the bending-penalty metadata, and the model API
     version without removing or altering any existing canonical or
-    model-metadata keys.
+    model-metadata keys.  ``N``/``n_beads`` is the RUNTIME chain length actually
+    used in the m^2/(2N) normalization; ``fit_chain_length`` records the (possibly
+    different) chain length the model was fit at, or None when unknown -- both are
+    kept so a contact-quadratic model transferred across chain lengths is fully
+    traceable.
     """
     dist["seed"] = int(seed)
     # N is preserved for backward compatibility and means the number of beads.
@@ -4298,6 +4599,10 @@ def attach_run_metadata(
     dist["kappa_bend"] = float(kappa_bend)
     dist["bending_enabled"] = bool(float(kappa_bend) != 0.0)
     dist["bend_definition"] = BEND_DEFINITION
+    # -1 is the "not recorded" sentinel (matches the fitter's fit_results.npz) so
+    # the distributions .npz stays free of pickled object arrays; the run summary
+    # JSON keeps None.  Runtime N is always dist["N"]/dist["n_beads"].
+    dist["fit_chain_length"] = int(-1 if fit_chain_length is None else fit_chain_length)
     return dist
 
 
@@ -4307,11 +4612,16 @@ def temperature_bias_arrays(
     """Per-temperature reduced bias b(T), coupling K(T)=-b(T), weight q=exp(K).
 
     These are model-independent bookkeeping quantities used downstream; they do
-    not assume the constant-(h, s) interpretation.
+    not assume the constant-(h, s) interpretation.  For the contact-quadratic
+    models the curvature coefficient kappa(T) (coefficient of m^2/(2N)) is also
+    exposed as ``quadratic_coefficient_by_temperature`` -- exactly 0 for linear
+    models, so the array is always present and additive.
     """
     Ts = np.asarray(Ts, dtype=float)
     b = np.array([reduced_bias(model_name, params, float(T), Tref, Tscale)
                   for T in Ts], dtype=float)
+    kappa = np.array([quadratic_bias(model_name, params, float(T), Tref, Tscale)
+                      for T in Ts], dtype=float)
     K = -b
     # K is authoritative.  q = exp(K) can overflow to +inf for large couplings;
     # keep the inf as a sentinel (serialized as null in JSON via _json_safe) and
@@ -4328,6 +4638,7 @@ def temperature_bias_arrays(
         "reduced_bias_by_temperature": b,
         "coupling_K_by_temperature": K,
         "contact_weight_q_by_temperature": q,
+        "quadratic_coefficient_by_temperature": kappa,
     }
 
 
@@ -4832,11 +5143,13 @@ def main() -> None:
             parameter_source, fit_summary_json,
         ) = resolve_model_params(args, Ts)
 
-    # The sampler below implements u = b(T)*m (+ the fixed bending penalty). A
-    # contact-quadratic model would have its m^2/(2N) term silently dropped, so
-    # refuse it here rather than write distributions labelled with a model that
-    # was not the one sampled.
-    require_linear_contact_potential(model_name)
+    # The sampler implements the full generic contact potential
+    # u_contact(m,T;N) = b(T)*m + kappa(T)*m^2/(2N) (plus the fixed bending
+    # penalty), so both linear and contact-quadratic models are sampled exactly.
+    # The contact-quadratic models normalize their curvature by the RUNTIME chain
+    # length; require it to be present and valid here so the m^2/(2N) term is
+    # well defined (linear models return N unchanged / accept None).
+    validate_chain_length(model_name, args.N)
 
     nT = len(Ts)
 
@@ -4846,13 +5159,29 @@ def main() -> None:
     # only extracts the penalty and cross-checks any CLI --kappa-bend.  Direct-K
     # and other direct-parameter runs carry no summary and use the CLI value
     # (default 0.0).  kappa_bend > 0 enables bending; there is no separate flag.
+    fit_chain_length = None
     if fit_summary_json is not None:
-        summary_kappa = load_fit_summary_json(fit_summary_json)["kappa_bend"]
+        _summary = load_fit_summary_json(fit_summary_json)
+        summary_kappa = _summary["kappa_bend"]
+        # Chain length the model was fit at (None for legacy summaries).  The
+        # sampler ALWAYS uses the runtime --N in m^2/(2N); this is provenance
+        # only, and a mismatch is permitted (chain-length transfer is allowed).
+        fit_chain_length = _summary["fit_chain_length"]
         kappa_bend = resolve_kappa_bend(
             args.kappa_bend, summary_kappa, True, source=fit_summary_json)
     else:
         kappa_bend = resolve_kappa_bend(args.kappa_bend, None, False)
     bending_enabled = bool(kappa_bend != 0.0)
+    if (
+        fit_chain_length is not None
+        and int(fit_chain_length) != int(args.N)
+        and MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+    ):
+        print(
+            f"  [note] contact-quadratic model fit at chain length "
+            f"{fit_chain_length} is being run at N={int(args.N)}; the runtime N "
+            f"is used in m^2/(2N). Both are recorded in the run summary."
+        )
 
     Tmin_resolved, Tmax_resolved = float(Ts.min()), float(Ts.max())
     diffs = np.diff(Ts)
@@ -4985,6 +5314,21 @@ def main() -> None:
             "snapshot_stride": int(args.snapshot_stride),
             "snapshot_start_cycle": int(args.snapshot_start_cycle),
             "snapshot_flush_interval": int(args.snapshot_flush_interval),
+            # Hamiltonian provenance describing the potential actually sampled.
+            # The fixed bending penalty and the contact-potential contract
+            # (linear vs contact-quadratic + its m^2/(2N) normalization) are
+            # recorded, with the fit-time chain length kept alongside the runtime
+            # n_beads.  Follows the multichain snapshot metadata conventions.
+            "kappa_bend": float(kappa_bend),
+            "bending_enabled": bool(bending_enabled),
+            "bend_definition": BEND_DEFINITION,
+            "potential_kind": str(MODEL_REGISTRY[model_name]["potential_kind"]),
+            "quadratic_normalization": (
+                str(MODEL_REGISTRY[model_name]["quadratic_normalization"])
+                if MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+                else "null"),
+            "fit_chain_length": (
+                int(fit_chain_length) if fit_chain_length is not None else "null"),
             "fixed_bin_definitions": json.dumps(fixed_defs),
             "scaled_bin_definitions": json.dumps(scaled_defs),
             "structural_bin_definitions": bin_defs,
@@ -5086,7 +5430,7 @@ def main() -> None:
         seed=args.seed, N=args.N,
         steps_per_swap=args.steps_per_swap, n_cycles=args.n_cycles,
         burnin_frac=args.burnin_frac, n_workers=args.n_workers,
-        kappa_bend=kappa_bend,
+        kappa_bend=kappa_bend, fit_chain_length=fit_chain_length,
     )
     # Additive bending observables (never touch canonical Pc/Prg).  n_bend_traj
     # is the per-lane per-cycle 90-degree-turn count; bend_fraction is the
@@ -5256,6 +5600,14 @@ def main() -> None:
         "kappa_bend": float(kappa_bend),
         "bending_enabled": bool(bending_enabled),
         "bend_definition": BEND_DEFINITION,
+        # Contact-potential contract for the sampled Hamiltonian.  fit_chain_length
+        # is the chain length the model was fit at (None when unknown / legacy);
+        # the runtime chain length used in m^2/(2N) is "N"/"n_beads" above.
+        "potential_kind": str(MODEL_REGISTRY[model_name]["potential_kind"]),
+        "quadratic_normalization": MODEL_REGISTRY[model_name]["quadratic_normalization"],
+        "fit_chain_length": (
+            None if fit_chain_length is None else int(fit_chain_length)
+        ),
         "bend_fraction": [float(v) for v in bend_fraction],
         "structural_observables_enabled": bool(structural_observables),
         "structural_stride": int(structural_stride_eff),
@@ -5273,6 +5625,7 @@ def main() -> None:
         "reduced_bias_by_temperature": dist["reduced_bias_by_temperature"].tolist(),
         "coupling_K_by_temperature": dist["coupling_K_by_temperature"].tolist(),
         "contact_weight_q_by_temperature": dist["contact_weight_q_by_temperature"].tolist(),
+        "quadratic_coefficient_by_temperature": dist["quadratic_coefficient_by_temperature"].tolist(),
         "wall_time_seconds": float(wall_time_seconds),
         "swap_rates": swap_rates,
         "swap_rate_min": float(swap_rates_finite.min()) if swap_rates_finite.size else None,

@@ -491,23 +491,26 @@ def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
 
 
 def require_linear_contact_potential(model_name: str) -> None:
-    """Reject models a *linear-only* sampler cannot represent.
+    """Reject a contact-quadratic model on a genuinely linear-only code path.
 
     This single-chain sampler now samples the full contact potential (linear and
-    contact-quadratic alike) and no longer calls this guard.  It is retained for
-    samplers that still implement only u = b(T)*m -- notably the multi-chain
-    sampler, which imports it from here -- so that a contact-quadratic model is
-    refused loudly instead of having its m^2 term silently dropped and writing
-    distributions mislabelled with a model that was not the one sampled.
+    contact-quadratic alike) through :func:`reduced_contact_potential` and no
+    longer calls this guard.  The helper is retained as a generic validator for
+    callers that evaluate only u = b(T)*m and therefore cannot represent the
+    m^2/(2N) curvature: it lets such a path refuse a contact-quadratic model
+    loudly at setup instead of silently dropping the m^2 term and writing
+    distributions mislabelled with a model that was not the one sampled.  (The
+    multi-chain sampler does NOT use this guard; it has its own aggregate-only
+    guard and otherwise samples the contact-quadratic models per chain.)
     """
     kind = str(MODEL_REGISTRY[model_name]["potential_kind"])
     if kind != "linear":
         raise NotImplementedError(
             f"model {model_name!r} has a contact-quadratic potential "
-            f"(potential_kind={kind!r}); this sampler only implements the linear "
-            f"contact potential u = b(T)*m and would silently drop the "
-            f"{QUADRATIC_NORMALIZATION} term. Use it with a sampler that "
-            f"implements the m^2/(2N) term (e.g. the single-chain sampler)."
+            f"(potential_kind={kind!r}); this code path implements only the "
+            f"linear contact potential u = b(T)*m and would silently drop the "
+            f"{QUADRATIC_NORMALIZATION} term. Evaluate it through a full contact "
+            f"potential that includes the m^2/(2N) term instead."
         )
 
 
@@ -5165,6 +5168,21 @@ def main() -> None:
             "snapshot_stride": int(args.snapshot_stride),
             "snapshot_start_cycle": int(args.snapshot_start_cycle),
             "snapshot_flush_interval": int(args.snapshot_flush_interval),
+            # Hamiltonian provenance describing the potential actually sampled.
+            # The fixed bending penalty and the contact-potential contract
+            # (linear vs contact-quadratic + its m^2/(2N) normalization) are
+            # recorded, with the fit-time chain length kept alongside the runtime
+            # n_beads.  Follows the multichain snapshot metadata conventions.
+            "kappa_bend": float(kappa_bend),
+            "bending_enabled": bool(bending_enabled),
+            "bend_definition": BEND_DEFINITION,
+            "potential_kind": str(MODEL_REGISTRY[model_name]["potential_kind"]),
+            "quadratic_normalization": (
+                str(MODEL_REGISTRY[model_name]["quadratic_normalization"])
+                if MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+                else "null"),
+            "fit_chain_length": (
+                int(fit_chain_length) if fit_chain_length is not None else "null"),
             "fixed_bin_definitions": json.dumps(fixed_defs),
             "scaled_bin_definitions": json.dumps(scaled_defs),
             "structural_bin_definitions": bin_defs,
