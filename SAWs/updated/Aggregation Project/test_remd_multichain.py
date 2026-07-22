@@ -977,5 +977,32 @@ def test_kappa_metadata_propagates_into_summary_and_distributions(tmp_path):
         assert "bend_fraction" in d and d["bend_fraction"].shape == (3,)
 
 
+def test_recorded_u_and_effective_energy_include_bending():
+    # (13) Regression: the recorded reduced potential u (and the effective energy
+    # T*u) must be the FULL potential u_contact + kappa_bend * n_bend, not the
+    # contact-only term.  With lambda_intra = lambda_inter = 0 the contact reduced
+    # potential is identically zero, so every recorded u must equal
+    # kappa_bend * n_bend (nonzero because dispersed chains bend) and the effective
+    # energy must be T * u.  Before the fix u_traj used the contacts-only helper
+    # and every recorded u would be 0 here.
+    kappa_bend = 0.7
+    Ts = np.linspace(305, 350, 4)
+    reps, *_ = rmc.run_remd_multichain(
+        n_chains=2, chain_length=8, box_size=10, Ts=Ts,
+        local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=15,
+        model_name="hs", params=[400.0, 1.3], Tref=320.0, Tscale=80.0,
+        lambda_intra=0.0, lambda_inter=0.0, kappa_bend=kappa_bend,
+        seed=13, n_workers=1, verbose=False)
+    saw_nonzero_bend = False
+    for rep in reps:
+        assert len(rep.u_traj) == len(rep.eeff_traj) == len(rep.n_bend_traj) == 15
+        for u, eeff, n_bend in zip(rep.u_traj, rep.eeff_traj, rep.n_bend_traj):
+            assert abs(u - kappa_bend * n_bend) < 1e-12
+            assert abs(eeff - rep.T * u) < 1e-12
+            if n_bend > 0:
+                saw_nonzero_bend = True
+    assert saw_nonzero_bend, "test never exercised a nonzero bending contribution"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([os.path.abspath(__file__), "-q"]))

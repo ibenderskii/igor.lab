@@ -510,9 +510,9 @@ def run_remd_multichain(
 
             for k, rep in enumerate(replicas):
                 cyc = obs.cycle_observables(rep.state, cluster_contact_threshold)
-                u = reduced_potential_counts(
+                u = reduced_potential_bending_counts(
                     rep.state.counts, rep.T, model_name, params, Tref, Tscale,
-                    lambda_intra, lambda_inter)
+                    lambda_intra, lambda_inter, kappa_bend, rep.state.n_bend)
                 rep.u_traj.append(u)
                 rep.eeff_traj.append(rep.T * u)
                 rep.m_intra_traj.append(cyc["m_intra"])

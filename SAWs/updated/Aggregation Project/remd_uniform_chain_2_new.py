@@ -162,7 +162,22 @@ import numpy as np
 # imported from another working directory.
 import os as _os
 import sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+_HERE_DIR = Path(__file__).resolve().parent
+_sys.path.insert(0, str(_HERE_DIR))
+# The authoritative project-definitions JSON and the offline
+# ``extract_contact_motif_features`` module live in the sibling ``ISAW Project``
+# directory (this "Aggregation Project" tree carries only runtime copies of the
+# shared isaw_* modules).  Resolve that directory RELATIVE TO THIS FILE so the
+# script runs from the repository root without ISAW_PROJECT_DEFINITIONS or
+# PYTHONPATH set by hand.  Append (never prepend) so the co-located isaw_*
+# modules stay authoritative here; reuse -- not duplicate -- what lives only there.
+_ISAW_DIR = _HERE_DIR.parent / "ISAW Project"
+if _ISAW_DIR.is_dir():
+    if str(_ISAW_DIR) not in _sys.path:
+        _sys.path.append(str(_ISAW_DIR))
+    _defs_json = _ISAW_DIR / "project_definitions.json"
+    if _defs_json.is_file():
+        _os.environ.setdefault("ISAW_PROJECT_DEFINITIONS", str(_defs_json))
 import isaw_contact_observables as ico  # noqa: E402
 import isaw_config_io as cio  # noqa: E402
 from isaw_config_io import SnapshotWriter  # noqa: E402,F401  (run_remd annotation)

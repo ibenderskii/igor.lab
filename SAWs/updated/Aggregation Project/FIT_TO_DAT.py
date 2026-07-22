@@ -2761,6 +2761,43 @@ def _run_rg_regression_tests(
             > lim_anti["rg_limit_b_neg_inf_lattice"]),
         "limit ordering flips with the sign of the contact-Rg coupling",
     )
+
+    # ---------------------------------------------------------------- test S --
+    # joint_reweight_stats must stabilize the exponent over the SUPPORTED contact
+    # bins, not the global maximum.  With zero-probability endpoint bins padded
+    # onto the contact axis and a strong bias, an unsupported padded bin would set
+    # the maximum and underflow every supported weight to 0 (Z == 0), raising a
+    # false "degenerate" error.  The support-aware stabilization returns finite
+    # statistics with the mass concentrated on the real (supported) bins.
+    print("Scalar-Rg test 13e: joint_reweight_stats stabilizes over supported bins")
+    pad = 6
+    n_core = crg_s.shape[0]
+    crg_pad = np.zeros((n_core + 2 * pad, crg_s.shape[1]), dtype=float)
+    crg_pad[pad:pad + n_core] = crg_s          # zero-prob endpoint bins both sides
+    ce_pad = np.arange(-0.5, crg_pad.shape[0] + 0.5, 1.0)
+    m_pad = 0.5 * (ce_pad[:-1] + ce_pad[1:])
+    r_c_pad = 0.5 * (re_s[:-1] + re_s[1:])
+    strong_b = 200.0                           # strong positive bias favors low m
+    # The unfixed stabilization (global max, set by the m=0 padded bin) underflows
+    # every supported weight for this bias -> Z == 0 -> ValueError.
+    st_pad = joint_reweight_stats(crg_pad, m_pad, r_c_pad, strong_b, "rms")
+    rcheck(
+        all(np.isfinite(v) for v in st_pad.values()),
+        "joint_reweight_stats returns finite stats with padded zero-prob bins and "
+        "a strong bias (no false 'degenerate' error)",
+    )
+    rcheck(
+        m_pad[pad - 1] < st_pad["mean_contacts"] < m_pad[pad + n_core],
+        "reweighted mean contacts lands inside the supported bins, not on a padded "
+        "zero-mass bin",
+    )
+    # A fully supported baseline is untouched: support-aware stabilization reduces
+    # to x - x.max() when every bin carries mass.
+    st_full = joint_reweight_stats(crg_s, m_c, r_c, strong_b, "rms")
+    rcheck(
+        np.isfinite(st_full["pred_rg_lattice"]),
+        "fully supported strong-bias reweighting is unchanged (still finite)",
+    )
     # The deprecated alias must keep working and keep mirroring the endpoints.
     with _warnings.catch_warnings(record=True) as caught:
         _warnings.simplefilter("always")
@@ -6030,8 +6067,12 @@ def joint_reweight_stats(
     All quantities are in lattice units.  Returns the scalar Rg summary, the mean
     contacts, and the contact-Rg covariance/correlation under P_b.
     """
-    x = -float(b) * m_centers
-    x = x - np.max(x)
+    # Stabilize the exponent over the SUPPORTED contact bins only (rows carrying
+    # baseline mass), matching the production reweighting paths.  Letting an
+    # unsupported (zero-mass) bin set the maximum can underflow every supported
+    # weight under a strong bias; those bins contribute nothing to Z anyway.
+    support = np.asarray(crg_prob, dtype=float).sum(axis=1) > 0.0
+    x = _stabilized_exponent(-float(b) * np.asarray(m_centers, dtype=float), support)
     w = np.exp(x)
     joint = crg_prob * w[:, None]
     Z = joint.sum()
