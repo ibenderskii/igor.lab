@@ -1,15 +1,12 @@
 {
   "target_remd": "remd_distributions_30mer.npz",
   "fit_script": "fit_lattice_contact_model_2.py",
-  "remd_script": "remd_uniform_chain_2.py",
-  "output_root": "model_suite_output_30mer",
+  "remd_script": "remd_uniform_chain_2_new.py",
+  "output_root": "quad_model_suite_output_30mer",
 
   "models": [
     "hs",
-    "hs_quadratic",
-    "poly2",
-    "poly3",
-    "heat_capacity"
+    "hs_m2_hs"
   ],
 
   "baselines": [
@@ -24,13 +21,13 @@
   "fit": {
     "loss": "js",
     "fit_rg": true,
-    "rg_weight": 0.5,
+    "rg_weight": 0.7,
     "holdout_every": null,
     "holdout_indices": null,
     "train_indices": null,
     "n_restarts": 8,
     "seed": 123,
-    "plots": false,
+    "plots": true,
 
     "bootstrap": {
       "enabled": true,
@@ -77,9 +74,9 @@
     "n_cycles": 5000,
     "rg_bins": 100,
     "burnin_frac": 0.7,
-    "n_workers": 16,
+    "n_workers": 32,
     "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-    "plots": false, 
+    "plots": true, 
     "timing": true,
     "diagnostics": {
       "enabled": true,
@@ -96,7 +93,7 @@
 
   "comparison": {
     "include_rg": true,
-    "rg_weight": 0.5,
+    "rg_weight": 0.7,
     "temperature_tolerance": 1e-10,
     "make_plots": true,
     "statistics": {

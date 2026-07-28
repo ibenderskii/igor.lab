@@ -1,0 +1,9 @@
+parameter,value,kind,bound_low,bound_high,at_boundary,units_or_description
+h1,1142.2436,thermodynamic,-2000,2000,,
+s1,-2.9853105,thermodynamic,-10,10,,
+h2,-2000,thermodynamic,-2000,2000,lo,
+s2,9.99787,thermodynamic,-10,10,,
+rg_scale,0.345,scale_fixed,,,,"observed Rg units per lattice unit (Rg_obs = rg_scale*Rg_lattice) [FIXED, not optimized]"
+rg_scale_effective,0.345,scale_effective,,,,scale used for every fitted-model lattice/observed conversion
+T_rg_max_slope,311.4,derived,,,,"temperature of steepest fitted collapse, argmax of -dRg/dT (K)"
+T_rg_half,312.69518,derived,,,,temperature crossing the midpoint Rg between the interval ends (K)
