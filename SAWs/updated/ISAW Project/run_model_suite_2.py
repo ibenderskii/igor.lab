@@ -848,12 +848,12 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
                         f"{coeff}(T) mismatch for {name!r} at T={T}: "
                         f"fitter={vf!r} remd={vr!r}"
                     )
-    n_quadratic = sum(
+    n_nonlinear = sum(
         1 for name in fit_models
         if fit_contract["models"][name]["potential_kind"] != "linear"
     )
     log(f"Preflight: model contract OK (api v{fit_contract['model_api_version']}, "
-        f"{len(fit_models)} models, {n_quadratic} contact-quadratic, "
+        f"{len(fit_models)} models, {n_nonlinear} nonlinear in m, "
         f"numeric b(T) and kappa(T) equal).")
     return fit_contract
 

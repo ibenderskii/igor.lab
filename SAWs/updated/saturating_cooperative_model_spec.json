@@ -1,0 +1,43 @@
+{
+  "model_name": "saturating_cooperative_contact",
+  "purpose": "Add bounded cooperative intrachain collapse while preserving the linear model's high-contact behavior and Rg plateau.",
+  "variables": {
+    "m_intra": "Raw nonbonded intrachain contact count for one chain.",
+    "N": "Number of beads in the chain.",
+    "q": "(m_intra - m_ref) / N, an intensive shifted contact density.",
+    "m_ref": "Reference contact count used only to center q; default 0 unless the fitter already uses another reference."
+  },
+  "reduced_potential_per_chain": {
+    "equation": "u_intra(T) = N * [b(T)*q - A(T)*q^2 / (1 + (q/q_sat)^2)]",
+    "linear_bias": "b(T) = h_b/T - s_b",
+    "cooperativity": "A(T) = A0 initially; optionally A(T) = h_A/T - s_A if validation supports temperature dependence.",
+    "saturation_parameter": "q_sat > 0 controls where the nonlinear attraction stops strengthening."
+  },
+  "behavior": {
+    "low_to_moderate_q": "Approximately b(T)q - A(T)q^2 + A(T)q^4/q_sat^2, giving negative-quadratic cooperativity plus positive-quartic stabilization.",
+    "high_q": "The cooperative correction approaches the constant -A(T)q_sat^2, so the marginal slope returns to the linear bias b(T) instead of becoming increasingly attractive.",
+    "expected_effect": "Sharper collapse than the linear model without the continued overcollapse caused by an unchecked negative m^2 term."
+  },
+  "multichain_rule": {
+    "equation": "u_total = sum_alpha u_intra_alpha + b_inter(T)*m_inter",
+    "requirement": "Evaluate the saturating intrachain term separately for each chain using that chain's own m_intra_alpha.",
+    "warning": "Do not apply the nonlinear function to total contacts or to m_intra + m_inter, because that creates artificial cross-chain coupling."
+  },
+  "implementation_notes": [
+    "Use raw lattice contact counts; never apply the molecular-to-lattice contact offset inside the Hamiltonian.",
+    "Update the energy from old and new per-chain intrachain contact counts during Monte Carlo moves.",
+    "Keep interchain contacts linear in the first implementation.",
+    "Fit against both P(m|T) and P(Rg|T), and compare against the existing linear, quadratic, and quartic models using held-out temperatures.",
+    "Enforce q_sat > 0 and preferably A(T) >= 0 over the fitted temperature range."
+  ],
+  "initial_parameterization": {
+    "free_parameters": [
+      "h_b",
+      "s_b",
+      "A0",
+      "q_sat"
+    ],
+    "recommended_first_version": "Temperature-independent A0 and q_sat.",
+    "optional_extension": "Add h_A and s_A only if cross-validation shows a clear improvement."
+  }
+}

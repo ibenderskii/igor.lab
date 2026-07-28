@@ -12,6 +12,26 @@ heat_capacity (see MODEL_REGISTRY).  The default model is hs:
 
     b(T) = h/T - s
 
+Contact potentials nonlinear in m
+---------------------------------
+Three of the registry entries do not stop at u = b(T)*m, and for them the
+sampled weight is exp[-u_contact(m,T;N)] with the FULL potential:
+
+    hs_m2_const, hs_m2_hs      u = b(T)*m + kappa(T)*m^2/(2N)
+    saturating_cooperative_contact
+                               u = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],
+                               q = m/N,  m_ref = 0,  b(T) = h_b/T - s_b
+
+A0 >= 0 and q_sat > 0 are temperature-independent; A0 = 0 reproduces the hs
+potential bit for bit, so an A0 = 0 run reproduces the seeded hs trajectory
+exactly.  These models need the chain length N (for the m^2/(2N) or q = m/N
+normalization); the sampler always uses the RUNTIME N and records the fit-time
+chain length separately.  Local-move acceptance, the generalized swap criterion,
+the recorded energies and the derived observables all evaluate the full
+potential -- never a b(T)*delta_m shortcut.  The optional bending penalty
+kappa_bend*n_bend stays a separate additive term and is never folded into a
+contact model.
+
 Loading fitted models
 ---------------------
 The preferred way to reproduce a fitted contact-energy model is
@@ -292,6 +312,22 @@ def _b_heat_capacity(params, T, Tref, Tscale):
 # QUADRATIC_NORMALIZATION exactly: it defines what a fitted kappa means.
 QUADRATIC_NORMALIZATION = "m^2/(2N)"
 
+# Contact-fraction normalization used by the saturating-cooperative family.
+# Must match the fitters' Q_NORMALIZATION exactly.
+Q_NORMALIZATION = "q = m/N"
+
+# Reference contact number.  Every potential defined here is measured from m = 0,
+# so q = (m - m_ref)/N = m/N; recorded explicitly rather than left implicit.
+M_REF_DEFAULT = 0
+
+# The exact saturating-cooperative potential, verbatim from the fitters.  Recorded
+# in the distributions and the run summary so a sampled parameter can never be
+# reinterpreted against a different convention.
+SATURATING_COOPERATIVE_DEFINITION = (
+    "u(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],  b(T) = h_b/T - s_b,  "
+    "q = m/N,  m_ref = 0,  A0 >= 0 and q_sat > 0 (both temperature-independent)"
+)
+
 
 def _q_zero(params, T, Tref, Tscale):
     """Quadratic coefficient of a purely linear contact potential: exactly 0."""
@@ -356,14 +392,43 @@ MODEL_REGISTRY = {
         "requires_chain_length": True,
         "description": "u(m,T;N) = (h1/T - s1)*m + (h2/T - s2)*m^2/(2N)",
     },
+    # --- saturating-cooperative model ---------------------------------------
+    # Written in the contact fraction q = m/N rather than in m, so the
+    # cooperative attraction saturates: it deepens the well at low contact
+    # density but its marginal contribution dies off once q >> q_sat, and the
+    # marginal slope du/dm returns to b(T).  A0 = 0 recovers hs exactly (bit for
+    # bit), so a run with A0 = 0 reproduces the seeded hs trajectory.
+    "saturating_cooperative_contact": {
+        "param_names": ["h_b", "s_b", "A0", "q_sat"],
+        "raw_b_fn": _b_hs,
+        # No raw_q_fn: this potential has no m^2/(2N) term, so kappa(T) is
+        # identically zero and the _q_zero default is the honest answer.
+        "potential_kind": "saturating_cooperative",
+        "quadratic_normalization": None,
+        "potential_normalization": Q_NORMALIZATION,
+        "potential_definition": SATURATING_COOPERATIVE_DEFINITION,
+        "m_ref": M_REF_DEFAULT,
+        "requires_chain_length": True,
+        "description": (
+            "u(m,T;N) = N*[(h_b/T - s_b)*q - A0*q^2/(1+(q/q_sat)^2)],  q = m/N  "
+            "(saturating cooperative attraction; A0 >= 0, q_sat > 0)"
+        ),
+    },
 }
 
-# Linear models carry no curvature in m and need no chain length.
+# Linear models carry no curvature in m and need no chain length.  Filling the
+# defaults here keeps the eight historical entries textually unchanged.
 for _spec in MODEL_REGISTRY.values():
     _spec.setdefault("raw_q_fn", _q_zero)
     _spec.setdefault("potential_kind", "linear")
     _spec.setdefault("quadratic_normalization", None)
     _spec.setdefault("requires_chain_length", False)
+    # Every potential defined so far is measured from m = 0.
+    _spec.setdefault("m_ref", M_REF_DEFAULT)
+    # For the pre-existing models the description already IS the exact potential
+    # definition, and m^2/(2N) is the only normalization that ever needed N.
+    _spec.setdefault("potential_definition", _spec["description"])
+    _spec.setdefault("potential_normalization", _spec["quadratic_normalization"])
 del _spec
 
 
@@ -374,7 +439,15 @@ del _spec
 #   v2: registry gains raw_q_fn / potential_kind / quadratic_normalization and
 #       the contact-number-quadratic models hs_m2_const and hs_m2_hs. Every v1
 #       model is potential_kind "linear", so their sampling weight is unchanged.
-MODEL_API_VERSION = 2
+#   v3: potential_kind gains "saturating_cooperative" and the model
+#       saturating_cooperative_contact; the full potential is built by
+#       POTENTIAL_BUILDERS[potential_kind] instead of being hard-coded as
+#       b*m + kappa*m^2/(2N), and the registry/contract gain
+#       potential_definition, potential_normalization and m_ref.  Every v1 and
+#       v2 model keeps its parameters, its potential, and its sampled
+#       trajectories bit for bit; the four pre-existing contract keys are
+#       unchanged, so a v2-era comparator that reads only those keys still works.
+MODEL_API_VERSION = 3
 
 # Output-schema version for the distributions NPZ / run summary / snapshot files.
 # Bump when the set of stored keys or their semantics change.
@@ -393,7 +466,13 @@ def get_model_contract() -> dict:
     """Return a callable-free description of the supported contact-bias models.
 
     Used to verify that this script and fit_lattice_contact_model.py agree on the
-    model API version, model names, and parameter ordering.
+    model API version, model names, parameter ordering, and the exact potential
+    each model defines.
+
+    ``potential_definition`` is the authoritative statement of the potential;
+    ``quadratic_normalization`` names the m^2/(2N) convention specifically and is
+    None for every model that does not use it, while ``potential_normalization``
+    is the generic label for whatever the chain length is used for.
     """
     return {
         "model_api_version": MODEL_API_VERSION,
@@ -403,6 +482,9 @@ def get_model_contract() -> dict:
                 "description": str(spec["description"]),
                 "potential_kind": str(spec["potential_kind"]),
                 "quadratic_normalization": spec["quadratic_normalization"],
+                "potential_definition": str(spec["potential_definition"]),
+                "potential_normalization": spec["potential_normalization"],
+                "m_ref": int(spec["m_ref"]),
             }
             for name, spec in MODEL_REGISTRY.items()
         },
@@ -441,17 +523,81 @@ def make_q_fn(model_name, Tref, Tscale):
 
 def validate_chain_length(model_name, n_beads):
     """Return a usable chain length, or raise when the model requires one and it is absent."""
-    if not MODEL_REGISTRY[model_name].get("requires_chain_length"):
+    spec = MODEL_REGISTRY[model_name]
+    if not spec.get("requires_chain_length"):
         return None if n_beads is None else int(n_beads)
     if n_beads is None:
         raise ValueError(
             f"model {model_name!r} needs a chain length for its "
-            f"{QUADRATIC_NORMALIZATION} normalization; none was supplied."
+            f"{spec.get('potential_normalization') or 'normalization'} "
+            f"normalization; none was supplied."
         )
     n = int(n_beads)
     if n < 2:
         raise ValueError(f"chain length must be >= 2, got {n_beads!r}")
     return n
+
+
+def validated_saturating_params(params):
+    """Return (A0, q_sat) for the saturating-cooperative model, or raise.
+
+    The potential is only defined for A0 >= 0 (an attraction, never a repulsion
+    dressed up as one) and q_sat > 0 (a saturation scale; q_sat = 0 would divide
+    by zero).  Mirrors the fitter's validator exactly, so a parameter set the
+    fitter accepts is one this sampler accepts and vice versa.
+    """
+    A0 = float(params[2])
+    q_sat = float(params[3])
+    if not math.isfinite(A0) or not math.isfinite(q_sat):
+        raise ValueError(
+            f"saturating_cooperative needs finite A0 and q_sat, got "
+            f"A0={A0!r}, q_sat={q_sat!r}"
+        )
+    if A0 < 0.0:
+        raise ValueError(f"saturating_cooperative requires A0 >= 0, got {A0!r}")
+    if q_sat <= 0.0:
+        raise ValueError(f"saturating_cooperative requires q_sat > 0, got {q_sat!r}")
+    return A0, q_sat
+
+
+# ---------------------------------------------------------------------------
+# Scalar potential kernels, one per potential_kind
+# ---------------------------------------------------------------------------
+# Each takes the already-resolved coefficients and returns u as a float.  Both
+# reduced_contact_potential (the hot scalar path used by every local move, swap,
+# observable and energy) and the closures returned by make_contact_u_fn go
+# through these, so the two can never drift apart.  The arithmetic expressions
+# for "linear" and "contact_quadratic" are the historical ones, operand for
+# operand, so every pre-existing model keeps its sampled trajectory bit for bit.
+
+def _u_linear_value(b, m):
+    """u = b(T) * m."""
+    return b * float(m)
+
+
+def _u_contact_quadratic_value(b, kappa, m, n):
+    """u = b(T)*m + kappa(T)*m^2/(2N)."""
+    return b * float(m) + kappa * (float(m) * float(m)) / (2.0 * float(n))
+
+
+def _u_saturating_cooperative_value(b, A0, q_sat, m, n):
+    """u = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)] with q = m/N and m_ref = 0.
+
+    The linear part is evaluated as ``b(T)*m``, not as ``N*(b(T)*(m/N))``.  The
+    two are the same number in exact arithmetic, but the round trip through m/N
+    and back through *N is exactly the avoidable rounding: writing it as b(T)*m
+    makes A0 = 0 reproduce the hs potential bit for bit, so an A0 = 0 run
+    reproduces the seeded hs trajectory exactly rather than approximately.  Only
+    the cooperative term, which has no linear counterpart to agree with, is
+    evaluated in q.
+    """
+    u_lin = b * float(m)
+    if A0 == 0.0:
+        return u_lin
+    n = float(n)
+    q = float(m) / n
+    r = q / q_sat
+    return u_lin - n * A0 * (q * q) / (1.0 + r * r)
 
 
 def reduced_contact_potential(
@@ -460,57 +606,123 @@ def reduced_contact_potential(
     """u_contact(m, T; N) for the selected model.
 
     Linear models return exactly ``b(T) * m``, i.e. :func:`reduced_potential`.
+    Contact-quadratic models add ``kappa(T)*m^2/(2N)``; the saturating-cooperative
+    model subtracts ``N*A0*q^2/(1 + (q/q_sat)^2)`` with ``q = m/N``.  This is the
+    single scalar authority for the sampled potential: local-move acceptance,
+    the generalized swap criterion, the recorded energies and every derived
+    observable all evaluate it directly rather than differencing ``b(T)*dm``.
     """
     spec = MODEL_REGISTRY[model_name]
+    kind = str(spec["potential_kind"])
     b = reduced_bias(model_name, params, float(T), Tref, Tscale)
-    if spec["potential_kind"] == "linear":
-        return b * float(m)
+    if kind == "linear":
+        return _u_linear_value(b, m)
     n = validate_chain_length(model_name, n_beads)
-    q = quadratic_bias(model_name, params, float(T), Tref, Tscale)
-    return b * float(m) + q * (float(m) * float(m)) / (2.0 * float(n))
+    if kind == "contact_quadratic":
+        kappa = quadratic_bias(model_name, params, float(T), Tref, Tscale)
+        return _u_contact_quadratic_value(b, kappa, m, n)
+    if kind == "saturating_cooperative":
+        A0, q_sat = validated_saturating_params(params)
+        return _u_saturating_cooperative_value(b, A0, q_sat, m, n)
+    raise ValueError(
+        f"model {model_name!r} declares potential_kind {kind!r}, which this "
+        f"sampler cannot evaluate. Known kinds: {sorted(POTENTIAL_BUILDERS)}"
+    )
 
 
-def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
-    """Return u(params, T, m) with Tref, Tscale and N captured by closure."""
-    spec = MODEL_REGISTRY[model_name]
+# ---------------------------------------------------------------------------
+# Potential builders
+# ---------------------------------------------------------------------------
+# One builder per potential_kind.  Each takes the registry spec plus the
+# temperature reference/scale and the (already validated) chain length, and
+# returns u_fn(params, T, m).  Adding a potential family means adding a kernel,
+# a builder and a registry entry -- no caller of u_fn needs to know which family
+# it got.
+
+def _build_u_linear(spec, Tref, Tscale, n):
+    """u = b(T) * m.  Needs no chain length."""
     raw_b = spec["raw_b_fn"]
-    if spec["potential_kind"] == "linear":
-        def u_fn_linear(params, T, m):
-            return float(raw_b(params, float(T), Tref, Tscale)) * float(m)
-        return u_fn_linear
 
+    def u_fn_linear(params, T, m):
+        return _u_linear_value(float(raw_b(params, float(T), Tref, Tscale)), m)
+
+    return u_fn_linear
+
+
+def _build_u_contact_quadratic(spec, Tref, Tscale, n):
+    """u = b(T)*m + kappa(T)*m^2/(2N)."""
+    raw_b = spec["raw_b_fn"]
     raw_q = spec["raw_q_fn"]
-    n = float(validate_chain_length(model_name, n_beads))
 
     def u_fn_quadratic(params, T, m):
         b = float(raw_b(params, float(T), Tref, Tscale))
-        q = float(raw_q(params, float(T), Tref, Tscale))
-        return b * float(m) + q * (float(m) * float(m)) / (2.0 * n)
+        kappa = float(raw_q(params, float(T), Tref, Tscale))
+        return _u_contact_quadratic_value(b, kappa, m, n)
 
     return u_fn_quadratic
 
 
-def require_linear_contact_potential(model_name: str) -> None:
-    """Reject a contact-quadratic model on a genuinely linear-only code path.
+def _build_u_saturating_cooperative(spec, Tref, Tscale, n):
+    """u = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],  q = m/N,  m_ref = 0."""
+    raw_b = spec["raw_b_fn"]
 
-    This single-chain sampler now samples the full contact potential (linear and
-    contact-quadratic alike) through :func:`reduced_contact_potential` and no
-    longer calls this guard.  The helper is retained as a generic validator for
-    callers that evaluate only u = b(T)*m and therefore cannot represent the
-    m^2/(2N) curvature: it lets such a path refuse a contact-quadratic model
-    loudly at setup instead of silently dropping the m^2 term and writing
-    distributions mislabelled with a model that was not the one sampled.  (The
-    multi-chain sampler does NOT use this guard; it has its own aggregate-only
-    guard and otherwise samples the contact-quadratic models per chain.)
+    def u_fn_saturating(params, T, m):
+        A0, q_sat = validated_saturating_params(params)
+        b = float(raw_b(params, float(T), Tref, Tscale))
+        return _u_saturating_cooperative_value(b, A0, q_sat, m, n)
+
+    return u_fn_saturating
+
+
+POTENTIAL_BUILDERS = {
+    "linear": _build_u_linear,
+    "contact_quadratic": _build_u_contact_quadratic,
+    "saturating_cooperative": _build_u_saturating_cooperative,
+}
+
+
+def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
+    """Return u(params, T, m) with Tref, Tscale and N captured by closure.
+
+    Dispatch is by potential_kind through POTENTIAL_BUILDERS, so an unknown kind
+    fails loudly here instead of silently sampling some other potential.
     """
-    kind = str(MODEL_REGISTRY[model_name]["potential_kind"])
+    spec = MODEL_REGISTRY[model_name]
+    kind = str(spec["potential_kind"])
+    try:
+        build = POTENTIAL_BUILDERS[kind]
+    except KeyError:
+        raise ValueError(
+            f"model {model_name!r} declares potential_kind {kind!r}, which has "
+            f"no builder. Known kinds: {sorted(POTENTIAL_BUILDERS)}"
+        ) from None
+    n = validate_chain_length(model_name, n_beads)
+    return build(spec, Tref, Tscale, None if n is None else float(n))
+
+
+def require_linear_contact_potential(model_name: str) -> None:
+    """Reject a model nonlinear in m on a genuinely linear-only code path.
+
+    This single-chain sampler now samples the full contact potential (linear,
+    contact-quadratic and saturating-cooperative alike) through
+    :func:`reduced_contact_potential` and no longer calls this guard.  The helper
+    is retained as a generic validator for callers that evaluate only
+    u = b(T)*m and therefore cannot represent any nonlinearity in m: it lets such
+    a path refuse a nonlinear model loudly at setup instead of silently dropping
+    the nonlinear term and writing distributions mislabelled with a model that
+    was not the one sampled.  (The multi-chain sampler does NOT use this guard;
+    it has its own aggregate-only guard and otherwise samples the nonlinear
+    models per chain.)
+    """
+    spec = MODEL_REGISTRY[model_name]
+    kind = str(spec["potential_kind"])
     if kind != "linear":
         raise NotImplementedError(
-            f"model {model_name!r} has a contact-quadratic potential "
-            f"(potential_kind={kind!r}); this code path implements only the "
-            f"linear contact potential u = b(T)*m and would silently drop the "
-            f"{QUADRATIC_NORMALIZATION} term. Evaluate it through a full contact "
-            f"potential that includes the m^2/(2N) term instead."
+            f"model {model_name!r} has a contact potential that is nonlinear in "
+            f"m (potential_kind={kind!r}): {spec['potential_definition']}. This "
+            f"code path implements only the linear contact potential u = b(T)*m "
+            f"and would silently drop the nonlinear term. Evaluate it through a "
+            f"full contact potential instead."
         )
 
 
@@ -532,12 +744,15 @@ def reduced_potential_bending(
     """Full reduced potential u(X,T) = u_contact(m,T;N) + kappa_bend*n_bend.
 
     ``u_contact`` is the generic contact potential: exactly ``b(T)*m`` for linear
-    models and ``b(T)*m + kappa(T)*m^2/(2N)`` for the contact-quadratic models
+    models, ``b(T)*m + kappa(T)*m^2/(2N)`` for the contact-quadratic models, and
+    ``N*[b(T)*q - A0*q^2/(1+(q/q_sat)^2)]`` for the saturating-cooperative one
     (see :func:`reduced_contact_potential`).  The optional fixed reduced bending
-    penalty is temperature-independent.  With ``kappa_bend == 0`` and a linear
-    model this equals :func:`reduced_potential` exactly, so the athermal /
-    no-bending behaviour is unchanged.  ``n_beads`` (the runtime chain length) is
-    ignored by linear models and required by the contact-quadratic ones.
+    penalty is a SEPARATE additive term: it is temperature-independent, depends
+    only on the bend count, and is deliberately NOT folded into any contact
+    model.  With ``kappa_bend == 0`` and a linear model this equals
+    :func:`reduced_potential` exactly, so the athermal / no-bending behaviour is
+    unchanged.  ``n_beads`` (the runtime chain length) is ignored by linear
+    models and required by every model whose normalization needs N.
     """
     return (
         reduced_contact_potential(m, T, model_name, params, Tref, Tscale, n_beads)
@@ -561,7 +776,8 @@ def energy_from_contacts(m, T, model_name, params, Tref, Tscale, n_beads=None) -
 
     For hs this is exactly H = m*(h - T*s), preserving old behavior.  For linear
     models it is the effective H corresponding to u = m*b(T); for the
-    contact-quadratic models it also carries the T*kappa(T)*m^2/(2N) term.
+    contact-quadratic models it also carries the T*kappa(T)*m^2/(2N) term, and
+    for the saturating-cooperative model the T*N*A0*q^2/(1+(q/q_sat)^2) term.
     ``n_beads`` (runtime chain length) is ignored by linear models.  The fixed
     reduced bending penalty is deliberately NOT part of H (it is dimensionless
     and temperature-independent); H remains the contact energy in model units.
@@ -793,10 +1009,12 @@ def swap_log_accept(
 
     log_accept = u(C_i,T_i) + u(C_j,T_j) - u(C_j,T_i) - u(C_i,T_j)
 
-    Uses the generalized full contact potential ``u_contact(m,T;N)`` (linear or
-    contact-quadratic).  ``n_beads`` (the runtime chain length) feeds the
-    m^2/(2N) normalization and is ignored by linear models; for linear models
-    every term is bit-identical to the historical ``b(T)*m`` criterion.
+    Uses the generalized full contact potential ``u_contact(m,T;N)`` -- linear,
+    contact-quadratic or saturating-cooperative -- evaluated at each of the four
+    (m, T) pairs.  It is NOT a b(T)*delta_m expression, so a potential nonlinear
+    in m contributes exactly.  ``n_beads`` (the runtime chain length) feeds the
+    m^2/(2N) or q = m/N normalization and is ignored by linear models; for linear
+    models every term is bit-identical to the historical ``b(T)*m`` criterion.
 
     The optional bending penalty kappa_bend*n_bend is temperature-INDEPENDENT, so
     its contribution to this expression is kappa*(n_i + n_j - n_j - n_i) = 0.  It
@@ -895,8 +1113,9 @@ def mc_sweep(
         accept if du <= 0 or rand < exp(-du).
     The contact difference is evaluated through the full potential -- it is NOT
     approximated as b(T)*dm -- so the m^2/(2N) curvature of the contact-quadratic
-    models is honoured exactly.  ``n_beads`` is the runtime chain length used in
-    that normalization; when omitted it defaults to the current chain length.
+    models and the saturating q-dependence of saturating_cooperative_contact are
+    both honoured exactly.  ``n_beads`` is the runtime chain length used in that
+    normalization; when omitted it defaults to the current chain length.
     For linear models it is ignored and du is bit-identical to the historical
     du = u_new - u_old criterion, so kappa_bend = 0 reproduces old seeded sampling
     exactly (the bend term contributes 0.0 and draws no extra random numbers) and
@@ -906,9 +1125,9 @@ def mc_sweep(
     state = replica.state
     counters = replica.move_counters
     kappa_bend = float(kappa_bend)
-    # Runtime chain length for the m^2/(2N) normalization (contact-quadratic
-    # models); ignored by linear models.  The chain length is invariant under
-    # every local move, so the cached value is stable for the whole sweep.
+    # Runtime chain length for the m^2/(2N) or q = m/N normalization (every model
+    # nonlinear in m); ignored by linear models.  The chain length is invariant
+    # under every local move, so the cached value is stable for the whole sweep.
     N = int(n_beads) if n_beads is not None else len(state.chain)
 
     for _ in range(steps):
@@ -3210,6 +3429,7 @@ def run_quick_test() -> None:
 
     run_bending_quick_test()
     run_contact_quadratic_quick_test()
+    run_saturating_cooperative_quick_test()
     run_diagnostics_quick_test()
     run_structural_quick_test()
 
@@ -3659,6 +3879,356 @@ def run_contact_quadratic_quick_test() -> None:
     print("  quick-test contact-quadratic old-output compatibility: PASSED")
 
 
+def run_saturating_cooperative_quick_test() -> None:
+    """Tests for sampling saturating_cooperative_contact.
+
+    The sampled contact potential is
+
+        u_contact(m,T;N) = N * [ b(T)*q - A0*q^2/(1 + (q/q_sat)^2) ],
+        q = m/N,  m_ref = 0,  b(T) = h_b/T - s_b
+
+    with the fixed bending penalty kappa_bend*n_bend added in local moves only --
+    it is a separate additive term and is never folded into the contact model.
+    Covers: direct potential values against an independently transcribed formula,
+    manual local-move differences (which must NOT be b(T)*dm), the manual
+    generalized swap criterion, the exact A0 = 0 regression onto hs, nonzero A0
+    combined with nonzero bending, cached contact/bend consistency,
+    serial/multiprocessing determinism, a fit-summary round-trip including the
+    v3/v4 API-version gate, and the additive output metadata.
+    """
+    import os
+    import tempfile
+    import types
+
+    MODEL = "saturating_cooperative_contact"
+    Tref, Tscale = 320.0, 80.0
+    N = 20
+    hs_p = [700.0, 2.4]
+    A0_t, qs_t = 3.0, 0.30
+    sat_p = [700.0, 2.4, A0_t, qs_t]      # h_b, s_b, A0, q_sat
+    sat_zero = [700.0, 2.4, 0.0, qs_t]    # A0 = 0 => exactly hs
+
+    def coop(m, A0=A0_t, q_sat=qs_t, n=N):
+        """The cooperative term alone, transcribed from the definition."""
+        q = m / n
+        return -n * A0 * q * q / (1.0 + (q / q_sat) ** 2)
+
+    # -- Test 1: direct potential values against the transcribed definition ----
+    for T in (300.0, 335.0, 360.0):
+        b = reduced_bias(MODEL, sat_p, T, Tref, Tscale)
+        # the model contributes no m^2/(2N) curvature at all
+        assert quadratic_bias(MODEL, sat_p, T, Tref, Tscale) == 0.0
+        for m in (0, 3, 7, 12, 19):
+            u = reduced_contact_potential(m, T, MODEL, sat_p, Tref, Tscale, N)
+            q = m / N
+            expect = N * (b * q - A0_t * q * q / (1.0 + (q / qs_t) ** 2))
+            assert abs(u - expect) < 1e-12, (T, m, u, expect)
+    # Extensive at fixed contact FRACTION: u/N depends on q only, not on N.
+    per_bead = [
+        reduced_contact_potential(0.25 * n, 330.0, MODEL, sat_p, Tref, Tscale, n) / n
+        for n in (20, 40, 80)
+    ]
+    assert max(per_bead) - min(per_bead) < 1e-12, per_bead
+    # Saturation: the cooperative term flattens to the finite -N*A0*q_sat^2 as
+    # q/q_sat -> inf, and the marginal slope du/dm returns to b(T).  The residual
+    # is exactly 1/(1 + r^2) of the plateau with r = q/q_sat, so it must fall by
+    # 100x per decade in r rather than merely "get small".
+    b330 = reduced_bias(MODEL, sat_p, 330.0, Tref, Tscale)
+    plateau = -float(N) * A0_t * qs_t * qs_t
+    slope_errs = []
+    for r in (10.0, 100.0, 1000.0):
+        m_big = r * qs_t * N                     # q = r*q_sat, so q/q_sat = r
+        excess = (
+            reduced_contact_potential(m_big, 330.0, MODEL, sat_p, Tref, Tscale, N)
+            - b330 * m_big
+        )
+        assert abs(excess) < abs(plateau), (r, excess, plateau)   # bounded
+        assert abs(excess / plateau - r * r / (1.0 + r * r)) < 1e-9, (r, excess)
+        secant = (
+            reduced_contact_potential(m_big + 1.0, 330.0, MODEL, sat_p, Tref, Tscale, N)
+            - reduced_contact_potential(m_big, 330.0, MODEL, sat_p, Tref, Tscale, N)
+        )
+        slope_errs.append(abs(secant - b330))
+    assert slope_errs[0] > slope_errs[1] > slope_errs[2], slope_errs
+    assert slope_errs[-1] < 1e-8, slope_errs                       # b(T) recovered
+    # Invalid parameters are refused, at potential evaluation and at load time.
+    for bad in ([700.0, 2.4, -1e-9, 0.3], [700.0, 2.4, 1.0, 0.0],
+                [700.0, 2.4, 1.0, -0.3]):
+        try:
+            reduced_contact_potential(5, 330.0, MODEL, bad, Tref, Tscale, N)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid parameters accepted: {bad}")
+        try:
+            validate_model_params(MODEL, bad, "quick test")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid parameters loaded: {bad}")
+    print("  quick-test saturating-cooperative direct potential values: PASSED")
+
+    # -- Test 2: manual local-move difference uses the FULL potential ----------
+    # du_contact must be u(m_new) - u(m_old) through the saturating form, NOT the
+    # linear b(T)*dm approximation; the two differ by the cooperative difference.
+    T = 330.0
+    m_old, m_new = 6, 9
+    du_full = (
+        reduced_contact_potential(m_new, T, MODEL, sat_p, Tref, Tscale, N)
+        - reduced_contact_potential(m_old, T, MODEL, sat_p, Tref, Tscale, N)
+    )
+    b = reduced_bias(MODEL, sat_p, T, Tref, Tscale)
+    du_linear = b * (m_new - m_old)
+    assert abs((du_full - du_linear) - (coop(m_new) - coop(m_old))) < 1e-12
+    assert abs(du_full - du_linear) > 1e-6, "cooperative term vanished from the move"
+    # With a fixed bending change the total move du adds kappa_bend*dn_bend exactly.
+    kb, dn = 0.5, 2
+    assert abs((du_full + kb * dn) - (du_full + 1.0)) < 1e-12
+    print("  quick-test saturating-cooperative manual move difference: PASSED")
+
+    # -- Test 3: manual generalized swap through the shared potential helper ---
+    for (m_i, m_j) in ((4, 11), (7, 7), (2, 13)):
+        Ti, Tj = 305.0, 350.0
+        manual = (
+            reduced_contact_potential(m_i, Ti, MODEL, sat_p, Tref, Tscale, N)
+            + reduced_contact_potential(m_j, Tj, MODEL, sat_p, Tref, Tscale, N)
+            - reduced_contact_potential(m_j, Ti, MODEL, sat_p, Tref, Tscale, N)
+            - reduced_contact_potential(m_i, Tj, MODEL, sat_p, Tref, Tscale, N)
+        )
+        got = swap_log_accept(m_i, m_j, Ti, Tj, MODEL, sat_p, Tref, Tscale, N)
+        assert abs(manual - got) < 1e-12, (m_i, m_j, manual, got)
+        # The temperature-INDEPENDENT cooperative term cancels from the exchange,
+        # leaving the same value the linear part alone would give -- but only
+        # because A0 and q_sat are temperature-independent, which is the point.
+        b_i = reduced_bias(MODEL, sat_p, Ti, Tref, Tscale)
+        b_j = reduced_bias(MODEL, sat_p, Tj, Tref, Tscale)
+        assert abs(got - (b_i - b_j) * (m_i - m_j)) < 1e-9, (m_i, m_j, got)
+        # Fixed bending penalty cancels for any bend counts, as for every model.
+        for (n_i, n_j, kap_b) in ((3, 9, 0.7), (0, 5, 2.1)):
+            full = (
+                reduced_potential_bending(m_i, Ti, MODEL, sat_p, Tref, Tscale, kap_b, n_i, N)
+                + reduced_potential_bending(m_j, Tj, MODEL, sat_p, Tref, Tscale, kap_b, n_j, N)
+                - reduced_potential_bending(m_j, Ti, MODEL, sat_p, Tref, Tscale, kap_b, n_j, N)
+                - reduced_potential_bending(m_i, Tj, MODEL, sat_p, Tref, Tscale, kap_b, n_i, N)
+            )
+            assert abs(full - got) < 1e-9, (n_i, n_j, kap_b, full, got)
+    print("  quick-test saturating-cooperative manual generalized swap: PASSED")
+
+    Ts = np.linspace(300.0, 360.0, 4)
+    run_kw = dict(N=N, Ts=Ts, steps_per_swap=30, n_cycles=20,
+                  Tref=Tref, Tscale=Tscale, verbose=False)
+
+    # -- Test 4: A0 = 0 regresses EXACTLY onto hs (bit-for-bit, same seed) -----
+    # Every potential value is bit-identical, so the Metropolis decisions, the
+    # RNG stream and therefore the whole seeded trajectory coincide with hs.
+    for T in (300.0, 330.0, 360.0):
+        for m in (0, 1, 5, 13, 19):
+            assert (
+                reduced_contact_potential(m, T, MODEL, sat_zero, Tref, Tscale, N)
+                == reduced_contact_potential(m, T, "hs", hs_p, Tref, Tscale, N)
+            ), (T, m)
+    reps_hs, sp_hs, sa_hs = run_remd(model_name="hs", params=hs_p,
+                                     seed=4242, n_workers=1, **run_kw)
+    reps_a0, sp_a0, sa_a0 = run_remd(model_name=MODEL, params=sat_zero,
+                                     seed=4242, n_workers=1, **run_kw)
+    for a, z in zip(reps_hs, reps_a0):
+        assert a.C_traj == z.C_traj, "A0=0 diverged from hs"
+        assert a.E_traj == z.E_traj
+        assert a.Rg_traj == z.Rg_traj
+        assert a.n_bend_traj == z.n_bend_traj
+    np.testing.assert_array_equal(sp_hs, sp_a0)
+    np.testing.assert_array_equal(sa_hs, sa_a0)
+    # A genuinely nonzero A0 must, in contrast, change the sampling.
+    reps_sat, _, _ = run_remd(model_name=MODEL, params=sat_p,
+                              seed=4242, n_workers=1, **run_kw)
+    assert any(a.C_traj != s.C_traj for a, s in zip(reps_hs, reps_sat)), (
+        "nonzero A0 left the sampling identical to hs")
+    print("  quick-test saturating-cooperative A0=0 regression: PASSED")
+
+    # -- Test 5: A0 = 0 with bending also regresses onto hs with bending -------
+    # The bending penalty is a separate additive term, so it is orthogonal to the
+    # contact model: turning it on must not disturb the nesting.
+    bend_kw = dict(kappa_bend=0.6, seed=515, n_workers=1, **run_kw)
+    reps_hs_b, _, _ = run_remd(model_name="hs", params=hs_p, **bend_kw)
+    reps_a0_b, _, _ = run_remd(model_name=MODEL, params=sat_zero, **bend_kw)
+    for a, z in zip(reps_hs_b, reps_a0_b):
+        assert a.C_traj == z.C_traj and a.n_bend_traj == z.n_bend_traj
+        assert a.state.n_bend == z.state.n_bend
+    # -- Test 6: nonzero A0 + bending, cached count/energy consistency ---------
+    global _DEBUG_CONTACTS
+    saved_debug = _DEBUG_CONTACTS
+    try:
+        _DEBUG_CONTACTS = True
+        reps_q, _, _ = run_remd(model_name=MODEL, params=sat_p,
+                                kappa_bend=0.6, seed=77, n_workers=1, **run_kw)
+    finally:
+        _DEBUG_CONTACTS = saved_debug
+    for rep in reps_q:
+        assert rep.state.m == int(round(contact_count(rep.state.chain, rep.state.occ)))
+        assert rep.state.n_bend == count_bends(rep.state.chain)
+        assert 0 <= rep.state.n_bend <= N - 2
+        expect_E = energy_from_contacts(
+            rep.state.m, rep.T, MODEL, sat_p, Tref, Tscale, N)
+        assert abs(rep.state.E - expect_E) < 1e-9
+        # The recorded per-cycle energy is the FULL contact potential times T,
+        # cooperative term included, and stays distinct from the linear-only
+        # reconstruction wherever the chain actually has contacts.
+        differs = False
+        for m_c, e_c in zip(rep.C_traj, rep.E_traj):
+            assert abs(e_c - energy_from_contacts(
+                m_c, rep.T, MODEL, sat_p, Tref, Tscale, N)) < 1e-9
+            lin_only = rep.T * reduced_bias(MODEL, sat_p, rep.T, Tref, Tscale) * m_c
+            differs = differs or abs(e_c - lin_only) > 1e-9
+        assert differs, "recorded energy never differed from the linear-only form"
+    print("  quick-test saturating-cooperative bending + energy consistency: PASSED")
+
+    # -- Test 7: serial/multiprocessing determinism ---------------------------
+    det_kw = dict(model_name=MODEL, params=sat_p, kappa_bend=0.4,
+                  seed=808, **run_kw)
+    reps_w2, sp2, sa2 = run_remd(n_workers=2, **det_kw)
+    reps_w3, sp3, sa3 = run_remd(n_workers=3, **det_kw)
+    for a, c in zip(reps_w2, reps_w3):
+        assert a.C_traj == c.C_traj and a.n_bend_traj == c.n_bend_traj
+        assert a.state.n_bend == c.state.n_bend
+    np.testing.assert_array_equal(sp2, sp3)
+    np.testing.assert_array_equal(sa2, sa3)
+    # Serial runs are reproducible run-to-run.  Serial and multiprocessing are
+    # NOT expected to coincide -- the worker split lays out the RNG stream
+    # differently, which is a pre-existing property of the sampler and holds for
+    # every model, hs included; what must hold is that the result does not depend
+    # on HOW MANY workers are used, which is the w2 == w3 check above.
+    reps_s1, _, _ = run_remd(n_workers=1, **det_kw)
+    reps_s2, _, _ = run_remd(n_workers=1, **det_kw)
+    for a, c in zip(reps_s1, reps_s2):
+        assert a.C_traj == c.C_traj and a.n_bend_traj == c.n_bend_traj
+    print("  quick-test saturating-cooperative serial/mp determinism: PASSED")
+
+    # -- Test 8: fit-summary round-trip + explicit v3/v4 API-version gate ------
+    with tempfile.TemporaryDirectory() as tmp:
+        summ = {
+            "model_api_version": 3,
+            "model": MODEL,
+            # scrambled order: the loader must use the registry order, not this
+            "params": {"q_sat": qs_t, "h_b": 700.0, "A0": A0_t, "s_b": 2.4},
+            "Tref": Tref, "Tscale": Tscale,
+            "kappa_bend": 0.25,
+            "fit_chain_length": 30,
+            "potential_kind": "saturating_cooperative",
+            "quadratic_normalization": None,
+            "potential_normalization": Q_NORMALIZATION,
+            "potential_definition": SATURATING_COOPERATIVE_DEFINITION,
+            "m_ref": 0,
+            "A0": A0_t,
+            "q_sat": qs_t,
+        }
+        path = os.path.join(tmp, "fit_summary.json")
+        with open(path, "w") as fh:
+            json.dump(summ, fh)
+        loaded = load_fit_summary_json(path)
+        assert loaded["model_name"] == MODEL
+        assert list(loaded["param_names"]) == ["h_b", "s_b", "A0", "q_sat"]
+        assert np.allclose(loaded["params"], [700.0, 2.4, A0_t, qs_t])
+        assert loaded["kappa_bend"] == 0.25
+        assert loaded["fit_chain_length"] == 30
+        # A v3 summary is exactly the current version and must load; a v4 summary
+        # is newer than this sampler understands and must be refused.
+        assert MODEL_API_VERSION == 3
+        p4 = os.path.join(tmp, "v4.json")
+        with open(p4, "w") as fh:
+            json.dump({**summ, "model_api_version": 4}, fh)
+        try:
+            load_fit_summary_json(p4)
+        except ValueError as exc:
+            assert "newer" in str(exc), str(exc)
+        else:
+            raise AssertionError("a v4 fit summary was accepted")
+        # An out-of-domain parameter set is refused at load time.
+        p_bad = os.path.join(tmp, "bad.json")
+        with open(p_bad, "w") as fh:
+            json.dump({**summ, "params": {**summ["params"], "A0": -1.0}}, fh)
+        try:
+            load_fit_summary_json(p_bad)
+        except ValueError as exc:
+            assert "A0 >= 0" in str(exc), str(exc)
+        else:
+            raise AssertionError("a negative A0 fit summary was accepted")
+
+        # resolve_model_params (Case A) recovers the model + params.
+        args_ns = types.SimpleNamespace(
+            fit_summary_json=path, fit_params_csv=None, params=None,
+            model=None, T0=None, Tref=None, Tscale=None, dh=None, ds=None,
+        )
+        (m_name, m_params, m_names, m_Tref, m_Tscale, m_src, m_summary) = \
+            resolve_model_params(args_ns, Ts)
+        assert m_name == MODEL and m_src == "fit_summary_json"
+        assert np.allclose(m_params, [700.0, 2.4, A0_t, qs_t])
+
+        # Chain-length transfer: run at runtime N (20) != fit_chain_length (30);
+        # metadata records BOTH and the run uses the runtime N in q = m/N.
+        dist = {}
+        attach_run_metadata(
+            dist, seed=1, N=N, steps_per_swap=1, n_cycles=1,
+            burnin_frac=0.5, n_workers=1, kappa_bend=0.25,
+            fit_chain_length=loaded["fit_chain_length"],
+        )
+        assert dist["N"] == N and dist["n_beads"] == N
+        assert dist["fit_chain_length"] == 30
+        assert dist["model_api_version"] == 3
+        reps_xfer, _, _ = run_remd(
+            model_name=m_name, params=m_params, kappa_bend=0.25,
+            seed=5, n_workers=1, **run_kw)
+        assert len(reps_xfer) == len(Ts)
+    print("  quick-test saturating-cooperative fit-summary round-trip: PASSED")
+
+    # -- Test 9: output metadata is complete and purely additive ---------------
+    dist = {}
+    attach_model_metadata(dist, MODEL, ["h_b", "s_b", "A0", "q_sat"], sat_p,
+                          Tref, Tscale)
+    dist.update(temperature_bias_arrays(Ts, MODEL, sat_p, Tref, Tscale))
+    assert dist["potential_kind"] == "saturating_cooperative"
+    assert dist["potential_definition"] == SATURATING_COOPERATIVE_DEFINITION
+    assert dist["potential_normalization"] == Q_NORMALIZATION
+    assert dist["m_ref"] == 0
+    assert dist["A0"] == A0_t and dist["q_sat"] == qs_t
+    # No m^2/(2N) term exists for this model: the curvature normalization stays
+    # the npz-safe empty sentinel and kappa(T) is identically zero.
+    assert dist["quadratic_normalization"] == ""
+    assert np.all(dist["quadratic_coefficient_by_temperature"] == 0.0)
+    # b(T) is still recorded under its historical name; the alias exists only in
+    # the variants of this module that define it.
+    assert np.array_equal(
+        dist["reduced_bias_by_temperature"],
+        [reduced_bias(MODEL, sat_p, float(T), Tref, Tscale) for T in Ts])
+    if "linear_coefficient_by_temperature" in dist:
+        assert np.array_equal(dist["reduced_bias_by_temperature"],
+                              dist["linear_coefficient_by_temperature"])
+    # Every value is npz-safe (no object arrays, so no allow_pickle on read).
+    with tempfile.TemporaryDirectory() as tmp:
+        p_npz = os.path.join(tmp, "meta.npz")
+        np.savez_compressed(p_npz, **dist)
+        with np.load(p_npz, allow_pickle=False) as z:
+            assert str(z["potential_definition"]) == SATURATING_COOPERATIVE_DEFINITION
+            assert str(z["potential_normalization"]) == Q_NORMALIZATION
+            assert int(z["m_ref"]) == 0
+            assert float(z["A0"]) == A0_t and float(z["q_sat"]) == qs_t
+    # The pre-existing models gain the same additive keys and lose nothing.
+    for model, names, p in (("hs", ["h", "s"], hs_p),
+                            ("hs_m2_const", ["h1", "s1", "kappa2"],
+                             [700.0, 2.4, 0.9])):
+        d = {}
+        attach_model_metadata(d, model, names, p, Tref, Tscale)
+        assert d["m_ref"] == 0
+        assert d["potential_definition"] == MODEL_REGISTRY[model]["description"]
+        assert "A0" not in d and "q_sat" not in d
+    assert attach_model_metadata({}, "hs", ["h", "s"], hs_p, Tref,
+                                 Tscale)["potential_normalization"] == ""
+    assert attach_model_metadata({}, "hs_m2_const", ["h1", "s1", "kappa2"],
+                                 [700.0, 2.4, 0.9], Tref,
+                                 Tscale)["potential_normalization"] == \
+        QUADRATIC_NORMALIZATION
+    print("  quick-test saturating-cooperative output metadata: PASSED")
+
+
 def run_structural_quick_test() -> None:
     """Smoke + invariant tests for the structural-observable additions."""
     import os
@@ -3939,7 +4509,10 @@ def validate_model_params(
     """Validate parameter count and finiteness; return floats in registry order.
 
     The parameter order always comes from MODEL_REGISTRY[model_name];
-    ``params`` is expected to already be in that order.
+    ``params`` is expected to already be in that order.  Models whose potential
+    is only defined on part of parameter space are additionally checked against
+    their own domain here, so an out-of-domain parameter set is rejected at load
+    time rather than at the first potential evaluation inside the sampler.
     """
     param_names = MODEL_REGISTRY[model_name]["param_names"]
 
@@ -3967,6 +4540,12 @@ def validate_model_params(
             )
 
         checked.append(value_float)
+
+    if str(MODEL_REGISTRY[model_name]["potential_kind"]) == "saturating_cooperative":
+        try:
+            validated_saturating_params(checked)
+        except ValueError as exc:
+            raise ValueError(f"{source_description}: {exc}") from None
 
     return checked
 
@@ -4462,6 +5041,14 @@ def attach_model_metadata(
     (``potential_kind``) and, for contact-quadratic models, the curvature
     normalization (``quadratic_normalization``) are recorded so consumers can
     tell whether the m^2/(2N) term was part of the sampled potential.
+
+    Additively, every distributions file also carries the exact potential that
+    was sampled (``potential_definition``), the normalization the chain length
+    served (``potential_normalization``, "" when N was not needed) and the
+    reference contact number (``m_ref``).  For the saturating-cooperative model
+    the two shape parameters are additionally written out by name (``A0``,
+    ``q_sat``), mirroring the fitter's outputs, so a consumer never has to know
+    the registry parameter order to read them back.
     """
     dist["model_name"] = model_name
     dist["param_names"] = np.array(param_names)
@@ -4474,6 +5061,13 @@ def attach_model_metadata(
     # normalization) so the distributions .npz never needs allow_pickle; the
     # run summary JSON keeps the human-readable null.
     dist["quadratic_normalization"] = str(spec["quadratic_normalization"] or "")
+    dist["potential_definition"] = str(spec["potential_definition"])
+    dist["potential_normalization"] = str(spec["potential_normalization"] or "")
+    dist["m_ref"] = int(spec["m_ref"])
+    if str(spec["potential_kind"]) == "saturating_cooperative":
+        A0, q_sat = validated_saturating_params(model_params)
+        dist["A0"] = float(A0)
+        dist["q_sat"] = float(q_sat)
     if parameter_source is not None:
         dist["parameter_source"] = str(parameter_source)
     if fit_summary_json is not None:
@@ -4533,7 +5127,10 @@ def temperature_bias_arrays(
     not assume the constant-(h, s) interpretation.  The linear coefficient b(T)
     is also exposed as ``linear_coefficient_by_temperature`` and, for the
     contact-quadratic models, the curvature coefficient kappa(T) (coefficient of
-    m^2/(2N)) as ``quadratic_coefficient_by_temperature`` -- 0 for linear models.
+    m^2/(2N)) as ``quadratic_coefficient_by_temperature`` -- 0 for linear models,
+    and also 0 for saturating_cooperative_contact, which has no m^2/(2N) term at
+    all (its cooperative attraction is written in q = m/N and does not reduce to
+    a curvature coefficient; read ``potential_definition`` for that model).
     ``reduced_bias_by_temperature`` is retained unchanged as the historical name.
     """
     Ts = np.asarray(Ts, dtype=float)
@@ -5074,10 +5671,13 @@ def main() -> None:
         and int(fit_chain_length) != int(args.N)
         and MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
     ):
+        _norm = (
+            MODEL_REGISTRY[model_name]["potential_normalization"] or "normalization"
+        )
         print(
-            f"  [note] contact-quadratic model fit at chain length "
+            f"  [note] model {model_name} (nonlinear in m) fit at chain length "
             f"{fit_chain_length} is being run at N={int(args.N)}; the runtime N "
-            f"is used in m^2/(2N). Both are recorded in the run summary."
+            f"is used in {_norm}. Both are recorded in the run summary."
         )
 
     print(
@@ -5085,6 +5685,9 @@ def main() -> None:
         f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
     )
     print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
+    if str(MODEL_REGISTRY[model_name]["potential_kind"]) == "saturating_cooperative":
+        print(f"Potential: {MODEL_REGISTRY[model_name]['potential_definition']}")
+        print(f"m_ref = {int(MODEL_REGISTRY[model_name]['m_ref'])}")
     print(f"Parameter source: {parameter_source}")
     if fit_summary_json is not None:
         print(f"Fit summary: {fit_summary_json}")
@@ -5170,17 +5773,25 @@ def main() -> None:
             "snapshot_flush_interval": int(args.snapshot_flush_interval),
             # Hamiltonian provenance describing the potential actually sampled.
             # The fixed bending penalty and the contact-potential contract
-            # (linear vs contact-quadratic + its m^2/(2N) normalization) are
-            # recorded, with the fit-time chain length kept alongside the runtime
-            # n_beads.  Follows the multichain snapshot metadata conventions.
+            # (potential_kind, the exact definition, and whatever normalization
+            # the chain length served) are recorded, with the fit-time chain
+            # length kept alongside the runtime n_beads.  Follows the multichain
+            # snapshot metadata conventions.
             "kappa_bend": float(kappa_bend),
             "bending_enabled": bool(bending_enabled),
             "bend_definition": BEND_DEFINITION,
             "potential_kind": str(MODEL_REGISTRY[model_name]["potential_kind"]),
             "quadratic_normalization": (
                 str(MODEL_REGISTRY[model_name]["quadratic_normalization"])
-                if MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+                if MODEL_REGISTRY[model_name]["quadratic_normalization"] is not None
                 else "null"),
+            "potential_definition": str(
+                MODEL_REGISTRY[model_name]["potential_definition"]),
+            "potential_normalization": (
+                str(MODEL_REGISTRY[model_name]["potential_normalization"])
+                if MODEL_REGISTRY[model_name]["potential_normalization"] is not None
+                else "null"),
+            "m_ref": int(MODEL_REGISTRY[model_name]["m_ref"]),
             "fit_chain_length": (
                 int(fit_chain_length) if fit_chain_length is not None else "null"),
             "fixed_bin_definitions": json.dumps(fixed_defs),
@@ -5405,6 +6016,11 @@ def main() -> None:
         "Tscale": float(Tscale),
         "potential_kind": str(MODEL_REGISTRY[model_name]["potential_kind"]),
         "quadratic_normalization": MODEL_REGISTRY[model_name]["quadratic_normalization"],
+        # Additive: the exact potential sampled, what the chain length normalized,
+        # and the reference contact number the potential is measured from.
+        "potential_definition": str(MODEL_REGISTRY[model_name]["potential_definition"]),
+        "potential_normalization": MODEL_REGISTRY[model_name]["potential_normalization"],
+        "m_ref": int(MODEL_REGISTRY[model_name]["m_ref"]),
         "fit_chain_length": (
             None if fit_chain_length is None else int(fit_chain_length)
         ),
@@ -5470,6 +6086,12 @@ def main() -> None:
         run_summary["diagnostics_warnings"] = diagnostics_result["warnings"]
     if model_name == "heat_capacity":
         run_summary["T0"] = float(Tref)
+    if str(MODEL_REGISTRY[model_name]["potential_kind"]) == "saturating_cooperative":
+        # Named alongside the positional params list, mirroring the fitter's
+        # fit_summary.json, so a consumer never has to know the registry order.
+        _A0, _q_sat = validated_saturating_params(model_params)
+        run_summary["A0"] = float(_A0)
+        run_summary["q_sat"] = float(_q_sat)
 
     run_summary_path = (
         args.run_summary_json

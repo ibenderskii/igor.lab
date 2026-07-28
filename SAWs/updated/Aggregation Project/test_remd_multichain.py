@@ -1068,17 +1068,18 @@ def test_legacy_linear_potential_equals_aggregate_formula():
 
 
 def test_aggregate_helpers_reject_contact_quadratic():
-    # The aggregate-ContactCounts compatibility helpers cannot determine
-    # sum_alpha m_alpha^2 and must reject the contact-quadratic models loudly.
+    # The aggregate-ContactCounts compatibility helpers carry only the total
+    # intrachain count and cannot determine sum_alpha u_contact(m_alpha), so they
+    # must reject the contact-quadratic models loudly.
     c = ContactCounts(4, 2)
     for model, p in (("hs_m2_const", CONST_P), ("hs_m2_hs", HSHS_P)):
-        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+        with pytest.raises(NotImplementedError, match="nonlinear in m"):
             rmc.reduced_potential_counts(c, 330.0, model, p, QTREF, QTSCALE, 1.0, 1.0)
-        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+        with pytest.raises(NotImplementedError, match="nonlinear in m"):
             rmc.reduced_potential_bending_counts(
                 c, 330.0, model, p, QTREF, QTSCALE, 1.0, 1.0,
                 kappa_bend=0.3, n_bend=5)
-        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+        with pytest.raises(NotImplementedError, match="nonlinear in m"):
             rmc.swap_log_accept_counts(c, c, 300.0, 350.0, model, p, QTREF,
                                        QTSCALE, 1.0, 1.0)
 
@@ -1394,6 +1395,546 @@ def test_output_roundtrip_quadratic_metadata(tmp_path):
             assert key in d, f"missing NPZ key {key}"
         assert int(d["fit_chain_length"]) == -1  # not from a fit summary
         assert int(d["runtime_chain_length"]) == 8
+
+
+# ---------------------------------------------------------------------------
+# saturating_cooperative_contact: per-chain saturating intra, linear inter
+#
+#   u(X,T) = lambda_intra * sum_alpha u_sat(m_intra_alpha, T; N)
+#            + lambda_inter * b(T) * m_inter
+#            + kappa_bend * n_bend_total
+#   u_sat(m,T;N) = N*[b(T)*(m/N) - A0*(m/N)^2/(1 + ((m/N)/q_sat)^2)]
+#   b(T)         = h_b/T - s_b
+#
+# q_sat is deliberately small enough (0.15) that the saturation is visible at the
+# handful of contacts an N = 8 test chain can make.
+# ---------------------------------------------------------------------------
+
+SAT = "saturating_cooperative_contact"
+SAT_P = [700.0, 2.4, 5.0, 0.15]    # h_b, s_b, A0, q_sat
+SAT_P0 = [700.0, 2.4, 0.0, 0.15]   # A0 = 0 -> the linear hs potential
+HS_P = [700.0, 2.4]                # the same h_b, s_b through the hs model
+
+
+def _u_sat_direct(m, T, N, params=SAT_P):
+    """The specified potential, transcribed literally (no shared helpers)."""
+    h_b, s_b, A0, q_sat = (float(v) for v in params)
+    b = h_b / float(T) - s_b
+    q = float(m) / float(N)
+    return float(N) * (b * q - A0 * q * q / (1.0 + (q / q_sat) ** 2))
+
+
+# Three N = 6 conformations with known intrachain contact counts, used to build
+# states whose TOTAL intrachain count is equal but whose per-chain allocation
+# differs.  P: 3x2 rectangle (2 contacts).  Q: square + tail (1 contact).
+# S: straight (0 contacts).
+_CHAIN_P = np.array([(0, 0, 0), (1, 0, 0), (2, 0, 0), (2, 1, 0), (1, 1, 0),
+                     (0, 1, 0)], dtype=np.int64)
+_CHAIN_Q = np.array([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 2, 0),
+                     (0, 3, 0)], dtype=np.int64)
+_CHAIN_S = np.array([(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0),
+                     (5, 0, 0)], dtype=np.int64)
+_FAR = np.array([0, 10, 0], dtype=np.int64)
+
+
+def test_saturating_per_chain_additivity():
+    # (1) The intrachain potential is the sum over chains of u_sat evaluated at
+    # that chain's OWN cached m_alpha, matching the literal formula.
+    for seed in (6, 17, 31):
+        state = mcs.initialize_dispersed_state(3, 8, 12, seed=seed)
+        N = state.chain_length
+        for T in (305.0, 335.0, 350.0):
+            direct = sum(_u_sat_direct(int(m), T, N)
+                         for m in state.intra_contacts_by_chain)
+            got = rmc.reduced_contact_potential_state(
+                state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 0.0)
+            assert abs(got - direct) < 1e-9
+    # Two well-separated chains (m_inter = 0): the total is the sum of the two
+    # single-chain potentials.
+    state = mcs.make_state(np.stack([_CHAIN_P, _CHAIN_Q + _FAR]), 30)
+    assert int(state.counts.inter) == 0
+    N = state.chain_length
+    for T in (305.0, 348.0):
+        u_total = rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0)
+        u_a = remd.reduced_contact_potential(
+            int(state.intra_contacts_by_chain[0]), T, SAT, SAT_P, QTREF,
+            QTSCALE, N)
+        u_b = remd.reduced_contact_potential(
+            int(state.intra_contacts_by_chain[1]), T, SAT, SAT_P, QTREF,
+            QTSCALE, N)
+        assert abs(u_total - (u_a + u_b)) < 1e-9
+
+
+def test_saturating_equal_total_different_allocation_differs():
+    # (2) The potential is NOT a function of the total intrachain count.  Two
+    # states with the same total (2) but different per-chain allocations --
+    # (2, 0) and (1, 1) -- have different potentials, and neither equals u_sat
+    # evaluated at the total, which is the forbidden shortcut.
+    st_a = mcs.make_state(np.stack([_CHAIN_P, _CHAIN_S + _FAR]), 30)
+    st_b = mcs.make_state(np.stack([_CHAIN_Q, _CHAIN_Q + _FAR]), 30)
+    assert sorted(st_a.intra_contacts_by_chain.tolist()) == [0, 2]
+    assert sorted(st_b.intra_contacts_by_chain.tolist()) == [1, 1]
+    assert int(st_a.counts.intra) == int(st_b.counts.intra) == 2
+    assert int(st_a.counts.inter) == int(st_b.counts.inter) == 0
+    N = st_a.chain_length
+    for T in (305.0, 335.0):
+        ua = rmc.reduced_contact_potential_state(
+            st_a, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0)
+        ub = rmc.reduced_contact_potential_state(
+            st_b, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0)
+        assert abs(ua - ub) > 1e-6, (
+            "equal total intrachain contacts must not force equal potentials")
+        assert abs(ua - (_u_sat_direct(2, T, N) + _u_sat_direct(0, T, N))) < 1e-9
+        assert abs(ub - 2.0 * _u_sat_direct(1, T, N)) < 1e-9
+        # The forbidden "evaluate at the total intrachain count" shortcut cannot
+        # reproduce state B.  It does coincide with state A, but only because A's
+        # second chain is contact-free and u_sat(0) = 0 exactly -- that is the
+        # correct per-chain answer, not a shortcut hit.
+        wrong = _u_sat_direct(2, T, N)
+        assert abs(ub - wrong) > 1e-6
+        assert _u_sat_direct(0, T, N) == 0.0
+    # A LINEAR model cannot tell the two allocations apart -- that is exactly the
+    # property the saturating model breaks.
+    for T in (305.0, 335.0):
+        assert rmc.reduced_contact_potential_state(
+            st_a, T, "hs", HS_P, QTREF, QTSCALE, 1.0, 1.0) == \
+            rmc.reduced_contact_potential_state(
+                st_b, T, "hs", HS_P, QTREF, QTSCALE, 1.0, 1.0)
+
+
+def test_saturating_interchain_term_is_separately_linear():
+    # (3) Interchain contacts enter only as b(T)*m_inter: the same fitted h_b and
+    # s_b, with no A0/q_sat correction.  The interchain contribution is therefore
+    # identical for A0 = 5 and A0 = 0, and exactly linear in m_inter.
+    state = mcs.initialize_dispersed_state(4, 8, 12, seed=6)
+    assert int(state.counts.inter) > 0
+    for T in (305.0, 335.0):
+        b = remd.reduced_bias(SAT, SAT_P, T, QTREF, QTSCALE)
+        assert b == remd.reduced_bias("hs", HS_P, T, QTREF, QTSCALE)
+        u10 = rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 0.0)
+        u11 = rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0)
+        u01 = rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 0.0, 1.0)
+        assert abs(u01 - b * int(state.counts.inter)) < 1e-9
+        assert abs((u11 - u10) - b * int(state.counts.inter)) < 1e-9
+        # Interchain-only is untouched by the saturating parameters ...
+        assert u01 == rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P0, QTREF, QTSCALE, 0.0, 1.0)
+        # ... and is exactly the linear model's interchain term.
+        assert u01 == rmc.reduced_contact_potential_state(
+            state, T, "hs", HS_P, QTREF, QTSCALE, 0.0, 1.0)
+        # Exactly linear: doubling m_inter doubles the term.
+        assert abs(rmc.reduced_potential_counts(
+            ContactCounts(0, 2 * int(state.counts.inter)), T, "hs", HS_P, QTREF,
+            QTSCALE, 0.0, 1.0) - 2.0 * u01) < 1e-9
+
+
+def test_saturating_lambda_control_modes():
+    # (4) lambda_intra scales the COMPLETE per-chain saturating potential and
+    # lambda_inter only the linear interchain term; they stay independent, and
+    # setting both to zero does not disable bending.
+    state = mcs.initialize_dispersed_state(4, 8, 12, seed=6)
+    T, N = 335.0, state.chain_length
+    b = remd.reduced_bias(SAT, SAT_P, T, QTREF, QTSCALE)
+    intra_u = sum(_u_sat_direct(int(m), T, N)
+                  for m in state.intra_contacts_by_chain)
+    inter = int(state.counts.inter)
+    assert inter > 0 and int(state.counts.intra) > 0 and state.n_bend > 0
+    cases = ((0.0, 0.0, 0.0), (1.0, 0.0, intra_u), (0.0, 1.0, b * inter),
+             (1.0, 1.0, intra_u + b * inter),
+             (0.5, 0.25, 0.5 * intra_u + 0.25 * b * inter))
+    for li, lin, expect in cases:
+        got = rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, li, lin)
+        assert abs(got - expect) < 1e-9, (li, lin)
+    # (5) Bending is a separate additive term: lambdas at zero keep it alive.
+    u_bend = rmc.reduced_potential_state(state, T, SAT, SAT_P, QTREF, QTSCALE,
+                                         0.0, 0.0, kappa_bend=0.5)
+    assert abs(u_bend - 0.5 * state.n_bend) < 1e-12
+    assert u_bend != 0.0
+    # and it is added on top of the contact terms, never folded into them.
+    u_full = rmc.reduced_potential_state(state, T, SAT, SAT_P, QTREF, QTSCALE,
+                                         1.0, 1.0, kappa_bend=0.5)
+    u_contacts = rmc.reduced_contact_potential_state(
+        state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0)
+    assert abs(u_full - (u_contacts + 0.5 * state.n_bend)) < 1e-9
+
+
+def test_saturating_move_delta_uses_full_potential():
+    # (6) Every accepted proposal's exact change in the full potential equals the
+    # per-chain full-potential difference plus the linear interchain and bending
+    # terms -- and differs from the b(T)*delta_m approximation whenever the moved
+    # chain's intrachain count changes.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=23)
+    T, kb = 335.0, 0.4
+    b = remd.reduced_bias(SAT, SAT_P, T, QTREF, QTSCALE)
+    rng = random.Random(11)
+    n_checked = n_nonlinear = 0
+    proposers = (mvs.propose_local, mvs.propose_translation, mvs.propose_reptation,
+                 mvs.propose_chain_rotation)
+    for step in range(800):
+        prop = proposers[step % len(proposers)](state, rng)
+        if not prop.ok:
+            continue
+        d_intra, d_inter = mvs.proposal_delta(state, prop)
+        d_bends = mvs.proposal_delta_bends(state, prop)
+        alpha = int(prop.chain)
+        m_old = int(state.intra_contacts_by_chain[alpha])
+        u_before = rmc.reduced_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0, kappa_bend=kb)
+        du = (remd.reduced_contact_potential(m_old + d_intra, T, SAT, SAT_P,
+                                             QTREF, QTSCALE, state.chain_length)
+              - remd.reduced_contact_potential(m_old, T, SAT, SAT_P, QTREF,
+                                               QTSCALE, state.chain_length)
+              + b * int(d_inter) + kb * int(d_bends))
+        mvs.apply_proposal(state, prop, (d_intra, d_inter), delta_bends=d_bends)
+        u_after = rmc.reduced_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0, kappa_bend=kb)
+        assert abs((u_after - u_before) - du) < 1e-9
+        n_checked += 1
+        if d_intra != 0:
+            linear_du = b * (int(d_intra) + int(d_inter)) + kb * int(d_bends)
+            assert abs(du - linear_du) > 1e-9, (
+                "the nonlinear move delta collapsed onto b(T)*delta_m")
+            n_nonlinear += 1
+    assert n_checked > 50 and n_nonlinear > 0
+    mcs.validate_state(state)
+    assert np.array_equal(state.intra_contacts_by_chain,
+                          mcc.full_intra_contacts_by_chain_state(state))
+
+
+def test_saturating_sweep_acceptance_uses_full_potential():
+    # (7) The sampler itself (not just the helpers) scores moves with the full
+    # potential: with debug_contacts on, a long sweep keeps every cache exact, and
+    # a strongly cooperative parameterization visibly differs from the linear
+    # model run from the same seed.
+    def sweep(model, p):
+        state = mcs.initialize_dispersed_state(3, 8, 12, seed=42)
+        counters = mvs.new_move_counters()
+        rmc.mc_sweep(state, counters, 335.0, model, p, QTREF, QTSCALE,
+                     lambda_intra=1.0, lambda_inter=1.0, n_local=600,
+                     n_translation=120, rng=random.Random(9), n_reptation=120,
+                     n_rotation=120, debug_contacts=True, kappa_bend=0.3)
+        mcs.validate_state(state)
+        return state, counters
+    st_sat, _ = sweep(SAT, SAT_P)
+    st_lin, _ = sweep("hs", HS_P)
+    assert np.array_equal(st_sat.intra_contacts_by_chain,
+                          mcc.full_intra_contacts_by_chain_state(st_sat))
+    assert not np.array_equal(st_sat.coords_unwrapped, st_lin.coords_unwrapped), (
+        "a strong cooperative attraction sampled the same trajectory as the "
+        "linear model; the sweep is probably ignoring A0")
+
+
+def test_saturating_full_state_swap_matches_manual_four_potential():
+    # (8) The generalized swap equals a manual four-potential calculation over the
+    # per-chain saturating potential, and the fixed bending penalty cancels.
+    sa = mcs.initialize_dispersed_state(3, 8, 12, seed=21)
+    sb = mcs.initialize_dispersed_state(3, 8, 12, seed=22)
+    Ti, Tj = 305.0, 350.0
+
+    def u(state, T):
+        return rmc.reduced_contact_potential_state(
+            state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 0.6)
+    manual = u(sa, Ti) + u(sb, Tj) - u(sb, Ti) - u(sa, Tj)
+    got = rmc.swap_log_accept_state(sa, sb, Ti, Tj, SAT, SAT_P, QTREF, QTSCALE,
+                                    1.0, 0.6)
+    assert abs(got - manual) < 1e-9
+    # Written out per chain, from the definition, with no shared helper.
+    N = sa.chain_length
+    b_i = remd.reduced_bias(SAT, SAT_P, Ti, QTREF, QTSCALE)
+    b_j = remd.reduced_bias(SAT, SAT_P, Tj, QTREF, QTSCALE)
+
+    def u_literal(state, T):
+        return (sum(_u_sat_direct(int(m), T, N)
+                    for m in state.intra_contacts_by_chain)
+                + 0.6 * (b_i if T == Ti else b_j) * int(state.counts.inter))
+    literal = (u_literal(sa, Ti) + u_literal(sb, Tj)
+               - u_literal(sb, Ti) - u_literal(sa, Tj))
+    assert abs(got - literal) < 1e-9
+    # The bending penalty is temperature-independent and cancels exactly.
+    for kap in (0.0, 0.7, 2.0):
+        def u_bend(state, T):
+            return rmc.reduced_potential_state(
+                state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 0.6, kappa_bend=kap)
+        la = (u_bend(sa, Ti) + u_bend(sb, Tj)
+              - u_bend(sb, Ti) - u_bend(sa, Tj))
+        assert abs(la - manual) < 1e-9
+    # attempt_swap uses exactly this log-acceptance (favorable -> no draw).
+    ra = rmc.MultiReplica(T=Ti, state=sa.copy())
+    rb = rmc.MultiReplica(T=Tj, state=sb.copy())
+    if manual >= 0.0:
+        stub = _StubRng(1.0)
+        assert rmc.attempt_swap(ra, rb, SAT, SAT_P, QTREF, QTSCALE, 1.0, 0.6,
+                                stub) is True
+        assert stub.calls == 0
+
+
+def test_saturating_m1_matches_single_chain_potential():
+    # (9) For M = 1 the multichain full potential equals the single-chain full
+    # potential, with bending off and on.
+    rng = np.random.RandomState(4)
+    for _ in range(6):
+        state = mcs.make_state(np.stack([mcs.generate_saw(18, rng)]), 60)
+        assert int(state.counts.inter) == 0
+        m = int(state.counts.intra)
+        for T in (300.0, 342.0):
+            for kappa in (0.0, 0.8):
+                u_mc = rmc.reduced_potential_state(
+                    state, T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0,
+                    kappa_bend=kappa)
+                u_ref = remd.reduced_potential_bending(
+                    m, T, SAT, SAT_P, QTREF, QTSCALE, kappa_bend=kappa,
+                    n_bend=state.n_bend, n_beads=state.chain_length)
+                assert abs(u_mc - u_ref) < 1e-9
+                assert abs(u_mc - (_u_sat_direct(m, T, state.chain_length)
+                                   + kappa * state.n_bend)) < 1e-9
+
+
+def test_saturating_a0_zero_matches_linear_multichain():
+    # (10) A0 = 0 nests the linear multichain model.  The potential agrees for
+    # every lambda mode, and a seeded run reproduces the linear trajectory.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=11)
+    for T in (300.0, 340.0):
+        for li, lin in ((1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.7, 0.3)):
+            u_hs = rmc.reduced_contact_potential_state(
+                state, T, "hs", HS_P, QTREF, QTSCALE, li, lin)
+            u_a0 = rmc.reduced_contact_potential_state(
+                state, T, SAT, SAT_P0, QTREF, QTSCALE, li, lin)
+            assert abs(u_a0 - u_hs) < 1e-9
+
+    def run(model, p, kappa):
+        return rmc.run_remd_multichain(
+            n_chains=2, chain_length=8, box_size=10, Ts=np.linspace(305, 350, 4),
+            local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=15,
+            model_name=model, params=p, Tref=QTREF, Tscale=QTSCALE,
+            lambda_intra=1.0, lambda_inter=1.0, kappa_bend=kappa, seed=13,
+            n_workers=1, verbose=False, debug_contacts=True)
+    for kappa in (0.0, 0.3):
+        reps_sat, sp_s, sa_s, wh_s = run(SAT, SAT_P0, kappa)
+        # hs_m2_const with zero curvature takes the SAME nonlinear code path and
+        # evaluates u_contact to the same bits, so this equality is exact by
+        # construction rather than by luck.
+        reps_q0, sp_q, sa_q, wh_q = run("hs_m2_const", CONST_P0, kappa)
+        # hs takes the historical linear-aggregate path; it reassociates
+        # b*m_new - b*m_old as b*delta_m, so agreement here is a value-level
+        # regression rather than an arithmetic identity.
+        reps_hs, sp_h, sa_h, wh_h = run("hs", HS_P, kappa)
+        for reps_ref, sp_r, sa_r, wh_r, exact in (
+                (reps_q0, sp_q, sa_q, wh_q, True),
+                (reps_hs, sp_h, sa_h, wh_h, False)):
+            assert np.array_equal(sp_s, sp_r) and np.array_equal(sa_s, sa_r)
+            assert np.array_equal(wh_s, wh_r)
+            for a, b in zip(reps_sat, reps_ref):
+                assert np.array_equal(a.state.coords_unwrapped,
+                                      b.state.coords_unwrapped)
+                assert np.array_equal(a.state.intra_contacts_by_chain,
+                                      b.state.intra_contacts_by_chain)
+                assert a.state.n_bend == b.state.n_bend
+                assert np.array_equal(a.move_counters, b.move_counters)
+                if exact:
+                    assert a.u_traj == b.u_traj
+                else:
+                    assert np.allclose(a.u_traj, b.u_traj, rtol=0, atol=1e-9)
+
+
+def _run_saturating(n_workers, kappa=0.0, seed=13, n_cycles=12, params=SAT_P):
+    Ts = np.linspace(305, 350, 4)
+    return rmc.run_remd_multichain(
+        n_chains=2, chain_length=8, box_size=10, Ts=Ts,
+        local_sweeps_per_swap=1, translation_sweeps_per_swap=1,
+        n_cycles=n_cycles, model_name=SAT, params=params, Tref=QTREF,
+        Tscale=QTSCALE, lambda_intra=1.0, lambda_inter=1.0, kappa_bend=kappa,
+        seed=seed, n_workers=n_workers, verbose=False, debug_contacts=True)
+
+
+def test_saturating_bending_enabled_and_disabled():
+    # (11) Runs complete with bending disabled and enabled; the recorded u
+    # includes the bending term; and a positive penalty straightens the chains.
+    reps0, *_ = _run_saturating(1, kappa=0.0)
+    repsK, *_ = _run_saturating(1, kappa=0.6)
+    for reps in (reps0, repsK):
+        for rep in reps:
+            mcs.validate_state(rep.state)
+            assert all(math.isfinite(x) for x in rep.u_traj)
+    # The recorded u is the full potential: contacts + kappa_bend * n_bend.
+    rep = repsK[0]
+    u_last = rmc.reduced_potential_state(
+        rep.state, rep.T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0, kappa_bend=0.6)
+    u_contacts = rmc.reduced_contact_potential_state(
+        rep.state, rep.T, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0)
+    assert abs(u_last - (u_contacts + 0.6 * rep.state.n_bend)) < 1e-9
+    assert abs(rep.eeff_traj[-1] - rep.T * rep.u_traj[-1]) < 1e-9
+    # A strong penalty reduces the bend fraction (longer run, athermal contacts
+    # so only the bending term differs).
+    long_kw = dict(n_chains=3, chain_length=8, box_size=12,
+                   Ts=np.linspace(320, 340, 3), local_sweeps_per_swap=3,
+                   translation_sweeps_per_swap=1, n_cycles=140, model_name=SAT,
+                   params=[0.0, 0.0, 0.0, 0.15], Tref=330.0, Tscale=40.0,
+                   seed=321, n_workers=1, verbose=False)
+    r0, *_ = rmc.run_remd_multichain(kappa_bend=0.0, **long_kw)
+    rK, *_ = rmc.run_remd_multichain(kappa_bend=1.5, **long_kw)
+    bf0 = np.nanmean(rmc._bend_fraction_by_temp(r0, 3, 8, 0.5))
+    bfK = np.nanmean(rmc._bend_fraction_by_temp(rK, 3, 8, 0.5))
+    assert bfK < bf0
+
+
+def test_saturating_serial_vs_workers_determinism():
+    # (12) Serial and multiprocessing runs are bit-identical, with bending off
+    # and on, including the per-chain cache carried across the process boundary.
+    for kappa in (0.0, 0.5):
+        r1, sp1, sa1, wh1 = _run_saturating(1, kappa)
+        r2, sp2, sa2, wh2 = _run_saturating(2, kappa)
+        assert np.array_equal(sp1, sp2) and np.array_equal(sa1, sa2)
+        assert np.array_equal(wh1, wh2)
+        for a, b in zip(r1, r2):
+            assert np.array_equal(a.state.coords_unwrapped,
+                                  b.state.coords_unwrapped)
+            assert a.state.counts.as_tuple() == b.state.counts.as_tuple()
+            assert np.array_equal(a.state.intra_contacts_by_chain,
+                                  b.state.intra_contacts_by_chain)
+            assert a.state.n_bend == b.state.n_bend
+            assert a.u_traj == b.u_traj
+            assert np.array_equal(a.move_counters, b.move_counters)
+            mcs.validate_state(a.state)
+
+
+def test_aggregate_helpers_reject_saturating_cooperative():
+    # (13) The aggregate-ContactCounts helpers must refuse the saturating model
+    # too: the total intrachain count cannot determine the sum of the per-chain
+    # nonlinear potentials.
+    c = ContactCounts(4, 2)
+    with pytest.raises(NotImplementedError, match="nonlinear in m"):
+        rmc.reduced_potential_counts(c, 330.0, SAT, SAT_P, QTREF, QTSCALE,
+                                     1.0, 1.0)
+    with pytest.raises(NotImplementedError, match="nonlinear in m"):
+        rmc.reduced_potential_bending_counts(
+            c, 330.0, SAT, SAT_P, QTREF, QTSCALE, 1.0, 1.0, kappa_bend=0.3,
+            n_bend=5)
+    with pytest.raises(NotImplementedError, match="nonlinear in m"):
+        rmc.swap_log_accept_counts(c, c, 300.0, 350.0, SAT, SAT_P, QTREF,
+                                   QTSCALE, 1.0, 1.0)
+    # Even A0 = 0 is refused: the guard keys on the model's potential_kind, not
+    # on a parameter value that happens to linearize it.
+    with pytest.raises(NotImplementedError, match="nonlinear in m"):
+        rmc.reduced_potential_counts(c, 330.0, SAT, SAT_P0, QTREF, QTSCALE,
+                                     1.0, 1.0)
+    # The linear models still work through the aggregate helpers.
+    assert math.isfinite(rmc.reduced_potential_counts(
+        c, 330.0, "hs", HS_P, QTREF, QTSCALE, 1.0, 1.0))
+
+
+def test_saturating_fit_summary_roundtrip_and_output_metadata(tmp_path):
+    # (14) A saturating fit_summary.json drives a multichain run end to end, and
+    # the run summary + distributions NPZ record the potential that was sampled.
+    import json as _json
+    fit_N = 30
+    summary_path = _write_fit_summary(
+        tmp_path / "sat_summary.json", SAT,
+        {"h_b": 700.0, "s_b": 2.4, "A0": 5.0, "q_sat": 0.15},
+        kappa_bend=0.4, fit_chain_length=fit_N)
+    loaded = remd.load_fit_summary_json(str(summary_path))
+    assert loaded["model_name"] == SAT
+    assert loaded["fit_chain_length"] == fit_N
+    assert loaded["kappa_bend"] == 0.4
+    assert [float(v) for v in loaded["params"]] == SAT_P
+
+    prefix = str(tmp_path / "sat_run")
+    rmc.main([
+        "--n-chains", "2", "--N", "8", "--box-size", "12",
+        "--n-cycles", "6", "--nT", "3", "--Tmin", "310", "--Tmax", "345",
+        "--fit-summary-json", str(summary_path),
+        "--seed", "1", "--no-plots", "--out-prefix", prefix])
+    with open(f"{prefix}_run_summary.json") as fh:
+        s = _json.load(fh)
+    assert s["model"] == SAT
+    assert s["model_api_version"] == remd.MODEL_API_VERSION
+    assert s["potential_kind"] == "saturating_cooperative"
+    assert s["potential_definition"] == remd.SATURATING_COOPERATIVE_DEFINITION
+    assert s["potential_normalization"] == remd.Q_NORMALIZATION == "q = m/N"
+    assert s["m_ref"] == 0
+    assert s["multichain_potential_definition"] == \
+        rmc.MULTICHAIN_POTENTIAL_DEFINITION
+    assert s["nonlinear_contact_scope"] == "intra_per_chain"
+    assert s["quadratic_contact_scope"] == "intra_per_chain"
+    assert s["interchain_contact_model"] == "linear_coefficient_only"
+    # No m^2/(2N) term exists in this family, so the quadratic fields stay empty.
+    assert s["quadratic_normalization"] is None
+    assert all(v == 0.0 for v in s["quadratic_coefficient_by_temperature"])
+    assert s["A0"] == 5.0 and s["q_sat"] == 0.15
+    assert s["params"] == SAT_P
+    assert s["runtime_chain_length"] == 8 and s["fit_chain_length"] == fit_N
+    assert s["kappa_bend"] == 0.4 and s["bending_enabled"] is True
+
+    # allow_pickle=False proves no None/object arrays leaked into the NPZ.
+    with np.load(f"{prefix}_distributions.npz", allow_pickle=False) as d:
+        assert str(d["potential_kind"]) == "saturating_cooperative"
+        assert str(d["potential_definition"]) == \
+            remd.SATURATING_COOPERATIVE_DEFINITION
+        assert str(d["potential_normalization"]) == "q = m/N"
+        assert int(d["m_ref"]) == 0
+        assert str(d["multichain_potential_definition"]) == \
+            rmc.MULTICHAIN_POTENTIAL_DEFINITION
+        assert str(d["nonlinear_contact_scope"]) == "intra_per_chain"
+        assert str(d["interchain_contact_model"]) == "linear_coefficient_only"
+        assert str(d["quadratic_normalization"]) == ""
+        assert float(d["A0"]) == 5.0 and float(d["q_sat"]) == 0.15
+        assert int(d["runtime_chain_length"]) == 8
+        assert int(d["fit_chain_length"]) == fit_N
+        assert np.all(d["quadratic_coefficient_by_temperature"] == 0.0)
+        assert np.array_equal(d["reduced_bias_by_temperature"],
+                              d["linear_coefficient_by_temperature"])
+        assert float(d["kappa_bend"]) == 0.4
+
+
+def test_saturating_invalid_parameters_rejected():
+    # (15) The domain constraints A0 >= 0 and q_sat > 0 are enforced when the
+    # parameters are resolved, not silently at the first potential evaluation.
+    for bad in ([700.0, 2.4, -1.0, 0.15], [700.0, 2.4, 5.0, 0.0],
+                [700.0, 2.4, 5.0, -0.15]):
+        with pytest.raises(ValueError):
+            remd.validate_model_params(SAT, bad, "test")
+        with pytest.raises(ValueError):
+            rmc.reduced_contact_potential_state(
+                mcs.initialize_dispersed_state(2, 8, 12, seed=3), 330.0, SAT,
+                bad, QTREF, QTSCALE, 1.0, 1.0)
+
+
+def test_quadratic_metadata_unchanged_for_legacy_models(tmp_path):
+    # (16) The generalized metadata is purely additive: a contact-quadratic run
+    # still records exactly the legacy contract values.
+    import json as _json
+    prefix = str(tmp_path / "legacy")
+    rmc.main([
+        "--n-chains", "2", "--N", "8", "--box-size", "12", "--n-cycles", "6",
+        "--nT", "3", "--Tmin", "310", "--Tmax", "345",
+        "--model", "hs_m2_const", "--params", "700,2.4,0.9",
+        "--Tref", "320", "--Tscale", "80",
+        "--seed", "2", "--no-plots", "--out-prefix", prefix])
+    with open(f"{prefix}_run_summary.json") as fh:
+        s = _json.load(fh)
+    assert s["potential_kind"] == "contact_quadratic"
+    assert s["quadratic_normalization"] == "m_chain^2/(2*N)"
+    assert s["quadratic_contact_scope"] == "intra_per_chain"
+    assert s["potential_normalization"] == "m^2/(2N)"
+    assert s["m_ref"] == 0
+    assert "A0" not in s and "q_sat" not in s
+    with np.load(f"{prefix}_distributions.npz", allow_pickle=False) as d:
+        assert str(d["quadratic_normalization"]) == "m_chain^2/(2*N)"
+        assert "A0" not in d and "q_sat" not in d
+    # And a linear run keeps the empty-string sentinel.
+    prefix2 = str(tmp_path / "lin")
+    rmc.main([
+        "--n-chains", "2", "--N", "8", "--box-size", "12", "--n-cycles", "6",
+        "--nT", "3", "--Tmin", "310", "--Tmax", "345",
+        "--model", "hs", "--params", "700,2.4", "--Tref", "320",
+        "--Tscale", "80", "--seed", "2", "--no-plots", "--out-prefix", prefix2])
+    with np.load(f"{prefix2}_distributions.npz", allow_pickle=False) as d:
+        assert str(d["quadratic_normalization"]) == ""
+        assert str(d["potential_normalization"]) == ""
 
 
 if __name__ == "__main__":

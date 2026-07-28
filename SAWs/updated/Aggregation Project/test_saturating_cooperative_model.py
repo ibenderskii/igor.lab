@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pytest suite for the saturating_cooperative contact model.
+"""pytest suite for the saturating_cooperative_contact model.
 
 The claim under test is narrow and specific.  With the contact fraction
 q = m/N measured from m_ref = 0,
@@ -35,7 +35,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 UPDATED = os.path.dirname(HERE)
 FITTER = os.path.join(HERE, "fit_lattice_contact_model_2.py")
 
-MODEL = "saturating_cooperative"
+MODEL = "saturating_cooperative_contact"
 LEGACY_MODELS = ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3", "heat_capacity")
 QUADRATIC_MODELS = ("hs_m2_const", "hs_m2_hs")
 TREF, TSCALE = 320.0, 80.0

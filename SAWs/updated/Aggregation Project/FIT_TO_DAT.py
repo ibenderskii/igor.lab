@@ -66,7 +66,7 @@ This one is written in the contact FRACTION q = m/N (measured from m_ref = 0)
 rather than in m, so its cooperative attraction saturates instead of growing
 without bound:
 
-saturating_cooperative
+saturating_cooperative_contact
               u_contact(m,T;N) = N * [ b(T)*q - A0*q^2/(1 + (q/q_sat)^2) ]
               b(T) = h_b/T - s_b,  q = m/N,  m_ref = 0
                 Parameters: h_b, s_b, A0, q_sat.  A0 >= 0 and q_sat > 0 are
@@ -187,7 +187,7 @@ claim about full-distribution support, which is reported separately.
 
 Both also presuppose a contact potential LINEAR in m: only then does a single
 scalar b index the whole family of reweightings.  For every model NONLINEAR in m
--- the contact-quadratic pair and saturating_cooperative alike -- the finite
+-- the contact-quadratic pair and saturating_cooperative_contact alike -- the finite
 one-dimensional scan and the b -> +/-inf endpoint reading are NOT applicable and
 are not run.  What replaces them is model-independent and
 holds for any contact-only reweighting: the support-overlap check, the rigorous
@@ -978,7 +978,7 @@ MODEL_REGISTRY: Dict[str, Dict] = {
     # density but its marginal contribution dies off once q >> q_sat, and the
     # marginal slope du/dm returns to b(T).  A0 = 0 recovers hs exactly, so the
     # first restart begins at the nested linear solution.
-    "saturating_cooperative": {
+    "saturating_cooperative_contact": {
         "param_names": ["h_b", "s_b", "A0", "q_sat"],
         "x0": [750.0, 2.8, 0.0, 0.35],
         "bounds": [
@@ -1025,7 +1025,7 @@ del _spec
 #       reweighting weight is exp[-u_contact(m,T;N)] rather than exp[-b(T)*m]
 #       (identical for every v1 model, all of which are potential_kind linear).
 #   v3: potential_kind gains "saturating_cooperative" and the model
-#       saturating_cooperative; the full potential is built by
+#       saturating_cooperative_contact; the full potential is built by
 #       POTENTIAL_BUILDERS[potential_kind] instead of being hard-coded as
 #       b*m + kappa*m^2/(2N), and the registry/contract gain
 #       potential_definition, potential_normalization and m_ref.  Every v1 and

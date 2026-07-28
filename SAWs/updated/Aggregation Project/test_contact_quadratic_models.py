@@ -421,25 +421,41 @@ def test_model_contract_parity_across_all_three_modules():
         "remd": remd.get_model_contract(),
     }
     versions = {k: c["model_api_version"] for k, c in contracts.items()}
-    assert versions["fitter"] == versions["fit_to_dat"] == fit.MODEL_API_VERSION
+    # Strict parity: fitters and sampler must be on the SAME model API version.
+    # A sampler left behind would happily read a fit summary and sample some
+    # other potential, which is precisely what this handshake exists to prevent.
+    assert (
+        versions["fitter"]
+        == versions["fit_to_dat"]
+        == versions["remd"]
+        == fit.MODEL_API_VERSION
+    ), versions
 
     names = {k: set(c["models"]) for k, c in contracts.items()}
-    # The two fitters must agree exactly. The REMD module is a separate consumer
-    # that lags the fitters when a model is added: it must know no model the
-    # fitters do not, but the fitters may know models it has not caught up with
-    # yet (currently saturating_cooperative, a v3 addition made in the fitters
-    # only). Every model it DOES know is compared field by field below.
-    assert names["fitter"] == names["fit_to_dat"]
-    assert names["remd"] <= names["fitter"], names["remd"] - names["fitter"]
-    assert {"hs_m2_const", "hs_m2_hs"} <= names["remd"]
+    # Strict parity again: all three must know exactly the same model set.
+    assert names["fitter"] == names["fit_to_dat"] == names["remd"], {
+        k: sorted(v) for k, v in names.items()
+    }
+    assert {"hs_m2_const", "hs_m2_hs", "saturating_cooperative_contact"} <= names["remd"]
 
     for model in sorted(names["fitter"]):
-        entries = [
-            c["models"][model] for c in contracts.values() if model in c["models"]
-        ]
-        for key in ("param_names", "potential_kind", "quadratic_normalization"):
+        entries = [c["models"][model] for c in contracts.values()]
+        for key in ("param_names", "potential_kind", "quadratic_normalization",
+                    "potential_normalization", "m_ref"):
             values = [e[key] for e in entries]
             assert all(v == values[0] for v in values), (model, key, values)
+        # potential_definition is back-filled from each module's own description
+        # for the models that predate the field, and those descriptions have
+        # always been worded differently in the sampler than in the fitters (the
+        # fitters' carry CLI hints) while describing the same potential -- which
+        # is checked numerically elsewhere. Where a model declares the field
+        # explicitly it is authoritative, and then every module must state it
+        # identically and none may fall back to its description.
+        defs = [e["potential_definition"] for e in entries]
+        declared = [d for d, e in zip(defs, entries) if d != e["description"]]
+        if declared:
+            assert len(declared) == len(entries), (model, defs)
+            assert all(d == declared[0] for d in declared), (model, defs)
 
     assert contracts["fitter"]["models"]["hs_m2_const"]["param_names"] == [
         "h1", "s1", "kappa2"
@@ -451,6 +467,84 @@ def test_model_contract_parity_across_all_three_modules():
         e = contracts["fitter"]["models"][model]
         assert e["potential_kind"] == "contact_quadratic"
         assert e["quadratic_normalization"] == "m^2/(2N)"
+
+
+def test_saturating_cooperative_contact_is_in_every_contract():
+    """The new model must be declared identically by the fitters AND the sampler.
+
+    Present in the fitters only would mean a fit summary the sampler cannot
+    reproduce; present with different fields would mean the two disagree about
+    what the fitted parameters mean.
+    """
+    model = "saturating_cooperative_contact"
+    entries = {
+        "fitter": fit.get_model_contract()["models"],
+        "fit_to_dat": dat.get_model_contract()["models"],
+        "remd": remd.get_model_contract()["models"],
+    }
+    for who, models in entries.items():
+        assert model in models, who
+        e = models[model]
+        assert e["param_names"] == ["h_b", "s_b", "A0", "q_sat"], who
+        assert e["potential_kind"] == "saturating_cooperative", who
+        # It is NOT an m^2/(2N) model: the curvature normalization stays None and
+        # the chain length serves the contact-fraction normalization instead.
+        assert e["quadratic_normalization"] is None, who
+        assert e["potential_normalization"] == "q = m/N", who
+        assert e["m_ref"] == 0, who
+        assert "A0*q^2/(1 + (q/q_sat)^2)" in e["potential_definition"], who
+
+
+def test_v3_fit_summary_loads_and_v4_is_rejected(tmp_path):
+    """End-to-end version gate on a summary the fitter actually wrote.
+
+    A summary written by the current fitter must load in the sampler unchanged;
+    a summary one version newer must be refused rather than silently sampled
+    against whatever this sampler happens to implement.
+    """
+    crg, c_edges, rg_edges = _write_baseline(tmp_path / "base.npz")
+    _write_remd(
+        tmp_path / "remd.npz", crg, c_edges,
+        np.array([780.0, 2.7, 1.2, 0.4]), "saturating_cooperative_contact",
+    )
+    out = tmp_path / "run"
+    subprocess.run(
+        [sys.executable, FITTER,
+         "--remd", str(tmp_path / "remd.npz"),
+         "--baseline", str(tmp_path / "base.npz"),
+         "--contact_offset", "0", "--model", "saturating_cooperative_contact",
+         "--loss", "js", "--n_restarts", "3", "--no-plots",
+         "--outdir", str(out)],
+        check=True, capture_output=True, text=True,
+    )
+    summary_path = out / "fit_summary.json"
+    summary = json.loads(summary_path.read_text())
+    assert summary["model_api_version"] == 3 == remd.MODEL_API_VERSION
+
+    loaded = remd.load_fit_summary_json(str(summary_path))
+    assert loaded["model_name"] == "saturating_cooperative_contact"
+    assert loaded["param_names"] == ["h_b", "s_b", "A0", "q_sat"]
+    assert loaded["fit_chain_length"] == N_BEADS
+    # the loaded parameters are the ones the fitter reported, in registry order
+    np.testing.assert_allclose(
+        loaded["params"], [summary["params"][n] for n in loaded["param_names"]]
+    )
+    # and they are usable: the sampler evaluates the same potential the fitter did
+    u_fit = fit.make_contact_u_fn(
+        loaded["model_name"], loaded["Tref"], loaded["Tscale"], n_beads=N_BEADS)
+    for T in (280.0, 320.0, 360.0):
+        for m in (0, 3, 11):
+            assert abs(
+                float(u_fit(np.asarray(loaded["params"]), T, float(m)))
+                - remd.reduced_contact_potential(
+                    m, T, loaded["model_name"], loaded["params"],
+                    loaded["Tref"], loaded["Tscale"], N_BEADS)
+            ) < 1e-12, (T, m)
+
+    future = tmp_path / "v4_summary.json"
+    future.write_text(json.dumps({**summary, "model_api_version": 4}))
+    with pytest.raises(ValueError, match="newer"):
+        remd.load_fit_summary_json(str(future))
 
 
 def test_generic_interface_present_in_every_module():
@@ -496,7 +590,7 @@ def test_remd_sampler_samples_contact_quadratic_models():
     for model in LEGACY_MODELS:
         remd.require_linear_contact_potential(model)   # no raise
     for model in NEW_MODELS:
-        with pytest.raises(NotImplementedError, match="contact-quadratic"):
+        with pytest.raises(NotImplementedError, match="nonlinear in m"):
             remd.require_linear_contact_potential(model)
 
 
