@@ -2,11 +2,13 @@
   "target_remd": "remd_distributions_30mer.npz",
   "fit_script": "fit_lattice_contact_model_2.py",
   "remd_script": "remd_uniform_chain_2_new.py",
-  "output_root": "quad_model_suite_output_30mer",
+  "output_root": "quart_model_suite_output_30mer",
 
   "models": [
     "hs",
-    "hs_m2_hs"
+    "hs_m2_const",
+    "hs_m2_hs",
+    "saturating_cooperative_contact"
   ],
 
   "baselines": [
@@ -21,7 +23,7 @@
   "fit": {
     "loss": "js",
     "fit_rg": true,
-    "rg_weight": 0.7,
+    "rg_weight": 0.5,
     "holdout_every": null,
     "holdout_indices": null,
     "train_indices": null,

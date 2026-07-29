@@ -2,7 +2,7 @@
   "target_remd": "remd_distributions_44mer.npz",
   "fit_script": "fit_lattice_contact_model_2.py",
   "remd_script": "remd_uniform_chain_2_new.py",
-  "output_root": "model_suite_output_44mer",
+  "output_root": "quart_model_suite_output_44mer",
 
   "models": [
     "hs",

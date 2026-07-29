@@ -1,16 +1,15 @@
 {
   "target_remd": "remd_distributions_60mer.npz",
   "fit_script": "fit_lattice_contact_model_2.py",
-  "remd_script": "remd_uniform_chain_2.py",
-  "output_root": "model_suite_output_60mer",
+  "remd_script": "remd_uniform_chain_2_new.py",
+  "output_root": "quart_model_suite_output_60mer",
 
   "models": [
     "hs",
-    "hs_quadratic",
-    "poly2",
-    "poly3",
-    "heat_capacity"
-  ],
+    "hs_m2_const",
+    "hs_m2_hs",
+    "saturating_cooperative_contact"
+   ],
 
   "baselines": [
     {
