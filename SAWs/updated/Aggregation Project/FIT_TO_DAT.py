@@ -4242,12 +4242,37 @@ def correlation_flags(
 
 
 def numerical_hessian(
-    f: Callable[[np.ndarray], float], x: np.ndarray, *, rel_step: float = 1e-4
+    f: Callable[[np.ndarray], float], x: np.ndarray, *, rel_step: float = 1e-4,
+    bounds=None,
 ) -> np.ndarray:
-    """Central-difference Hessian of scalar f at x (objective curvature)."""
+    """Central-difference Hessian of scalar f at x (objective curvature).
+
+    ``bounds`` is the model's optimizer box [(lo, hi), ...].  When it is given,
+    the evaluation point is moved to the nearest point at least one step inside
+    the box, so no stencil point leaves the feasible region.  This matters for
+    models with a hard domain constraint: ``saturating_cooperative_contact``
+    requires A0 >= 0, and a fit that lands on A0 = 0 (its lower bound, and the
+    common outcome when the data do not support cooperativity) would otherwise
+    have its curvature probed at A0 < 0, where the potential is undefined.
+
+    A coordinate already more than one step inside its bounds is NOT moved, so
+    for every historical fit -- where no parameter sits within 1e-4 of a bound --
+    the stencil, and therefore the reported Hessian, is unchanged bit for bit.
+    Passing ``bounds=None`` reproduces the previous unconstrained behaviour.
+    """
     x = np.asarray(x, dtype=float)
     n = x.size
     h = rel_step * np.maximum(np.abs(x), 1.0)
+    if bounds is not None:
+        x = x.copy()
+        for i, (lo, hi) in enumerate(bounds):
+            lo, hi = float(lo), float(hi)
+            if hi - lo <= 2.0 * h[i]:
+                # Box narrower than the stencil: centre it and shrink to fit.
+                x[i] = 0.5 * (lo + hi)
+                h[i] = max(0.5 * (hi - lo), np.finfo(float).tiny)
+            else:
+                x[i] = min(max(x[i], lo + h[i]), hi - h[i])
     f0 = float(f(x))
     H = np.zeros((n, n), dtype=float)
     for i in range(n):
@@ -4885,10 +4910,14 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
           f"distinct local minima: {rs['distinct_minima']} "
           f"({rs['n_distinct_objectives']} objective level(s))")
 
-    # Numerical Hessian (objective curvature) at the optimum.
+    # Numerical Hessian (objective curvature) at the optimum.  The optimizer box
+    # is passed so the finite-difference stencil stays inside the model's declared
+    # domain (a fit that lands on a bound -- A0 = 0 for
+    # saturating_cooperative_contact -- would otherwise be probed outside it).
     def f(p: np.ndarray) -> float:
         return float(obj_fn(p, *obj_args))
-    H = numerical_hessian(f, params_fit)
+    H = numerical_hessian(
+        f, params_fit, bounds=MODEL_REGISTRY[ctx["model_name"]]["bounds"])
     hdiag = hessian_diagnostics(H)
     print(f"  Hessian eigenvalues: "
           + ", ".join("%.4g" % e for e in hdiag["eigenvalues"])
@@ -9336,7 +9365,9 @@ def run_rg_scalar_uncertainty_diagnostics(
     def f(x: np.ndarray) -> float:
         return float(obj_fn(x, *train_args))
 
-    H = numerical_hessian(f, params_fit)
+    # Same optimizer box the scalar fit used, so the finite-difference stencil
+    # cannot step outside a model's declared domain.
+    H = numerical_hessian(f, params_fit, bounds=ctx.get("bounds"))
     diag = hessian_diagnostics(H)
     diag["note"] = (
         "Local objective-curvature diagnostics only. The scalar-Rg regression "

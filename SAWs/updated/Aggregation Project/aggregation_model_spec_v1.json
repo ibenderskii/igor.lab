@@ -1,9 +1,15 @@
 {
   "model_name": "multichain_lattice_aggregation",
-  "schema_version": 1,
-  "multichain_output_schema_version": 1,
-  "model_api_version": 1,
+  "spec_revision": 2,
+  "schema_version": 4,
+  "multichain_output_schema_version": 4,
+  "model_api_version": 3,
   "description": "Minimal scientifically valid multi-chain lattice-polymer aggregation model. Extends the validated single-chain ISAW replica-exchange architecture (remd_uniform_chain_2_new.py) to M identical self-avoiding chains in a periodic cubic box, reusing the single-chain fitted contact free energy without refitting. This document is the model/software CONTRACT; it deliberately does NOT hard-code one set of runtime parameters (M, N, L, temperatures, lambda values). Those are chosen per run and recorded in each run's output metadata.",
+
+  "spec_revision_history": [
+    {"spec_revision": 1, "model_api_version": 1, "change": "Initial contract. The reduced potential was fixed to a single linear form u = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter]."},
+    {"spec_revision": 2, "model_api_version": 3, "change": "The authoritative reduced potential now delegates the INTRACHAIN term to the selected model's own single-chain contact potential u_contact(m,T;N), which may be nonlinear in m (contact_quadratic, saturating_cooperative) and is evaluated PER CHAIN. Interchain contacts remain a separate, strictly linear b(T)*m_inter term and the bending penalty remains a separate additive term. Output/model-API versions realigned with the code (schema 4, model API 3)."}
+  ],
 
   "system": {
     "number_of_chains_symbol": "M",
@@ -89,13 +95,45 @@
   },
 
   "reduced_potential": {
-    "equation": "u(X, T) = b(T) * [ lambda_intra * m_intra(X) + lambda_inter * m_inter(X) ]",
+    "equation": "u(X, T) = lambda_intra * sum_alpha u_contact(m_intra_alpha(X), T; N) + lambda_inter * b(T) * m_inter(X) + kappa_bend * n_bend_total(X)",
     "sampling_weight": "P(X | T) proportional to exp(-u(X, T))",
+    "structure": "Three independent additive terms: a per-chain intrachain contact potential that may be NONLINEAR in m, a strictly linear interchain contact term, and a fixed bending penalty. No term is folded into another.",
+
+    "intrachain_term": {
+      "equation": "lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N)",
+      "delegation": "u_contact(m, T; N) is the selected model's OWN single-chain contact potential, taken unchanged from the model API (MODEL_REGISTRY / reduced_contact_potential in remd_uniform_chain_2_new.py). The multi-chain layer never redefines it.",
+      "supported_potential_kinds": {
+        "linear": "u_contact(m,T;N) = b(T)*m",
+        "contact_quadratic": "u_contact(m,T;N) = b(T)*m + kappa(T)*m^2/(2N)",
+        "saturating_cooperative": "u_contact(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)] with q = m/N"
+      },
+      "per_chain_requirement": "u_contact MUST be evaluated separately for every chain alpha at that chain's OWN cached intrachain count m_intra_alpha, using the RUNTIME chain length N.",
+      "prohibited": "u_contact MUST NOT be evaluated at the total intrachain count sum_alpha m_intra_alpha, nor at m_intra + m_inter. For any u_contact that is nonlinear in m these give a different potential and manufacture artificial cross-chain coupling: two states with equal total intrachain contacts but different per-chain allocations have genuinely different potentials.",
+      "aggregate_helper_rule": "Helpers that see only the aggregate ContactCounts (total intra, total inter) are valid for linear models ONLY and must reject every nonlinear model explicitly rather than approximating it.",
+      "move_delta_rule": "A proposed move's intrachain contribution is the exact difference of the full per-chain potential at the moved chain's old and new count, lambda_intra * (u_contact(m_alpha + d_intra) - u_contact(m_alpha)). It MUST NOT be approximated as b(T)*d_intra. Only the moved chain's count can change, so every other chain cancels from the difference.",
+      "chain_length": "Models whose potential needs a normalization (m^2/(2N), q = m/N) require a chain length. The RUNTIME N is authoritative; the chain length the model was FIT at is recorded separately as provenance, and a mismatch is a permitted chain-length transfer that must be reported, not silently rescaled."
+    },
+
+    "interchain_term": {
+      "equation": "lambda_inter * b(T) * m_inter",
+      "linearity": "Interchain contacts are STRICTLY LINEAR in m_inter for every model, including the nonlinear ones.",
+      "coefficient": "b(T) is the selected model's own linear coefficient (reduced_bias), using the SAME fitted parameters as the intrachain term -- for saturating_cooperative_contact the same fitted h_b and s_b through b(T) = h_b/T - s_b.",
+      "no_nonlinear_correction": "No m^2/(2N) curvature and no A0/q_sat cooperative correction is applied to interchain contacts, because a single-chain fit does not identify an interchain nonlinear term."
+    },
+
+    "bending_term": {
+      "equation": "kappa_bend * n_bend_total",
+      "independence": "The fixed reduced bending penalty is a SEPARATE additive term, never absorbed into any contact model. It is independent of lambda_intra and lambda_inter: setting both lambdas to zero disables the contact interactions but does NOT disable bending when kappa_bend != 0.",
+      "default": "kappa_bend = 0 reproduces the contacts-only sampler exactly."
+    },
+
     "b_of_T": {
       "meaning": "reduced contact bias b(T) for the selected contact-bias model, loaded with the SAME semantics as remd_uniform_chain_2_new.py (MODEL_REGISTRY, fitted params, Tref, Tscale).",
       "loading": "Loaded through the existing fit_summary.json and model-registry interfaces (resolve_model_params / load_fit_summary_json). Fitted parameters are never modified or refit.",
-      "single_chain_consistency": "For M = 1 and lambda_intra = 1, u reduces to b(T) * m_intra, matching the single-chain reduced potential u = m * b(T)."
+      "scope_note": "b(T) is the FULL potential only for the linear models. For every nonlinear model b(T) is one coefficient of it; potential_definition in the run metadata is the authoritative statement of what was sampled.",
+      "single_chain_consistency": "For M = 1 and lambda_intra = 1, u reduces to u_contact(m_intra, T; N) + kappa_bend * n_bend, matching the single-chain reduced potential exactly for every model kind."
     },
+    "nesting": "Each nonlinear family nests the linear one at zero extra amplitude: kappa(T) = 0 for contact_quadratic and A0 = 0 for saturating_cooperative reduce u_contact to b(T)*m. At A0 = 0 the value of q_sat has no effect on the potential at all.",
     "effective_energy": {
       "definition": "effective_energy = T * u",
       "label": "temperature-dependent EFFECTIVE energy (reported for compatibility only; the reduced potential u is the canonical sampling quantity). It is NOT a temperature-independent microscopic energy."
@@ -105,13 +143,14 @@
 
   "lambda_controls": {
     "lambda_intra": {
-      "meaning": "coupling multiplier on intrachain contacts in the reduced potential",
+      "meaning": "coupling multiplier on the COMPLETE per-chain intrachain contact potential (the whole u_contact, including any nonlinear term), not on the contact count",
       "default": 1.0
     },
     "lambda_inter": {
-      "meaning": "coupling multiplier on interchain contacts in the reduced potential",
+      "meaning": "coupling multiplier on the linear interchain contact term b(T)*m_inter",
       "default": 1.0
     },
+    "independence": "The two multipliers are independent of each other and both are independent of kappa_bend; (lambda_intra, lambda_inter) = (0, 0) leaves the bending penalty in force.",
     "note": "lambda_intra and lambda_inter select control modes WITHOUT changing the energy implementation.",
     "control_modes": {
       "full_transferability": {"lambda_intra": 1, "lambda_inter": 1, "meaning": "null model: a monomer-monomer contact has the same effective free energy whether intra- or interchain (DEFAULT)."},
@@ -123,7 +162,8 @@
 
   "replica_exchange": {
     "swap_rule": "log_accept = u(X_i, T_i) + u(X_j, T_j) - u(X_j, T_i) - u(X_i, T_j)",
-    "swap_rule_note": "Generalized reduced-potential swap rule. Because u depends on both m_intra and m_inter (and on lambda_intra, lambda_inter), swap calculations MUST use BOTH cached contact counts, not the total contact count alone.",
+    "swap_rule_note": "Generalized reduced-potential swap rule. Because u depends on both m_intra and m_inter (and on lambda_intra, lambda_inter), swap calculations MUST use BOTH cached contact counts, not the total contact count alone. For a model that is nonlinear in m the swap must be evaluated through the same PER-CHAIN state-aware potential as the sampler, so it uses the full per-chain intrachain allocation rather than the intrachain total.",
+    "bending_cancels": "The fixed reduced bending penalty is temperature-independent and identical within each state, so kappa_bend*(n_i + n_j - n_j - n_i) = 0: it cancels exactly and never enters the swap criterion. There is a single swap rule for all three potential families.",
     "temperatures": "Temperatures are fixed to lanes; complete MultiChainState objects are exchanged between adjacent lanes with even/odd alternation."
   },
 
@@ -261,13 +301,36 @@
     "model_name", "model_params", "param_names", "Tref", "Tscale",
     "seed", "temperature_ladder", "schema_version",
     "multichain_output_schema_version", "snapshot_schema_version",
+    "model_api_version",
     "local_sweeps_per_swap", "translation_sweeps_per_swap",
     "local_proposals_per_cycle", "translation_proposals_per_cycle",
     "cluster_contact_threshold", "parameter_source", "fit_summary_json",
     "initialization_seeds", "initial_states",
     "coordinate_canonicalization_enabled", "snapshot_coordinate_dtype",
-    "diagnostics_enabled", "diagnostic_thresholds", "output_files"
+    "diagnostics_enabled", "diagnostic_thresholds", "output_files",
+    "kappa_bend", "bending_enabled", "bend_definition",
+    "potential_kind", "potential_definition", "potential_normalization",
+    "m_ref", "multichain_potential_definition",
+    "quadratic_contact_scope", "nonlinear_contact_scope",
+    "interchain_contact_model", "quadratic_normalization",
+    "runtime_chain_length", "fit_chain_length"
   ],
+
+  "potential_metadata_contract": {
+    "purpose": "A run's outputs must state the Hamiltonian that was actually sampled, so a reader never has to reconstruct it from the model name.",
+    "potential_kind": "one of linear, contact_quadratic, saturating_cooperative",
+    "potential_definition": "the exact single-chain u_contact(m,T;N) that was sampled, verbatim from the model registry",
+    "multichain_potential_definition": "the assembled multi-chain potential (per-chain intrachain term + linear interchain term + bending term)",
+    "potential_normalization": "what the chain length was used for: empty for linear models, 'm^2/(2N)' for contact_quadratic, 'q = m/N' for saturating_cooperative",
+    "quadratic_normalization": "'m_chain^2/(2*N)' for contact_quadratic ONLY; empty/null for linear AND for saturating_cooperative, which has no m^2/(2N) term",
+    "m_ref": "contact-number reference used to center q; 0 for every model, recorded explicitly rather than left implicit",
+    "nonlinear_contact_scope": "'intra_per_chain' -- whatever nonlinear-in-m structure the model carries applies per chain, intrachain only. quadratic_contact_scope is retained with the same value for readers written before the third family.",
+    "interchain_contact_model": "'linear_coefficient_only'",
+    "runtime_chain_length": "the N actually used in the normalization",
+    "fit_chain_length": "the N the model was FIT at (provenance only; -1/null when not recorded)",
+    "model_specific_parameters": "Models with named domain parameters record them alongside the packed model_params vector: saturating_cooperative_contact writes A0 and q_sat.",
+    "additivity_rule": "New contract fields are ADDITIVE. Existing field names, types and values are never repurposed, so readers written against an earlier revision keep working."
+  },
 
   "scope_notes": [
     "This is the minimum scientifically valid multi-chain simulator to test whether the single-chain contact free energy predicts aggregation.",

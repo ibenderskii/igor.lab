@@ -5,7 +5,8 @@ run_model_suite.py — subprocess orchestrator for the lattice contact-model sui
 For every baseline x every selected contact-bias model this script:
   1. fits the model to the target REMD distributions (fit_lattice_contact_model_2.py),
   2. loads the resulting fit_summary.json,
-  3. runs one or more lattice REMD replicates (remd_uniform_chain_2.py),
+  3. runs one or more lattice REMD replicates (remd_uniform_chain_2_new.py, or
+     the verified compatibility shim remd_uniform_chain_2.py),
   4. compares simulated outputs to the target with a standardized metric,
   5. writes a per-baseline comparison table and a provenance manifest.
 
@@ -130,6 +131,35 @@ BFN_CHECK_T = (250.0, 300.0, 350.0)
 BFN_CHECK_TREF = 300.0
 BFN_CHECK_TSCALE = 100.0
 
+# Numeric FULL-potential cross-check grid.  b(T) cannot distinguish the three
+# potential families -- it is identical for hs, hs_m2_const and
+# saturating_cooperative_contact at the same (h, s) -- and kappa(T) from raw_q_fn
+# is identically zero for the linear models AND for the saturating-cooperative
+# one, which has no m^2/(2N) term at all.  Neither coefficient can therefore
+# stand alone as the nonlinear contract check; the assembled u(m, T; N) is
+# authoritative.  The chain length is fixed here so q = m/N and m^2/(2N) are
+# well defined, and the contact grid spans q from 0 to nearly 1.
+UFN_CHECK_N = 30
+UFN_CHECK_M = (0, 1, 5, 12, 29)
+
+# Chain length used by --quick-test, recorded in the synthetic baseline AND used
+# as the REMD --N so the fit and the simulation share one chain length.  Models
+# that are nonlinear in m refuse to fit without a resolvable chain length.
+# Must exceed the fixed contour-bin long threshold (15 in project_definitions.json)
+# because the sampler validates the structural bin definitions against n_beads;
+# the previous value of 12 made every REMD subprocess exit non-zero.
+QUICK_TEST_N = 20
+
+# Contract metadata compared field by field between the fitter and the sampler.
+# potential_kind / quadratic_normalization say WHAT family is being reweighted;
+# potential_normalization and m_ref pin the normalization the chain length serves
+# and the contact-number reference.  A disagreement in any of them means the two
+# scripts would be exponentiating different potentials.
+CONTRACT_COMPARE_KEYS = (
+    "potential_kind", "quadratic_normalization",
+    "potential_normalization", "m_ref",
+)
+
 
 # ---------------------------------------------------------------------------
 # Small utilities
@@ -167,20 +197,31 @@ def sanitize_name(name: str) -> str:
 
 _SHA256_CACHE: dict[tuple[str, int, int], str] = {}
 
+# A (size, mtime) cache key cannot see a same-size rewrite that happens inside the
+# filesystem's timestamp granularity -- on Windows two writes microseconds apart
+# can share an st_mtime_ns.  Results younger than this are recomputed rather than
+# served from the cache, so a freshly rewritten input is never hashed staly.  The
+# cache still does its job for the large NPZ inputs it exists for, which are
+# written once and read many times.
+_SHA256_CACHE_MIN_AGE_NS = 2_000_000_000  # 2 s
+
 
 def sha256_file(path: str | Path) -> str:
     p = Path(path)
     st = p.stat()
     key = (str(p.resolve()), int(st.st_size), int(st.st_mtime_ns))
-    cached = _SHA256_CACHE.get(key)
-    if cached is not None:
-        return cached
+    fresh = (time.time_ns() - int(st.st_mtime_ns)) < _SHA256_CACHE_MIN_AGE_NS
+    if not fresh:
+        cached = _SHA256_CACHE.get(key)
+        if cached is not None:
+            return cached
     h = hashlib.sha256()
     with open(p, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     digest = h.hexdigest()
-    _SHA256_CACHE[key] = digest
+    if not fresh:
+        _SHA256_CACHE[key] = digest
     return digest
 
 
@@ -207,8 +248,14 @@ class Logger:
 
 REQUIRED_TOP = ("target_remd", "fit_script", "remd_script", "output_root",
                 "models", "baselines")
+# Models exercised end to end by --quick-test.  This is the FULL model registry,
+# not just the linear family: the two contact-quadratic models and the
+# saturating-cooperative model carry the nonlinear-in-m code paths (per-chain
+# m^2/(2N) curvature, saturating cooperative attraction) that a linear-only
+# quick test would never reach.  Kept in registry order.
 SUPPORTED_MODELS = ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3",
-                    "heat_capacity")
+                    "heat_capacity", "hs_m2_const", "hs_m2_hs",
+                    "saturating_cooperative_contact")
 
 # Supported values for the fitter's newer analyses (verified against
 # fit_lattice_contact_model_2.py: build_split_schemes() and the --bootstrap-method
@@ -221,8 +268,23 @@ SUPPORTED_SPLIT_SCHEMES = (
 SUPPORTED_BOOTSTRAP_METHODS = ("temperature",)
 # Parameter names that are "extra" terms whose interval containing zero is a
 # meaningful identifiability signal (a2/a3 polynomial corrections, dCp heat
-# capacity). Used only for reporting, never for fitting.
-EXTRA_TERM_PARAMS = ("a2", "a3", "dCp")
+# capacity, A0 saturating-cooperative amplitude). Used only for reporting, never
+# for fitting.  A0 is the NESTING parameter of saturating_cooperative_contact:
+# at A0 = 0 the potential collapses exactly onto the linear hs model.
+EXTRA_TERM_PARAMS = ("a2", "a3", "dCp", "A0")
+
+# Parameters that enter the potential ONLY multiplied by a nesting extra term.
+# When that term is not resolved away from zero, the dependent parameters are not
+# identified by the data and must be reported as weakly identified rather than
+# interpreted physically.  For
+#     u(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],  q = m/N
+# the whole q_sat dependence sits inside the A0 term, so at A0 = 0 the potential
+# is exactly b(T)*m for EVERY q_sat: the fitted q_sat is then an artifact of the
+# optimizer's starting point, not a saturation contact density.
+NESTED_TERM_DEPENDENTS = {"A0": ("q_sat",)}
+# |A0| at or below this contributes less than ~1e-4 reduced units anywhere in the
+# physical range (0 <= q <= 1, N <= 100), i.e. far below any fit's resolution.
+NESTING_NEAR_ZERO_ATOL = 1e-6
 
 DEFAULT_FIT = {
     "loss": "js", "fit_rg": False, "rg_weight": 1.0, "holdout_every": None,
@@ -794,8 +856,64 @@ def import_module_from_path(mod_name: str, path: str):
     return module
 
 
+def declares_potential_definition(entry) -> bool:
+    """True when a model states its potential explicitly rather than by default.
+
+    ``potential_definition`` is back-filled from ``description`` for every model
+    that does not declare one.  The fitter's descriptions carry CLI hints the
+    sampler's never had (``heat_capacity`` names ``--T0``), so for back-filled
+    models the two strings differ in help text while describing the same
+    potential.  Comparing them verbatim would fail on wording; comparing nothing
+    would let a real divergence through.  The rule is therefore: compare the
+    definition wherever a model DECLARES one, and require that if either module
+    declares it, both do.
+    """
+    return str(entry["potential_definition"]) != str(entry["description"])
+
+
+def contract_probe_params(spec) -> list:
+    """Deterministic, non-degenerate probe parameters for a contract check.
+
+    Several models declare an x0 whose higher-order entries are exactly zero:
+    ``poly2``/``poly3`` are all-zero, ``hs_quadratic`` has a2 = 0,
+    ``heat_capacity`` has dCp = 0, ``hs_m2_const`` has kappa2 = 0, ``hs_m2_hs``
+    has h2 = s2 = 0 and ``saturating_cooperative_contact`` has A0 = 0.  Comparing
+    b(T) or u(m,T;N) at such an x0 tests only the degenerate branch -- at A0 = 0
+    the saturating potential collapses onto b(T)*m and its nonlinear code is
+    never reached, and at the all-zero poly2 x0 even b(T) is identically zero.
+    Every zero entry is therefore replaced by a fixed in-bounds nonzero value
+    while every nonzero x0 entry is kept exactly as the fitter declares it, so
+    the probe stays inside the model's own declared domain (A0 >= 0, q_sat > 0).
+    """
+    probe = []
+    for value, (lo, hi) in zip(spec["x0"], spec["bounds"]):
+        v = float(value)
+        if v != 0.0:
+            probe.append(v)
+            continue
+        cand = float(lo) + 0.3 * (float(hi) - float(lo))
+        if cand == 0.0:  # a symmetric box whose 30% point lands back on zero
+            cand = float(lo) + 0.7 * (float(hi) - float(lo))
+        probe.append(cand)
+    return probe
+
+
 def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
-    """Compare API version, model names, param_names, and numeric b(T)."""
+    """Cross-check the fitter's and the sampler's model contracts.
+
+    Compares, for every model: the MODEL_API_VERSION, the model-name set,
+    parameter names AND order, the potential-contract metadata
+    (``potential_kind``, ``quadratic_normalization``, ``potential_definition``,
+    ``potential_normalization``, ``m_ref``, ``requires_chain_length``), numeric
+    b(T), numeric kappa(T), and -- authoritatively -- the numeric FULL potential
+    u(m, T; N) over a grid of temperatures and contact counts.
+
+    The u(m,T;N) comparison is the check that actually pins the potential down.
+    b(T) is shared by hs, hs_m2_const and saturating_cooperative_contact at the
+    same (h, s), and kappa(T) via ``raw_q_fn`` is identically zero both for the
+    linear models and for the saturating-cooperative one (which has no m^2/(2N)
+    term), so raw_q_fn alone would pass vacuously for the nonlinear family.
+    """
     fit_contract = fit_mod.get_model_contract()
     remd_contract = remd_mod.get_model_contract()
 
@@ -821,40 +939,85 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
             raise ValueError(
                 f"param_names differ for {name!r}: fitter={fn} remd={rn}"
             )
-        # potential_kind and quadratic_normalization define WHAT is being
-        # reweighted, so a disagreement is as fatal as a parameter-order one:
-        # the two scripts would be exponentiating different potentials.
-        for key in ("potential_kind", "quadratic_normalization"):
-            fv = fit_contract["models"][name][key]
-            rv = remd_contract["models"][name][key]
+        # The potential-contract metadata defines WHAT is being reweighted, so a
+        # disagreement is as fatal as a parameter-order one: the two scripts
+        # would be exponentiating different potentials.
+        fe = fit_contract["models"][name]
+        re_ = remd_contract["models"][name]
+        for key in CONTRACT_COMPARE_KEYS:
+            fv, rv = fe[key], re_[key]
             if fv != rv:
                 raise ValueError(
                     f"{key} differs for {name!r}: fitter={fv!r} remd={rv!r}"
                 )
+        f_decl, r_decl = (declares_potential_definition(fe),
+                          declares_potential_definition(re_))
+        if f_decl != r_decl:
+            raise ValueError(
+                f"potential_definition is declared explicitly by only one module "
+                f"for {name!r}: fitter={f_decl} remd={r_decl}"
+            )
+        if f_decl and fe["potential_definition"] != re_["potential_definition"]:
+            raise ValueError(
+                f"potential_definition differs for {name!r}: "
+                f"fitter={fe['potential_definition']!r} "
+                f"remd={re_['potential_definition']!r}"
+            )
 
-    # Numeric b(T) and kappa(T) equality using the fitter's x0 for each model.
+    # Numeric equality on non-degenerate probe parameters: the coefficients
+    # b(T) and kappa(T), then the assembled potential u(m, T; N) itself.
     fit_reg = fit_mod.MODEL_REGISTRY
     remd_reg = remd_mod.MODEL_REGISTRY
+    n_u_checks = 0
     for name in sorted(fit_models):
-        x0 = list(fit_reg[name]["x0"])
+        probe = contract_probe_params(fit_reg[name])
         for coeff, key in (("b", "raw_b_fn"), ("kappa", "raw_q_fn")):
             ff = fit_reg[name][key]
             rf = remd_reg[name][key]
             for T in BFN_CHECK_T:
-                vf = float(ff(x0, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
-                vr = float(rf(x0, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
+                vf = float(ff(probe, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
+                vr = float(rf(probe, T, BFN_CHECK_TREF, BFN_CHECK_TSCALE))
                 if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
                     raise ValueError(
                         f"{coeff}(T) mismatch for {name!r} at T={T}: "
                         f"fitter={vf!r} remd={vr!r}"
                     )
+        # Whether the chain length is required at all is part of the contract:
+        # a model that needs N in one script and not the other is normalizing
+        # its nonlinear term differently.
+        fneed = bool(fit_reg[name].get("requires_chain_length", False))
+        rneed = bool(remd_reg[name].get("requires_chain_length", False))
+        if fneed != rneed:
+            raise ValueError(
+                f"requires_chain_length differs for {name!r}: "
+                f"fitter={fneed} remd={rneed}"
+            )
+        # Full potential u(m, T; N) -- the authoritative nonlinear check.
+        n_beads = UFN_CHECK_N if fneed else None
+        for T in BFN_CHECK_T:
+            for m in UFN_CHECK_M:
+                vf = float(fit_mod.reduced_contact_potential(
+                    m, float(T), name, probe, BFN_CHECK_TREF, BFN_CHECK_TSCALE,
+                    n_beads))
+                vr = float(remd_mod.reduced_contact_potential(
+                    m, float(T), name, probe, BFN_CHECK_TREF, BFN_CHECK_TSCALE,
+                    n_beads))
+                if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
+                    raise ValueError(
+                        f"u(m,T;N) mismatch for {name!r} at T={T}, m={m}, "
+                        f"N={n_beads}: fitter={vf!r} remd={vr!r}"
+                    )
+                n_u_checks += 1
+    kinds = sorted({fit_contract["models"][n]["potential_kind"]
+                    for n in fit_models})
     n_nonlinear = sum(
         1 for name in fit_models
         if fit_contract["models"][name]["potential_kind"] != "linear"
     )
     log(f"Preflight: model contract OK (api v{fit_contract['model_api_version']}, "
-        f"{len(fit_models)} models, {n_nonlinear} nonlinear in m, "
-        f"numeric b(T) and kappa(T) equal).")
+        f"{len(fit_models)} models, {n_nonlinear} nonlinear in m, kinds "
+        f"{'/'.join(kinds)}; metadata, b(T), kappa(T) and {n_u_checks} "
+        f"u(m,T;N) values equal).")
     return fit_contract
 
 
@@ -2167,6 +2330,7 @@ COMPARISON_COLUMNS = [
     "boot_failed_replicates", "boot_confidence", "boot_widest_relative_ci",
     "boot_max_abs_param_correlation", "boot_n_identifiability_warnings",
     "boot_max_bound_hit_fraction", "boot_extra_terms_ci_include_zero", "boot_status",
+    "nesting_terms_unresolved", "weakly_identified_params",
     "split_enabled", "split_n_attempted", "split_n_succeeded",
     "split_mean_heldout_loss", "split_range_heldout_loss", "split_worst_blocked_low",
     "split_worst_blocked_mid", "split_worst_blocked_high", "split_max_param_cv",
@@ -2273,6 +2437,59 @@ def _max_abs_offdiag(matrix) -> float | None:
     return best
 
 
+def nested_term_identifiability(fitted_by_param: dict, ci_by_param=None) -> dict:
+    """Flag parameters left unidentified by a nesting extra term stuck at zero.
+
+    ``NESTED_TERM_DEPENDENTS`` maps a nesting parameter to the parameters that
+    enter the potential ONLY multiplied by it.  For
+    ``saturating_cooperative_contact`` that is A0 -> (q_sat,): the potential is
+
+        u(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],   q = m/N
+
+    so at A0 = 0 it is exactly the linear b(T)*m for EVERY value of q_sat.  A
+    q_sat reported from such a fit is wherever the optimizer happened to stop,
+    not a saturation contact density, and must not be interpreted physically.
+
+    A nesting term counts as unresolved when its bootstrap CI brackets zero or
+    its fitted magnitude is at or below ``NESTING_NEAR_ZERO_ATOL``.  Passing
+    ``ci_by_param=None`` applies the fitted-magnitude test alone, so this works
+    with or without a bootstrap.
+    """
+    ci_by_param = ci_by_param or {}
+    weak: list = []
+    reasons: list = []
+    unresolved: list = []
+    for nest, dependents in NESTED_TERM_DEPENDENTS.items():
+        fitted = fitted_by_param.get(nest)
+        lo, hi = (ci_by_param.get(nest) or (None, None))
+        if fitted is None and lo is None and hi is None:
+            continue  # this model does not have the nesting parameter
+        ci_zero = lo is not None and hi is not None and lo <= 0.0 <= hi
+        near_zero = fitted is not None and abs(fitted) <= NESTING_NEAR_ZERO_ATOL
+        if not (ci_zero or near_zero):
+            continue
+        unresolved.append(nest)
+        why = ("bootstrap CI brackets zero" if ci_zero
+               else f"fitted |{nest}| <= {NESTING_NEAR_ZERO_ATOL:g}")
+        present = [d for d in dependents
+                   if d in fitted_by_param or d in ci_by_param]
+        if present:
+            weak.extend(present)
+            reasons.append(
+                f"{nest} not resolved from zero ({why}); the potential reduces to "
+                f"its linear nesting limit, so {', '.join(present)} "
+                f"{'is' if len(present) == 1 else 'are'} weakly identified and "
+                f"should not be read as a physical scale"
+            )
+        else:
+            reasons.append(f"{nest} not resolved from zero ({why})")
+    return {
+        "nesting_terms_unresolved": unresolved,
+        "weakly_identified_params": weak,
+        "weak_identification_reasons": reasons,
+    }
+
+
 def parse_bootstrap_summary(fit_dir: Path, fit_cfg: dict) -> dict:
     """Distill bootstrap_summary.json into concise robustness fields."""
     bs = (fit_cfg.get("bootstrap") or {})
@@ -2319,7 +2536,7 @@ def parse_bootstrap_summary(fit_dir: Path, fit_cfg: dict) -> dict:
             if v is not None and (max_bound is None or v > max_bound):
                 max_bound = v
     out["max_bound_hit_fraction"] = max_bound
-    # Extra terms (a2/a3/dCp) whose CI brackets zero -> term may be unnecessary.
+    # Extra terms (a2/a3/dCp/A0) whose CI brackets zero -> term may be unnecessary.
     incl_zero = []
     for pn in EXTRA_TERM_PARAMS:
         if pn in ci_by_param:
@@ -2327,6 +2544,14 @@ def parse_bootstrap_summary(fit_dir: Path, fit_cfg: dict) -> dict:
             if lo is not None and hi is not None and lo <= 0.0 <= hi:
                 incl_zero.append(pn)
     out["extra_terms_ci_include_zero"] = incl_zero
+    # A nesting extra term that is not resolved away from zero leaves every
+    # parameter that only enters multiplied by it unidentified.  Report those as
+    # weakly identified instead of reading them as physical quantities: q_sat is
+    # a saturation contact density only while A0 > 0.
+    fitted_by_param = {pn: _num(st.get("fitted"))
+                       for pn, st in params.items() if isinstance(st, dict)}
+    out.update(nested_term_identifiability(fitted_by_param, ci_by_param))
+    weak = out["weakly_identified_params"]
     # Derived Tc interval (only when defined for this model).
     derived = data.get("derived") or {}
     if isinstance(derived.get("Tc"), dict):
@@ -2334,7 +2559,7 @@ def parse_bootstrap_summary(fit_dir: Path, fit_cfg: dict) -> dict:
     failed = out.get("failed_replicates") or 0
     warn = (out["n_identifiability_warnings"] > 0
             or (max_bound is not None and max_bound >= 0.5)
-            or bool(incl_zero))
+            or bool(incl_zero) or bool(weak))
     if not data.get("n_success"):
         out["status"] = "no_successful_replicates"
     elif warn or failed:
@@ -2524,7 +2749,17 @@ def parse_rg_weight_sensitivity(fit_dir: Path, fit_cfg: dict) -> dict:
 
 # Parameter names across all models (used to recognize parameter columns in the
 # Rg-weight per-weight records without misreading loss columns as parameters).
-_RGW_PARAM_KEYS = {"h", "s", "A", "Tc", "a0", "a1", "a2", "a3", "dh0", "ds0", "dCp"}
+# A name missing here is silently dropped from the parameter-path spread, so the
+# set must cover EVERY model in MODEL_REGISTRY:
+#   hs (h, s) / tc_scale (A, Tc) / hs_quadratic (h, s, a2) / poly2, poly3
+#   (a0..a3) / heat_capacity (dh0, ds0, dCp) / hs_m2_const (h1, s1, kappa2) /
+#   hs_m2_hs (h1, s1, h2, s2) / saturating_cooperative_contact
+#   (h_b, s_b, A0, q_sat).
+_RGW_PARAM_KEYS = {
+    "h", "s", "A", "Tc", "a0", "a1", "a2", "a3", "dh0", "ds0", "dCp",
+    "h1", "s1", "kappa2", "h2", "s2",
+    "h_b", "s_b", "A0", "q_sat",
+}
 
 
 FIT_ROBUSTNESS_COLUMNS = [
@@ -2533,6 +2768,7 @@ FIT_ROBUSTNESS_COLUMNS = [
     "boot_failed_replicates", "boot_confidence", "boot_widest_relative_ci",
     "boot_max_abs_param_correlation", "boot_n_identifiability_warnings",
     "boot_max_bound_hit_fraction", "boot_extra_terms_ci_include_zero", "boot_status",
+    "nesting_terms_unresolved", "weakly_identified_params",
     "split_enabled", "split_n_attempted", "split_n_succeeded",
     "split_mean_heldout_loss", "split_range_heldout_loss", "split_worst_blocked_low",
     "split_worst_blocked_mid", "split_worst_blocked_high", "split_max_param_cv",
@@ -2586,9 +2822,23 @@ def collect_fit_robustness(suite_state, rows, log: Logger):
             rgw = parse_rg_weight_sensitivity(fit_dir, fit_cfg) if fit_ok else {"enabled": bool((fit_cfg.get("rg_weight_sensitivity") or {}).get("enabled"))}
             if any(d.get("enabled") for d in (boot, unc, split, rgw)):
                 any_enabled = True
+            # Nested-term identifiability: prefer the bootstrap's CI-aware verdict,
+            # otherwise fall back to the fitted magnitude from fit_summary.json so
+            # the warning still appears when no bootstrap was run.
+            if boot.get("weakly_identified_params") is not None:
+                nested = {k: boot.get(k) for k in (
+                    "nesting_terms_unresolved", "weakly_identified_params",
+                    "weak_identification_reasons")}
+            else:
+                summary = rec.get("summary") or {}
+                fitted_by_param = {
+                    str(k): _num(v)
+                    for k, v in (summary.get("params") or {}).items()}
+                nested = nested_term_identifiability(fitted_by_param)
             structured[raw][model] = {
                 "model": model, "bootstrap": boot, "uncertainty_diagnostics": unc,
                 "split_sensitivity": split, "rg_weight_sensitivity": rgw,
+                "nested_term_identifiability": nested,
             }
 
             row = row_by_key.get((raw, model))
@@ -2604,6 +2854,10 @@ def collect_fit_robustness(suite_state, rows, log: Logger):
                 "boot_max_bound_hit_fraction": boot.get("max_bound_hit_fraction"),
                 "boot_extra_terms_ci_include_zero": _join_list(boot.get("extra_terms_ci_include_zero")),
                 "boot_status": boot.get("status"),
+                "nesting_terms_unresolved": _join_list(
+                    nested.get("nesting_terms_unresolved")),
+                "weakly_identified_params": _join_list(
+                    nested.get("weakly_identified_params")),
                 "split_enabled": bool(split.get("enabled")),
                 "split_n_attempted": split.get("n_attempted"),
                 "split_n_succeeded": split.get("n_succeeded"),
@@ -3806,6 +4060,30 @@ def _fit_robustness_report_lines(cfg, rows, robustness) -> list[str]:
                 lines.append(f"- **{model}**: {msg}.")
             lines += [""]
 
+        # --- Nested-term identifiability subsection ---
+        # A model whose nesting extra term (A0) is not resolved away from zero
+        # has collapsed onto its linear limit; any parameter that only enters
+        # multiplied by that term (q_sat) is then undetermined by the data and
+        # must not be read as a physical scale.  Reported for every model that
+        # has such a parameter, with or without a bootstrap.
+        nested_models = {
+            m: d["nested_term_identifiability"] for m, d in per_model.items()
+            if (d.get("nested_term_identifiability") or {}).get("weak_identification_reasons")
+        }
+        if nested_models:
+            lines += ["#### Nested-term identifiability", ""]
+            for model, n in nested_models.items():
+                for reason in n.get("weak_identification_reasons") or []:
+                    lines.append(f"- **{model}**: {reason}.")
+            lines += [
+                "",
+                "_A nested model evaluated at its linear limit still fits; its "
+                "extra shape parameters are simply not constrained there. Compare "
+                "such a fit against the nesting linear model on held-out "
+                "temperatures before claiming the extra structure is supported._",
+                "",
+            ]
+
         # --- Validation-split sensitivity subsection ---
         split_models = {m: d["split_sensitivity"] for m, d in per_model.items()
                         if d.get("split_sensitivity", {}).get("enabled")}
@@ -4347,8 +4625,14 @@ def _write_synthetic_target(path: Path, temps, m_max=8, n_rg=12, h=300.0, s=1.0)
     return p0, m, rg_centers
 
 
-def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers):
-    """Joint athermal baseline P0(m, Rg): keys c_edges, rg_edges, crg_prob."""
+def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers, n_beads=None):
+    """Joint athermal baseline P0(m, Rg): keys c_edges, rg_edges, crg_prob.
+
+    ``n_beads`` records the chain length the baseline was generated at.  Models
+    that are nonlinear in m need it: the fitter resolves N from this key (or
+    ``--N``) to normalize m^2/(2N) and q = m/N, and refuses to fit without it.
+    Omitting it keeps the historical linear-only baseline shape.
+    """
     c_edges = centers_to_edges(m)
     rg_edges = centers_to_edges(rg_centers)
     m_max = float(m[-1])
@@ -4359,8 +4643,36 @@ def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers):
         prof /= prof.sum()
         crg[i] = p0[i] * prof
     crg /= crg.sum()
+    extra = {} if n_beads is None else {"n_beads": int(n_beads)}
     np.savez(path, c_edges=c_edges, rg_edges=rg_edges, crg_prob=crg,
-             c_vals=np.asarray(m, dtype=int), c_prob=np.asarray(p0, dtype=float))
+             c_vals=np.asarray(m, dtype=int), c_prob=np.asarray(p0, dtype=float),
+             **extra)
+
+
+def quick_test_remd_script(here: Path) -> str:
+    """Resolve the sampler the quick test drives, preferring the canonical module.
+
+    ``remd_uniform_chain_2_new.py`` is the canonical implementation.
+    ``remd_uniform_chain_2.py`` is a compatibility shim that mirrors the
+    canonical module's namespace by object identity; it is only accepted here
+    after being verified as such, so a stale standalone copy left at that path
+    can never silently run a different model than the fitter was checked against.
+    """
+    canonical = here / "remd_uniform_chain_2_new.py"
+    if canonical.is_file():
+        return str(canonical)
+    legacy = here / "remd_uniform_chain_2.py"
+    if not legacy.is_file():
+        raise FileNotFoundError(
+            f"no REMD sampler found: neither {canonical} nor {legacy} exists")
+    text = legacy.read_text(encoding="utf-8", errors="replace")
+    if "remd_uniform_chain_2_new" not in text or "CANONICAL_MODULE" not in text:
+        raise RuntimeError(
+            f"{legacy} is not the verified compatibility shim (it does not "
+            f"re-export remd_uniform_chain_2_new); refusing to drive the quick "
+            f"test with a sampler whose model core was never contract-checked."
+        )
+    return str(legacy)
 
 
 def _pairwise_statistics_unit_tests() -> None:
@@ -4611,6 +4923,71 @@ def _fit_robustness_unit_tests() -> None:
     assert rows_plain[1]["simulation_rank"] == 1  # poly3 has lower JS -> rank 1
     print("  suite quick-test REMD ranking invariance to robustness fields: PASSED")
 
+    # 9. Contract probes are non-degenerate: every zero x0 entry is replaced by an
+    # in-bounds nonzero value, and every nonzero entry is preserved exactly.
+    for x0, bounds, expect in (
+        ([750.0, 2.8], [(-2000.0, 2000.0), (-10.0, 10.0)], [750.0, 2.8]),
+        ([0.0, 0.0, 0.0], [(-20.0, 20.0)] * 3, [-8.0, -8.0, -8.0]),
+        ([750.0, 2.8, 0.0, 0.35],
+         [(-2000.0, 2000.0), (-10.0, 10.0), (0.0, 20.0), (0.02, 2.0)],
+         [750.0, 2.8, 6.0, 0.35]),
+    ):
+        got = contract_probe_params({"x0": x0, "bounds": bounds})
+        assert got == expect, (got, expect)
+        for v, (lo, hi) in zip(got, bounds):
+            assert v != 0.0 and lo <= v <= hi, (v, lo, hi)
+    # A box whose 30% point lands back on zero (-3 + 0.3*10 == 0) still yields a
+    # nonzero probe via the 70% fallback.
+    assert contract_probe_params({"x0": [0.0], "bounds": [(-3.0, 7.0)]}) == [4.0]
+
+    # 10. A0 near zero makes q_sat weakly identified; a resolved A0 does not.
+    at_zero = nested_term_identifiability({"A0": 0.0, "q_sat": 0.42})
+    assert at_zero["nesting_terms_unresolved"] == ["A0"]
+    assert at_zero["weakly_identified_params"] == ["q_sat"]
+    assert "not resolved from zero" in at_zero["weak_identification_reasons"][0]
+    resolved = nested_term_identifiability({"A0": 3.0, "q_sat": 0.42})
+    assert resolved["weakly_identified_params"] == []
+    assert resolved["nesting_terms_unresolved"] == []
+    # A bootstrap CI that brackets zero counts as unresolved even when the point
+    # estimate is nominally large.
+    ci_zero = nested_term_identifiability(
+        {"A0": 2.0, "q_sat": 0.42}, {"A0": [-0.5, 5.0]})
+    assert ci_zero["weakly_identified_params"] == ["q_sat"]
+    assert "CI brackets zero" in ci_zero["weak_identification_reasons"][0]
+    # Models without the nesting parameter are untouched.
+    assert nested_term_identifiability({"h": 700.0, "s": 2.4}) == {
+        "nesting_terms_unresolved": [], "weakly_identified_params": [],
+        "weak_identification_reasons": []}
+    # A0 is reported as an extra term, and every model's parameters are
+    # recognized by the Rg-weight parameter whitelist.
+    assert "A0" in EXTRA_TERM_PARAMS
+    for pn in ("h_b", "s_b", "A0", "q_sat", "h1", "s1", "kappa2", "h2", "s2"):
+        assert pn in _RGW_PARAM_KEYS, pn
+    # The quick test must exercise all three potential families.
+    for mdl in ("hs_m2_const", "hs_m2_hs", "saturating_cooperative_contact"):
+        assert mdl in SUPPORTED_MODELS, mdl
+    print("  suite quick-test contract probes + nested-term identifiability: PASSED")
+
+    # 11. The quick test drives the canonical sampler, or a VERIFIED shim.
+    _here = Path(__file__).resolve().parent
+    _script = Path(quick_test_remd_script(_here))
+    assert _script.is_file(), _script
+    if _script.name != "remd_uniform_chain_2_new.py":
+        _txt = _script.read_text(encoding="utf-8", errors="replace")
+        assert "remd_uniform_chain_2_new" in _txt and "CANONICAL_MODULE" in _txt
+    # A stale standalone file at the legacy path is refused rather than used.
+    with tempfile.TemporaryDirectory() as _fake:
+        _fake = Path(_fake)
+        (_fake / "remd_uniform_chain_2.py").write_text(
+            "# a stale standalone sampler, not a shim\n", encoding="utf-8")
+        try:
+            quick_test_remd_script(_fake)
+        except RuntimeError as exc:
+            assert "compatibility shim" in str(exc)
+        else:
+            raise AssertionError("a stale standalone sampler was accepted")
+    print(f"  suite quick-test sampler resolution ({_script.name}): PASSED")
+
 
 def run_quick_test() -> None:
     """End-to-end tiny suite run on synthetic data, plus unit checks."""
@@ -4719,12 +5096,16 @@ def run_quick_test() -> None:
                 rg_hists=td["rg_hists"],
             )
         target = tmp / "target_Ts.npz"
-        _write_synthetic_joint_baseline(baseline, p0, m, rg_centers)
+        # The runtime chain length is recorded in the baseline so the models that
+        # are nonlinear in m can resolve N for m^2/(2N) and q = m/N; it matches
+        # the REMD "N" below so the fit and the simulation share one chain length.
+        _write_synthetic_joint_baseline(baseline, p0, m, rg_centers,
+                                        n_beads=QUICK_TEST_N)
 
         config = {
             "target_remd": str(target),
             "fit_script": str(here / "fit_lattice_contact_model_2.py"),
-            "remd_script": str(here / "remd_uniform_chain_2.py"),
+            "remd_script": quick_test_remd_script(here),
             "output_root": str(tmp / "out"),
             "models": list(SUPPORTED_MODELS),
             "baselines": [{
@@ -4738,7 +5119,8 @@ def run_quick_test() -> None:
                 "holdout_every": 2, "plots": False,
             },
             "remd": {
-                "N": 12, "steps_per_swap": 20, "n_cycles": 16, "rg_bins": 16,
+                "N": QUICK_TEST_N, "steps_per_swap": 20, "n_cycles": 16,
+                "rg_bins": 16,
                 "burnin_frac": 0.5, "n_workers": 1, "seeds": [1, 2],
                 "plots": False,
                 "diagnostics": {
@@ -4810,7 +5192,8 @@ def run_quick_test() -> None:
         assert n_ok == len(SUPPORTED_MODELS), (
             f"only {n_ok}/{len(SUPPORTED_MODELS)} REMD model runs succeeded"
         )
-        print(f"  suite quick-test end-to-end ({n_ok}/6 models simulated, "
+        print(f"  suite quick-test end-to-end ({n_ok}/{len(SUPPORTED_MODELS)} "
+              f"models simulated across all three potential families, "
               f"Rg+plots+report): PASSED")
 
         # --- Diagnostics outputs (diagnostics enabled in the config above) --
@@ -4900,14 +5283,18 @@ def _robustness_end_to_end_quick_test(here: Path) -> None:
         target = tmp / "target.npz"
         baseline = tmp / "baseline.npz"
         p0, m, rg_centers = _write_synthetic_target(target, temps)
-        _write_synthetic_joint_baseline(baseline, p0, m, rg_centers)
+        _write_synthetic_joint_baseline(baseline, p0, m, rg_centers,
+                                        n_beads=QUICK_TEST_N)
 
         config = {
             "target_remd": str(target),
             "fit_script": str(here / "fit_lattice_contact_model_2.py"),
-            "remd_script": str(here / "remd_uniform_chain_2.py"),
+            "remd_script": quick_test_remd_script(here),
             "output_root": str(tmp / "out"),
-            "models": ["hs", "hs_quadratic"],
+            # saturating_cooperative_contact is included so the nested-term
+            # reporting (A0 as the extra term, q_sat weakly identified when A0
+            # is not resolved from zero) is exercised with a real bootstrap.
+            "models": ["hs", "hs_quadratic", "saturating_cooperative_contact"],
             "baselines": [{
                 "name": "synthetic", "path": str(baseline),
                 "contact_offset": 0, "rg_scale": 1.0,
@@ -4925,7 +5312,8 @@ def _robustness_end_to_end_quick_test(here: Path) -> None:
                                           "normalization_diagnostics": True},
             },
             "remd": {
-                "N": 12, "steps_per_swap": 20, "n_cycles": 16, "rg_bins": 16,
+                "N": QUICK_TEST_N, "steps_per_swap": 20, "n_cycles": 16,
+                "rg_bins": 16,
                 "burnin_frac": 0.5, "n_workers": 1, "seeds": [1, 2], "plots": False,
             },
             "comparison": {"include_rg": True, "rg_weight": 0.25, "make_plots": False},
@@ -4940,7 +5328,7 @@ def _robustness_end_to_end_quick_test(here: Path) -> None:
 
         out = Path(config["output_root"])
         # Per-model supplementary outputs present and validated.
-        for model in ("hs", "hs_quadratic"):
+        for model in config["models"]:
             fdir = out / "synthetic" / model / "fit"
             for fn in (FIT_BOOTSTRAP_FILES + FIT_UNCERTAINTY_FILES
                        + FIT_SPLIT_FILES + FIT_RGW_FILES
@@ -4957,8 +5345,23 @@ def _robustness_end_to_end_quick_test(here: Path) -> None:
 
         cmp_csv = (comp / "model_comparison.csv").read_text()
         for col in ("boot_status", "split_stability_status", "rgw_status",
-                    "unc_identifiability_status", "boot_successful_replicates"):
+                    "unc_identifiability_status", "boot_successful_replicates",
+                    "nesting_terms_unresolved", "weakly_identified_params"):
             assert col in cmp_csv, f"comparison CSV missing {col}"
+        rcsv = (comp / "fit_robustness.csv").read_text()
+        for col in ("nesting_terms_unresolved", "weakly_identified_params"):
+            assert col in rcsv, f"fit_robustness CSV missing {col}"
+        # A0 is treated as the nested extra term: whichever way the tiny
+        # synthetic fit lands, the verdict must be self-consistent -- q_sat is
+        # reported as weakly identified exactly when A0 is unresolved.
+        sat = rsum["baselines"]["synthetic"]["saturating_cooperative_contact"]
+        nested = sat["nested_term_identifiability"]
+        assert ("q_sat" in nested["weakly_identified_params"]) == \
+            ("A0" in nested["nesting_terms_unresolved"])
+        if nested["weakly_identified_params"]:
+            assert nested["weak_identification_reasons"]
+            assert "#### Nested-term identifiability" in (
+                comp / "report.md").read_text(encoding="utf-8")
 
         report = (comp / "report.md").read_text(encoding="utf-8")
         for needle in ("## Fit robustness and parameter identifiability",
