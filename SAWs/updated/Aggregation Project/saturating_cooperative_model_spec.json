@@ -88,7 +88,7 @@
     "A0_zero": "u(m,T;N) = b(T)*m exactly, for every q_sat and every N. The model nests hs bit for bit: an A0 = 0 run reproduces the seeded hs trajectory, and q_sat has no effect on the potential at all.",
     "m_zero": "u(0,T;N) = 0 for every parameter set (q = 0 makes both terms vanish).",
     "low_q": "For q << q_sat the cooperative term expands as A0*q^2 * (1 - (q/q_sat)^2 + ...), so u ~ N*(b(T)*q - A0*q^2) + N*A0*q^4/q_sat^2: negative-quadratic cooperativity plus a positive-quartic stabilization. The residual against the pure quadratic form scales as q^4.",
-    "high_q": "For q >> q_sat the cooperative term approaches the finite constant -N*A0*q_sat^2, so the potential returns to a straight line of slope b(T) offset downward by a bounded amount. The excess over that plateau is exactly plateau * r^2/(1 + r^2) with r = q/q_sat.",
+    "high_q": "For q >> q_sat the cooperative correction C(q) = -N*A0*q^2/(1 + (q/q_sat)^2) approaches the finite plateau -P with P = N*A0*q_sat^2, so the potential returns to a straight line of slope b(T) offset downward by a bounded amount. With r = q/q_sat these are two DIFFERENT quantities and must not be confused: the fraction of the plateau MAGNITUDE already reached is |C(q)|/P = r^2/(1 + r^2), while the remaining signed distance ABOVE the plateau is C(q) - (-P) = P/(1 + r^2). The two are complementary and sum to P.",
     "boundedness": "The cooperative correction is bounded below by -N*A0*q_sat^2 for all m; it can never drive unbounded overcollapse.",
     "extensivity": "At fixed q, u/N is independent of N.",
     "expected_effect": "Sharper collapse than the linear model without the continued overcollapse caused by an unchecked negative m^2 term."
@@ -140,7 +140,7 @@
     "exact_formula": "u from the model API must equal a directly transcribed N*(b*q - A0*q^2/(1+(q/q_sat)^2)) to floating-point tolerance.",
     "nesting_regression": "With A0 = 0 the potential must equal b(T)*m and a seeded sampler run must reproduce the corresponding hs run. Compare with exact equality (array_equal / ==), not a tolerance.",
     "legacy_preservation": "Adding this model must leave every pre-existing model bit-for-bit unchanged: trajectories, observables, move counters, swap counts and potential values compared with ==.",
-    "saturation": "The cooperative excess over the -N*A0*q_sat^2 plateau must equal r^2/(1+r^2) with r = q/q_sat, and the numerical marginal slope du/dm must approach b(T) as r grows.",
+    "saturation": "With P = N*A0*q_sat^2, r = q/q_sat and C(q) the cooperative correction, BOTH identities must hold numerically and must be tested as distinct quantities: the fraction of plateau magnitude reached, |C(q)|/P = r^2/(1+r^2), and the remaining signed distance above the plateau, C(q) - (-P) = P/(1+r^2), which sum to P. The numerical marginal slope du/dm must approach b(T) as r grows.",
     "extensivity": "u/N at fixed q must be independent of N.",
     "per_chain_additivity": "In the multi-chain sampler the intrachain potential must equal the sum over chains of u evaluated at each chain's own m_alpha.",
     "allocation_sensitivity": "Two multi-chain states with equal TOTAL intrachain contacts but different per-chain allocations must have different potentials; a linear model must not be able to tell them apart.",

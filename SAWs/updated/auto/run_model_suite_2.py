@@ -137,10 +137,14 @@ BFN_CHECK_TSCALE = 100.0
 # is identically zero for the linear models AND for the saturating-cooperative
 # one, which has no m^2/(2N) term at all.  Neither coefficient can therefore
 # stand alone as the nonlinear contract check; the assembled u(m, T; N) is
-# authoritative.  The chain length is fixed here so q = m/N and m^2/(2N) are
-# well defined, and the contact grid spans q from 0 to nearly 1.
-UFN_CHECK_N = 30
-UFN_CHECK_M = (0, 1, 5, 12, 29)
+# authoritative.  Several chain lengths are probed, not one: a sampler that
+# accidentally hard-codes N (say 30) instead of using the supplied runtime value
+# passes a single-N check vacuously while silently corrupting every other chain
+# length.  The contact counts are regenerated per N from fixed contact densities
+# so each N is probed at comparable q, spanning q from 0 to nearly 1.
+UFN_CHECK_N = (20, 30, 44, 60)
+UFN_CHECK_Q = (0.05, 0.4, 0.95)   # interior low, interior mid, high
+UFN_CHECK_M_ALWAYS = (0, 1)       # empty and single-contact edge cases
 
 # Chain length used by --quick-test, recorded in the synthetic baseline AND used
 # as the REMD --N so the fit and the simulation share one chain length.  Models
@@ -898,7 +902,30 @@ def contract_probe_params(spec) -> list:
     return probe
 
 
-def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
+def ufn_check_counts(n_beads: int) -> list:
+    """Integer contact counts probing fixed contact densities at chain length N.
+
+    Regenerating m per N (rather than reusing one N's raw counts) keeps the
+    u(m,T;N) grid at comparable q across chain lengths.  Rounding can collide,
+    so the result is deduplicated and kept nonnegative.
+    """
+    counts = set(UFN_CHECK_M_ALWAYS)
+    counts.update(int(round(q * int(n_beads))) for q in UFN_CHECK_Q)
+    return sorted(m for m in counts if m >= 0)
+
+
+def ufn_check_chain_lengths(runtime_chain_lengths=None) -> list:
+    """The chain lengths the full-potential handshake is probed at: the fixed
+    grid plus every distinct runtime N the resolved config actually uses."""
+    lengths = set(UFN_CHECK_N)
+    for n in runtime_chain_lengths or ():
+        if n is not None:
+            lengths.add(int(n))
+    return sorted(n for n in lengths if n > 0)
+
+
+def check_model_contracts(fit_mod, remd_mod, log: Logger,
+                          runtime_chain_lengths=None) -> dict:
     """Cross-check the fitter's and the sampler's model contracts.
 
     Compares, for every model: the MODEL_API_VERSION, the model-name set,
@@ -913,6 +940,11 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
     same (h, s), and kappa(T) via ``raw_q_fn`` is identically zero both for the
     linear models and for the saturating-cooperative one (which has no m^2/(2N)
     term), so raw_q_fn alone would pass vacuously for the nonlinear family.
+
+    Every model with ``requires_chain_length`` is checked at each of
+    :func:`ufn_check_chain_lengths` (the fixed grid plus ``runtime_chain_lengths``
+    from the resolved config), so a sampler that ignores the supplied N cannot
+    pass by agreeing at one chain length alone.
     """
     fit_contract = fit_mod.get_model_contract()
     remd_contract = remd_mod.get_model_contract()
@@ -968,6 +1000,7 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
     # b(T) and kappa(T), then the assembled potential u(m, T; N) itself.
     fit_reg = fit_mod.MODEL_REGISTRY
     remd_reg = remd_mod.MODEL_REGISTRY
+    n_check = ufn_check_chain_lengths(runtime_chain_lengths)
     n_u_checks = 0
     for name in sorted(fit_models):
         probe = contract_probe_params(fit_reg[name])
@@ -992,22 +1025,25 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
                 f"requires_chain_length differs for {name!r}: "
                 f"fitter={fneed} remd={rneed}"
             )
-        # Full potential u(m, T; N) -- the authoritative nonlinear check.
-        n_beads = UFN_CHECK_N if fneed else None
-        for T in BFN_CHECK_T:
-            for m in UFN_CHECK_M:
-                vf = float(fit_mod.reduced_contact_potential(
-                    m, float(T), name, probe, BFN_CHECK_TREF, BFN_CHECK_TSCALE,
-                    n_beads))
-                vr = float(remd_mod.reduced_contact_potential(
-                    m, float(T), name, probe, BFN_CHECK_TREF, BFN_CHECK_TSCALE,
-                    n_beads))
-                if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
-                    raise ValueError(
-                        f"u(m,T;N) mismatch for {name!r} at T={T}, m={m}, "
-                        f"N={n_beads}: fitter={vf!r} remd={vr!r}"
-                    )
-                n_u_checks += 1
+        # Full potential u(m, T; N) -- the authoritative nonlinear check.  A
+        # model that needs N is probed at every chain length; one that does not
+        # keeps its single N-free pass over a representative contact grid.
+        for n_beads in (n_check if fneed else [None]):
+            m_grid = ufn_check_counts(n_beads if fneed else UFN_CHECK_N[1])
+            for T in BFN_CHECK_T:
+                for m in m_grid:
+                    vf = float(fit_mod.reduced_contact_potential(
+                        m, float(T), name, probe, BFN_CHECK_TREF,
+                        BFN_CHECK_TSCALE, n_beads))
+                    vr = float(remd_mod.reduced_contact_potential(
+                        m, float(T), name, probe, BFN_CHECK_TREF,
+                        BFN_CHECK_TSCALE, n_beads))
+                    if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
+                        raise ValueError(
+                            f"u(m,T;N) mismatch for {name!r} at T={T}, m={m}, "
+                            f"N={n_beads}: fitter={vf!r} remd={vr!r}"
+                        )
+                    n_u_checks += 1
     kinds = sorted({fit_contract["models"][n]["potential_kind"]
                     for n in fit_models})
     n_nonlinear = sum(
@@ -1017,7 +1053,8 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger) -> dict:
     log(f"Preflight: model contract OK (api v{fit_contract['model_api_version']}, "
         f"{len(fit_models)} models, {n_nonlinear} nonlinear in m, kinds "
         f"{'/'.join(kinds)}; metadata, b(T), kappa(T) and {n_u_checks} "
-        f"u(m,T;N) values equal).")
+        f"u(m,T;N) values equal; chain lengths checked: "
+        f"{', '.join(str(n) for n in n_check)}).")
     return fit_contract
 
 
@@ -2762,6 +2799,12 @@ _RGW_PARAM_KEYS = {
 }
 
 
+# The OPTIONAL robustness analyses -- the ones a config can switch on or off.
+# Nested-term identifiability is deliberately not among them: it is always
+# computed, so it gates reporting but never `any_analysis_enabled`.
+ROBUSTNESS_ANALYSIS_KEYS = ("bootstrap", "uncertainty_diagnostics",
+                            "split_sensitivity", "rg_weight_sensitivity")
+
 FIT_ROBUSTNESS_COLUMNS = [
     "baseline", "model",
     "bootstrap_enabled", "boot_requested_replicates", "boot_successful_replicates",
@@ -3785,6 +3828,32 @@ def _statistics_report_lines(raw, bstat, stats_result, ok_rows):
 # Report (Part 14)
 # ---------------------------------------------------------------------------
 
+def baseline_robustness_reportable(per_model) -> bool:
+    """True when one baseline's robustness records hold anything worth printing.
+
+    Two independent sources of content: an enabled optional analysis, or a
+    nested-term identifiability warning.  The latter is computed unconditionally
+    (it needs only the fitted parameters), so gating the report on
+    ``any_enabled`` alone silently drops it -- exactly the case of
+    saturating_cooperative_contact with A0 unresolved from zero, where q_sat is
+    not identified and the default report must say so.
+    """
+    for d in (per_model or {}).values():
+        if any((d.get(k) or {}).get("enabled") for k in ROBUSTNESS_ANALYSIS_KEYS):
+            return True
+        if (d.get("nested_term_identifiability") or {}).get(
+                "weak_identification_reasons"):
+            return True
+    return False
+
+
+def robustness_reportable(robustness) -> bool:
+    """True when any baseline has reportable robustness content."""
+    return bool(robustness) and any(
+        baseline_robustness_reportable(pm)
+        for pm in (robustness.get("structured") or {}).values())
+
+
 def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
                  log: Logger, stats_result=None, robustness=None) -> None:
     cfg = suite_state["config"]
@@ -3929,8 +3998,9 @@ def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
         if bstat:
             lines += _statistics_report_lines(raw, bstat, stats_result, ok)
 
-    # Fit robustness and parameter identifiability (only when any analysis ran).
-    if robustness and robustness.get("any_enabled"):
+    # Fit robustness and parameter identifiability (whenever there is content:
+    # an optional analysis ran, or a nested extra term is unresolved).
+    if robustness_reportable(robustness):
         lines += _fit_robustness_report_lines(cfg, rows, robustness)
 
     if global_ranking:
@@ -3958,7 +4028,7 @@ def write_report(suite_state, rows, global_ranking, comparison_dir: Path,
             f"- `{comparison_dir / 'model_rank_stability.csv'}`",
             f"- `{comparison_dir / 'model_statistics_summary.json'}`",
         ]
-    if robustness and robustness.get("any_enabled"):
+    if robustness_reportable(robustness):
         lines += [
             f"- `{comparison_dir / 'fit_robustness_summary.json'}`",
             f"- `{comparison_dir / 'fit_robustness.csv'}`",
@@ -3987,13 +4057,7 @@ def _fit_robustness_report_lines(cfg, rows, robustness) -> list[str]:
     for baseline in cfg["baselines"]:
         raw = baseline["raw_name"]
         per_model = structured.get(raw, {})
-        if not any(
-            d.get("bootstrap", {}).get("enabled")
-            or d.get("split_sensitivity", {}).get("enabled")
-            or d.get("rg_weight_sensitivity", {}).get("enabled")
-            or d.get("uncertainty_diagnostics", {}).get("enabled")
-            for d in per_model.values()
-        ):
+        if not baseline_robustness_reportable(per_model):
             continue
         lines += [f"### Baseline: {raw}", "",
                   "| model | bootstrap success | widest rel CI | max |corr| | "
@@ -4300,7 +4364,11 @@ def run_suite(config_path: str, args) -> dict:
             raise SuiteError(f"py_compile failed for {path}:\n{rc.stdout}")
     fit_mod = import_module_from_path("_suite_fit_mod", cfg["fit_script"])
     remd_mod = import_module_from_path("_suite_remd_mod", cfg["remd_script"])
-    model_contract = check_model_contracts(fit_mod, remd_mod, log)
+    # The handshake must cover the chain lengths this run will actually sample,
+    # not just the fixed grid (config is already normalized: remd.N is required).
+    model_contract = check_model_contracts(
+        fit_mod, remd_mod, log,
+        [b["remd"]["N"] for b in cfg["baselines"]])
     available_models = set(model_contract["models"])
     unknown_models = [m for m in cfg["models"] if m not in available_models]
     if unknown_models:
@@ -4987,6 +5055,136 @@ def _fit_robustness_unit_tests() -> None:
         else:
             raise AssertionError("a stale standalone sampler was accepted")
     print(f"  suite quick-test sampler resolution ({_script.name}): PASSED")
+
+    # 12. The full-potential handshake is a MULTI-N contract: a sampler that
+    # ignores the supplied runtime N and hard-codes 30 must be rejected.
+    m20 = ufn_check_counts(20)
+    assert m20[0] == 0 and 1 in m20 and m20 == sorted(set(m20))
+    assert all(m >= 0 for m in m20) and max(m20) < 20
+    assert ufn_check_counts(44) != ufn_check_counts(60)   # regenerated per N
+    lens = ufn_check_chain_lengths([37, 30, None])
+    assert lens == [20, 30, 37, 44, 60], lens              # runtime N folded in
+    assert ufn_check_chain_lengths(None) == [20, 30, 44, 60]
+
+    _fit_mod = import_module_from_path(
+        "_contract_fit_mod", str(_here / "fit_lattice_contact_model_2.py"))
+    _remd_mod = import_module_from_path("_contract_remd_mod", str(_script))
+    _quiet = Logger(None)
+    # The real pair agrees at 20/30/44/60 and at a nonstandard configured N.
+    check_model_contracts(_fit_mod, _remd_mod, _quiet, [37])
+
+    _orig_u = _remd_mod.reduced_contact_potential
+    try:
+        def _hardcoded_n30(m, T, name, params, tref, tscale, n_beads=None):
+            """Sampler bug: the saturating model ignores the runtime N."""
+            if name == "saturating_cooperative_contact" and n_beads is not None:
+                n_beads = 30
+            return _orig_u(m, T, name, params, tref, tscale, n_beads)
+
+        _remd_mod.reduced_contact_potential = _hardcoded_n30
+        try:
+            check_model_contracts(_fit_mod, _remd_mod, _quiet, [37])
+        except ValueError as exc:
+            msg = str(exc)
+            assert "u(m,T;N) mismatch" in msg and \
+                "saturating_cooperative_contact" in msg, msg
+            # The old single-N=30 probe would have passed this sampler outright.
+            assert "N=30" not in msg, msg
+        else:
+            raise AssertionError("a sampler that hard-codes N=30 was accepted")
+
+        def _hardcoded_n30_at_44(m, T, name, params, tref, tscale, n_beads=None):
+            """Same substitution, isolated to N=44, to prove per-N coverage."""
+            if name == "saturating_cooperative_contact" and n_beads == 44:
+                n_beads = 30
+            return _orig_u(m, T, name, params, tref, tscale, n_beads)
+
+        _remd_mod.reduced_contact_potential = _hardcoded_n30_at_44
+        try:
+            check_model_contracts(_fit_mod, _remd_mod, _quiet)
+        except ValueError as exc:
+            msg = str(exc)
+            assert "N=44" in msg and "saturating_cooperative_contact" in msg, msg
+            assert "T=" in msg and "m=" in msg, msg   # model, T, m and N reported
+        else:
+            raise AssertionError("an N=44-only substitution was accepted")
+    finally:
+        _remd_mod.reduced_contact_potential = _orig_u
+    # Restoration must leave the real contract passing for later tests.
+    check_model_contracts(_fit_mod, _remd_mod, _quiet)
+    print("  suite quick-test multi-N full-potential handshake: PASSED")
+
+    # 13. With every OPTIONAL robustness analysis disabled, a nested-term
+    # identifiability warning must still reach report.md.
+    def _robustness_record(fitted_params):
+        per_model = {
+            "hs": {"model": "hs",
+                   "nested_term_identifiability": nested_term_identifiability(
+                       {"h": 700.0, "s": 2.4})},
+            "saturating_cooperative_contact": {
+                "model": "saturating_cooperative_contact",
+                "nested_term_identifiability": nested_term_identifiability(
+                    fitted_params)},
+        }
+        for d in per_model.values():
+            for k in ROBUSTNESS_ANALYSIS_KEYS:
+                d[k] = {"enabled": False}
+        return {"any_enabled": False, "structured": {"B": per_model},
+                "flat_rows": []}
+
+    rep_rows = [
+        {"baseline": "B", "model": "hs", "fit_status": "ok",
+         "n_successful_seeds": 2, "n_parameters": 2, "has_validation": False,
+         "fit_all_contact_loss": 0.10, "remd_target_all_combined_js_mean": 0.20},
+        {"baseline": "B", "model": "saturating_cooperative_contact",
+         "fit_status": "ok", "n_successful_seeds": 2, "n_parameters": 4,
+         "has_validation": False, "fit_all_contact_loss": 0.05,
+         "remd_target_all_combined_js_mean": 0.10},
+    ]
+    _assign_ranks(rep_rows, Logger(None))
+    ranks_before = [r["simulation_rank"] for r in rep_rows]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rep_cfg = {
+            "target_remd": "t.npz", "output_root": str(tmp),
+            "models": ["hs", "saturating_cooperative_contact"],
+            "baselines": [{"name": "B", "raw_name": "B", "path": "b.npz",
+                           "contact_offset": 0, "remd": {"N": 30}}],
+        }
+        state = {"config": rep_cfg}
+
+        # (a) A0 = 0 -> q_sat weakly identified -> the section must appear.
+        warn = _robustness_record({"A0": 0.0, "q_sat": 0.42})
+        assert robustness_reportable(warn) and warn["any_enabled"] is False
+        cdir = tmp / "warn"
+        cdir.mkdir()
+        write_report(state, rep_rows, None, cdir, Logger(None), None, warn)
+        write_fit_robustness(warn, cdir, Logger(None))
+        rep = (cdir / "report.md").read_text(encoding="utf-8")
+        for needle in ("## Fit robustness and parameter identifiability",
+                       "#### Nested-term identifiability",
+                       "saturating_cooperative_contact", "q_sat",
+                       "fit_robustness_summary.json", "fit_robustness.csv"):
+            assert needle in rep, f"default report missing {needle!r}"
+        # The baseline carrying the warning is not skipped.
+        assert "### Baseline: B" in rep
+        # Reporting the warning must not claim an analysis ran, or move a rank.
+        assert json.loads((cdir / "fit_robustness_summary.json").read_text()
+                          )["any_analysis_enabled"] is False
+        assert [r["simulation_rank"] for r in rep_rows] == ranks_before
+
+        # (b) Negative case: nothing enabled and nothing weakly identified must
+        # not produce an empty robustness section.
+        quiet = _robustness_record({"A0": 3.0, "q_sat": 0.42})
+        assert not robustness_reportable(quiet)
+        cdir2 = tmp / "quiet"
+        cdir2.mkdir()
+        write_report(state, rep_rows, None, cdir2, Logger(None), None, quiet)
+        rep2 = (cdir2 / "report.md").read_text(encoding="utf-8")
+        assert "## Fit robustness and parameter identifiability" not in rep2
+        assert "fit_robustness_summary.json" not in rep2
+    print("  suite quick-test default-report nested-term visibility: PASSED")
 
 
 def run_quick_test() -> None:
