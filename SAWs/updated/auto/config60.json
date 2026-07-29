@@ -39,15 +39,15 @@
       "method": "temperature",
       "confidence": 0.95,
       "correlation_threshold": 0.9,
-      "save_prediction_bands": true
+      "save_prediction_bands": false
     },
 
     "uncertainty_diagnostics": {
-      "enabled": true
+      "enabled": false
     },
 
     "split_sensitivity": {
-      "enabled": true,
+      "enabled": false,
       "schemes": [
         "every_third_phase",
         "kfold",
@@ -65,7 +65,7 @@
     },
 
     "rg_weight_sensitivity": {
-      "enabled": true,
+      "enabled": false,
       "weights": [0, 0.1, 0.25, 0.5, 1, 2, 4],
       "normalization_diagnostics": true
     }
@@ -80,10 +80,10 @@
     "n_workers": 16,
     "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
     "plots": false, 
-    "timing": true,
+    "timing": false,
     "diagnostics": {
-      "enabled": true,
-      "trajectories": true,
+      "enabled": false,
+      "trajectories": false,
       "n_blocks": 5,
       "min_round_trips": 64,
       "min_temp_coverage": 0.8,
@@ -101,7 +101,7 @@
     "make_plots": true,
     "seed_averaged_distribution_plots": true,
     "statistics": {
-      "enabled": true,
+      "enabled": false,
       "alpha": 0.05,
       "bootstrap_replicates": 10000,
       "seed": 12345,
