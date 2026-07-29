@@ -96,6 +96,7 @@
     "rg_weight": 0.7,
     "temperature_tolerance": 1e-10,
     "make_plots": true,
+    "seed_averaged_distribution_plots": true,
     "statistics": {
       "enabled": true,
       "alpha": 0.05,

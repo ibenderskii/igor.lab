@@ -26,6 +26,7 @@ Usage:
     python run_model_suite.py --config model_suite_config.json --resume
     python run_model_suite.py --config model_suite_config.json --force
     python run_model_suite.py --config model_suite_config.json --continue-on-error
+    python run_model_suite.py --config model_suite_config.json --postprocess-only
     python run_model_suite.py --quick-test
 """
 from __future__ import annotations
@@ -342,7 +343,8 @@ DEFAULT_REMD_DIAGNOSTICS = {
 }
 DEFAULT_COMPARISON = {
     "include_rg": False, "rg_weight": 1.0, "temperature_tolerance": 1e-10,
-    "make_plots": False, "statistics": None,
+    "make_plots": False, "seed_averaged_distribution_plots": False,
+    "statistics": None,
 }
 # Paired model-comparison statistics defaults (backward compatible: disabled).
 DEFAULT_COMPARISON_STATISTICS = {
@@ -782,6 +784,13 @@ def validate_config(cfg: dict) -> dict:
             )
         comp["temperature_tolerance"] = temp_tol
         comp["rg_weight"] = rg_cmp_weight
+        seed_avg_plots = comp.get("seed_averaged_distribution_plots", False)
+        if not isinstance(seed_avg_plots, (bool, np.bool_)):
+            raise ValueError(
+                f"Baseline {name!r}: "
+                "comparison.seed_averaged_distribution_plots must be true or false"
+            )
+        comp["seed_averaged_distribution_plots"] = bool(seed_avg_plots)
 
         stats = _merge(DEFAULT_COMPARISON_STATISTICS, comp.get("statistics"))
         stats["enabled"] = bool(stats.get("enabled", False))
@@ -1607,6 +1616,101 @@ def _common_rg_grid(edge_arrays, target_width: float) -> np.ndarray:
     if edges[-1] < hi:  # guarantee coverage of the union
         edges = np.append(edges, edges[-1] + w)
     return edges
+
+
+def aggregate_seed_distributions(seed_dirs, target_temps: np.ndarray,
+                                 temperature_tolerance: float = 1e-10) -> dict:
+    """Align and average Pc/Prg probability masses across successful seeds.
+
+    Contact distributions are zero-padded onto the union integer support. Rg
+    distributions are mass-conservingly rebinned onto a uniform grid spanning
+    every seed's support before the equal-weight mean and between-seed sample
+    SD are calculated.
+    """
+    target_temps = np.asarray(target_temps, dtype=float)
+    loaded = []
+    for seed_dir in seed_dirs:
+        path = Path(seed_dir) / "run_distributions.npz"
+        with np.load(path, allow_pickle=True) as d:
+            temps = np.asarray(d["temps" if "temps" in d else "Ts"], dtype=float)
+            c_vals = np.asarray(d["c_vals"], dtype=float)
+            pc = np.asarray(d["Pc"], dtype=float)
+            rg_edges = np.asarray(d["rg_edges"], dtype=float)
+            prg = np.asarray(d["Prg"], dtype=float)
+        if temps.shape != target_temps.shape or not np.allclose(
+            temps, target_temps, rtol=0.0, atol=float(temperature_tolerance)
+        ):
+            raise ValueError(f"{path}: temperature grid does not match target")
+        if (
+            c_vals.ndim != 1
+            or pc.shape != (target_temps.size, c_vals.size)
+            or not np.all(np.isfinite(c_vals))
+            or not np.allclose(c_vals, np.rint(c_vals), rtol=0.0, atol=1e-10)
+        ):
+            raise ValueError(f"{path}: invalid contact support or Pc shape")
+        if (
+            rg_edges.ndim != 1
+            or rg_edges.size < 2
+            or not np.all(np.isfinite(rg_edges))
+            or not np.all(np.diff(rg_edges) > 0)
+            or prg.shape != (target_temps.size, rg_edges.size - 1)
+        ):
+            raise ValueError(f"{path}: invalid Rg grid or Prg shape")
+        for label, arr in (("Pc", pc), ("Prg", prg)):
+            if not np.all(np.isfinite(arr)) or np.any(arr < 0):
+                raise ValueError(f"{path}: {label} must be finite and nonnegative")
+            if np.any(np.abs(arr.sum(axis=1) - 1.0) > 1e-6):
+                raise ValueError(f"{path}: {label} rows are not normalized")
+        loaded.append({
+            "c_vals": c_vals,
+            "Pc": pc,
+            "rg_edges": rg_edges,
+            "Prg": prg,
+        })
+    if not loaded:
+        raise ValueError("At least one successful seed is required")
+
+    contact_grid = union_int_grid(*(d["c_vals"] for d in loaded))
+    pc_rows = []
+    for d in loaded:
+        pc_rows.append(np.stack([
+            align_contact_row(d["c_vals"], row, contact_grid)
+            for row in d["Pc"]
+        ]))
+    pc_stack = np.stack(pc_rows)
+
+    widths = [
+        float(np.median(np.diff(d["rg_edges"])))
+        for d in loaded
+        if d["rg_edges"].size > 1
+    ]
+    common_rg_edges = _common_rg_grid(
+        [d["rg_edges"] for d in loaded],
+        min(widths) if widths else float("nan"),
+    )
+    prg_rows = []
+    for d in loaded:
+        rows = np.stack([
+            rebin_mass_piecewise(d["rg_edges"], row, common_rg_edges)
+            for row in d["Prg"]
+        ])
+        if np.any(np.abs(rows.sum(axis=1) - 1.0) > 1e-6):
+            raise ValueError("Rg grid alignment did not conserve probability mass")
+        prg_rows.append(rows)
+    prg_stack = np.stack(prg_rows)
+
+    ddof = 1 if len(loaded) > 1 else 0
+    return {
+        "n_seeds": len(loaded),
+        "temps": target_temps,
+        "c_vals": contact_grid,
+        "Pc_mean": np.mean(pc_stack, axis=0),
+        "Pc_sd": np.std(pc_stack, axis=0, ddof=ddof),
+        "rg_edges": common_rg_edges,
+        "rg_centers": 0.5 * (common_rg_edges[:-1] + common_rg_edges[1:]),
+        "Prg_mean": np.mean(prg_stack, axis=0),
+        "Prg_sd": np.std(prg_stack, axis=0, ddof=ddof),
+    }
 
 
 def _split_indices(fit_results_path: Path, n_temps: int):
@@ -3380,6 +3484,132 @@ def _write_rows_csv(path: Path, columns, rows):
 # Plots (Part 14)
 # ---------------------------------------------------------------------------
 
+def make_seed_averaged_distribution_plots(suite_state, comparison_dir: Path,
+                                          log: Logger) -> list[Path]:
+    """Write one side-by-side Pc/Prg mean ± 1 SD figure per model."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+    except Exception as exc:  # pragma: no cover
+        log(f"Seed-averaged distribution plots skipped "
+            f"(matplotlib unavailable): {exc}")
+        return []
+
+    cfg = suite_state["config"]
+    target_temps = validate_target_npz(cfg["target_remd"])
+    plots_dir = comparison_dir / "plots"
+    written = []
+
+    for baseline in cfg["baselines"]:
+        if not baseline["comparison"].get(
+            "seed_averaged_distribution_plots", False
+        ):
+            continue
+        bname = baseline["name"]
+        raw_name = baseline["raw_name"]
+        tol = float(baseline["comparison"]["temperature_tolerance"])
+        for model in cfg["models"]:
+            rec = suite_state["models"].get((bname, model), {})
+            seed_records = [
+                (seed, srec)
+                for seed, srec in rec.get("seeds", {}).items()
+                if srec.get("status") == "ok"
+            ]
+            if not seed_records:
+                log(f"Seed-averaged distributions skipped for {raw_name}/{model}: "
+                    "no successful seeds.")
+                continue
+            seed_records.sort(key=lambda pair: pair[0])
+            agg = aggregate_seed_distributions(
+                [srec["seed_dir"] for _, srec in seed_records],
+                target_temps,
+                tol,
+            )
+
+            plots_dir.mkdir(parents=True, exist_ok=True)
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+            temps = np.asarray(agg["temps"], dtype=float)
+            if temps.size > 1 and float(np.max(temps)) > float(np.min(temps)):
+                norm = Normalize(vmin=float(np.min(temps)),
+                                 vmax=float(np.max(temps)))
+            else:
+                norm = Normalize(vmin=float(temps[0]) - 0.5,
+                                 vmax=float(temps[0]) + 0.5)
+            cmap = plt.get_cmap("viridis")
+
+            for i, temp in enumerate(temps):
+                color = cmap(norm(float(temp)))
+                pc_mean = agg["Pc_mean"][i]
+                pc_sd = agg["Pc_sd"][i]
+                axes[0].plot(agg["c_vals"], pc_mean, color=color, linewidth=1.5)
+                axes[0].fill_between(
+                    agg["c_vals"],
+                    np.clip(pc_mean - pc_sd, 0.0, 1.0),
+                    np.clip(pc_mean + pc_sd, 0.0, 1.0),
+                    color=color,
+                    alpha=0.16,
+                    linewidth=0,
+                )
+
+                prg_mean = agg["Prg_mean"][i]
+                prg_sd = agg["Prg_sd"][i]
+                axes[1].plot(
+                    agg["rg_centers"], prg_mean, color=color, linewidth=1.5
+                )
+                axes[1].fill_between(
+                    agg["rg_centers"],
+                    np.clip(prg_mean - prg_sd, 0.0, 1.0),
+                    np.clip(prg_mean + prg_sd, 0.0, 1.0),
+                    color=color,
+                    alpha=0.16,
+                    linewidth=0,
+                )
+
+            axes[0].set(
+                xlabel="Contacts, m",
+                ylabel="Probability mass",
+                title=r"$P(m\mid T)$",
+            )
+            axes[1].set(
+                xlabel=r"$R_g$",
+                ylabel="Probability mass",
+                title=r"$P(R_g\mid T)$",
+            )
+            for ax in axes:
+                ax.set_ylim(bottom=0.0)
+                ax.grid(alpha=0.2, linewidth=0.6)
+            fig.suptitle(
+                f"{raw_name}: {model}\n"
+                f"equal-weight seed mean ± 1 SD "
+                f"(n={agg['n_seeds']} successful seeds)",
+                fontsize=11,
+            )
+            colorbar = fig.colorbar(
+                ScalarMappable(norm=norm, cmap=cmap),
+                ax=axes,
+                pad=0.03,
+                fraction=0.04,
+            )
+            colorbar.set_label("Temperature (K)")
+            fig.subplots_adjust(left=0.08, right=0.9, bottom=0.12,
+                                top=0.82, wspace=0.28)
+            out = (
+                plots_dir
+                / f"{bname}__{sanitize_name(model)}"
+                  "__seed_averaged_distributions.png"
+            )
+            fig.savefig(out, dpi=180)
+            plt.close(fig)
+            written.append(out)
+            log(f"Wrote {out} from seeds "
+                f"{[seed for seed, _ in seed_records]}")
+
+    return written
+
+
 def make_plots(suite_state, rows, per_temp_rows, remd_mod, comparison_dir: Path,
                log: Logger, per_temp_diag_rows=None) -> None:
     """Generate per-baseline diagnostic plots (best-effort; never fatal)."""
@@ -4340,15 +4570,98 @@ class SuiteError(RuntimeError):
     pass
 
 
+def _load_fit_for_postprocessing(baseline, model, fit_dir: Path, rec: dict,
+                                 suite_state: dict, log: Logger) -> bool:
+    """Validate an existing fit without launching the fitter."""
+    completion_files = expected_fit_outputs(baseline["fit"])
+    if not _completion_ok(fit_dir, completion_files):
+        missing = [name for name in completion_files if not (fit_dir / name).exists()]
+        validation = {
+            "status": "failed",
+            "error": f"missing existing fit output(s): {', '.join(missing)}",
+        }
+    else:
+        validation = validate_fit_outputs(fit_dir, model, baseline["fit"])
+    ok = validation["status"] == "ok"
+    if ok:
+        rec["summary"] = validation["summary"]
+        log(f"Postprocess: fit {baseline['name']}/{model} validated.")
+    else:
+        rec["error"] = validation.get("error")
+        log(f"POSTPROCESS FIT INVALID {baseline['name']}/{model}: "
+            f"{validation.get('error')}")
+    suite_state["jobs"].append({
+        "kind": "fit",
+        "baseline": baseline["name"],
+        "model": model,
+        "status": "loaded_postprocess" if ok else "failed",
+        "error": validation.get("error"),
+    })
+    return ok
+
+
+def _load_remd_for_postprocessing(baseline, fit_dir: Path, seed: int,
+                                  seed_dir: Path, rec: dict, srec: dict,
+                                  suite_state: dict, log: Logger,
+                                  target_temps: np.ndarray) -> bool:
+    """Validate an existing REMD seed without launching the sampler."""
+    missing = [
+        name for name in REMD_COMPLETION_FILES if not (seed_dir / name).exists()
+    ]
+    if missing:
+        validation = {
+            "status": "failed",
+            "error": f"missing existing REMD output(s): {', '.join(missing)}",
+        }
+    else:
+        validation = validate_remd_outputs(
+            seed_dir,
+            rec["summary"],
+            target_temps,
+            float(baseline["comparison"]["temperature_tolerance"]),
+            baseline["remd"].get("diagnostics") or {},
+        )
+    ok = validation["status"] == "ok"
+    srec["status"] = "ok" if ok else "failed"
+    srec["error"] = validation.get("error")
+    if ok:
+        srec["run_summary"] = _load_run_summary(seed_dir)
+        log(f"Postprocess: REMD {baseline['name']}/{rec['summary']['model']} "
+            f"seed={seed} validated.")
+    else:
+        log(f"POSTPROCESS REMD INVALID "
+            f"{baseline['name']}/{rec['summary']['model']} seed={seed}: "
+            f"{validation.get('error')}")
+    suite_state["jobs"].append({
+        "kind": "remd",
+        "baseline": baseline["name"],
+        "model": rec["summary"]["model"],
+        "seed": seed,
+        "status": "loaded_postprocess" if ok else "failed",
+        "error": validation.get("error"),
+    })
+    return ok
+
+
 def run_suite(config_path: str, args) -> dict:
     cfg = resolve_config_paths(validate_config(load_config(config_path)), config_path)
     output_root = Path(cfg["output_root"])
-    if not args.dry_run:
+    postprocess_only = bool(getattr(args, "postprocess_only", False))
+    if postprocess_only and (args.dry_run or args.resume or args.force):
+        raise SuiteError(
+            "--postprocess-only cannot be combined with --dry-run, --resume, or --force"
+        )
+    if postprocess_only and not output_root.is_dir():
+        raise SuiteError(
+            f"--postprocess-only requires an existing output_root: {output_root}"
+        )
+    if not args.dry_run and not postprocess_only:
         output_root.mkdir(parents=True, exist_ok=True)
     log = Logger(output_root / "pipeline.log" if not args.dry_run else None)
     log(f"=== model suite start ({now_iso()}) ===")
     log(f"config={config_path} dry_run={args.dry_run} resume={args.resume} "
-        f"force={args.force} continue_on_error={args.continue_on_error}")
+        f"force={args.force} continue_on_error={args.continue_on_error} "
+        f"postprocess_only={postprocess_only}")
 
     # Preflight (Part 6).
     for label, path in (("fit_script", cfg["fit_script"]),
@@ -4441,7 +4754,19 @@ def run_suite(config_path: str, args) -> dict:
             suite_state["models"][key] = rec
 
             fit_cmd = build_fit_command(cfg, baseline, model, fit_dir)
-            if args.dry_run:
+            if postprocess_only:
+                ok = _load_fit_for_postprocessing(
+                    baseline, model, fit_dir, rec, suite_state, log
+                )
+                if not ok:
+                    rec["status"] = "fit_failed"
+                    if not args.continue_on_error:
+                        raise SuiteError(
+                            f"existing fit invalid for {bname}/{model}"
+                        )
+                    continue
+                rec["status"] = "ok"
+            elif args.dry_run:
                 log(f"[dry-run] FIT {bname}/{model}: {' '.join(fit_cmd)}")
             else:
                 ok = _do_fit(cfg, baseline, model, fit_dir, fit_cmd,
@@ -4460,7 +4785,18 @@ def run_suite(config_path: str, args) -> dict:
                 rec["seeds"][seed] = srec
                 remd_cmd = build_remd_command(cfg, baseline, fit_dir, seed,
                                               seed_dir)
-                if args.dry_run:
+                if postprocess_only:
+                    ok = _load_remd_for_postprocessing(
+                        baseline, fit_dir, seed, seed_dir, rec, srec,
+                        suite_state, log, target_temps
+                    )
+                    if not ok and not args.continue_on_error:
+                        raise SuiteError(
+                            f"existing REMD output invalid for "
+                            f"{bname}/{model} seed={seed}"
+                        )
+                    continue
+                elif args.dry_run:
                     log(f"[dry-run] REMD {bname}/{model} seed={seed}: "
                         f"{' '.join(remd_cmd)}")
                     continue
@@ -4501,6 +4837,14 @@ def run_suite(config_path: str, args) -> dict:
         make_plots(suite_state, rows, per_temp_rows, remd_mod, comparison_dir,
                    log, per_temp_diag_rows=per_temp_diag_rows)
         make_statistics_plots(stats_result, comparison_dir, log)
+    make_seed_average_plots = any(
+        b["comparison"].get("seed_averaged_distribution_plots", False)
+        for b in cfg["baselines"]
+    )
+    if make_seed_average_plots:
+        make_seed_averaged_distribution_plots(
+            suite_state, comparison_dir, log
+        )
     write_report(suite_state, rows, global_ranking, comparison_dir, log,
                  stats_result=stats_result, robustness=robustness)
     write_manifest(suite_state, config_path, log)
@@ -5214,6 +5558,50 @@ def run_quick_test() -> None:
     # A failed seed must not be scored as zero.
     assert math.isnan(_safe_mean([None, float("nan")]))
 
+    # Seed aggregation aligns unequal contact and Rg grids, conserves mean mass,
+    # and uses the between-seed sample SD.
+    with tempfile.TemporaryDirectory() as aggregate_tmp:
+        aggregate_tmp = Path(aggregate_tmp)
+        aggregate_temps = np.array([280.0, 300.0])
+        aggregate_specs = (
+            {
+                "c_vals": np.array([0, 1]),
+                "Pc": np.array([[0.8, 0.2], [0.4, 0.6]]),
+                "rg_edges": np.array([0.5, 1.5, 2.5]),
+                "Prg": np.array([[0.75, 0.25], [0.3, 0.7]]),
+            },
+            {
+                "c_vals": np.array([1, 2]),
+                "Pc": np.array([[0.3, 0.7], [0.9, 0.1]]),
+                "rg_edges": np.array([0.25, 1.0, 1.75, 2.5]),
+                "Prg": np.array([[0.2, 0.5, 0.3], [0.6, 0.3, 0.1]]),
+            },
+        )
+        aggregate_dirs = []
+        for index, spec in enumerate(aggregate_specs, start=1):
+            seed_dir = aggregate_tmp / f"seed_{index}"
+            seed_dir.mkdir()
+            np.savez(
+                seed_dir / "run_distributions.npz",
+                temps=aggregate_temps,
+                **spec,
+            )
+            aggregate_dirs.append(seed_dir)
+        aggregate = aggregate_seed_distributions(
+            aggregate_dirs, aggregate_temps
+        )
+        assert aggregate["n_seeds"] == 2
+        np.testing.assert_array_equal(aggregate["c_vals"], [0, 1, 2])
+        np.testing.assert_allclose(
+            aggregate["Pc_mean"][0], [0.4, 0.25, 0.35]
+        )
+        np.testing.assert_allclose(
+            aggregate["Pc_sd"][0, 0], np.std([0.8, 0.0], ddof=1)
+        )
+        np.testing.assert_allclose(aggregate["Pc_mean"].sum(axis=1), 1.0)
+        np.testing.assert_allclose(aggregate["Prg_mean"].sum(axis=1), 1.0)
+        assert np.all(np.isfinite(aggregate["Prg_sd"]))
+
     # Rg target-vs-REMD scoring must work with a contact-only analytic fit.
     with tempfile.TemporaryDirectory() as unit_tmp:
         unit_tmp = Path(unit_tmp)
@@ -5329,6 +5717,7 @@ def run_quick_test() -> None:
             },
             "comparison": {
                 "include_rg": True, "rg_weight": 0.25, "make_plots": True,
+                "seed_averaged_distribution_plots": True,
                 "statistics": {
                     "enabled": True, "alpha": 0.05,
                     "bootstrap_replicates": 500, "seed": 12345,
@@ -5354,6 +5743,15 @@ def run_quick_test() -> None:
             assert (out / rel).exists(), f"missing {rel}"
         plots = list((out / "comparison" / "plots").glob("*.png"))
         assert plots, "no plots produced"
+        seed_average_plots = list(
+            (out / "comparison" / "plots").glob(
+                "*__seed_averaged_distributions.png"
+            )
+        )
+        assert len(seed_average_plots) == len(SUPPORTED_MODELS), (
+            f"expected {len(SUPPORTED_MODELS)} seed-averaged distribution "
+            f"plots, found {len(seed_average_plots)}"
+        )
 
         rows = json.loads((out / "comparison/model_comparison.json").read_text())
         models_seen = {r["model"] for r in rows}
@@ -5460,6 +5858,43 @@ def run_quick_test() -> None:
         assert splots, "missing pairwise mean-delta heatmap"
         print("  suite quick-test paired statistics (5 files, columns, report, "
               "plots): PASSED")
+
+        # Postprocessing regenerates the new figures from validated completed
+        # outputs and must never call the fitter/REMD subprocess launcher.
+        for plot_path in seed_average_plots:
+            plot_path.unlink()
+        post_config = json.loads(config_path.read_text())
+        post_config["comparison"]["make_plots"] = False
+        config_path.write_text(json.dumps(post_config, indent=2))
+        original_run_subprocess = globals()["run_subprocess"]
+
+        def _forbid_computational_subprocess(*_args, **_kwargs):
+            raise AssertionError(
+                "--postprocess-only attempted to launch a fitter or REMD job"
+            )
+
+        globals()["run_subprocess"] = _forbid_computational_subprocess
+        try:
+            post_args = argparse.Namespace(
+                config=str(config_path), dry_run=False, resume=False,
+                force=False, continue_on_error=False, quick_test=True,
+                postprocess_only=True,
+            )
+            post_state = run_suite(str(config_path), post_args)
+        finally:
+            globals()["run_subprocess"] = original_run_subprocess
+        assert all(
+            job["status"] == "loaded_postprocess"
+            for job in post_state["jobs"]
+        )
+        regenerated = list(
+            (out / "comparison" / "plots").glob(
+                "*__seed_averaged_distributions.png"
+            )
+        )
+        assert len(regenerated) == len(SUPPORTED_MODELS)
+        print("  suite quick-test postprocess-only distribution "
+              "regeneration without fit/REMD launch: PASSED")
 
     _robustness_end_to_end_quick_test(here)
     print("suite quick-test complete.")
@@ -5605,6 +6040,15 @@ def main() -> None:
     ap.add_argument("--continue-on-error", action="store_true",
                     dest="continue_on_error",
                     help="Record failures and continue independent jobs.")
+    ap.add_argument(
+        "--postprocess-only",
+        action="store_true",
+        dest="postprocess_only",
+        help=(
+            "Validate completed fit/REMD outputs and regenerate comparison "
+            "artifacts without launching either computational job."
+        ),
+    )
     ap.add_argument("--quick-test", action="store_true", dest="quick_test",
                     help="Run a tiny synthetic end-to-end suite and exit.")
     args = ap.parse_args()
