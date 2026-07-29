@@ -1,15 +1,14 @@
 {
   "target_remd": "remd_distributions_44mer.npz",
   "fit_script": "fit_lattice_contact_model_2.py",
-  "remd_script": "remd_uniform_chain_2.py",
+  "remd_script": "remd_uniform_chain_2_new.py",
   "output_root": "model_suite_output_44mer",
 
   "models": [
     "hs",
-    "hs_quadratic",
-    "poly2",
-    "poly3",
-    "heat_capacity"
+    "hs_m2_const",
+    "hs_m2_hs",
+    "saturating_cooperative_contact"
   ],
 
   "baselines": [
@@ -39,7 +38,7 @@
       "method": "temperature",
       "confidence": 0.95,
       "correlation_threshold": 0.9,
-      "save_prediction_bands": true
+      "save_prediction_bands": false
     },
 
     "uncertainty_diagnostics": {
@@ -77,9 +76,9 @@
     "n_cycles": 5000,
     "rg_bins": 100,
     "burnin_frac": 0.7,
-    "n_workers": 16,
+    "n_workers": 32,
     "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-    "plots": false, 
+    "plots": true, 
     "timing": true,
     "diagnostics": {
       "enabled": true,
