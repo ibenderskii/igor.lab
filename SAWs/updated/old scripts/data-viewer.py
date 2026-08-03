@@ -14,7 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-data = np.load("remd_distributions_44mer.npz")
+data = np.load("remd_distributions_30mer.npz")
 temps = data["temps"]
 norm = plt.Normalize(temps.min(), temps.max())
 cmap = cm.coolwarm

@@ -1,0 +1,227 @@
+SLURM JOB SUBMISSION GUIDE FOR PYTHON (TOKMAKOFF GROUP)
+========================================================
+
+This guide explains how to run Python scripts on the University of Chicago's Midway2 and Midway3 clusters using SLURM.
+
+--------------------------------------------------------
+I. WHAT IS SLURM?
+--------------------------------------------------------
+SLURM is the workload manager used to submit and manage jobs on the HPC clusters.
+Instead of running programs interactively, you create a batch script and submit it with "sbatch".
+
+--------------------------------------------------------
+II. BASIC TERMINOLOGY
+--------------------------------------------------------
+- Partition: A group of nodes (like a queue). Examples: "tokmakoff", "beagle3".
+- Node: A physical machine with CPUs (and possibly GPUs and lots of memory).
+- CPU/Core: Processing units.
+- GPU: Required for deep learning or GPU-accelerated Python.
+- Memory: RAM requested by your job.
+- Wall Time: Maximum allowed time your job will run (use --time).
+- Account: Group name (you are in pi-tokmakoff).
+
+--------------------------------------------------------
+III. AVAILABLE PARTITIONS
+--------------------------------------------------------
+
+1. MIDWAY2: Partition "tokmakoff" (CPU-only)
+   - CPUs per node: ~16–32
+   - Memory per CPU: 1.9 GB
+   - GPU: NOT available
+   - Max wall time: 7 days
+
+2. MIDWAY3: Partition "beagle3" (GPU REQUIRED)
+   - CPUs per node: 32
+   - Memory per CPU: 7.8 GB
+   - GPU: YES (must request one)
+   - Max wall time: 7 days
+
+3. MIDWAY3: Partition "beagle3-bigmem" (GPU REQUIRED, HIGH MEMORY)
+   - CPUs per node: 32–64
+   - Memory per node: UNLIMITED
+   - GPU: YES (must request one)
+   - Max wall time: 7 days
+
+--------------------------------------------------------
+IV. EXAMPLE SBATCH SCRIPTS
+--------------------------------------------------------
+
+NOTE DIFFERENCE BETWEEN midway2 AND midway3
+Log in to your account: ssh ibenderskii@midway2.rcc.uchicago.edu
+Log in to your account: ssh ibenderskii@midway3.rcc.uchicago.edu
+
+
+------------------------------
+A. MIDWAY2 - CPU job (tokmakoff)
+------------------------------
+#!/bin/bash
+#SBATCH --job-name=python_cpu_job
+#SBATCH --output=out_%j.txt
+#SBATCH --error=err_%j.txt
+#SBATCH --partition=tokmakoff
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1        # Valid range: 1–32
+#SBATCH --mem=2G                 # Max ~1.9G per CPU
+#SBATCH --time=06:00:00          # Max: 7-00:00:00
+
+python your_script.py
+
+------------------------------
+B. MIDWAY3 - GPU job (beagle3)
+------------------------------
+#!/bin/bash
+#SBATCH --job-name=python_gpu_beagle3
+#SBATCH --output=out_%j.txt
+#SBATCH --error=err_%j.txt
+#SBATCH --partition=beagle3
+#SBATCH --account=pi-tokmakoff
+#SBATCH --gres=gpu:1             # GPU REQUIRED
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4        # Valid range: 1–32
+#SBATCH --mem=16G                # ~7.8G per CPU
+#SBATCH --time=04:00:00          # Max: 7-00:00:00
+
+python your_script.py
+
+--------------------------------------
+C. MIDWAY3 - High-Memory GPU (bigmem)
+--------------------------------------
+#!/bin/bash
+#SBATCH --job-name=python_gpu_bigmem
+#SBATCH --output=out_%j.txt
+#SBATCH --error=err_%j.txt
+#SBATCH --partition=beagle3-bigmem
+#SBATCH --account=pi-tokmakoff
+#SBATCH --gres=gpu:1             # GPU REQUIRED
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8        # Valid range: 1–64
+#SBATCH --mem=64G                # Memory: be reasonable
+#SBATCH --time=08:00:00          # Max: 7-00:00:00
+
+python your_script.py
+
+--------------------------------------------------------
+V. HOW TO SUBMIT A JOB
+--------------------------------------------------------
+1. Save your script as "job.sh"
+2. Run:
+   sbatch job.sh
+
+--------------------------------------------------------
+VI. HOW TO CHECK JOB STATUS
+--------------------------------------------------------
+- squeue -u $USER             : See your running/queued jobs
+- scontrol show job <jobid>  : Detailed info about a job
+- scancel <jobid>            : Cancel a job
+
+--------------------------------------------------------
+VII. BEST PRACTICES
+--------------------------------------------------------
+- Always specify --time (otherwise it may default to very short)
+- NEVER run CPU-only jobs on beagle3 or beagle3-bigmem — you must request a GPU or your job may be canceled
+- Always use --account=pi-tokmakoff on Midway3 jobs
+- Don't request more memory or CPUs than needed
+
+--------------------------------------------------------
+VIII. COMMON ERRORS
+--------------------------------------------------------
+- "Invalid account": You forgot --account on Midway3
+- "Job cancelled by admin": You submitted a CPU-only job to a GPU-only partition
+- "Out Of Memory": You requested too little memory; increase --mem
+- "Job never starts": Check if you requested too many resources
+
+--------------------------------------------------------
+IX. GETTING HELP
+--------------------------------------------------------
+Ask Ian or the RCC (rcc-support@rcc.uchicago.edu) for help.
+You can also check the SLURM manual:
+https://rcc.uchicago.edu/docs/slurm/index.html
+
+--------------------------------------------------------
+X. USING MODULES
+--------------------------------------------------------
+
+Most software (like Python, CUDA, GROMACS, etc.) is not available by default.
+Instead, you load it using the "module" system.
+
+To see available modules:
+    module avail
+
+To load a module:
+    module load python
+    module load cuda
+    module load gromacs
+
+To unload a module:
+    module unload python
+
+To see which modules are currently loaded:
+    module list
+
+Tip: Put your "module load" commands near the top of your sbatch script,
+before running your Python script.
+
+If you don't know which Python version you need, ask Ian or run:
+    module spider python
+
+--------------------------------------------------------
+XI. OTHER GOOD TO KNOW
+--------------------------------------------------------
+
+• It's best to write a *new sbatch script* for each type of job
+  (e.g., one for CPU-only, one for GPU jobs, one for large memory jobs).
+
+• Your output and error files (out_%j.txt, err_%j.txt) will appear
+  in the same folder as your job script unless otherwise specified.
+
+• Don't request more resources than you need — it slows down the queue
+  and might get your job flagged by admins.
+
+• Use full or relative paths in your scripts:
+     GOOD: ./my_script.py
+     GOOD: /home/yourname/project/my_script.py
+     BAD: just "my_script.py" if you’re not in that directory
+
+• For debugging, try submitting a short test job with minimal resources
+  and just 1–5 minutes of wall time.
+
+-----------------------------------
+Using AI Help for Parallelization
+-----------------------------------
+If your Python script is taking too long, you might be able to speed it up
+using multiprocessing or SLURM array jobs. You can ask ChatGPT or other
+LLMs something like:
+
+    "My Python script has a loop over many files. How can I rewrite it
+     to use multiprocessing or job arrays on SLURM?"
+
+Be specific — share example code, your current sbatch script, and describe
+how you want to split the work. Always double check that parallel jobs don't
+overwrite each other’s output.
+
+--------------------------------------------------------
+Transferring Files With SCP
+--------------------------------------------------------
+
+If you're working on your personal computer, you'll often want to copy
+files between your machine and the cluster.
+
+From your computer → Midway:
+    scp local_file.py ibenderskii@midway2.rcc.uchicago.edu:~/yourfolder/
+
+From Midway → your computer:
+    scp ibenderskii@midway2.rcc.uchicago.edu:~/yourfolder/output.txt .
+
+For directories, use `-r` (recursive):
+    scp -r my_folder ibenderskii@midway2.rcc.uchicago.edu:~/my_folder
+
+If you're on Midway3, replace `midway2.rcc.uchicago.edu` with `midway3.rcc.uchicago.edu`.
+
+Tip: `scp` works from any Mac/Linux terminal or Windows with WSL or MobaXterm.
+
+--------------------------------------------------------
+XII. STILL STUCK?
+--------------------------------------------------------
+
+Email RCC support: rcc-support@rcc.uchicago.edu
+Or ask Ian! ianjefab@uchicago.edu
