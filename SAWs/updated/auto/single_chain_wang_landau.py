@@ -298,6 +298,7 @@ def _save_checkpoint(
             temporary.unlink()
 
 
+<<<<<<< HEAD
 def probe_reachable_levels(
     n_beads: int,
     m_min: int,
@@ -339,6 +340,8 @@ def probe_reachable_levels(
     return visits
 
 
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
 def learn_log_density(
     *,
     n_beads: int,
@@ -351,11 +354,15 @@ def learn_log_density(
     min_visits: int,
     check_every: int,
     max_steps: int,
+<<<<<<< HEAD
     active: Optional[np.ndarray] = None,
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     checkpoint: Optional[Path] = None,
     resume_checkpoint: Optional[Path] = None,
     progress: bool = True,
 ) -> Dict[str, Any]:
+<<<<<<< HEAD
     """Learn a contact density estimate with the original WL refinement rule.
 
     ``active`` is a boolean mask over the window marking levels that must become
@@ -363,6 +370,9 @@ def learn_log_density(
     they are only excluded from the convergence test, so a geometrically
     unreachable level cannot stall the run forever.
     """
+=======
+    """Learn a contact density estimate with the original WL refinement rule."""
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     if resume_checkpoint is None:
         chain: List[Vec] = [(i, 0, 0) for i in range(n_beads)]
         log_g = np.zeros(m_max - m_min + 1, dtype=np.float64)
@@ -391,6 +401,7 @@ def learn_log_density(
             previous_round_trips = int(saved["round_trips"])
         validate_chain(chain)
 
+<<<<<<< HEAD
     if active is None:
         active = np.ones(m_max - m_min + 1, dtype=bool)
     active = np.asarray(active, dtype=bool)
@@ -399,6 +410,8 @@ def learn_log_density(
     if not active.any():
         raise ValueError("active mask excludes every contact level")
 
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     occupied = set(chain)
     contact = contact_count(chain, occupied)
     if not (m_min <= contact <= m_max):
@@ -418,6 +431,7 @@ def learn_log_density(
         while True:
             block = min(check_every, max_steps - total_steps)
             if block <= 0:
+<<<<<<< HEAD
                 missing = np.flatnonzero(active & (histogram < min_visits)) + m_min
                 raise RuntimeError(
                     "Wang-Landau learning exhausted --wl_max_steps before "
@@ -425,6 +439,16 @@ def learn_log_density(
                     f"below --wl_min_visits in the current stage: {missing.tolist()}. "
                     "Increase the limit, lower --m_max, or raise --probe_steps so "
                     "the reachability probe classifies these levels correctly."
+=======
+                missing = np.flatnonzero(histogram < min_visits) + m_min
+                raise RuntimeError(
+                    "Wang-Landau learning exhausted --wl_max_steps before "
+                    f"convergence at log_f={log_f:.3g}. Contact levels below "
+                    f"--wl_min_visits in the current stage: {missing.tolist()}. "
+                    "Increase the limit, lower --m_max only if the omitted tail is "
+                    "scientifically irrelevant, or verify that every requested "
+                    "integer contact level is geometrically reachable."
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
                 )
             for _ in range(block):
                 chain, occupied, contact, _, was_accepted = metropolis_step(
@@ -440,11 +464,18 @@ def learn_log_density(
                 histogram[index] += 1
                 tracker.observe(contact)
 
+<<<<<<< HEAD
             required = histogram[active]
             mean_count = float(required.mean())
             minimum_count = int(required.min())
             ratio = minimum_count / mean_count if mean_count else 0.0
             range_covered = bool(required[0] > 0 and required[-1] > 0)
+=======
+            mean_count = float(histogram.mean())
+            minimum_count = int(histogram.min())
+            ratio = minimum_count / mean_count if mean_count else 0.0
+            range_covered = bool(histogram[0] > 0 and histogram[-1] > 0)
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
             is_flat = (
                 range_covered
                 and minimum_count >= min_visits
@@ -495,7 +526,10 @@ def learn_log_density(
         "round_trips": previous_round_trips + tracker.round_trips,
         "wall_time": time.time() - t0,
         "next_log_f": log_f,
+<<<<<<< HEAD
         "active": active,
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     }
 
 
@@ -603,15 +637,21 @@ def build_distributions(
     c_edges = np.arange(c_min - 0.5, c_max + 1.5, 1.0, dtype=np.float64)
     c_full = np.arange(c_min, c_max + 1, dtype=np.int64)
     c_mass = np.bincount(contacts - c_min, weights=weights, minlength=c_full.size)
+<<<<<<< HEAD
     c_counts_full = np.bincount(contacts - c_min, minlength=c_full.size)
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     positive = c_mass > 0.0
     c_vals = c_full[positive]
     c_prob = c_mass[positive]
     c_prob /= c_prob.sum()
+<<<<<<< HEAD
     # Raw, unweighted visits per contact level.  Every sample in one level shares
     # the same importance weight, so these counts -- not n_samples -- set the
     # per-level statistical error of P0(m) and of P0(Rg | m).
     c_counts = c_counts_full[positive].astype(np.int64)
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
 
     rg_min, rg_max = float(radii.min()), float(radii.max())
     pad = 1e-9 if rg_max <= rg_min else 0.02 * (rg_max - rg_min)
@@ -645,7 +685,10 @@ def build_distributions(
         "weights": weights,
         "c_vals": c_vals,
         "c_prob": c_prob,
+<<<<<<< HEAD
         "c_counts": c_counts,
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
         "c_edges": c_edges,
         "rg_edges": rg_edges,
         "rg_prob": rg_prob,
@@ -767,6 +810,7 @@ def run_self_test() -> int:
             candidate, candidate_occupied, candidate_contact
         )
     checks["incremental contact updates match full recounts"] = delta_updates_agree
+<<<<<<< HEAD
 
     # Regression guard for the gapped contact spectrum.  The 8-bead SAW can reach
     # m=5 but not m=4, so a run that demands flatness over all of [0,5] cannot
@@ -789,6 +833,8 @@ def run_self_test() -> int:
     except RuntimeError:
         gap_learn_ok = False
     checks["learning converges on a gapped window"] = gap_learn_ok
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     print(f"  exact P(m)       = {dict(zip(exact_values.tolist(), exact_prob.tolist()))}")
     print(f"  estimated P(m)   = {dict(zip(built['c_vals'].tolist(), built['c_prob'].tolist()))}")
     print(f"  contact TVD      = {total_variation:.6g}")
@@ -838,11 +884,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--wl_check_every", type=int, default=100_000)
     parser.add_argument("--wl_max_steps", type=int, default=500_000_000)
     parser.add_argument(
+<<<<<<< HEAD
         "--probe_steps", type=int, default=2_000_000,
         help="compacting-bias steps used to find which contact levels are reachable; "
              "0 requires every level in the window to become flat",
     )
     parser.add_argument(
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
         "--checkpoint", type=str, default=None,
         help="write a restartable NPZ after every completed WL refinement stage",
     )
@@ -870,6 +919,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--m_max is required; choose it from the contact support you need")
     if args.m_min != 0 or args.m_max < args.m_min:
         raise ValueError("this implementation requires --m_min=0 and --m_max >= 0")
+<<<<<<< HEAD
     # Edge-isoperimetric bound: N sites induce at most 3N - 3N^(2/3) lattice
     # edges, of which N-1 are bonded, so m <= 2N + 1 - 3N^(2/3).  This is far
     # tighter than the degree bound 2N+1 (51 vs 89 at N=44) and rejects ceilings
@@ -880,6 +930,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--m_max={args.m_max} exceeds the cubic-lattice contact bound "
             f"{rigorous_bound} for N={args.N}"
+=======
+    rigorous_bound = 2 * args.N + 1
+    if args.m_max > rigorous_bound:
+        raise ValueError(
+            f"--m_max={args.m_max} exceeds the cubic-lattice degree bound {rigorous_bound}"
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
         )
     if args.n_workers < 1 or args.steps_per_worker < 1:
         raise ValueError("--n_workers and --steps_per_worker must be positive")
@@ -896,8 +952,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--wl_flatness must lie in (0,1]")
     if min(args.wl_min_visits, args.wl_check_every, args.wl_max_steps) < 1:
         raise ValueError("WL visit/check/step controls must be positive")
+<<<<<<< HEAD
     if args.probe_steps < 0:
         raise ValueError("--probe_steps must be nonnegative")
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     if args.min_production_round_trips < 0:
         raise ValueError("--min_production_round_trips must be nonnegative")
 
@@ -910,6 +969,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     checkpoint = Path(args.checkpoint) if args.checkpoint else None
     resume = Path(args.resume_checkpoint) if args.resume_checkpoint else None
 
+<<<<<<< HEAD
     window = np.arange(args.m_min, args.m_max + 1, dtype=np.int64)
     if args.probe_steps > 0:
         print(f"=== Reachability probe ({args.probe_steps} biased steps) ===", flush=True)
@@ -942,6 +1002,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         probe_visits = np.zeros(window.size, dtype=np.int64)
         active = np.ones(window.size, dtype=bool)
 
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     print("=== Wang-Landau learning (adaptive samples are discarded) ===", flush=True)
     learned = learn_log_density(
         n_beads=args.N,
@@ -954,7 +1016,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_visits=args.wl_min_visits,
         check_every=args.wl_check_every,
         max_steps=args.wl_max_steps,
+<<<<<<< HEAD
         active=active,
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
         checkpoint=checkpoint,
         resume_checkpoint=resume,
     )
@@ -1012,6 +1077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"below required {args.min_production_round_trips}; output was not written"
         )
 
+<<<<<<< HEAD
     production_max_contact = int(contacts.max())
     if production_max_contact < args.m_max:
         print(
@@ -1022,6 +1088,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
 
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     accepted_per_worker = np.asarray([r["accepted_moves"] for r in results], dtype=np.int64)
     valid_per_worker = np.asarray([r["geometrically_valid_moves"] for r in results], dtype=np.int64)
     attempted_per_worker = np.asarray([r["attempted_moves"] for r in results], dtype=np.int64)
@@ -1081,11 +1149,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         importance_effective_sample_size=float(ess),
         importance_effective_fraction=float(ess / contacts.size),
+<<<<<<< HEAD
         n_samples_effective=float(ess),
         production_max_contact=production_max_contact,
         probe_steps=int(args.probe_steps),
         probe_visits=probe_visits,
         wl_active_levels=np.asarray(learned["active"], dtype=bool),
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
         joint_contact_marginal_error=float(built["marginal_m_error"]),
         joint_rg_marginal_error=float(built["marginal_rg_error"]),
     )
@@ -1103,8 +1174,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"joint -> P(m) max error          : {built['marginal_m_error']:.3e}")
     print(f"joint -> P(Rg) max error         : {built['marginal_rg_error']:.3e}")
     print(f"importance ESS                   : {ess:.1f}/{contacts.size}")
+<<<<<<< HEAD
     print(f"min raw visits per sampled level : {int(built['c_counts'].min())}")
     print(f"highest sampled contact level    : {production_max_contact} (window {args.m_max})")
+=======
+>>>>>>> 4dc746c35f0cdf3ea0228c1f540b540a5ae7da91
     print(f"production round trips           : {total_round_trips}")
     print(f"combined production acceptance   : {total_accepted / total_attempted:.4f}")
     print(f"production wall time             : {time.time() - t0:.1f}s")
