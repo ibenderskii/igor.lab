@@ -916,7 +916,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no_joint", action="store_true", help="omit joint P(m,Rg)")
     parser.add_argument("--base_seed", type=int, default=42, help="production seed base")
     parser.add_argument("--wl_seed", type=int, default=1729, help="WL learning seed")
-    parser.add_argument("--n_workers", type=int, default=8, help="fixed-weight production workers")
+    parser.add_argument("--n_workers", type=int, default=12, help="fixed-weight production workers")
     parser.add_argument(
         "--steps_per_worker", type=int, default=400_000_000,
         help="fixed-weight production attempts per worker",

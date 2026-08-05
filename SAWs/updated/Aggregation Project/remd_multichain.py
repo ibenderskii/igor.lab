@@ -2,7 +2,7 @@
 """
 Replica-exchange Monte Carlo for the multi-chain lattice aggregation model.
 
-Simulates M identical connected self-avoiding chains (N beads each) in a
+Simulateses M identical connected self-avoiding chains (N beads each) in a
 periodic cubic box of side L, reusing the validated single-chain contact free
 energy from ``remd_uniform_chain_2_new.py`` WITHOUT refitting.  The reduced
 For the ``hs`` and ``saturating_cooperative_contact`` models, the reduced
