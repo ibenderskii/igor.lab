@@ -790,7 +790,8 @@ def _plot_target_errors(path: Path, metrics: list[dict]) -> None:
         (ax_c, "contact RMSE vs target"),
         (ax_rg, "Rg RMSE vs target"),
     ):
-        axis.set_xticks(x, labels, rotation=25, ha="right")
+        axis.set_xticks(x)
+        axis.set_xticklabels(labels, rotation=25, ha="right")
         axis.set_ylabel(ylabel)
         axis.grid(axis="y", alpha=0.2)
     figure.suptitle("Transfer error across the common temperature ladder")
