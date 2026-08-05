@@ -1,10 +1,10 @@
 {
   "model_name": "saturating_cooperative_contact",
-  "spec_revision": 1,
+  "spec_revision": 2,
   "model_api_version": 3,
   "potential_kind": "saturating_cooperative",
   "status": "implemented",
-  "purpose": "Add bounded cooperative intrachain collapse while preserving the linear model's high-contact behavior and Rg plateau. The cooperative attraction strengthens the collapse at low contact density but its marginal contribution dies off once q >> q_sat, so the marginal slope returns to b(T) instead of growing without bound as an unchecked negative m^2 term does.",
+  "purpose": "Add a bounded cooperative contact interaction while preserving the linear model's high-contact behavior and Rg plateau. In a multichain system the same Hamiltonian applies to the total of all intra- and interchain contacts, so contact energy does not depend on chain identity.",
   "description": "This document is the CONTRACT for the third contact-potential family. It states the exact implemented equations, the parameters and their bounds, the limiting behavior, the multi-chain rule, the metadata every run must record, and the validation requirements. It supersedes the earlier design note for the implemented model: A(T) is temperature-independent (A0) and m_ref is fixed at 0. The optional temperature-dependent extension A(T) = h_A/T - s_A is listed under future_extensions and is NOT implemented.",
 
   "implemented_in": {
@@ -29,8 +29,8 @@
   },
 
   "variables": {
-    "m": "Raw nonbonded intrachain contact count for ONE chain (lattice count; the molecular-to-lattice contact offset is never applied inside the Hamiltonian).",
-    "N": "Number of beads in the chain (runtime chain length).",
+    "m": "Raw nonbonded contact count. For one chain this is m_intra; for the multichain model it is m_total = m_intra + m_inter. The molecular-to-lattice contact offset is never applied inside the Hamiltonian.",
+    "N": "Number of beads represented by m: one-chain N for a single chain and total beads M*N for the multichain Hamiltonian.",
     "m_ref": "Reference contact count used to center q. Fixed at 0 in this implementation and recorded explicitly in every output.",
     "q": "Intensive contact density q = (m - m_ref)/N = m/N, since m_ref = 0.",
     "T": "Temperature in the same units as the fitted Tref/Tscale."
@@ -95,15 +95,15 @@
   },
 
   "multichain_rule": {
-    "equation": "u(X,T) = lambda_intra * sum_alpha u(m_intra_alpha, T; N) + lambda_inter * b(T) * m_inter + kappa_bend * n_bend_total",
-    "per_chain_requirement": "Evaluate the saturating intrachain term SEPARATELY for every chain alpha using that chain's own cached m_intra_alpha and the runtime N.",
-    "prohibited": "Do NOT apply the nonlinear function to the total intrachain contacts sum_alpha m_intra_alpha, nor to m_intra + m_inter. Because u is nonlinear in m, that is a different potential and it manufactures artificial cross-chain coupling: two states with equal total intrachain contacts but different per-chain allocations genuinely have different potentials.",
-    "interchain_term": "Interchain contacts use the SAME fitted h_b and s_b through b(T) = h_b/T - s_b, but carry NO A0/q_sat correction. The single-chain fit does not identify an interchain cooperative term.",
-    "lambda_controls": "lambda_intra multiplies the COMPLETE per-chain intrachain potential; lambda_inter multiplies only the linear interchain term. They are independent multipliers.",
+    "equation": "u(X,T) = lambda_contact * u(m_total, T; M*N) + kappa_bend * n_bend_total, where m_total = m_intra + m_inter and lambda_contact = lambda_intra = lambda_inter",
+    "all_contact_requirement": "Evaluate the complete fitted single-chain Hamiltonian once at the globally unique total contact count m_total and total bead count M*N.",
+    "contact_identity_invariance": "Any two states with the same m_total and total bead count have the same contact potential even if their intra/inter partition or per-chain allocation differs.",
+    "interchain_term": "There is no separate interchain energy term. Interchain contacts participate in the same b(T), A0 and q_sat Hamiltonian as intrachain contacts.",
+    "lambda_controls": "lambda_intra and lambda_inter are retained as input fields for compatibility but must be equal. Unequal values are rejected because they would distinguish intra- from interchain contacts.",
     "bending": "kappa_bend * n_bend_total is a separate additive term, never folded into the contact model. Setting lambda_intra = lambda_inter = 0 does NOT disable bending.",
-    "move_delta_rule": "A proposed move's intrachain contribution is the exact difference of the full per-chain potential at the moved chain's old and new count, lambda_intra * (u(m_alpha + d_intra) - u(m_alpha)). It MUST NOT be approximated as b(T)*d_intra.",
-    "swap_rule": "log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j), evaluated through the same per-chain state-aware potential. The temperature-independent bending term cancels exactly.",
-    "aggregate_helper_rule": "Helpers that see only aggregate contact totals must REJECT this model explicitly; total intrachain contacts cannot determine the sum of the per-chain nonlinear potentials."
+    "move_delta_rule": "A proposed move uses lambda_contact * [u(m_total + d_intra + d_inter, T; M*N) - u(m_total, T; M*N)] plus the bending delta.",
+    "swap_rule": "log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j), evaluated through the same total-contact potential. The temperature-independent bending term cancels exactly.",
+    "aggregate_helper_rule": "Helpers that receive only ContactCounts still reject this model because they do not know the required total bead count M*N."
   },
 
   "metadata_requirements": {
@@ -126,8 +126,8 @@
       "potential_normalization": "q = m/N",
       "quadratic_normalization": "empty string in NPZ / null in JSON -- this family has NO m^2/(2N) term and must not claim one",
       "m_ref": 0,
-      "nonlinear_contact_scope": "intra_per_chain",
-      "interchain_contact_model": "linear_coefficient_only"
+      "nonlinear_contact_scope": "all_contacts_global",
+      "interchain_contact_model": "same_single_chain_potential"
     },
     "quadratic_coefficient": "kappa(T), the coefficient of m^2/(2N), is identically 0 for this model. quadratic_coefficient_by_temperature is therefore all zeros and must NOT be read as evidence that the model is linear -- read potential_definition, A0 and q_sat instead.",
     "named_parameters": "A0 and q_sat are written as named scalars alongside the packed model_params vector, mirroring the h/s convention of the hs model.",
@@ -142,9 +142,9 @@
     "legacy_preservation": "Adding this model must leave every pre-existing model bit-for-bit unchanged: trajectories, observables, move counters, swap counts and potential values compared with ==.",
     "saturation": "With P = N*A0*q_sat^2, r = q/q_sat and C(q) the cooperative correction, BOTH identities must hold numerically and must be tested as distinct quantities: the fraction of plateau magnitude reached, |C(q)|/P = r^2/(1+r^2), and the remaining signed distance above the plateau, C(q) - (-P) = P/(1+r^2), which sum to P. The numerical marginal slope du/dm must approach b(T) as r grows.",
     "extensivity": "u/N at fixed q must be independent of N.",
-    "per_chain_additivity": "In the multi-chain sampler the intrachain potential must equal the sum over chains of u evaluated at each chain's own m_alpha.",
-    "allocation_sensitivity": "Two multi-chain states with equal TOTAL intrachain contacts but different per-chain allocations must have different potentials; a linear model must not be able to tell them apart.",
-    "move_delta": "The exact change in the full potential across an applied move must equal the per-chain full-potential difference plus the linear interchain and bending terms, and must differ from b(T)*delta_m whenever the moved chain's count changes.",
+    "all_contact_formula": "In the multichain sampler the contact potential must equal u(m_intra + m_inter, T; M*N).",
+    "contact_identity_invariance": "Repartitioning a fixed m_total between intra- and interchain contacts or among chains must not change the contact potential.",
+    "move_delta": "The exact change across an applied move must equal the total-contact full-potential difference plus the bending term.",
     "swap_consistency": "The generalized swap must equal a manual four-potential calculation, and must be unchanged by any value of kappa_bend.",
     "determinism": "Serial and multiprocessing runs must be bit-identical, including the per-chain contact cache carried across the process boundary.",
     "contract_parity": "The fitter and the sampler must agree on API version, parameter names and order, potential_kind, potential_definition, potential_normalization, m_ref, requires_chain_length, numeric b(T), and the numeric FULL u(m,T;N) on a grid of temperatures and contact counts. Numeric checks must use NON-DEGENERATE probe parameters: at the registry x0 (A0 = 0) the potential is linear and the nonlinear code is never reached.",
@@ -159,10 +159,10 @@
       "status": "NOT implemented",
       "gate": "Add only if cross-validation on held-out temperatures shows a clear improvement over constant A0."
     },
-    "interchain_cooperativity": {
-      "description": "A saturating cooperative term on interchain contacts",
+    "separate_interchain_parameters": {
+      "description": "Distinct interchain parameters for a deliberately non-transferable comparison model",
       "status": "NOT implemented",
-      "reason": "A single-chain fit does not identify an interchain nonlinear term; adding one would require multi-chain data to constrain it."
+      "reason": "This would break the equal-contact null model and require multichain data to constrain it."
     }
   }
 }
