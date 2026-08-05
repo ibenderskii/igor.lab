@@ -104,12 +104,17 @@ meaningful probability in the mapped target distributions.  Proposals above the
 ceiling are rejected, which leaves the degeneracy within included contact levels
 unchanged.
 
-The learning stage requires every integer contact level from `0` through
-`m_max` to be visited and flat.  It does not silently label an unvisited level
-as inaccessible.  If the requested ceiling is unreachable, or a genuine
-internal gap exists, the run stops at `wl_max_steps` and reports the deficient
-bins.  The user must then verify the geometry or choose a scientifically
-justified lower ceiling.
+By default, the learning stage requires every integer contact level from `0`
+through `m_max` to be visited and flat.  A finite simulation is never used to
+classify an unvisited level as geometrically unreachable.  Known internal gaps
+may be supplied with `--excluded_contact_levels`, but only after independent
+geometric verification.  If learning or production ever encounters an excluded
+level, the run fails and writes no output.
+
+If the requested ceiling is unreachable or an unlisted internal gap exists, the
+run stops at `wl_max_steps` and reports the deficient bins.  The user must then
+verify the geometry or choose a scientifically justified lower ceiling.  The
+contact-window endpoints cannot be excluded.
 
 For the current project, select the ceiling from the shifted REMD contact support
 and then confirm it independently with the support diagnostic.  Do not set the
@@ -129,10 +134,12 @@ The output records:
 - agreement of both joint-distribution marginals with their separately built
   one-dimensional distributions.
 
-At least one summed production round trip is required by default.  A serious
-production run should require several round trips per worker and should inspect
-the worker-to-worker means.  A flat adaptive histogram alone is not evidence of
-adequate fixed-weight production mixing.
+At least one summed production round trip is required by default.  Production
+must also record at least `min_production_samples_per_level` samples in every
+required contact level, with a default minimum of one.  A serious production
+run should increase both checks and inspect the worker-to-worker means.  A flat
+adaptive histogram alone is not evidence of adequate fixed-weight production
+mixing.
 
 ## 6. Output compatibility
 
@@ -146,8 +153,10 @@ The NPZ contains the athermal, reweighted versions of the existing fields:
 The stored raw `c_samples`, `rg_samples`, and `bend_samples` are obtained by
 systematic importance resampling, so their semantics remain athermal rather than
 multicanonical.  The weighted histograms, not the resampled arrays, are the
-authoritative output.  `wl_*` and importance-diagnostic fields are additive and
-can be ignored by legacy readers.
+authoritative output.  `c_counts` is constructed from the same athermal
+resampled contacts.  The raw fixed-weight visit counts are stored separately as
+`production_c_counts`.  `wl_*` and importance-diagnostic fields are additive
+and can be ignored by legacy readers.
 
 ## 7. Validation sequence
 
