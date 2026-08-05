@@ -298,6 +298,112 @@ def _save_checkpoint(
             temporary.unlink()
 
 
+SURVEY_MIN_VISITS = 50
+
+
+def contact_bound(n_beads: int) -> int:
+    """Largest contact number an N-bead cubic-lattice SAW can have.
+
+    N sites induce at most 3N - 3N^(2/3) lattice edges and N-1 of them are
+    bonded, so m <= 2N + 1 - 3N^(2/3).  The Hamiltonian-path constraint makes
+    the true maximum lower still, which is what --find_m_max measures.
+    """
+    return int(2 * n_beads + 1 - 3 * n_beads ** (2.0 / 3.0))
+
+
+def survey_contact_levels(
+    *,
+    n_beads: int,
+    m_min: int,
+    m_max: int,
+    steps: int,
+    seed: int,
+    log_f: float = 1.0,
+) -> np.ndarray:
+    """Run one Wang-Landau stage and return per-level visit counts.
+
+    Wang-Landau drives the chain toward whichever levels it has visited least,
+    so a single stage covers the reachable window on its own.  A fixed-bias
+    probe does not: a weak bias never reaches the compact end and a strong one
+    skips intermediate levels, so different schedules disagree about which
+    levels exist.
+
+    The counts are reported for a human to act on.  Nothing is excluded from any
+    convergence test as a result -- that still requires an explicit
+    --excluded_contact_levels, because a finite run cannot prove a level is
+    unreachable.
+    """
+    rng = random.Random(seed)
+    log_g = np.zeros(m_max - m_min + 1, dtype=np.float64)
+    visits = np.zeros_like(log_g, dtype=np.int64)
+    chain: List[Vec] = [(i, 0, 0) for i in range(n_beads)]
+    occupied = set(chain)
+    contact = contact_count(chain, occupied)
+    visits[contact - m_min] += 1
+    log_g[contact - m_min] += log_f
+    for _ in range(steps):
+        chain, occupied, contact, _, _ = metropolis_step(
+            chain, occupied, contact, log_g, m_min, m_max, rng
+        )
+        visits[contact - m_min] += 1
+        log_g[contact - m_min] += log_f
+    return visits
+
+
+def report_m_max(args: argparse.Namespace) -> int:
+    """Survey the contact window and print a runnable --m_max, then stop."""
+    if args.N < 3:
+        raise ValueError("--N must be at least 3")
+    ceiling = contact_bound(args.N) if args.m_max is None else int(args.m_max)
+    if ceiling > contact_bound(args.N):
+        raise ValueError(
+            f"--m_max={ceiling} exceeds the cubic-lattice contact bound "
+            f"{contact_bound(args.N)} for N={args.N}"
+        )
+    print(
+        f"=== Contact-window survey: N={args.N}, searching [0,{ceiling}], "
+        f"{args.find_m_max_steps} steps ===",
+        flush=True,
+    )
+    visits = survey_contact_levels(
+        n_beads=args.N,
+        m_min=args.m_min,
+        m_max=ceiling,
+        steps=args.find_m_max_steps,
+        seed=args.wl_seed,
+    )
+    window = np.arange(args.m_min, ceiling + 1, dtype=np.int64)
+    reached = visits >= SURVEY_MIN_VISITS
+    if not reached.any():
+        raise RuntimeError("survey visited no contact level often enough; raise --find_m_max_steps")
+    recommended = int(window[reached].max())
+    gaps = window[(~reached) & (window < recommended)].tolist()
+    print(f"{'m':>5} {'visits':>12}")
+    for level, count in zip(window.tolist(), visits.tolist()):
+        flag = ""
+        if count < SURVEY_MIN_VISITS:
+            flag = "  <- below threshold" + (" (candidate internal gap)" if level < recommended else "")
+        print(f"{level:>5} {count:>12}{flag}")
+    print(f"\nrecommended --m_max {recommended}")
+    if gaps:
+        print(f"candidate internal gaps: --excluded_contact_levels {' '.join(map(str, gaps))}")
+        print(
+            "  Verify these before using them.  A level that is merely hard to reach\n"
+            "  is not a gap, and excluding a reachable level aborts the real run."
+        )
+    if recommended < ceiling:
+        print(f"levels {recommended + 1}..{ceiling} were not reached and are excluded from the ceiling.")
+    suggestion = f"  --N {args.N} --m_max {recommended}"
+    if gaps:
+        suggestion += f" --excluded_contact_levels {' '.join(map(str, gaps))}"
+    print(f"\nsuggested production arguments:\n{suggestion}")
+    print(
+        f"\nThis is a {args.find_m_max_steps}-step reconnaissance run, not proof.  "
+        "Raise --find_m_max_steps if the top of the window looks marginal."
+    )
+    return 0
+
+
 def learn_log_density(
     *,
     n_beads: int,
@@ -589,9 +695,18 @@ def build_distributions(
     c_vals = c_full[positive]
     c_prob = c_mass[positive]
     c_prob /= c_prob.sum()
-    # These are visits from the biased fixed-weight production run.  They are
-    # useful diagnostics but are not counts from the athermal distribution.
+    # Raw visits from the biased fixed-weight production run.  These are not
+    # athermal counts, but because every sample in one contact level carries the
+    # same importance weight, they are what sets the statistical error of
+    # P0(m) and of P0(Rg | m) in that level.  n_samples * c_prob does not:
+    # in the compact tail it is orders of magnitude smaller than the number of
+    # samples actually backing the bin, which would report the best-sampled
+    # levels as the worst.
     production_c_counts = production_c_counts_full[positive].astype(np.int64)
+    # Per-level relative standard error, assuming the recorded samples in a
+    # level are independent.  Read this instead of deriving an error from
+    # n_samples or c_prob.
+    c_rel_stderr = 1.0 / np.sqrt(production_c_counts.astype(np.float64))
 
     rg_min, rg_max = float(radii.min()), float(radii.max())
     pad = 1e-9 if rg_max <= rg_min else 0.02 * (rg_max - rg_min)
@@ -626,6 +741,7 @@ def build_distributions(
         "c_vals": c_vals,
         "c_prob": c_prob,
         "production_c_counts": production_c_counts,
+        "c_rel_stderr": c_rel_stderr,
         "c_edges": c_edges,
         "rg_edges": rg_edges,
         "rg_prob": rg_prob,
@@ -802,17 +918,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--wl_seed", type=int, default=1729, help="WL learning seed")
     parser.add_argument("--n_workers", type=int, default=8, help="fixed-weight production workers")
     parser.add_argument(
-        "--steps_per_worker", type=int, default=20_000_000,
+        "--steps_per_worker", type=int, default=400_000_000,
         help="fixed-weight production attempts per worker",
     )
     parser.add_argument("--burnin", type=float, default=0.3, help="production burn-in fraction")
-    parser.add_argument("--sample_every", type=int, default=1000, help="production sampling interval")
+    parser.add_argument("--sample_every", type=int, default=500, help="production sampling interval")
     parser.add_argument("--wl_initial_log_f", type=float, default=1.0)
     parser.add_argument("--wl_final_log_f", type=float, default=1e-6)
     parser.add_argument("--wl_flatness", type=float, default=0.8)
     parser.add_argument("--wl_min_visits", type=int, default=1000)
     parser.add_argument("--wl_check_every", type=int, default=100_000)
     parser.add_argument("--wl_max_steps", type=int, default=500_000_000)
+    parser.add_argument(
+        "--find_m_max", action="store_true",
+        help="survey the contact window, print a usable --m_max and any candidate "
+             "internal gaps, then exit without learning or production",
+    )
+    parser.add_argument(
+        "--find_m_max_steps", type=int, default=3_000_000,
+        help="survey length for --find_m_max (about one minute at N=44)",
+    )
     parser.add_argument(
         "--excluded_contact_levels", type=int, nargs="*", default=[],
         help="verified unreachable internal contact levels to omit from flatness "
@@ -847,15 +972,14 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.N < 3:
         raise ValueError("--N must be at least 3")
     if args.m_max is None:
-        raise ValueError("--m_max is required; choose it from the contact support you need")
+        raise ValueError(
+            "--m_max is required; run with --find_m_max first to get a reachable value"
+        )
     if args.m_min != 0 or args.m_max < args.m_min:
         raise ValueError("this implementation requires --m_min=0 and --m_max >= 0")
-    # Edge-isoperimetric bound: N sites induce at most 3N - 3N^(2/3) lattice
-    # edges, of which N-1 are bonded, so m <= 2N + 1 - 3N^(2/3).  This is far
-    # tighter than the degree bound 2N+1 (51 vs 89 at N=44) and rejects ceilings
-    # that no conformation can reach.  The Hamiltonian-path constraint makes the
-    # true maximum can be lower still.
-    rigorous_bound = int(2 * args.N + 1 - 3 * args.N ** (2.0 / 3.0))
+    # Far tighter than the degree bound 2N+1 (51 vs 89 at N=44); see
+    # contact_bound.  Use --find_m_max for the reachable ceiling.
+    rigorous_bound = contact_bound(args.N)
     if args.m_max > rigorous_bound:
         raise ValueError(
             f"--m_max={args.m_max} exceeds the cubic-lattice contact bound "
@@ -898,6 +1022,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         return run_self_test()
+    if args.find_m_max:
+        return report_m_max(args)
     validate_args(args)
     checkpoint = Path(args.checkpoint) if args.checkpoint else None
     resume = Path(args.resume_checkpoint) if args.resume_checkpoint else None
@@ -993,14 +1119,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         contacts, radii, bends, learned["log_g"], args.m_min, args.rg_bins, args.no_joint
     )
     weights = built.pop("weights")
-    resampled_indices = systematic_resample(
-        weights, np.random.default_rng(args.base_seed + 10_000_019)
-    )
-    resampled_contacts = contacts[resampled_indices]
-    built["c_counts"] = np.asarray(
-        [np.count_nonzero(resampled_contacts == value) for value in built["c_vals"]],
-        dtype=np.int64,
-    )
     ess = effective_sample_size(weights)
     total_round_trips = sum(result["round_trips"] for result in results)
     if total_round_trips < args.min_production_round_trips:
@@ -1076,13 +1194,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sorted(args.excluded_contact_levels), dtype=np.int64
         ),
         min_production_samples_per_level=int(args.min_production_samples_per_level),
+        survey_min_visits=int(SURVEY_MIN_VISITS),
         production_samples_per_level=production_counts_full.astype(np.int64),
         wl_active_levels=np.asarray(learned["active"], dtype=bool),
         joint_contact_marginal_error=float(built["marginal_m_error"]),
         joint_rg_marginal_error=float(built["marginal_rg_error"]),
     )
     if args.save_raw_samples:
-        save["c_samples"] = resampled_contacts
+        resampled_indices = systematic_resample(
+            weights, np.random.default_rng(args.base_seed + 10_000_019)
+        )
+        save["c_samples"] = contacts[resampled_indices]
         save["rg_samples"] = radii[resampled_indices]
         save["bend_samples"] = bends[resampled_indices]
     np.savez_compressed(output_path, **save)
@@ -1097,6 +1219,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         "min production visits per required level: "
         f"{int(production_counts_full[active].min())}"
+    )
+    print(
+        "worst per-level relative error   : "
+        f"{float(built['c_rel_stderr'].max()):.4f} "
+        f"at m={int(built['c_vals'][int(np.argmax(built['c_rel_stderr']))])}"
     )
     print(f"highest sampled contact level    : {production_max_contact} (window {args.m_max})")
     print(f"production round trips           : {total_round_trips}")
