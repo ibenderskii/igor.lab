@@ -172,7 +172,7 @@ def test_saturating_snapshot_records_full_hamiltonian_metadata():
 
 
 def test_multichain_saturating_snapshot_records_full_hamiltonian_metadata():
-    """Multi-chain snapshot: per-chain saturating intra + linear interchain."""
+    """Snapshot metadata records the label-blind saturation Hamiltonian."""
     if not _MULTICHAIN_SCRIPT.is_file():
         pytest.skip(f"entry-point script not found: {_MULTICHAIN_SCRIPT}")
     h5py = _h5py_or_skip()
@@ -229,11 +229,12 @@ def test_multichain_saturating_snapshot_records_full_hamiltonian_metadata():
             assert int(meta["m_ref"]) == 0
             assert str(meta["multichain_potential_definition"]) == \
                 rmc.MULTICHAIN_POTENTIAL_DEFINITION
-            # The nonlinear term is per chain; interchain contacts stay linear.
-            assert str(meta["quadratic_contact_scope"]) == "intra_per_chain"
-            assert str(meta["nonlinear_contact_scope"]) == "intra_per_chain"
+            assert str(meta["quadratic_contact_scope"]) == \
+                "all_contacts_global"
+            assert str(meta["nonlinear_contact_scope"]) == \
+                "all_contacts_global"
             assert str(meta["interchain_contact_model"]) == \
-                "linear_coefficient_only"
+                "same_single_chain_potential"
             assert float(meta["A0"]) == pytest.approx(SAT_PARAMS["A0"])
             assert float(meta["q_sat"]) == pytest.approx(SAT_PARAMS["q_sat"])
             # Runtime N drives q = m/N; the fit length is provenance only.
