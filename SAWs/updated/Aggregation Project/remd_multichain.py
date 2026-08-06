@@ -2,14 +2,47 @@
 """
 Replica-exchange Monte Carlo for the multi-chain lattice aggregation model.
 
-Simulates M identical connected self-avoiding chains (N beads each) in a
+Simulateses M identical connected self-avoiding chains (N beads each) in a
 periodic cubic box of side L, reusing the validated single-chain contact free
 energy from ``remd_uniform_chain_2_new.py`` WITHOUT refitting.  The reduced
-potential is
+LINEAR models (hs, poly2, ...) use the intra/inter split with INDEPENDENT
+scales, which is what the three-control pilot needs:
 
-    u(X, T) = lambda_intra * sum_alpha u_contact(m_intra_alpha(X), T; N)
-              + lambda_inter * b(T) * m_inter(X)
+    u(X, T) = b(T) * [lambda_intra * m_intra + lambda_inter * m_inter]
               + kappa_bend * n_bend_total(X)
+
+(1, 1) is the equal-contact null model, (1, 0) is collapse-only and (0, 1) is
+association-only.
+
+The ``saturating_cooperative_contact`` model is NONLINEAR in the contact count,
+so the intra/inter split cannot be carried through it: it requires
+``lambda_intra == lambda_inter`` and offers two multichain rules.
+
+``cooperativity="global"`` (default, unchanged) applies the fitted single-chain
+Hamiltonian once to the total contact count:
+
+    u(X, T) = lambda_contact * u_contact(m_total(X), T; M*N)
+              + kappa_bend * n_bend_total(X)
+    m_total = m_intra + m_inter
+
+At small q this contains -A0 * m_total^2 / (M*N), an all-to-all coupling between
+every pair of contacts in the box: it is non-additive over non-interacting
+chains and is completely blind to WHERE the contacts are.
+
+``cooperativity="local"`` replaces the box-average density with each monomer's
+own nonbonded contact degree k_i, which counts intra- AND interchain neighbours
+alike so the two boost each other:
+
+    u(X, T) = lambda_contact * [b(T)*m_total - A0 * sum_i g(k_i)]
+              + kappa_bend * n_bend_total(X)
+    g(k) = kappa^2 / (1 + (kappa/q_sat)^2),   kappa = k/2
+
+Since sum_i k_i = 2*m_total exactly, kappa is the local analogue of q = m/N, and
+when every degree is equal (k_i = 2m/N) the sum reproduces the fitted
+single-chain cooperative term EXACTLY with the same A0 and q_sat -- no refit.
+Being a sum of strictly local terms it is exactly additive over separated
+chains.  The contact-quadratic models keep their existing per-chain-intrachain
+plus linear-interchain definition.
 
 where ``u_contact(m, T; N)`` is the generic single-chain contact potential from
 the model API, in whichever of the three families the fitted model belongs to:
@@ -20,25 +53,13 @@ the model API, in whichever of the three families the fitted model belongs to:
 
 where ``b(T)`` is the model's own linear coefficient (``h_b/T - s_b`` for the
 hs family, which includes ``saturating_cooperative_contact``) and ``m_ref = 0``
-for every model, so ``q = m/N`` exactly.  Whatever
-NONLINEAR-in-m structure the model carries -- the fitted ``m^2/(2N)`` curvature
-of ``hs_m2_const`` / ``hs_m2_hs``, or the saturating cooperative attraction of
-``saturating_cooperative_contact`` -- applies PER CHAIN, evaluated separately at
-each chain's own ``m_intra_alpha``; it is NEVER evaluated at the total
-intrachain count sum_alpha m_intra_alpha, which would be a different (and
-wrong) potential.  Interchain contacts stay linear (``b(T) = reduced_bias``,
-using the SAME fitted h_b and s_b but no curvature and no A0/q_sat correction)
-because the single-chain fit does not identify an interchain nonlinear term.
-b(T), kappa(T), A0 and q_sat are loaded through the existing model registry /
-fit_summary.json interfaces.  Raw lattice contact counts
-m_intra_alpha and m_inter are authoritative; the single molecular-to-lattice
-contact offset is NOT applied to the Hamiltonian.  Default
-(lambda_intra, lambda_inter) = (1, 1) (the full-transferability null model);
-(1,0), (0,1), (0,0) select the other control modes.  ``lambda_intra`` multiplies
-the COMPLETE per-chain intrachain contact potential and ``lambda_inter`` only the
-linear interchain term; the bending penalty is independent of both.  Note that
-(lambda_intra, lambda_inter) = (0, 0) disables the contact interactions but does
-NOT disable bending when kappa_bend != 0.
+for every model, so ``q = m/N`` exactly.  In the multichain saturation model,
+``m`` is the globally unique total contact count and ``N`` in that formula is the
+total bead count ``M*N``.  Thus intrachain and interchain contacts enter only
+through their sum and receive the same fitted cooperative Hamiltonian.  The
+single molecular-to-lattice contact offset is NOT applied.  Setting both lambda
+values to zero disables contact interactions but does not disable bending when
+``kappa_bend != 0``.
 
 Sampling weight P(X|T) ∝ exp(-u).  The REMD swap uses the generalized full-state
 reduced-potential rule (evaluated through the shared state-aware potential):
@@ -89,22 +110,110 @@ from multichain_state import MultiChainState, ContactCounts
 SCHEMA_VERSION = mcio.MULTICHAIN_OUTPUT_SCHEMA_VERSION
 MODEL_API_VERSION = remd.MODEL_API_VERSION
 
-# The exact multi-chain potential this sampler realizes, recorded verbatim in the
-# outputs so a reader never has to reconstruct it from the model name.  The
-# per-chain u_contact is the single-chain model potential (whose own definition
-# is recorded separately as ``potential_definition``); the interchain term keeps
-# only the linear coefficient b(T).
+# The exact label-blind potential used by hs and saturating_cooperative_contact.
+# The two retained lambda arguments must be equal and therefore form one common
+# contact scale.  Contact-quadratic models retain the older split definition.
 MULTICHAIN_POTENTIAL_DEFINITION = (
+    "u(X,T) = lambda_contact * u_contact(m_total, T; M*N) "
+    "+ kappa_bend * n_bend_total;  m_total = m_intra + m_inter;  "
+    "lambda_contact = lambda_intra = lambda_inter;  intra- and interchain "
+    "contacts are energetically indistinguishable")
+
+SPLIT_MULTICHAIN_POTENTIAL_DEFINITION = (
     "u(X,T) = lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N) "
     "+ lambda_inter * b(T) * m_inter + kappa_bend * n_bend_total;  "
-    "u_contact is evaluated PER CHAIN (never at the total intrachain count);  "
-    "the interchain term is linear in m_inter with the same fitted b(T)")
+    "u_contact is evaluated per chain and the interchain term is linear")
 
-# Scope label for whatever nonlinear-in-m structure the model carries (the
-# m^2/(2N) curvature, the saturating cooperative term): always per chain, always
-# intrachain only.  ``quadratic_contact_scope`` is retained with this same value
-# for backward compatibility with readers written before the third family.
+LINEAR_SPLIT_MULTICHAIN_POTENTIAL_DEFINITION = (
+    "u(X,T) = b(T) * [lambda_intra * m_intra + lambda_inter * m_inter] "
+    "+ kappa_bend * n_bend_total;  lambda_intra and lambda_inter are "
+    "INDEPENDENT (lambda_intra = lambda_inter = 1 is the equal-contact null "
+    "model; (1,0) and (0,1) are the collapse-only and association-only "
+    "controls)")
+
+LOCAL_MULTICHAIN_POTENTIAL_DEFINITION = (
+    "u(X,T) = lambda_contact * [b(T)*m_total - A0*sum_i g(k_i)] "
+    "+ kappa_bend * n_bend_total;  g(k) = kappa^2/(1 + (kappa/q_sat)^2) with "
+    "kappa = k/2;  k_i is the nonbonded contact degree of monomer i counting "
+    "BOTH intra- and interchain neighbours;  sum_i k_i = 2*m_total;  "
+    "lambda_contact = lambda_intra = lambda_inter")
+
+# Only the SATURATING model is label blind: it is nonlinear in the contact
+# count, so the intra/inter split cannot be carried through it and one common
+# contact scale is required.  hs is LINEAR, so u = b(T)*(l_i*m_intra +
+# l_e*m_inter) is well defined for independent lambdas and is exactly what the
+# three-control pilot (equal / collapse-only / association-only) needs.
+LABEL_BLIND_CONTACT_MODELS = frozenset(("saturating_cooperative_contact",))
+
+# Multichain rule for the saturating-cooperative family:
+#   "global" (default, unchanged): u = u_contact(m_total, T; M*N).  The
+#       cooperative term is -A0*m_total^2/(M*N) at small q, an all-to-all
+#       coupling between every pair of contacts in the box.
+#   "local": the cooperativity acts through each monomer's own contact degree,
+#       so it is short ranged and exactly additive over non-interacting chains.
+COOPERATIVITY_MODES = ("global", "local")
+DEFAULT_COOPERATIVITY = "global"
+
+
+def _validate_cooperativity(mode: str, model_name: str) -> str:
+    m = str(mode)
+    if m not in COOPERATIVITY_MODES:
+        raise ValueError(
+            f"cooperativity must be one of {COOPERATIVITY_MODES}, got {mode!r}")
+    if m == "local" and str(model_name) != "saturating_cooperative_contact":
+        raise ValueError(
+            f"cooperativity='local' applies only to "
+            f"saturating_cooperative_contact, not {model_name!r}")
+    return m
+
+# Scope retained by the contact-quadratic models.  The saturation model reports
+# ``all_contacts_global`` through :func:`_contact_scope` instead.
 NONLINEAR_CONTACT_SCOPE = "intra_per_chain"
+
+
+def _uses_label_blind_contacts(model_name: str) -> bool:
+    return str(model_name) in LABEL_BLIND_CONTACT_MODELS
+
+
+def _label_blind_contact_scale(lambda_intra: float, lambda_inter: float) -> float:
+    """Return the common contact scale, rejecting intra/inter discrimination."""
+    li = float(lambda_intra)
+    lin = float(lambda_inter)
+    if li != lin:
+        raise ValueError(
+            "saturating_cooperative_contact requires "
+            "lambda_intra == lambda_inter so all contacts use one Hamiltonian")
+    return li
+
+
+def _multichain_potential_definition(
+    model_name: str, cooperativity: str = DEFAULT_COOPERATIVITY,
+) -> str:
+    if _uses_label_blind_contacts(model_name):
+        if str(cooperativity) == "local":
+            return LOCAL_MULTICHAIN_POTENTIAL_DEFINITION
+        return MULTICHAIN_POTENTIAL_DEFINITION
+    if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
+        return LINEAR_SPLIT_MULTICHAIN_POTENTIAL_DEFINITION
+    return SPLIT_MULTICHAIN_POTENTIAL_DEFINITION
+
+
+def _contact_scope(model_name: str,
+                   cooperativity: str = DEFAULT_COOPERATIVITY) -> str:
+    if _uses_label_blind_contacts(model_name):
+        return "all_contacts_local_degree" if str(cooperativity) == "local" \
+            else "all_contacts_global"
+    if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
+        return "linear_intra_inter_split"
+    return NONLINEAR_CONTACT_SCOPE
+
+
+def _interchain_contact_model(model_name: str) -> str:
+    if _uses_label_blind_contacts(model_name):
+        return "same_single_chain_potential"
+    if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
+        return "same_linear_coefficient_independent_lambda"
+    return "linear_coefficient_only"
 
 
 def _import_matplotlib():
@@ -124,23 +233,17 @@ def _import_matplotlib():
 def _require_linear_for_aggregate(model_name: str, where: str) -> None:
     """Reject EVERY nonlinear model for the aggregate-count compatibility helpers.
 
-    The aggregate ``ContactCounts`` carries only the TOTAL intrachain count
-    ``sum_alpha m_alpha``.  For any u_contact that is nonlinear in m,
-    ``sum_alpha u_contact(m_alpha)`` is not a function of that total: the
-    quadratic family needs ``sum_alpha m_alpha^2`` and the saturating-cooperative
-    family needs the whole per-chain allocation.  Two states with equal total
-    intrachain contacts but different per-chain splits genuinely have different
-    potentials, so these helpers support linear models only; the per-chain
-    state-aware functions (:func:`reduced_contact_potential_state` and friends)
-    handle every nonlinear model.
+    The contact-quadratic family needs the per-chain allocation, while the
+    saturating-cooperative family needs the total bead count M*N for q.  Neither
+    is available from ``ContactCounts`` alone, so these helpers remain linear-only.
     """
     kind = str(remd.MODEL_REGISTRY[model_name]["potential_kind"])
     if kind != "linear":
         raise NotImplementedError(
             f"{where} received model {model_name!r}, which is nonlinear in m "
             f"(potential_kind={kind!r}); the aggregate ContactCounts carries only "
-            f"the total intrachain count and cannot determine sum_alpha "
-            f"u_contact(m_alpha). Use the per-chain state-aware potential "
+            f"contact totals without the state information needed by this "
+            f"model. Use the state-aware potential "
             f"(reduced_potential_state / reduced_contact_potential_state)."
         )
 
@@ -157,41 +260,74 @@ def reduced_potential_counts(
     """
     _require_linear_for_aggregate(model_name, "reduced_potential_counts")
     b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
+    if _uses_label_blind_contacts(model_name):
+        scale = _label_blind_contact_scale(lambda_intra, lambda_inter)
+        return scale * float(b) * (int(counts.intra) + int(counts.inter))
     return float(b) * (
         float(lambda_intra) * int(counts.intra)
         + float(lambda_inter) * int(counts.inter))
 
 
+def local_cooperative_potential_state(
+    state: MultiChainState, temperature: float, model_name: str, params,
+    Tref: float, Tscale: float,
+) -> float:
+    """Contacts-only saturating potential with LOCAL (per-monomer) cooperativity.
+
+    ``u = b(T)*m_total - A0 * sum_i g(k_i)`` with ``g(k) = kappa^2/(1 +
+    (kappa/q_sat)^2)``, ``kappa = k/2``, and ``k_i`` the nonbonded contact degree
+    of monomer ``i`` counting BOTH intra- and interchain neighbours.  The
+    identity ``sum_i k_i = 2*m_total`` ties the cooperative term to the same
+    authoritative contact pairs as the linear term.
+
+    Reduces to the fitted single-chain potential EXACTLY (same A0, same q_sat)
+    whenever the contact degree is uniform, ``k_i = 2m/N``: then ``kappa = q``
+    and ``sum_i g(k_i) = N*q^2/(1 + (q/q_sat)^2)``.  Unlike the global form it is
+    a sum of strictly local terms, so it is exactly additive over
+    non-interacting chains and it does distinguish states that concentrate their
+    contacts on a few monomers from states that spread them out.
+    """
+    A0, q_sat = remd.validated_saturating_params(params)
+    b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
+    m_total = int(state.counts.intra) + int(state.counts.inter)
+    if A0 == 0.0:
+        return float(b) * m_total  # exact hs nesting; q_sat cannot matter
+    return float(b) * m_total - A0 * mcc.cooperative_sum(state, q_sat)
+
+
 def reduced_contact_potential_state(
     state: MultiChainState, temperature: float, model_name: str, params,
     Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
+    cooperativity: str = DEFAULT_COOPERATIVITY,
 ) -> float:
-    """State-aware contacts-only reduced potential (per-chain intra + linear inter).
+    """State-aware contacts-only reduced potential.
 
-        u_contact = lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N)
-                    + lambda_inter * b(T) * m_inter
+    For saturating_cooperative_contact the contact classification is absent from
+    the energy and one common contact scale applies.  Two multichain rules are
+    available: ``cooperativity="global"`` (default, unchanged) applies the
+    single-chain Hamiltonian once to ``m_total`` using ``M*N`` beads, while
+    ``cooperativity="local"`` routes the cooperative term through each monomer's
+    own contact degree (see :func:`local_cooperative_potential_state`).
 
-    where ``u_contact(m, T; N)`` is the generic single-chain contact potential
-    (:func:`remd.reduced_contact_potential`): ``b(T)*m`` for linear models,
-    ``b(T)*m + kappa(T)*m^2/(2N)`` for the contact-quadratic models, and
-    ``N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)]`` with ``q = m/N`` for the
-    saturating-cooperative model.  It is applied PER CHAIN, evaluated at each
-    chain's OWN cached ``m_intra_alpha`` with the runtime chain length ``N`` --
-    never at the total intrachain count, which for a nonlinear potential is a
-    different quantity entirely.  Whatever nonlinear structure the model carries
-    is intrachain-only; the interchain term keeps ONLY the linear coefficient
-    ``b(T) = reduced_bias`` (the same fitted h_b and s_b, with no curvature and
-    no A0/q_sat correction) because the single-chain fit does not identify an
-    interchain nonlinear term.
+    Linear models use the split form ``b(T) * (lambda_intra * m_intra +
+    lambda_inter * m_inter)`` with INDEPENDENT lambdas.  The contact-quadratic
+    models keep
 
-    ``lambda_intra`` multiplies the COMPLETE per-chain intrachain potential and
-    ``lambda_inter`` only the linear interchain term; they stay independent.
-
-    For linear models this is exactly :func:`reduced_potential_counts` (same
-    arithmetic on the aggregate totals), so legacy behaviour is bit-for-bit
-    unchanged.
+        lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N)
+        + lambda_inter * b(T) * m_inter
     """
     spec = remd.MODEL_REGISTRY[model_name]
+    if _uses_label_blind_contacts(model_name):
+        scale = _label_blind_contact_scale(lambda_intra, lambda_inter)
+        if _validate_cooperativity(cooperativity, model_name) == "local":
+            return scale * local_cooperative_potential_state(
+                state, temperature, model_name, params, Tref, Tscale)
+        m_total = int(state.counts.intra) + int(state.counts.inter)
+        total_beads = int(state.n_chains) * int(state.chain_length)
+        return scale * remd.reduced_contact_potential(
+            m_total, float(temperature), model_name, params, Tref, Tscale,
+            total_beads)
+    _validate_cooperativity(cooperativity, model_name)
     b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
     if spec["potential_kind"] == "linear":
         # Aggregate form: identical to the historical contacts-only potential.
@@ -210,7 +346,7 @@ def reduced_contact_potential_state(
 def reduced_potential_state(
     state: MultiChainState, temperature: float, model_name: str, params,
     Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
-    kappa_bend: float = 0.0,
+    kappa_bend: float = 0.0, cooperativity: str = DEFAULT_COOPERATIVITY,
 ) -> float:
     """Full state-aware reduced potential: contacts + kappa_bend * n_bend_total.
 
@@ -223,7 +359,8 @@ def reduced_potential_state(
     """
     return reduced_contact_potential_state(
         state, temperature, model_name, params, Tref, Tscale,
-        lambda_intra, lambda_inter) + float(kappa_bend) * int(state.n_bend)
+        lambda_intra, lambda_inter,
+        cooperativity=cooperativity) + float(kappa_bend) * int(state.n_bend)
 
 
 def reduced_potential_bending_counts(
@@ -277,15 +414,17 @@ def swap_log_accept_state(
     state_i: MultiChainState, state_j: MultiChainState, T_i: float, T_j: float,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float,
+    cooperativity: str = DEFAULT_COOPERATIVITY,
 ) -> float:
-    """Generalized full-state swap log-acceptance (per-chain aware).
+    """Generalized full-state swap log-acceptance.
 
     log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j)
 
     evaluated through the shared state-aware contacts-only potential
     :func:`reduced_contact_potential_state`, so whatever nonlinear structure the
-    model carries (the ``m^2/(2N)`` curvature, the saturating cooperative term)
-    is honoured per chain.  The fixed reduced bending penalty is
+    model carries is evaluated with its authoritative scope: global total
+    contacts for saturation and per-chain intrachain contacts for the quadratic
+    family.  The fixed reduced bending penalty is
     temperature-independent and identical within each state, so it cancels
     exactly (kappa_bend * (n_i + n_j - n_j - n_i) = 0) and is omitted -- there is
     a single swap rule for all three potential families.  For linear models every
@@ -293,7 +432,8 @@ def swap_log_accept_state(
     """
     def u(state, T):
         return reduced_contact_potential_state(
-            state, T, model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
+            state, T, model_name, params, Tref, Tscale, lambda_intra,
+            lambda_inter, cooperativity=cooperativity)
     return (u(state_i, T_i) + u(state_j, T_j)
             - u(state_j, T_i) - u(state_i, T_j))
 
@@ -327,6 +467,7 @@ def attempt_swap(
     replica_a: "MultiReplica", replica_b: "MultiReplica",
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float, rng: random.Random,
+    cooperativity: str = DEFAULT_COOPERATIVITY,
 ) -> bool:
     """Attempt a generalized REMD state exchange between two lanes.
 
@@ -347,7 +488,8 @@ def attempt_swap(
     """
     log_accept = swap_log_accept_state(
         replica_a.state, replica_b.state, replica_a.T, replica_b.T,
-        model_name, params, Tref, Tscale, lambda_intra, lambda_inter)
+        model_name, params, Tref, Tscale, lambda_intra, lambda_inter,
+        cooperativity=cooperativity)
     if log_accept >= 0.0 or rng.random() < math.exp(log_accept):
         replica_a.state, replica_b.state = replica_b.state, replica_a.state
         return True
@@ -365,18 +507,22 @@ def mc_sweep(
     n_local: int, n_translation: int, rng: random.Random,
     n_reptation: int = 1, n_rotation: int = 1,
     debug_contacts: bool = False, kappa_bend: float = 0.0,
+    cooperativity: str = DEFAULT_COOPERATIVITY,
 ) -> None:
     """Run one lane's local + translation + reptation + rotation proposals in place.
 
-    For a LINEAR model ``du = b(T) * (lambda_intra * d_intra + lambda_inter *
-    d_inter) + kappa_bend * d_bends`` (via :func:`metropolis_accept_delta`).  For
-    every model that is NONLINEAR in m the intra part is the exact difference of
-    the full per-chain contact potential at the moved chain's old and new
-    intrachain count, ``lambda_intra * (u_contact(m_alpha + d_intra) -
-    u_contact(m_alpha))``, never ``b(T) * d_intra``; the interchain part stays
-    ``lambda_inter * b(T) * d_inter``.  Accept if ``du <= 0`` or ``random() <
-    exp(-du)``.  b(T) and kappa_bend are constant across the sweep.  The fixed
-    bending penalty
+    For saturating_cooperative_contact under the default ``cooperativity=
+    "global"`` rule, the contact contribution is the exact difference
+    ``lambda_contact * [u_contact(m_total + d_total; M*N) - u_contact(m_total;
+    M*N)]``, where ``d_total = d_intra + d_inter``.  Under
+    ``cooperativity="local"`` it is instead ``lambda_contact * [b(T)*d_total -
+    A0*delta_S]`` with ``delta_S`` the O(len(moved)) change in the local
+    cooperative sum ``sum_i g(k_i)``.  Linear models (including hs) use the exact
+    historical ``b(T)*(lambda_intra*d_intra + lambda_inter*d_inter)`` with
+    INDEPENDENT lambdas; the contact-quadratic models retain their per-chain
+    intrachain and linear interchain scoring.  Accept if ``du <= 0`` or
+    ``random() < exp(-du)``.  The fixed bending
+    penalty
     ``kappa_bend * d_bends`` defaults off (``kappa_bend == 0``): the bend delta is
     still cached, but it contributes exactly 0 to ``du`` and draws no random
     number, so kappa_bend=0 runs are bit-for-bit identical to the contacts-only
@@ -390,12 +536,24 @@ def mc_sweep(
     li = float(lambda_intra)
     lin = float(lambda_inter)
     kb = float(kappa_bend)
+    label_blind = _uses_label_blind_contacts(model_name)
+    contact_scale = _label_blind_contact_scale(li, lin) if label_blind else 0.0
+    coop = _validate_cooperativity(cooperativity, model_name)
+    local_coop = label_blind and coop == "local"
+    # A0 and q_sat are read once per sweep (they are temperature independent and
+    # invariant under every move).  A0 == 0 nests hs exactly, so the cooperative
+    # sum is never evaluated in that case.
+    if local_coop:
+        A0_coop, q_sat_coop = remd.validated_saturating_params(params)
+    else:
+        A0_coop, q_sat_coop = 0.0, 1.0
     # Runtime chain length for the per-chain normalization (m^2/(2N) for the
     # quadratic family, q = m/N for the saturating one); invariant under every
     # move, so it is read once per sweep.  Every model that is nonlinear in m
     # scores the intra term from the moved chain's cached m_alpha; linear models
     # keep the exact historical b*delta arithmetic (bit-for-bit).
     N = state.chain_length
+    total_beads = int(state.n_chains) * int(N)
     nonlinear = remd.MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
 
     def _attempt(prop):
@@ -408,7 +566,32 @@ def mc_sweep(
             counters[idx, 2] += 1  # state changing
         d_intra, d_inter = mvs.proposal_delta(state, prop)
         d_bends = mvs.proposal_delta_bends(state, prop)
-        if nonlinear:
+        if local_coop:
+            # Local cooperativity: the linear term is exact in the contact
+            # delta, and the cooperative term uses the O(moved) change in
+            # sum_i g(k_i).  Only beads that moved, or whose neighbourhood
+            # gained/lost an occupant, can change degree.
+            d_total = int(d_intra) + int(d_inter)
+            if A0_coop == 0.0:
+                d_contact = b * d_total
+            else:
+                d_S = mcc.delta_cooperative_sum(
+                    state, prop.moved.keys(), prop.new_sites, q_sat_coop)
+                d_contact = b * d_total - A0_coop * d_S
+            du = contact_scale * d_contact + kb * int(d_bends)
+            accept = (du <= 0.0) or (rng.random() < math.exp(-du))
+        elif label_blind:
+            m_old = int(state.counts.intra) + int(state.counts.inter)
+            m_new = m_old + int(d_intra) + int(d_inter)
+            u_old = remd.reduced_contact_potential(
+                m_old, temperature, model_name, params, Tref, Tscale,
+                total_beads)
+            u_new = remd.reduced_contact_potential(
+                m_new, temperature, model_name, params, Tref, Tscale,
+                total_beads)
+            du = contact_scale * (u_new - u_old) + kb * int(d_bends)
+            accept = (du <= 0.0) or (rng.random() < math.exp(-du))
+        elif nonlinear:
             # Nonlinear intra term: evaluate the full per-chain contact potential
             # at the moved chain's OWN old and new intrachain count (never
             # approximate it as b*delta, and never evaluate it at the total
@@ -521,7 +704,7 @@ def evolve_lane_worker(
     n_local: int, n_translation: int, n_reptation: int, n_rotation: int,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float, kappa_bend: float, seed: int,
-    debug_contacts: bool,
+    debug_contacts: bool, cooperativity: str = DEFAULT_COOPERATIVITY,
 ) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int, np.ndarray]:
     """Evolve one lane for a cycle without transferring trajectories.
 
@@ -544,7 +727,8 @@ def evolve_lane_worker(
     mc_sweep(state, counters, temperature, model_name, params, Tref, Tscale,
              lambda_intra, lambda_inter, n_local, n_translation, rng,
              n_reptation=n_reptation, n_rotation=n_rotation,
-             debug_contacts=debug_contacts, kappa_bend=kappa_bend)
+             debug_contacts=debug_contacts, kappa_bend=kappa_bend,
+             cooperativity=cooperativity)
     return (state.coords_unwrapped, state.counts.as_tuple(), counters,
             int(state.n_bend), state.intra_contacts_by_chain)
 
@@ -603,7 +787,7 @@ def run_remd_multichain(
     reptation_sweeps_per_swap: int = 1, rotation_sweeps_per_swap: int = 1,
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float = 1.0, lambda_inter: float = 1.0,
-    kappa_bend: float = 0.0,
+    kappa_bend: float = 0.0, cooperativity: str = DEFAULT_COOPERATIVITY,
     cluster_contact_threshold: int = 1,
     seed: int | None = None, n_workers: int = 1, verbose: bool = True,
     debug_contacts: bool = False,
@@ -623,6 +807,9 @@ def run_remd_multichain(
     kappa_bend = float(kappa_bend)
     if not math.isfinite(kappa_bend) or kappa_bend < 0.0:
         raise ValueError(f"kappa_bend must be finite and >= 0, got {kappa_bend!r}")
+    if _uses_label_blind_contacts(model_name):
+        _label_blind_contact_scale(lambda_intra, lambda_inter)
+    cooperativity = _validate_cooperativity(cooperativity, model_name)
     # Environment-controlled contact debugging works even without the CLI flag.
     debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
 
@@ -668,7 +855,8 @@ def run_remd_multichain(
                         n_local, n_translation, n_reptation, n_rotation,
                         model_name, params, Tref, Tscale,
                         lambda_intra, lambda_inter, kappa_bend,
-                        _lane_seed(base_seed, cycle, k), debug_contacts)
+                        _lane_seed(base_seed, cycle, k), debug_contacts,
+                        cooperativity)
                     for k in range(nT)]
                 for k, fut in enumerate(futures):
                     coords, counts_tuple, counters, n_bend, intra_by_chain = \
@@ -689,7 +877,8 @@ def run_remd_multichain(
                              params, Tref, Tscale, lambda_intra, lambda_inter,
                              n_local, n_translation, rng,
                              n_reptation=n_reptation, n_rotation=n_rotation,
-                             debug_contacts=debug_contacts, kappa_bend=kappa_bend)
+                             debug_contacts=debug_contacts, kappa_bend=kappa_bend,
+                             cooperativity=cooperativity)
 
             # Even/odd adjacent swaps (temperatures fixed to lanes).  The actual
             # production swap operation is attempt_swap; the deterministic
@@ -701,7 +890,7 @@ def run_remd_multichain(
                 swap_rng = random.Random(_lane_seed(base_seed, cycle, 1000 + k))
                 if attempt_swap(replicas[k], replicas[k + 1], model_name, params,
                                 Tref, Tscale, lambda_intra, lambda_inter,
-                                swap_rng):
+                                swap_rng, cooperativity=cooperativity):
                     swap_accs[k] += 1
                     wa, wb = lane_walker[k], lane_walker[k + 1]
                     lane_walker[k], lane_walker[k + 1] = wb, wa
@@ -723,7 +912,8 @@ def run_remd_multichain(
                 cyc = obs.cycle_observables(rep.state, cluster_contact_threshold)
                 u = reduced_potential_state(
                     rep.state, rep.T, model_name, params, Tref, Tscale,
-                    lambda_intra, lambda_inter, kappa_bend)
+                    lambda_intra, lambda_inter, kappa_bend,
+                    cooperativity=cooperativity)
                 rep.u_traj.append(u)
                 rep.eeff_traj.append(rep.T * u)
                 rep.m_intra_traj.append(cyc["m_intra"])
@@ -851,7 +1041,8 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
                     burnin_frac, cluster_contact_threshold, parameter_source,
                     fit_summary_json, reptation_sweeps_per_swap=1,
                     rotation_sweeps_per_swap=1, kappa_bend=0.0,
-                    fit_chain_length=None) -> dict:
+                    fit_chain_length=None,
+                    cooperativity=DEFAULT_COOPERATIVITY) -> dict:
     """Inject full model + run provenance into a distributions/summary dict."""
     dist["schema_version"] = int(SCHEMA_VERSION)
     dist["model_api_version"] = int(MODEL_API_VERSION)
@@ -862,26 +1053,26 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["Tscale"] = float(Tscale)
     dist["lambda_intra"] = float(lambda_intra)
     dist["lambda_inter"] = float(lambda_inter)
-    # Contact-potential contract.  Whatever nonlinear-in-m structure the model
-    # carries applies PER CHAIN to intrachain contacts; interchain contacts keep
-    # only the linear coefficient b(T).  The runtime chain length N is
-    # authoritative for the normalization; fit_chain_length records the length the
-    # model was fitted at (-1 = not recorded / legacy, keeps the NPZ pickle-free).
+    # Contact-potential contract.  hs and saturating_cooperative_contact use one
+    # label-blind total-contact Hamiltonian; the other models retain the split
+    # per-chain-intra / linear-inter definition.
     # potential_definition is the single-chain u_contact actually sampled and
     # multichain_potential_definition is the assembled multi-chain potential;
     # potential_normalization says what the chain length was used for ("" when it
     # was not needed) and m_ref is the contact-number reference (0 everywhere).
     spec = remd.MODEL_REGISTRY[model_name]
     dist["potential_kind"] = str(spec["potential_kind"])
-    dist["quadratic_contact_scope"] = NONLINEAR_CONTACT_SCOPE
-    dist["nonlinear_contact_scope"] = NONLINEAR_CONTACT_SCOPE
-    dist["interchain_contact_model"] = "linear_coefficient_only"
+    dist["quadratic_contact_scope"] = _contact_scope(model_name, cooperativity)
+    dist["nonlinear_contact_scope"] = _contact_scope(model_name, cooperativity)
+    dist["cooperativity"] = str(cooperativity)
+    dist["interchain_contact_model"] = _interchain_contact_model(model_name)
     dist["quadratic_normalization"] = (
         "m_chain^2/(2*N)" if spec["potential_kind"] == "contact_quadratic" else "")
     dist["potential_definition"] = str(spec["potential_definition"])
     dist["potential_normalization"] = str(spec["potential_normalization"] or "")
     dist["m_ref"] = int(spec["m_ref"])
-    dist["multichain_potential_definition"] = MULTICHAIN_POTENTIAL_DEFINITION
+    dist["multichain_potential_definition"] = \
+        _multichain_potential_definition(model_name, cooperativity)
     if str(spec["potential_kind"]) == "saturating_cooperative":
         # Named saturating parameters alongside the packed model_params vector,
         # mirroring the single-chain sampler's convention.
@@ -1019,6 +1210,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "all chains). Loaded from the fit summary when present "
                          "(a supplied value must match it); kappa_bend > 0 enables "
                          "bending, 0 (default) disables it.")
+    ap.add_argument("--cooperativity", type=str, default=DEFAULT_COOPERATIVITY,
+                    choices=list(COOPERATIVITY_MODES),
+                    help="multichain rule for saturating_cooperative_contact. "
+                         "'global' (default, unchanged) evaluates the fitted "
+                         "single-chain potential once at m_total with M*N beads, "
+                         "which couples every contact in the box to every other. "
+                         "'local' routes the cooperative term through each "
+                         "monomer's own nonbonded contact degree (intra AND "
+                         "inter), giving a short-ranged, exactly additive "
+                         "cooperativity with the same fitted A0 and q_sat.")
     ap.add_argument("--cluster-contact-threshold", type=int, default=1,
                     dest="cluster_contact_threshold")
     ap.add_argument("--seed", type=int, default=42)
@@ -1134,13 +1335,13 @@ def main(argv=None) -> None:
     (model_name, model_params, param_names, Tref, Tscale,
      parameter_source, fit_summary_json) = remd.resolve_model_params(args, Ts)
 
-    # This sampler samples the full contact potential in all three families: the
-    # model's nonlinear-in-m structure (the fitted m^2/(2N) curvature, or the
-    # saturating cooperative term) is applied PER CHAIN to intrachain contacts and
-    # interchain contacts stay linear.  The runtime chain length N is required by
-    # every model that needs a normalization -- m^2/(2N) for the quadratic family,
-    # q = m/N for the saturating one (validate_chain_length is a no-op for linear
-    # models).
+    if _uses_label_blind_contacts(model_name):
+        _label_blind_contact_scale(args.lambda_intra, args.lambda_inter)
+    cooperativity = _validate_cooperativity(args.cooperativity, model_name)
+
+    # Validate the fitted single-chain normalization.  The label-blind saturation
+    # Hamiltonian uses M*N total beads at evaluation time, while N remains the
+    # physical chain length and the fit-transfer provenance value.
     remd.validate_chain_length(model_name, args.N)
 
     # Resolve the fixed reduced bending penalty AFTER the model, reusing the
@@ -1173,8 +1374,11 @@ def main(argv=None) -> None:
     print(f"Multi-chain REMD: M={M} N={N} L={L} phi={phi:.4f}, {len(Ts)} lanes "
           f"T in [{Ts.min():.4g}, {Ts.max():.4g}] ({temp_source})")
     print(f"Model: {model_name} — {_spec['description']}")
-    print(f"Intrachain potential (per chain): {_spec['potential_definition']}")
-    print(f"Multichain potential: {MULTICHAIN_POTENTIAL_DEFINITION}")
+    print(f"Single-chain contact potential: {_spec['potential_definition']}")
+    print(f"Multichain potential: "
+          f"{_multichain_potential_definition(model_name, cooperativity)}")
+    if _uses_label_blind_contacts(model_name):
+        print(f"Cooperativity rule: {cooperativity}")
     print(f"m_ref = {int(_spec['m_ref'])}")
     print(f"Parameter source: {parameter_source}"
           + (f" ({fit_summary_json})" if fit_summary_json else ""))
@@ -1212,7 +1416,7 @@ def main(argv=None) -> None:
             n_cycles=args.n_cycles, model_name=model_name, params=model_params,
             Tref=Tref, Tscale=Tscale,
             lambda_intra=args.lambda_intra, lambda_inter=args.lambda_inter,
-            kappa_bend=kappa_bend,
+            kappa_bend=kappa_bend, cooperativity=cooperativity,
             cluster_contact_threshold=args.cluster_contact_threshold,
             seed=args.seed, n_workers=args.n_workers, verbose=True,
             debug_contacts=args.debug_contacts,
@@ -1241,7 +1445,8 @@ def main(argv=None) -> None:
         n_cycles=args.n_cycles, burnin_frac=args.burnin_frac,
         cluster_contact_threshold=args.cluster_contact_threshold,
         parameter_source=parameter_source, fit_summary_json=fit_summary_json,
-        kappa_bend=kappa_bend, fit_chain_length=fit_chain_length)
+        kappa_bend=kappa_bend, fit_chain_length=fit_chain_length,
+        cooperativity=cooperativity)
 
     out_files = {
         "results_csv": mcio.save_results_csv(results, args.out_prefix),
@@ -1280,7 +1485,7 @@ def main(argv=None) -> None:
         Tscale, parameter_source, fit_summary_json, phi, swap_props, swap_accs,
         results, wall, out_files, replicas, diagnostics,
         configuration_path is not None, kappa_bend, bending_enabled,
-        fit_chain_length)
+        fit_chain_length, cooperativity)
     summary_path = f"{args.out_prefix}_run_summary.json"
     out_files["run_summary_json"] = summary_path
     mcio.save_run_summary(run_summary, summary_path)
@@ -1305,9 +1510,11 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         # Contact-potential contract: the Hamiltonian this snapshot file was
         # produced under, stated in full rather than implied by the model name.
         "potential_kind": str(spec["potential_kind"]),
-        "quadratic_contact_scope": NONLINEAR_CONTACT_SCOPE,
-        "nonlinear_contact_scope": NONLINEAR_CONTACT_SCOPE,
-        "interchain_contact_model": "linear_coefficient_only",
+        "quadratic_contact_scope": _contact_scope(model_name,
+                                                  args.cooperativity),
+        "nonlinear_contact_scope": _contact_scope(model_name,
+                                                  args.cooperativity),
+        "interchain_contact_model": _interchain_contact_model(model_name),
         "quadratic_normalization": (
             "m_chain^2/(2*N)"
             if spec["potential_kind"] == "contact_quadratic" else "null"),
@@ -1316,7 +1523,9 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
             str(spec["potential_normalization"])
             if spec["potential_normalization"] is not None else "null"),
         "m_ref": int(spec["m_ref"]),
-        "multichain_potential_definition": MULTICHAIN_POTENTIAL_DEFINITION,
+        "multichain_potential_definition":
+            _multichain_potential_definition(model_name, args.cooperativity),
+        "cooperativity": str(args.cooperativity),
         "runtime_chain_length": int(args.N),
         "fit_chain_length": (int(fit_chain_length)
                              if fit_chain_length is not None else "null"),
@@ -1366,7 +1575,8 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
                  Tref, Tscale, parameter_source, fit_summary_json, phi,
                  swap_props, swap_accs, results, wall, out_files, replicas,
                  diagnostics, snapshots_saved, kappa_bend=0.0,
-                 bending_enabled=False, fit_chain_length=None) -> dict:
+                 bending_enabled=False, fit_chain_length=None,
+                 cooperativity=DEFAULT_COOPERATIVITY) -> dict:
     swap_rates = [float(swap_accs[k] / swap_props[k]) if swap_props[k] else float("nan")
                   for k in range(len(swap_props))]
     M = int(args.n_chains)
@@ -1398,10 +1608,9 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "bending_enabled": bool(bending_enabled),
         "bend_definition": BEND_DEFINITION,
         "bend_fraction": [float(v) for v in bend_fraction],
-        # Contact-potential contract.  Whatever nonlinear-in-m structure the model
-        # carries applies per chain to intrachain contacts; interchain contacts
-        # stay linear.  The runtime N drives the normalization; the fit chain
-        # length is recorded for provenance (null when not recorded).  The
+        # Contact-potential contract.  The runtime N and fit chain length remain
+        # chain-level provenance; for a label-blind nonlinear model the exact
+        # M*N normalization is stated in multichain_potential_definition.  The
         # potential is no longer one b(T) curve once the model is nonlinear in m,
         # so the linear coefficient b(T) and quadratic coefficient kappa(T) (0 for
         # linear models and for the saturating-cooperative model, which has no
@@ -1409,16 +1618,18 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         # single-chain u_contact and multichain_potential_definition the assembled
         # multi-chain potential.
         "potential_kind": str(spec["potential_kind"]),
-        "quadratic_contact_scope": NONLINEAR_CONTACT_SCOPE,
-        "nonlinear_contact_scope": NONLINEAR_CONTACT_SCOPE,
-        "interchain_contact_model": "linear_coefficient_only",
+        "quadratic_contact_scope": _contact_scope(model_name, cooperativity),
+        "nonlinear_contact_scope": _contact_scope(model_name, cooperativity),
+        "cooperativity": str(cooperativity),
+        "interchain_contact_model": _interchain_contact_model(model_name),
         "quadratic_normalization": (
             "m_chain^2/(2*N)"
             if spec["potential_kind"] == "contact_quadratic" else None),
         "potential_definition": str(spec["potential_definition"]),
         "potential_normalization": spec["potential_normalization"],
         "m_ref": int(spec["m_ref"]),
-        "multichain_potential_definition": MULTICHAIN_POTENTIAL_DEFINITION,
+        "multichain_potential_definition":
+            _multichain_potential_definition(model_name, cooperativity),
         "runtime_chain_length": int(N),
         "fit_chain_length": (int(fit_chain_length)
                              if fit_chain_length is not None else None),
@@ -1516,16 +1727,31 @@ def _qt_lambda_modes() -> None:
     b = remd.reduced_bias(*(("hs", [400.0, 1.3], 340.0, 320.0, 80.0)))
     # (0,0): athermal -> u == 0 for any counts.
     assert reduced_potential_counts(c, 340.0, *args_common, 0.0, 0.0) == 0.0
-    # (1,0): u depends only on intra.
+    # hs is LINEAR, so the intra/inter split carries through exactly and the two
+    # scales are INDEPENDENT: (1,0) is the collapse-only control and (0,1) the
+    # association-only control of the three-model pilot.
     u10 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 0.0)
     assert abs(u10 - b * c.intra) < 1e-9
-    # (0,1): u depends only on inter.
     u01 = reduced_potential_counts(c, 340.0, *args_common, 0.0, 1.0)
     assert abs(u01 - b * c.inter) < 1e-9
-    # (1,1): full transferability.
+    for li, lin in ((1.0, 0.0), (0.0, 1.0), (0.5, 0.25), (1.0, 1.0)):
+        u = reduced_potential_counts(c, 340.0, *args_common, li, lin)
+        assert abs(u - b * (li * c.intra + lin * c.inter)) < 1e-12
+    # (1,1): the equal-contact null model.
     u11 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 1.0)
     assert abs(u11 - b * (c.intra + c.inter)) < 1e-9
-    print("  quick-test lambda control modes: PASSED")
+    # The nonlinear saturating model still requires one common scale.
+    sat_args = ("saturating_cooperative_contact", [400.0, 1.3, 0.6, 0.35],
+                320.0, 80.0)
+    for li, lin in ((1.0, 0.0), (0.0, 1.0)):
+        try:
+            reduced_contact_potential_state(state, 340.0, *sat_args, li, lin)
+        except ValueError:
+            pass
+        else:  # pragma: no cover - the guard is the point of this check
+            raise AssertionError("saturating accepted unequal contact scales")
+    print("  quick-test lambda control modes (hs split, saturating common): "
+          "PASSED")
 
 
 def _qt_generalized_swap() -> None:
@@ -1605,137 +1831,95 @@ def _qt_bending() -> None:
 
 
 def _qt_saturating_cooperative() -> None:
-    """Multi-chain sampling of ``saturating_cooperative_contact``.
-
-    The multi-chain potential under test is
-
-        u(X,T) = lambda_intra * sum_alpha u_sat(m_intra_alpha, T; N)
-                 + lambda_inter * b(T) * m_inter
-                 + kappa_bend * n_bend_total
-
-        u_sat(m,T;N) = N*[b(T)*(m/N) - A0*(m/N)^2/(1 + ((m/N)/q_sat)^2)]
-        b(T)         = h_b/T - s_b
-
-    The nonlinear term is evaluated PER CHAIN; the interchain term uses the same
-    fitted h_b and s_b through b(T) but carries no A0/q_sat correction.
-    """
+    """Check the label-blind all-contact saturation Hamiltonian."""
     model = "saturating_cooperative_contact"
-    p = [700.0, 2.4, 5.0, 0.15]        # h_b, s_b, A0, q_sat
-    p0 = [700.0, 2.4, 0.0, 0.15]       # A0 = 0 -> the linear hs potential
+    p = [700.0, 2.4, 5.0, 0.15]
+    p0 = [700.0, 2.4, 0.0, 0.15]
     Tref, Tscale = 320.0, 80.0
     T = 335.0
 
-    def u_sat(m, N):
-        """The definition, transcribed literally."""
+    def u_sat(m, n_beads, temperature=T):
         b = 700.0 / T - 2.4
-        q = float(m) / float(N)
+        if temperature != T:
+            b = 700.0 / float(temperature) - 2.4
+        q = float(m) / float(n_beads)
         r = q / 0.15
-        return float(N) * (b * q - 5.0 * q * q / (1.0 + r * r))
+        return float(n_beads) * (b * q - 5.0 * q * q / (1.0 + r * r))
 
-    # (1) Per-chain additivity: the intrachain potential is the sum over chains of
-    # u_sat evaluated at that chain's OWN m_alpha.
+    # The exact single-chain formula is evaluated at the total contact count and
+    # total bead count.
     state = mcs.initialize_dispersed_state(3, 8, 12, seed=6)
-    N = state.chain_length
-    b = remd.reduced_bias(model, p, T, Tref, Tscale)
-    inter = int(state.counts.inter)
-    assert inter > 0 and int(state.counts.intra) > 0
-    direct = sum(u_sat(int(m), N) for m in state.intra_contacts_by_chain)
-    u10 = reduced_contact_potential_state(state, T, model, p, Tref, Tscale, 1.0, 0.0)
-    assert abs(u10 - direct) < 1e-9, (u10, direct)
+    m_total = int(state.counts.intra) + int(state.counts.inter)
+    total_beads = state.n_chains * state.chain_length
+    got = reduced_contact_potential_state(
+        state, T, model, p, Tref, Tscale, 1.0, 1.0)
+    assert abs(got - u_sat(m_total, total_beads)) < 1e-9
 
-    # (2) The potential is NOT a function of the total intrachain count: two
-    # allocations with the same total give different potentials, and neither
-    # equals u_sat evaluated at the total.  Chain P has 2 intrachain contacts,
-    # chain Q has 1 and chain S (straight) has 0, so (P,S) and (Q,Q) both total 2.
-    P = np.array([(0, 0, 0), (1, 0, 0), (2, 0, 0), (2, 1, 0), (1, 1, 0), (0, 1, 0)],
-                 dtype=np.int64)
-    Q = np.array([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 2, 0), (0, 3, 0)],
-                 dtype=np.int64)
-    S = np.array([(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0), (5, 0, 0)],
-                 dtype=np.int64)
-    far = np.array([0, 10, 0], dtype=np.int64)
-    st_a = mcs.make_state(np.stack([P, S + far]), 30)          # per chain (2, 0)
-    st_b = mcs.make_state(np.stack([Q, Q + far]), 30)          # per chain (1, 1)
-    assert int(st_a.counts.inter) == 0 and int(st_b.counts.inter) == 0
-    assert sorted(st_a.intra_contacts_by_chain.tolist()) == [0, 2]
-    assert sorted(st_b.intra_contacts_by_chain.tolist()) == [1, 1]
-    assert int(st_a.counts.intra) == int(st_b.counts.intra) == 2
-    ua = reduced_contact_potential_state(st_a, T, model, p, Tref, Tscale, 1.0, 1.0)
-    ub = reduced_contact_potential_state(st_b, T, model, p, Tref, Tscale, 1.0, 1.0)
-    assert ua != ub, (
-        "equal total intrachain contacts must not force equal potentials")
-    u_wrong = u_sat(2, 6)   # the forbidden "evaluate at the total" shortcut
-    assert abs(ua - u_wrong) > 1e-9 or abs(ub - u_wrong) > 1e-9
+    # Reclassifying contacts without changing their total cannot change u.
+    state_a = state.copy()
+    state_b = state.copy()
+    state_a.counts = ContactCounts(2, 5)
+    state_b.counts = ContactCounts(5, 2)
+    ua = reduced_contact_potential_state(
+        state_a, T, model, p, Tref, Tscale, 1.0, 1.0)
+    ub = reduced_contact_potential_state(
+        state_b, T, model, p, Tref, Tscale, 1.0, 1.0)
+    assert ua == ub
 
-    # (3) The interchain term is separately linear in m_inter with coefficient
-    # b(T) and no A0/q_sat correction: it is identical for A0 = 5 and A0 = 0.
-    u11 = reduced_contact_potential_state(state, T, model, p, Tref, Tscale, 1.0, 1.0)
-    u01 = reduced_contact_potential_state(state, T, model, p, Tref, Tscale, 0.0, 1.0)
-    assert abs(u01 - b * inter) < 1e-9
-    assert abs((u11 - u10) - b * inter) < 1e-9
-    assert reduced_contact_potential_state(
-        state, T, model, p0, Tref, Tscale, 0.0, 1.0) == u01
-
-    # (4) lambda controls, and bending independent of both.
+    # Unequal contact scales are invalid; equal zero disables contacts only.
+    for li, lin in ((1.0, 0.0), (0.0, 1.0), (0.5, 0.25)):
+        try:
+            reduced_contact_potential_state(
+                state, T, model, p, Tref, Tscale, li, lin)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError("saturation model accepted unequal contact scales")
     assert reduced_contact_potential_state(
         state, T, model, p, Tref, Tscale, 0.0, 0.0) == 0.0
-    assert abs(reduced_contact_potential_state(
-        state, T, model, p, Tref, Tscale, 0.5, 0.25)
-        - (0.5 * direct + 0.25 * b * inter)) < 1e-9
     u_bend = reduced_potential_state(state, T, model, p, Tref, Tscale, 0.0, 0.0,
                                      kappa_bend=0.5)
     assert abs(u_bend - 0.5 * state.n_bend) < 1e-12
-    assert state.n_bend > 0
 
-    # (5) Move deltas use the FULL potential, not b(T)*delta_m.  For each applied
-    # proposal the exact potential difference must equal the sweep's du, and it
-    # must differ from the linear approximation whenever the moved chain's
-    # intrachain count changes.
+    # Every proposal delta equals the exact change in the total-contact potential.
     st = mcs.initialize_dispersed_state(3, 8, 12, seed=23)
     rng = random.Random(11)
     kb = 0.4
-    n_checked = n_nonlinear = 0
+    n_checked = 0
     for _ in range(600):
         prop = mvs.propose_local(st, rng)
         if not prop.ok:
             continue
         d_intra, d_inter = mvs.proposal_delta(st, prop)
         d_bends = mvs.proposal_delta_bends(st, prop)
-        alpha = int(prop.chain)
-        m_old = int(st.intra_contacts_by_chain[alpha])
+        m_old = int(st.counts.intra) + int(st.counts.inter)
+        d_total = int(d_intra) + int(d_inter)
         u_before = reduced_potential_state(st, T, model, p, Tref, Tscale,
                                            1.0, 1.0, kappa_bend=kb)
-        du = (remd.reduced_contact_potential(m_old + d_intra, T, model, p, Tref,
-                                             Tscale, st.chain_length)
-              - remd.reduced_contact_potential(m_old, T, model, p, Tref, Tscale,
-                                               st.chain_length)
-              + b * int(d_inter) + kb * int(d_bends))
+        du = (u_sat(m_old + d_total, st.n_chains * st.chain_length)
+              - u_sat(m_old, st.n_chains * st.chain_length)
+              + kb * int(d_bends))
         mvs.apply_proposal(st, prop, (d_intra, d_inter), delta_bends=d_bends)
         u_after = reduced_potential_state(st, T, model, p, Tref, Tscale,
                                           1.0, 1.0, kappa_bend=kb)
         assert abs((u_after - u_before) - du) < 1e-9
         n_checked += 1
-        if d_intra != 0:
-            linear_du = b * int(d_intra) + b * int(d_inter) + kb * int(d_bends)
-            assert abs(du - linear_du) > 1e-9, (
-                "nonlinear move delta collapsed onto b(T)*delta_m")
-            n_nonlinear += 1
-    assert n_checked > 50 and n_nonlinear > 0
+    assert n_checked > 50
 
-    # (6) Manual generalized swap over the full per-chain potential.
+    # The generalized swap uses the same total-contact Hamiltonian.
     sa = mcs.initialize_dispersed_state(3, 8, 12, seed=21)
     sb = mcs.initialize_dispersed_state(3, 8, 12, seed=22)
     Ti, Tj = 305.0, 350.0
 
     def u_state(s, t):
         return reduced_contact_potential_state(s, t, model, p, Tref, Tscale,
-                                               1.0, 0.6)
+                                               1.0, 1.0)
     manual = (u_state(sa, Ti) + u_state(sb, Tj)
               - u_state(sb, Ti) - u_state(sa, Tj))
-    got = swap_log_accept_state(sa, sb, Ti, Tj, model, p, Tref, Tscale, 1.0, 0.6)
+    got = swap_log_accept_state(sa, sb, Ti, Tj, model, p, Tref, Tscale, 1.0, 1.0)
     assert abs(got - manual) < 1e-9
 
-    # (7) M = 1 reproduces the single-chain full potential (contacts + bending).
+    # M = 1 reproduces the original single-chain Hamiltonian exactly.
     saw_rng = np.random.RandomState(4)
     for _ in range(4):
         one = mcs.make_state(np.stack([mcs.generate_saw(18, saw_rng)]), 60)
@@ -1748,15 +1932,14 @@ def _qt_saturating_cooperative() -> None:
                 n_bend=one.n_bend, n_beads=one.chain_length)
             assert abs(u_mc - u_ref) < 1e-9
 
-    # (8) A0 = 0 reproduces the linear multichain model.
-    for li, lin in ((1.0, 1.0), (1.0, 0.0), (0.0, 1.0)):
-        u_lin = reduced_contact_potential_state(
-            state, T, "hs", [700.0, 2.4], Tref, Tscale, li, lin)
-        u_a0 = reduced_contact_potential_state(
-            state, T, model, p0, Tref, Tscale, li, lin)
-        assert abs(u_a0 - u_lin) < 1e-9
+    # A0 = 0 nests the label-blind hs model.
+    u_lin = reduced_contact_potential_state(
+        state, T, "hs", [700.0, 2.4], Tref, Tscale, 1.0, 1.0)
+    u_a0 = reduced_contact_potential_state(
+        state, T, model, p0, Tref, Tscale, 1.0, 1.0)
+    assert abs(u_a0 - u_lin) < 1e-9
 
-    # (9) Bending disabled / enabled, and serial vs multiprocessing determinism.
+    # Bending disabled / enabled, and serial vs multiprocessing determinism.
     run_kw = dict(n_chains=2, chain_length=8, box_size=10,
                   Ts=np.linspace(305, 350, 4), local_sweeps_per_swap=1,
                   translation_sweeps_per_swap=1, n_cycles=10, model_name=model,
@@ -1779,7 +1962,7 @@ def _qt_saturating_cooperative() -> None:
             mcs.validate_state(ra.state)
         assert all(math.isfinite(x) for r in reps1 for x in r.u_traj)
 
-    # (10) Aggregate ContactCounts helpers must refuse this model outright.
+    # Aggregate ContactCounts helpers lack M*N and must refuse this model.
     for fn, kw in ((reduced_potential_counts, {}),
                    (reduced_potential_bending_counts,
                     dict(kappa_bend=0.3, n_bend=5))):
@@ -1790,9 +1973,8 @@ def _qt_saturating_cooperative() -> None:
         else:  # pragma: no cover - the guard is the point of the test
             raise AssertionError(f"{fn.__name__} accepted a nonlinear model")
 
-    print("  quick-test saturating-cooperative multichain "
-          "(per-chain additivity/allocation/inter-linear/lambdas/move-delta/"
-          "swap/M=1/A0=0/bending/determinism/aggregate-guard): PASSED")
+    print("  quick-test saturating-cooperative all-contact Hamiltonian "
+          "(formula/label-blind/move-delta/swap/M=1/A0=0/determinism): PASSED")
 
 
 def _qt_short_run(n_workers, tmp, tag, lambda_intra=1.0, lambda_inter=1.0,
@@ -1915,7 +2097,7 @@ def _qt_strong_attraction_smoke() -> None:
                   n_cycles=120, model_name="hs", params=[0.0, 4.0], Tref=330.0,
                   Tscale=40.0, seed=7, n_workers=1, verbose=False)
     reps_ath, *_ = run_remd_multichain(lambda_intra=0.0, lambda_inter=0.0, **common)
-    reps_att, *_ = run_remd_multichain(lambda_intra=0.0, lambda_inter=1.0, **common)
+    reps_att, *_ = run_remd_multichain(lambda_intra=1.0, lambda_inter=1.0, **common)
 
     def mean_tail(reps, attr):
         vals = []

@@ -285,6 +285,179 @@ def apply_moved_beads(
 
 
 # ---------------------------------------------------------------------------
+# Per-monomer contact degree and LOCAL cooperative sum
+# ---------------------------------------------------------------------------
+# The contact degree k_i of bead i is the number of its six wrapped nearest
+# neighbour sites occupied by a bead that is NOT one of its covalent neighbours.
+# Both intrachain and interchain neighbours count, so an interchain neighbour
+# raises the same degree that an intrachain neighbour does and the two boost each
+# other cooperatively.  The degree is tied to the authoritative pair counts by
+#
+#     sum_i k_i == 2 * (m_intra + m_inter)
+#
+# because every counted contact contributes one incidence to each of its two
+# endpoints.  This identity is asserted in the debug path.
+#
+# The local cooperative sum is
+#
+#     S(X; q_sat) = sum_i g(k_i),   g(k) = kappa^2 / (1 + (kappa/q_sat)^2),
+#                                   kappa = k / 2,
+#
+# an intensive per-bead contact density kappa (contacts per monomer, the local
+# analogue of q = m/N).  The factor 1/2 is fixed, not free: when every bead has
+# the same degree k_i = 2m/N, kappa = q and S = N*q^2/(1 + (q/q_sat)^2), so
+# A0 * S reproduces the fitted single-chain cooperative term EXACTLY with the
+# same A0 and q_sat.  S is a sum of terms that each depend only on one bead and
+# its six neighbours, so it is strictly local and exactly additive over
+# non-interacting subsystems.
+
+
+def contact_degrees(state: MultiChainState) -> np.ndarray:
+    """Nonbonded contact degree k_i of every bead, shape ``(M*N,)`` (oracle).
+
+    Indexed by global bead ID.  Counts occupied wrapped nearest neighbours that
+    are not covalently bonded, without regard to chain identity, so intra- and
+    interchain neighbours contribute equally.  Satisfies
+    ``contact_degrees(state).sum() == 2 * (counts.intra + counts.inter)``.
+    """
+    N = state.chain_length
+    L = int(state.box_size)
+    deg = np.zeros(int(state.n_chains) * int(N), dtype=np.int64)
+    for site, gid in state.site_owner.items():
+        gid = int(gid)
+        deg[gid] = _degree_at(state.site_owner, gid, site, N, L)
+    return deg
+
+
+def _degree_at(occ: Dict[Site, int], gid: int, site: Site, N: int, L: int) -> int:
+    """Nonbonded contact degree of bead ``gid`` sitting at ``site`` within ``occ``."""
+    ci = gid // N
+    mi = gid % N
+    sx, sy, sz = site
+    k = 0
+    for dx, dy, dz in NN6:
+        g2 = occ.get(((sx + dx) % L, (sy + dy) % L, (sz + dz) % L))
+        if g2 is None:
+            continue
+        g2 = int(g2)
+        if g2 == gid:
+            continue
+        if g2 // N == ci and abs(mi - (g2 % N)) == 1:
+            continue  # covalently bonded: never a contact
+        k += 1
+    return k
+
+
+def cooperative_g(k, q_sat: float) -> float:
+    """``g(k) = kappa^2 / (1 + (kappa/q_sat)^2)`` with ``kappa = k/2``.
+
+    Bounded above by ``q_sat**2``, so the cooperative energy per bead saturates
+    exactly as the single-chain model's does.  ``q_sat > 0`` is the caller's
+    responsibility (validated once when the model parameters are resolved).
+    """
+    kappa = 0.5 * float(k)
+    r = kappa / float(q_sat)
+    return (kappa * kappa) / (1.0 + r * r)
+
+
+def _g_table(q_sat: float) -> Tuple[float, ...]:
+    """``g(k)`` for the only degrees a cubic-lattice chain bead can have (0..6)."""
+    return tuple(cooperative_g(k, q_sat) for k in range(7))
+
+
+def degree_histogram(state: MultiChainState) -> Tuple[int, ...]:
+    """Counts of beads at each possible contact degree 0..6 (oracle; O(M*N)).
+
+    Order independent by construction: only integer counts are accumulated, so
+    the result cannot depend on the iteration order of ``site_owner``.  This
+    matters because the multiprocessing path REBUILDS ``site_owner`` from
+    coordinates while the serial path updates it incrementally, giving the two
+    dicts different iteration orders for the same physical state.
+    """
+    N = state.chain_length
+    L = int(state.box_size)
+    hist = [0] * 7
+    for site, gid in state.site_owner.items():
+        hist[_degree_at(state.site_owner, int(gid), site, N, L)] += 1
+    return tuple(hist)
+
+
+def cooperative_sum(state: MultiChainState, q_sat: float) -> float:
+    """``S = sum_i g(k_i)`` over all beads (oracle; O(M*N)).
+
+    Evaluated as ``sum_k g(k) * n_k`` over the seven possible degrees in fixed
+    ascending order, so the floating-point result is bit-identical for any
+    ``site_owner`` iteration order (serial vs multiprocessing).
+    """
+    g = _g_table(q_sat)
+    hist = degree_histogram(state)
+    total = 0.0
+    for k in range(7):
+        total += g[k] * hist[k]
+    return float(total)
+
+
+def _affected_beads(
+    occ: Dict[Site, int], sites: Dict[int, Site], N: int, L: int,
+) -> set:
+    """Global IDs whose degree can change: the moved beads and their neighbours."""
+    out = set(int(g) for g in sites)
+    for s in sites.values():
+        sx, sy, sz = s
+        for dx, dy, dz in NN6:
+            g2 = occ.get(((sx + dx) % L, (sy + dy) % L, (sz + dz) % L))
+            if g2 is not None:
+                out.add(int(g2))
+    return out
+
+
+def delta_cooperative_sum(
+    state: MultiChainState,
+    moved_ids: Iterable[int],
+    new_sites: Dict[int, Site],
+    q_sat: float,
+) -> float:
+    """Change in ``S`` if ``moved_ids`` move to ``new_sites`` (O(len(moved))).
+
+    A bead's degree can change only if it moved or if one of its six neighbour
+    sites gained or lost an occupant, so only the union of the moved beads and
+    the neighbours of their OLD and NEW sites is re-evaluated.  Returns
+    ``S(after) - S(before)``; the move is assumed geometrically valid (the caller
+    validates it first), exactly as for :func:`delta_contacts`.
+    """
+    g = _g_table(q_sat)
+    N = state.chain_length
+    L = int(state.box_size)
+    moved_ids = [int(x) for x in moved_ids]
+    old_sites: Dict[int, Site] = {x: _wrapped_site(state, x) for x in moved_ids}
+
+    occ_new = dict(state.site_owner)
+    for x in moved_ids:
+        occ_new.pop(old_sites[x], None)
+    for x in moved_ids:
+        occ_new[new_sites[x]] = x
+
+    affected = _affected_beads(state.site_owner, old_sites, N, L)
+    affected |= _affected_beads(occ_new, new_sites, N, L)
+
+    # Accumulate INTEGER per-degree count changes, then contract with g in fixed
+    # ascending degree order.  Only integers are summed over the (unordered) set,
+    # so the float result cannot depend on set iteration order -- which is what
+    # keeps serial and multiprocessing runs bit-identical.
+    dn = [0] * 7
+    for gid in affected:
+        home = _wrapped_site(state, gid)
+        dn[_degree_at(state.site_owner, gid, old_sites.get(gid, home), N, L)] -= 1
+        dn[_degree_at(occ_new, gid, new_sites.get(gid, home), N, L)] += 1
+
+    delta = 0.0
+    for k in range(7):
+        if dn[k]:
+            delta += g[k] * dn[k]
+    return float(delta)
+
+
+# ---------------------------------------------------------------------------
 # Interchain pair aggregation (for the chain-cluster graph)
 # ---------------------------------------------------------------------------
 
@@ -342,3 +515,11 @@ def assert_counts_match(state: MultiChainState, context: str = "") -> None:
         raise AssertionError(
             f"cached intra_contacts_by_chain {cached.tolist()} != full per-chain "
             f"recount {intra_by_chain.tolist()}{' ' + context if context else ''}")
+    # Degree/pair-count identity: every contact contributes one incidence to each
+    # of its two endpoints, so sum_i k_i == 2 * m_total for ANY valid state.
+    deg_sum = int(contact_degrees(state).sum())
+    if deg_sum != 2 * (recount_intra + int(inter)):
+        raise AssertionError(
+            f"sum of contact degrees {deg_sum} != 2*m_total "
+            f"{2 * (recount_intra + int(inter))}"
+            f"{' ' + context if context else ''}")
