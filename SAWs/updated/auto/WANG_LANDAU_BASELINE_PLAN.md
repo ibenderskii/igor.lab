@@ -99,10 +99,13 @@ mixing and variance, not the limiting target measure.
 
 ## 4. Contact-window policy
 
-`m_max` is explicit and required.  It should cover all contact levels that carry
-meaningful probability in the mapped target distributions.  Proposals above the
-ceiling are rejected, which leaves the degeneracy within included contact levels
-unchanged.
+`m_max` must be the independently verified exact geometric contact maximum for
+the selected chain length.  Proposals above that maximum are impossible, so
+rejecting them does not truncate the athermal ensemble.  Using any lower ceiling
+instead samples a conditional distribution rather than the full athermal
+baseline.  The script uses verified maxima 30, 50, and 74 automatically for
+`N=30`, `44`, and `60`; other chain lengths require an externally verified
+exact maximum.
 
 By default, the learning stage requires every integer contact level from `0`
 through `m_max` to be visited and flat.  A finite simulation is never used to
@@ -113,13 +116,13 @@ level, the run fails and writes no output.
 
 If the requested ceiling is unreachable or an unlisted internal gap exists, the
 run stops at `wl_max_steps` and reports the deficient bins.  The user must then
-verify the geometry or choose a scientifically justified lower ceiling.  The
-contact-window endpoints cannot be excluded.
+verify the geometry or any proposed internal gap independently.  The contact
+window cannot be reduced based on finite sampling, and its endpoints cannot be
+excluded.
 
-For the current project, select the ceiling from the shifted REMD contact support
-and then confirm it independently with the support diagnostic.  Do not set the
-ceiling only from the largest contact seen in the old athermal run, since that is
-the sampling limitation this method is intended to test.
+For the current project, use the encoded exact geometric maxima.  Shifted REMD
+contact support can establish the minimum support needed by a fit, but it cannot
+set the ceiling of a complete athermal baseline.
 
 ## 5. Diagnostics required before accepting a production baseline
 
@@ -182,8 +185,8 @@ test.
 
 ## 8. Recommended first production workflow
 
-Pilot the 44-mer before the 60-mer.  Choose `m_max` from the full shifted target
-support that the fit must reproduce.  Run with checkpointing, multiple
-fixed-weight workers, and a production length sufficient for repeated window
-round trips.  Retain the direct athermal baseline as an independent bulk
-comparison rather than replacing or deleting it.
+Pilot the 44-mer before the 60-mer, using the exact geometric `m_max` selected
+automatically for each chain length.  Run with checkpointing, multiple fixed-weight
+workers, and a production length sufficient for repeated window round trips.
+Retain the direct athermal baseline as an independent bulk comparison rather than
+replacing or deleting it.
