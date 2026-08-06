@@ -1,12 +1,23 @@
 {
   "model_name": "saturating_cooperative_contact",
-  "spec_revision": 2,
+  "spec_revision": 3,
   "model_api_version": 3,
   "potential_kind": "saturating_cooperative",
   "status": "implemented",
-  "purpose": "Add a bounded cooperative contact interaction while preserving the linear model's high-contact behavior and Rg plateau. In a multichain system the same Hamiltonian applies to the total of all intra- and interchain contacts, so contact energy does not depend on chain identity.",
+  "purpose": "Add a bounded cooperative contact interaction while preserving the linear model's high-contact behavior and Rg plateau. In a multichain system the same Hamiltonian applies to intra- and interchain contacts alike, so contact energy never depends on chain identity. Whether it depends on the spatial ARRANGEMENT of a fixed number of contacts is set by the cooperativity rule: 'global' is arrangement blind, 'local' is not.",
   "description": "This document is the CONTRACT for the third contact-potential family. It states the exact implemented equations, the parameters and their bounds, the limiting behavior, the multi-chain rule, the metadata every run must record, and the validation requirements. It supersedes the earlier design note for the implemented model: A(T) is temperature-independent (A0) and m_ref is fixed at 0. The optional temperature-dependent extension A(T) = h_A/T - s_A is listed under future_extensions and is NOT implemented.",
-
+  "spec_revision_history": [
+    {
+      "spec_revision": 2,
+      "model_api_version": 3,
+      "change": "Implemented contract: A0 temperature-independent, m_ref = 0, one label-blind multichain Hamiltonian evaluated at m_total with M*N beads."
+    },
+    {
+      "spec_revision": 3,
+      "model_api_version": 3,
+      "change": "Documents the multichain COOPERATIVITY RULE, which revision 2 left implicit. 'global' (default) is revision 2's rule unchanged: u_contact(m_total,T;M*N). 'local' routes the cooperative term through each monomer's own nonbonded contact degree k_i, using the same fitted A0 and q_sat with no refit. Both are label blind, but only 'global' is invariant under repartitioning a fixed m_total. Adds 'cooperativity' to the required multichain metadata and makes nonlinear_contact_scope mode-dependent."
+    }
+  ],
   "implemented_in": {
     "fitters": [
       "ISAW Project/fit_lattice_contact_model_2.py",
@@ -27,7 +38,6 @@
     "registry_key": "saturating_cooperative_contact",
     "registry_key_note": "The MODEL_REGISTRY key is saturating_cooperative_contact; the potential_kind recorded in outputs is saturating_cooperative. There is exactly one registry key -- no alias."
   },
-
   "variables": {
     "m": "Raw nonbonded contact count. For one chain this is m_intra; for the multichain model it is m_total = m_intra + m_inter. The molecular-to-lattice contact offset is never applied inside the Hamiltonian.",
     "N": "Number of beads represented by m: one-chain N for a single chain and total beads M*N for the multichain Hamiltonian.",
@@ -35,7 +45,6 @@
     "q": "Intensive contact density q = (m - m_ref)/N = m/N, since m_ref = 0.",
     "T": "Temperature in the same units as the fitted Tref/Tscale."
   },
-
   "equations": {
     "reduced_potential_per_chain": "u(m,T;N) = N * [ b(T)*q - A0*q^2 / (1 + (q/q_sat)^2) ]",
     "linear_bias": "b(T) = h_b/T - s_b",
@@ -46,26 +55,39 @@
     "linear_part_evaluation": "The linear part is evaluated as b(T)*m, NOT as N*(b(T)*(m/N)). The two agree in exact arithmetic, but the round trip through m/N and back through *N introduces floating-point drift; evaluating b(T)*m directly is what makes A0 = 0 reproduce the hs potential bit for bit.",
     "marginal_slope": "du/dm = b(T) - A0 * d/dq[ q^2/(1 + (q/q_sat)^2) ], which tends to b(T) as q/q_sat -> infinity."
   },
-
   "parameters": {
-    "order": ["h_b", "s_b", "A0", "q_sat"],
+    "order": [
+      "h_b",
+      "s_b",
+      "A0",
+      "q_sat"
+    ],
     "order_note": "Parameter order is authoritative and identical in the fitter, the samplers and every output; params vectors are always written in this order.",
     "h_b": {
       "meaning": "enthalpic part of the linear contact bias, b(T) = h_b/T - s_b",
       "x0": 750.0,
-      "bounds": [-2000.0, 2000.0],
+      "bounds": [
+        -2000.0,
+        2000.0
+      ],
       "temperature_dependence": "enters b(T) as h_b/T"
     },
     "s_b": {
       "meaning": "entropic part of the linear contact bias, b(T) = h_b/T - s_b",
       "x0": 2.8,
-      "bounds": [-10.0, 10.0],
+      "bounds": [
+        -10.0,
+        10.0
+      ],
       "temperature_dependence": "enters b(T) as -s_b"
     },
     "A0": {
       "meaning": "amplitude of the saturating cooperative attraction",
       "x0": 0.0,
-      "bounds": [0.0, 20.0],
+      "bounds": [
+        0.0,
+        20.0
+      ],
       "domain": "A0 >= 0 and finite",
       "domain_reason": "A0 is an attraction amplitude; a negative A0 would be a repulsion dressed up as one.",
       "temperature_dependence": "none (temperature-independent)",
@@ -74,7 +96,10 @@
     "q_sat": {
       "meaning": "contact density at which the cooperative attraction stops strengthening",
       "x0": 0.35,
-      "bounds": [0.02, 2.0],
+      "bounds": [
+        0.02,
+        2.0
+      ],
       "domain": "q_sat > 0 and finite",
       "domain_reason": "q_sat is a saturation scale; q_sat = 0 divides by zero and a negative value is meaningless.",
       "temperature_dependence": "none (temperature-independent)",
@@ -83,7 +108,6 @@
     "requires_chain_length": true,
     "chain_length_rule": "N is required because q = m/N. The RUNTIME N is authoritative; the chain length the model was FIT at is recorded separately as provenance and a mismatch is a permitted, reported chain-length transfer."
   },
-
   "limiting_behavior": {
     "A0_zero": "u(m,T;N) = b(T)*m exactly, for every q_sat and every N. The model nests hs bit for bit: an A0 = 0 run reproduces the seeded hs trajectory, and q_sat has no effect on the potential at all.",
     "m_zero": "u(0,T;N) = 0 for every parameter set (q = 0 makes both terms vanish).",
@@ -93,31 +117,65 @@
     "extensivity": "At fixed q, u/N is independent of N.",
     "expected_effect": "Sharper collapse than the linear model without the continued overcollapse caused by an unchecked negative m^2 term."
   },
-
   "multichain_rule": {
-    "equation": "u(X,T) = lambda_contact * u(m_total, T; M*N) + kappa_bend * n_bend_total, where m_total = m_intra + m_inter and lambda_contact = lambda_intra = lambda_inter",
-    "all_contact_requirement": "Evaluate the complete fitted single-chain Hamiltonian once at the globally unique total contact count m_total and total bead count M*N.",
-    "contact_identity_invariance": "Any two states with the same m_total and total bead count have the same contact potential even if their intra/inter partition or per-chain allocation differs.",
-    "interchain_term": "There is no separate interchain energy term. Interchain contacts participate in the same b(T), A0 and q_sat Hamiltonian as intrachain contacts.",
-    "lambda_controls": "lambda_intra and lambda_inter are retained as input fields for compatibility but must be equal. Unequal values are rejected because they would distinguish intra- from interchain contacts.",
+    "label_blindness": "Common to both cooperativity rules and NOT optional: u_contact is nonlinear in m, so the intra/inter split cannot be carried through it. lambda_intra and lambda_inter are retained as input fields for compatibility but MUST be equal and form lambda_contact; unequal values are rejected because they would distinguish intra- from interchain contacts. This is the one model in the registry with that restriction -- the linear hs model keeps independent lambdas.",
+    "cooperativity_modes": [
+      "global",
+      "local"
+    ],
+    "cooperativity_default": "global",
+    "cooperativity_applicability": "The cooperativity rule applies ONLY to this model; every other registered model rejects a non-default value.",
+    "global": {
+      "equation": "u(X,T) = lambda_contact * u(m_total, T; M*N) + kappa_bend * n_bend_total, where m_total = m_intra + m_inter",
+      "all_contact_requirement": "Evaluate the complete fitted single-chain Hamiltonian once at the globally unique total contact count m_total and total bead count M*N.",
+      "contact_identity_invariance": "Any two states with the same m_total and total bead count have the same contact potential even if their intra/inter partition or per-chain allocation differs.",
+      "move_delta_rule": "lambda_contact * [u(m_total + d_intra + d_inter, T; M*N) - u(m_total, T; M*N)] plus the bending delta.",
+      "physical_reading": "At small q the cooperative term is -A0*m_total^2/(M*N), an all-to-all coupling between every pair of contacts in the box. It is therefore NOT additive over non-interacting chains: two infinitely separated chains have a lower contact energy than the sum of their isolated energies. This is a property of the rule, not a bug, and is the reason the local rule exists.",
+      "nonlinear_contact_scope": "all_contacts_global"
+    },
+    "local": {
+      "equation": "u(X,T) = lambda_contact * [b(T)*m_total - A0*sum_i g(k_i)] + kappa_bend * n_bend_total, with g(k) = kappa^2/(1 + (kappa/q_sat)^2) and kappa = k/2",
+      "degree_definition": "k_i is the nonbonded contact degree of monomer i, counting BOTH intra- and interchain neighbours alike, so the two boost each other. Bonded neighbours are excluded exactly as in the contact count itself.",
+      "no_refit": "Since sum_i k_i = 2*m_total exactly, kappa = k_i/2 is the local analogue of q = m/N. When every degree is equal (k_i = 2m/N) the sum reproduces the fitted single-chain cooperative term EXACTLY with the same A0 and q_sat. No parameter is refit or rescaled.",
+      "additivity": "Being a sum of strictly local terms, the potential is exactly additive over separated chains: two non-interacting chains have the sum of their isolated energies.",
+      "contact_identity_invariance": "Label blind but NOT partition invariant. Repartitioning a fixed m_total between intra- and interchain contacts leaves the energy unchanged only when the degree sequence {k_i} is unchanged; rearranging the same number of contacts into a different degree distribution does change the energy. The global rule's stronger invariance does NOT hold here.",
+      "move_delta_rule": "lambda_contact * [b(T)*d_total - A0*delta_S], where delta_S is the O(len(moved)) change in sum_i g(k_i). Only beads that moved, or whose neighbourhood gained or lost an occupant, can change degree.",
+      "nonlinear_contact_scope": "all_contacts_local_degree"
+    },
+    "nesting": "At A0 = 0 both rules reduce to lambda_contact * b(T) * m_total bit for bit, so an A0 = 0 run reproduces the seeded hs trajectory under either mode and the cooperative sum is never evaluated.",
+    "interchain_term": "There is no separate interchain energy term under either rule. Interchain contacts participate in the same b(T), A0 and q_sat Hamiltonian as intrachain contacts.",
     "bending": "kappa_bend * n_bend_total is a separate additive term, never folded into the contact model. Setting lambda_intra = lambda_inter = 0 does NOT disable bending.",
-    "move_delta_rule": "A proposed move uses lambda_contact * [u(m_total + d_intra + d_inter, T; M*N) - u(m_total, T; M*N)] plus the bending delta.",
-    "swap_rule": "log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j), evaluated through the same total-contact potential. The temperature-independent bending term cancels exactly.",
-    "aggregate_helper_rule": "Helpers that receive only ContactCounts still reject this model because they do not know the required total bead count M*N."
+    "swap_rule": "log_accept = u(X_i,T_i) + u(X_j,T_j) - u(X_j,T_i) - u(X_i,T_j), evaluated through whichever contact rule the run selected. The temperature-independent bending term cancels exactly.",
+    "aggregate_helper_rule": "Helpers that receive only ContactCounts reject this model under both rules: the global rule needs the total bead count M*N and the local rule needs the full degree sequence, neither of which is recoverable from contact totals."
   },
-
   "metadata_requirements": {
     "must_record": [
-      "model_api_version", "model_name", "param_names", "model_params",
-      "Tref", "Tscale", "potential_kind", "potential_definition",
-      "potential_normalization", "m_ref", "A0", "q_sat",
-      "runtime_chain_length", "fit_chain_length"
+      "model_api_version",
+      "model_name",
+      "param_names",
+      "model_params",
+      "Tref",
+      "Tscale",
+      "potential_kind",
+      "potential_definition",
+      "potential_normalization",
+      "m_ref",
+      "A0",
+      "q_sat",
+      "runtime_chain_length",
+      "fit_chain_length"
     ],
     "multichain_additional": [
-      "multichain_potential_definition", "nonlinear_contact_scope",
-      "quadratic_contact_scope", "interchain_contact_model",
-      "lambda_intra", "lambda_inter",
-      "kappa_bend", "bending_enabled", "bend_definition"
+      "multichain_potential_definition",
+      "cooperativity",
+      "nonlinear_contact_scope",
+      "quadratic_contact_scope",
+      "interchain_contact_model",
+      "lambda_intra",
+      "lambda_inter",
+      "kappa_bend",
+      "bending_enabled",
+      "bend_definition"
     ],
     "values": {
       "model_api_version": 3,
@@ -126,15 +184,16 @@
       "potential_normalization": "q = m/N",
       "quadratic_normalization": "empty string in NPZ / null in JSON -- this family has NO m^2/(2N) term and must not claim one",
       "m_ref": 0,
-      "nonlinear_contact_scope": "all_contacts_global",
-      "interchain_contact_model": "same_single_chain_potential"
+      "nonlinear_contact_scope": "'all_contacts_global' under cooperativity='global'; 'all_contacts_local_degree' under cooperativity='local'",
+      "interchain_contact_model": "same_single_chain_potential",
+      "cooperativity": "'global' or 'local'; recorded on every multichain run, including runs of other models, where it is always 'global'"
     },
     "quadratic_coefficient": "kappa(T), the coefficient of m^2/(2N), is identically 0 for this model. quadratic_coefficient_by_temperature is therefore all zeros and must NOT be read as evidence that the model is linear -- read potential_definition, A0 and q_sat instead.",
     "named_parameters": "A0 and q_sat are written as named scalars alongside the packed model_params vector, mirroring the h/s convention of the hs model.",
     "npz_safety": "All metadata values are strings, ints or floats -- no None and no object arrays -- so distributions NPZ files load with allow_pickle=False.",
-    "additivity": "Every field above is ADDITIVE. No pre-existing field name, type or value is repurposed, so readers written against model API v1/v2 outputs keep working."
+    "additivity": "Every field above is ADDITIVE. No pre-existing field name, type or value is repurposed, so readers written against model API v1/v2 outputs keep working.",
+    "cooperativity_disambiguation": "cooperativity is the only field that distinguishes the two multichain rules at fixed parameters. potential_definition, potential_kind, A0 and q_sat are IDENTICAL under both, so a reader must not infer the sampled multichain Hamiltonian from them; read cooperativity and multichain_potential_definition."
   },
-
   "validation_requirements": {
     "parameter_domain": "A0 >= 0, q_sat > 0, both finite, enforced when parameters are RESOLVED (validate_model_params / fit summary load), not lazily at the first potential evaluation. Out-of-domain parameters must raise rather than produce a silent NaN.",
     "exact_formula": "u from the model API must equal a directly transcribed N*(b*q - A0*q^2/(1+(q/q_sat)^2)) to floating-point tolerance.",
@@ -142,17 +201,17 @@
     "legacy_preservation": "Adding this model must leave every pre-existing model bit-for-bit unchanged: trajectories, observables, move counters, swap counts and potential values compared with ==.",
     "saturation": "With P = N*A0*q_sat^2, r = q/q_sat and C(q) the cooperative correction, BOTH identities must hold numerically and must be tested as distinct quantities: the fraction of plateau magnitude reached, |C(q)|/P = r^2/(1+r^2), and the remaining signed distance above the plateau, C(q) - (-P) = P/(1+r^2), which sum to P. The numerical marginal slope du/dm must approach b(T) as r grows.",
     "extensivity": "u/N at fixed q must be independent of N.",
-    "all_contact_formula": "In the multichain sampler the contact potential must equal u(m_intra + m_inter, T; M*N).",
-    "contact_identity_invariance": "Repartitioning a fixed m_total between intra- and interchain contacts or among chains must not change the contact potential.",
-    "move_delta": "The exact change across an applied move must equal the total-contact full-potential difference plus the bending term.",
+    "all_contact_formula": "Under cooperativity='global' the multichain contact potential must equal u(m_intra + m_inter, T; M*N).",
+    "contact_identity_invariance": "Under cooperativity='global', repartitioning a fixed m_total between intra- and interchain contacts or among chains must not change the contact potential. This test is specific to the global rule and must NOT be applied to the local rule, which is deliberately arrangement sensitive.",
+    "move_delta": "The exact change across an applied move must equal the full-potential difference under the selected cooperativity rule plus the bending term.",
     "swap_consistency": "The generalized swap must equal a manual four-potential calculation, and must be unchanged by any value of kappa_bend.",
     "determinism": "Serial and multiprocessing runs must be bit-identical, including the per-chain contact cache carried across the process boundary.",
     "contract_parity": "The fitter and the sampler must agree on API version, parameter names and order, potential_kind, potential_definition, potential_normalization, m_ref, requires_chain_length, numeric b(T), and the numeric FULL u(m,T;N) on a grid of temperatures and contact counts. Numeric checks must use NON-DEGENERATE probe parameters: at the registry x0 (A0 = 0) the potential is linear and the nonlinear code is never reached.",
     "insufficient_checks": "b(T) alone cannot distinguish this model from hs or hs_m2_const at the same (h, s), and kappa(T) from raw_q_fn is identically zero here as well as for the linear models. Neither may be used as the only nonlinear contract check.",
     "identifiability_reporting": "A0 is the nested extra term for uncertainty reporting: flag it when its bootstrap CI brackets zero or its fitted magnitude is negligible, and in that case report q_sat as WEAKLY IDENTIFIED rather than interpreting it as a saturation density.",
-    "model_selection": "Fit against both P(m|T) and P(Rg|T) and compare against the linear and contact-quadratic models on HELD-OUT temperatures. A nested model evaluated at its linear limit still fits; only an out-of-sample improvement supports the extra structure."
+    "model_selection": "Fit against both P(m|T) and P(Rg|T) and compare against the linear and contact-quadratic models on HELD-OUT temperatures. A nested model evaluated at its linear limit still fits; only an out-of-sample improvement supports the extra structure.",
+    "local_cooperativity": "Under cooperativity='local': (a) the incremental delta_S from an applied move must equal a full recount of sum_i g(k_i) to floating-point tolerance; (b) at a uniform degree sequence the potential must equal the global-rule potential with the same A0 and q_sat; (c) the potential must be exactly additive over separated chains; (d) at A0 = 0 it must equal the global rule bit for bit."
   },
-
   "future_extensions": {
     "temperature_dependent_amplitude": {
       "equation": "A(T) = h_A/T - s_A in place of the constant A0",
