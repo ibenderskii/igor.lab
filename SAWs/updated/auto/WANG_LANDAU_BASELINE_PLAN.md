@@ -99,22 +99,30 @@ mixing and variance, not the limiting target measure.
 
 ## 4. Contact-window policy
 
-`m_max` is explicit and required.  It should cover all contact levels that carry
-meaningful probability in the mapped target distributions.  Proposals above the
-ceiling are rejected, which leaves the degeneracy within included contact levels
-unchanged.
+`m_max` must be the independently verified exact geometric contact maximum for
+the selected chain length.  Proposals above that maximum are impossible, so
+rejecting them does not truncate the athermal ensemble.  Using any lower ceiling
+instead samples a conditional distribution rather than the full athermal
+baseline.  The script uses verified maxima 30, 50, and 74 automatically for
+`N=30`, `44`, and `60`; other chain lengths require an externally verified
+exact maximum.
 
-The learning stage requires every integer contact level from `0` through
-`m_max` to be visited and flat.  It does not silently label an unvisited level
-as inaccessible.  If the requested ceiling is unreachable, or a genuine
-internal gap exists, the run stops at `wl_max_steps` and reports the deficient
-bins.  The user must then verify the geometry or choose a scientifically
-justified lower ceiling.
+By default, the learning stage requires every integer contact level from `0`
+through `m_max` to be visited and flat.  A finite simulation is never used to
+classify an unvisited level as geometrically unreachable.  Known internal gaps
+may be supplied with `--excluded_contact_levels`, but only after independent
+geometric verification.  If learning or production ever encounters an excluded
+level, the run fails and writes no output.
 
-For the current project, select the ceiling from the shifted REMD contact support
-and then confirm it independently with the support diagnostic.  Do not set the
-ceiling only from the largest contact seen in the old athermal run, since that is
-the sampling limitation this method is intended to test.
+If the requested ceiling is unreachable or an unlisted internal gap exists, the
+run stops at `wl_max_steps` and reports the deficient bins.  The user must then
+verify the geometry or any proposed internal gap independently.  The contact
+window cannot be reduced based on finite sampling, and its endpoints cannot be
+excluded.
+
+For the current project, use the encoded exact geometric maxima.  Shifted REMD
+contact support can establish the minimum support needed by a fit, but it cannot
+set the ceiling of a complete athermal baseline.
 
 ## 5. Diagnostics required before accepting a production baseline
 
@@ -129,10 +137,12 @@ The output records:
 - agreement of both joint-distribution marginals with their separately built
   one-dimensional distributions.
 
-At least one summed production round trip is required by default.  A serious
-production run should require several round trips per worker and should inspect
-the worker-to-worker means.  A flat adaptive histogram alone is not evidence of
-adequate fixed-weight production mixing.
+At least one summed production round trip is required by default.  Production
+must also record at least `min_production_samples_per_level` samples in every
+required contact level, with a default minimum of one.  A serious production
+run should increase both checks and inspect the worker-to-worker means.  A flat
+adaptive histogram alone is not evidence of adequate fixed-weight production
+mixing.
 
 ## 6. Output compatibility
 
@@ -146,8 +156,10 @@ The NPZ contains the athermal, reweighted versions of the existing fields:
 The stored raw `c_samples`, `rg_samples`, and `bend_samples` are obtained by
 systematic importance resampling, so their semantics remain athermal rather than
 multicanonical.  The weighted histograms, not the resampled arrays, are the
-authoritative output.  `wl_*` and importance-diagnostic fields are additive and
-can be ignored by legacy readers.
+authoritative output.  `c_counts` is constructed from the same athermal
+resampled contacts.  The raw fixed-weight visit counts are stored separately as
+`production_c_counts`.  `wl_*` and importance-diagnostic fields are additive
+and can be ignored by legacy readers.
 
 ## 7. Validation sequence
 
@@ -173,8 +185,8 @@ test.
 
 ## 8. Recommended first production workflow
 
-Pilot the 44-mer before the 60-mer.  Choose `m_max` from the full shifted target
-support that the fit must reproduce.  Run with checkpointing, multiple
-fixed-weight workers, and a production length sufficient for repeated window
-round trips.  Retain the direct athermal baseline as an independent bulk
-comparison rather than replacing or deleting it.
+Pilot the 44-mer before the 60-mer, using the exact geometric `m_max` selected
+automatically for each chain length.  Run with checkpointing, multiple fixed-weight
+workers, and a production length sufficient for repeated window round trips.
+Retain the direct athermal baseline as an independent bulk comparison rather than
+replacing or deleting it.
