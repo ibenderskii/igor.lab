@@ -75,12 +75,29 @@ def test_athermal_all_configs_equal_potential():
 
 
 @pytest.mark.parametrize("lambda_intra,lambda_inter", [
+    (1.0, 1.0), (1.0, 0.0), (0.0, 1.0), (0.5, 0.25),
+])
+def test_hs_supports_independent_contact_scales(lambda_intra, lambda_inter):
+    # hs is LINEAR in the contact count, so the intra/inter split carries
+    # through exactly and the two scales are independent.  (1,0) and (0,1) are
+    # the collapse-only and association-only pilot controls; forcing
+    # lambda_intra == lambda_inter would make them unreachable.
+    c = ContactCounts(4, 3)
+    b = remd.reduced_bias(*MP[:2], 330.0, *MP[2:])
+    u = rmc.reduced_potential_counts(c, 330.0, *MP, lambda_intra, lambda_inter)
+    assert u == b * (lambda_intra * c.intra + lambda_inter * c.inter)
+
+
+@pytest.mark.parametrize("lambda_intra,lambda_inter", [
     (1.0, 0.0), (0.0, 1.0), (0.5, 0.25),
 ])
-def test_hs_rejects_unequal_contact_scales(lambda_intra, lambda_inter):
+def test_saturating_rejects_unequal_contact_scales(lambda_intra, lambda_inter):
+    # Only the model that is NONLINEAR in m needs one common contact scale.
+    state = mcs.initialize_dispersed_state(3, 8, 12, seed=4)
     with pytest.raises(ValueError, match="lambda_intra == lambda_inter"):
-        rmc.reduced_potential_counts(
-            ContactCounts(4, 3), 330.0, *MP, lambda_intra, lambda_inter)
+        rmc.reduced_contact_potential_state(
+            state, 330.0, SAT, SAT_P, QTREF, QTSCALE,
+            lambda_intra, lambda_inter)
 
 
 def test_m1_lambda_intra_matches_single_chain():
@@ -1023,10 +1040,11 @@ def test_per_chain_sum_equals_total_intra():
         mcs.validate_state(state)
 
 
-def test_hs_state_potential_equals_label_blind_aggregate_formula():
+def test_hs_state_potential_equals_split_aggregate_formula():
     state = mcs.initialize_dispersed_state(3, 8, 12, seed=7)
     for T in (300.0, 330.0, 345.0):
-        for li, lin in ((1.0, 1.0), (0.0, 0.0), (0.7, 0.7)):
+        for li, lin in ((1.0, 1.0), (0.0, 0.0), (0.7, 0.7),
+                        (1.0, 0.0), (0.0, 1.0), (0.5, 0.25)):
             u_state = rmc.reduced_contact_potential_state(
                 state, T, *MP, li, lin)
             u_agg = rmc.reduced_potential_counts(state.counts, T, *MP, li, lin)

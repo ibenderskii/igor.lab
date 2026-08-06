@@ -5,17 +5,11 @@ Replica-exchange Monte Carlo for the multi-chain lattice aggregation model.
 Simulateses M identical connected self-avoiding chains (N beads each) in a
 periodic cubic box of side L, reusing the validated single-chain contact free
 energy from ``remd_uniform_chain_2_new.py`` WITHOUT refitting.  The reduced
-For the ``hs`` and ``saturating_cooperative_contact`` models, the reduced
-potential is the selected single-chain Hamiltonian applied to every contact:
+LINEAR models (hs, poly2, ...) use the intra/inter split with INDEPENDENT
+scales, which is what the three-control pilot needs:
 
-    u(X, T) = lambda_contact * u_contact(m_total(X), T; M*N)
+    u(X, T) = b(T) * [lambda_intra * m_intra + lambda_inter * m_inter]
               + kappa_bend * n_bend_total(X)
-    m_total = m_intra + m_inter
-
-where ``lambda_contact = lambda_intra = lambda_inter``.  Unequal lambda values
-are rejected for these two models because they would make the Hamiltonian depend
-on whether a contact is intra- or interchain.  The contact-quadratic models keep
-their existing per-chain-intrachain plus linear-interchain definition.
 
 (1, 1) is the equal-contact null model, (1, 0) is collapse-only and (0, 1) is
 association-only.
@@ -130,7 +124,47 @@ SPLIT_MULTICHAIN_POTENTIAL_DEFINITION = (
     "+ lambda_inter * b(T) * m_inter + kappa_bend * n_bend_total;  "
     "u_contact is evaluated per chain and the interchain term is linear")
 
-LABEL_BLIND_CONTACT_MODELS = frozenset(("hs", "saturating_cooperative_contact"))
+LINEAR_SPLIT_MULTICHAIN_POTENTIAL_DEFINITION = (
+    "u(X,T) = b(T) * [lambda_intra * m_intra + lambda_inter * m_inter] "
+    "+ kappa_bend * n_bend_total;  lambda_intra and lambda_inter are "
+    "INDEPENDENT (lambda_intra = lambda_inter = 1 is the equal-contact null "
+    "model; (1,0) and (0,1) are the collapse-only and association-only "
+    "controls)")
+
+LOCAL_MULTICHAIN_POTENTIAL_DEFINITION = (
+    "u(X,T) = lambda_contact * [b(T)*m_total - A0*sum_i g(k_i)] "
+    "+ kappa_bend * n_bend_total;  g(k) = kappa^2/(1 + (kappa/q_sat)^2) with "
+    "kappa = k/2;  k_i is the nonbonded contact degree of monomer i counting "
+    "BOTH intra- and interchain neighbours;  sum_i k_i = 2*m_total;  "
+    "lambda_contact = lambda_intra = lambda_inter")
+
+# Only the SATURATING model is label blind: it is nonlinear in the contact
+# count, so the intra/inter split cannot be carried through it and one common
+# contact scale is required.  hs is LINEAR, so u = b(T)*(l_i*m_intra +
+# l_e*m_inter) is well defined for independent lambdas and is exactly what the
+# three-control pilot (equal / collapse-only / association-only) needs.
+LABEL_BLIND_CONTACT_MODELS = frozenset(("saturating_cooperative_contact",))
+
+# Multichain rule for the saturating-cooperative family:
+#   "global" (default, unchanged): u = u_contact(m_total, T; M*N).  The
+#       cooperative term is -A0*m_total^2/(M*N) at small q, an all-to-all
+#       coupling between every pair of contacts in the box.
+#   "local": the cooperativity acts through each monomer's own contact degree,
+#       so it is short ranged and exactly additive over non-interacting chains.
+COOPERATIVITY_MODES = ("global", "local")
+DEFAULT_COOPERATIVITY = "global"
+
+
+def _validate_cooperativity(mode: str, model_name: str) -> str:
+    m = str(mode)
+    if m not in COOPERATIVITY_MODES:
+        raise ValueError(
+            f"cooperativity must be one of {COOPERATIVITY_MODES}, got {mode!r}")
+    if m == "local" and str(model_name) != "saturating_cooperative_contact":
+        raise ValueError(
+            f"cooperativity='local' applies only to "
+            f"saturating_cooperative_contact, not {model_name!r}")
+    return m
 
 # Scope retained by the contact-quadratic models.  The saturation model reports
 # ``all_contacts_global`` through :func:`_contact_scope` instead.
@@ -147,25 +181,39 @@ def _label_blind_contact_scale(lambda_intra: float, lambda_inter: float) -> floa
     lin = float(lambda_inter)
     if li != lin:
         raise ValueError(
-            "hs and saturating_cooperative_contact require "
+            "saturating_cooperative_contact requires "
             "lambda_intra == lambda_inter so all contacts use one Hamiltonian")
     return li
 
 
-def _multichain_potential_definition(model_name: str) -> str:
+def _multichain_potential_definition(
+    model_name: str, cooperativity: str = DEFAULT_COOPERATIVITY,
+) -> str:
     if _uses_label_blind_contacts(model_name):
+        if str(cooperativity) == "local":
+            return LOCAL_MULTICHAIN_POTENTIAL_DEFINITION
         return MULTICHAIN_POTENTIAL_DEFINITION
+    if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
+        return LINEAR_SPLIT_MULTICHAIN_POTENTIAL_DEFINITION
     return SPLIT_MULTICHAIN_POTENTIAL_DEFINITION
 
 
-def _contact_scope(model_name: str) -> str:
-    return "all_contacts_global" if _uses_label_blind_contacts(model_name) \
-        else NONLINEAR_CONTACT_SCOPE
+def _contact_scope(model_name: str,
+                   cooperativity: str = DEFAULT_COOPERATIVITY) -> str:
+    if _uses_label_blind_contacts(model_name):
+        return "all_contacts_local_degree" if str(cooperativity) == "local" \
+            else "all_contacts_global"
+    if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
+        return "linear_intra_inter_split"
+    return NONLINEAR_CONTACT_SCOPE
 
 
 def _interchain_contact_model(model_name: str) -> str:
-    return "same_single_chain_potential" if _uses_label_blind_contacts(model_name) \
-        else "linear_coefficient_only"
+    if _uses_label_blind_contacts(model_name):
+        return "same_single_chain_potential"
+    if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
+        return "same_linear_coefficient_independent_lambda"
+    return "linear_coefficient_only"
 
 
 def _import_matplotlib():
@@ -254,10 +302,16 @@ def reduced_contact_potential_state(
 ) -> float:
     """State-aware contacts-only reduced potential.
 
-    For hs and saturating_cooperative_contact, apply the selected single-chain
-    Hamiltonian once to ``m_total = m_intra + m_inter``, using ``M*N`` beads for
-    any intensive normalization.  The contact classification is therefore absent
-    from the energy.  Other registered models retain the existing split form:
+    For saturating_cooperative_contact the contact classification is absent from
+    the energy and one common contact scale applies.  Two multichain rules are
+    available: ``cooperativity="global"`` (default, unchanged) applies the
+    single-chain Hamiltonian once to ``m_total`` using ``M*N`` beads, while
+    ``cooperativity="local"`` routes the cooperative term through each monomer's
+    own contact degree (see :func:`local_cooperative_potential_state`).
+
+    Linear models use the split form ``b(T) * (lambda_intra * m_intra +
+    lambda_inter * m_inter)`` with INDEPENDENT lambdas.  The contact-quadratic
+    models keep
 
         lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N)
         + lambda_inter * b(T) * m_inter
@@ -265,11 +319,15 @@ def reduced_contact_potential_state(
     spec = remd.MODEL_REGISTRY[model_name]
     if _uses_label_blind_contacts(model_name):
         scale = _label_blind_contact_scale(lambda_intra, lambda_inter)
+        if _validate_cooperativity(cooperativity, model_name) == "local":
+            return scale * local_cooperative_potential_state(
+                state, temperature, model_name, params, Tref, Tscale)
         m_total = int(state.counts.intra) + int(state.counts.inter)
         total_beads = int(state.n_chains) * int(state.chain_length)
         return scale * remd.reduced_contact_potential(
             m_total, float(temperature), model_name, params, Tref, Tscale,
             total_beads)
+    _validate_cooperativity(cooperativity, model_name)
     b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
     if spec["potential_kind"] == "linear":
         # Aggregate form: identical to the historical contacts-only potential.
@@ -453,11 +511,17 @@ def mc_sweep(
 ) -> None:
     """Run one lane's local + translation + reptation + rotation proposals in place.
 
-    For hs and saturating_cooperative_contact, the contact contribution is the
-    exact difference ``lambda_contact * [u_contact(m_total + d_total; M*N) -
-    u_contact(m_total; M*N)]``, where ``d_total = d_intra + d_inter``.  Other
-    models retain their existing per-chain intrachain and linear interchain
-    scoring.  Accept if ``du <= 0`` or ``random() < exp(-du)``.  The fixed bending
+    For saturating_cooperative_contact under the default ``cooperativity=
+    "global"`` rule, the contact contribution is the exact difference
+    ``lambda_contact * [u_contact(m_total + d_total; M*N) - u_contact(m_total;
+    M*N)]``, where ``d_total = d_intra + d_inter``.  Under
+    ``cooperativity="local"`` it is instead ``lambda_contact * [b(T)*d_total -
+    A0*delta_S]`` with ``delta_S`` the O(len(moved)) change in the local
+    cooperative sum ``sum_i g(k_i)``.  Linear models (including hs) use the exact
+    historical ``b(T)*(lambda_intra*d_intra + lambda_inter*d_inter)`` with
+    INDEPENDENT lambdas; the contact-quadratic models retain their per-chain
+    intrachain and linear interchain scoring.  Accept if ``du <= 0`` or
+    ``random() < exp(-du)``.  The fixed bending
     penalty
     ``kappa_bend * d_bends`` defaults off (``kappa_bend == 0``): the bend delta is
     still cached, but it contributes exactly 0 to ``du`` and draws no random
@@ -474,6 +538,15 @@ def mc_sweep(
     kb = float(kappa_bend)
     label_blind = _uses_label_blind_contacts(model_name)
     contact_scale = _label_blind_contact_scale(li, lin) if label_blind else 0.0
+    coop = _validate_cooperativity(cooperativity, model_name)
+    local_coop = label_blind and coop == "local"
+    # A0 and q_sat are read once per sweep (they are temperature independent and
+    # invariant under every move).  A0 == 0 nests hs exactly, so the cooperative
+    # sum is never evaluated in that case.
+    if local_coop:
+        A0_coop, q_sat_coop = remd.validated_saturating_params(params)
+    else:
+        A0_coop, q_sat_coop = 0.0, 1.0
     # Runtime chain length for the per-chain normalization (m^2/(2N) for the
     # quadratic family, q = m/N for the saturating one); invariant under every
     # move, so it is read once per sweep.  Every model that is nonlinear in m
@@ -493,7 +566,21 @@ def mc_sweep(
             counters[idx, 2] += 1  # state changing
         d_intra, d_inter = mvs.proposal_delta(state, prop)
         d_bends = mvs.proposal_delta_bends(state, prop)
-        if label_blind:
+        if local_coop:
+            # Local cooperativity: the linear term is exact in the contact
+            # delta, and the cooperative term uses the O(moved) change in
+            # sum_i g(k_i).  Only beads that moved, or whose neighbourhood
+            # gained/lost an occupant, can change degree.
+            d_total = int(d_intra) + int(d_inter)
+            if A0_coop == 0.0:
+                d_contact = b * d_total
+            else:
+                d_S = mcc.delta_cooperative_sum(
+                    state, prop.moved.keys(), prop.new_sites, q_sat_coop)
+                d_contact = b * d_total - A0_coop * d_S
+            du = contact_scale * d_contact + kb * int(d_bends)
+            accept = (du <= 0.0) or (rng.random() < math.exp(-du))
+        elif label_blind:
             m_old = int(state.counts.intra) + int(state.counts.inter)
             m_new = m_old + int(d_intra) + int(d_inter)
             u_old = remd.reduced_contact_potential(
@@ -722,6 +809,7 @@ def run_remd_multichain(
         raise ValueError(f"kappa_bend must be finite and >= 0, got {kappa_bend!r}")
     if _uses_label_blind_contacts(model_name):
         _label_blind_contact_scale(lambda_intra, lambda_inter)
+    cooperativity = _validate_cooperativity(cooperativity, model_name)
     # Environment-controlled contact debugging works even without the CLI flag.
     debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
 
@@ -974,8 +1062,9 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     # was not needed) and m_ref is the contact-number reference (0 everywhere).
     spec = remd.MODEL_REGISTRY[model_name]
     dist["potential_kind"] = str(spec["potential_kind"])
-    dist["quadratic_contact_scope"] = _contact_scope(model_name)
-    dist["nonlinear_contact_scope"] = _contact_scope(model_name)
+    dist["quadratic_contact_scope"] = _contact_scope(model_name, cooperativity)
+    dist["nonlinear_contact_scope"] = _contact_scope(model_name, cooperativity)
+    dist["cooperativity"] = str(cooperativity)
     dist["interchain_contact_model"] = _interchain_contact_model(model_name)
     dist["quadratic_normalization"] = (
         "m_chain^2/(2*N)" if spec["potential_kind"] == "contact_quadratic" else "")
@@ -983,7 +1072,7 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["potential_normalization"] = str(spec["potential_normalization"] or "")
     dist["m_ref"] = int(spec["m_ref"])
     dist["multichain_potential_definition"] = \
-        _multichain_potential_definition(model_name)
+        _multichain_potential_definition(model_name, cooperativity)
     if str(spec["potential_kind"]) == "saturating_cooperative":
         # Named saturating parameters alongside the packed model_params vector,
         # mirroring the single-chain sampler's convention.
@@ -1248,6 +1337,7 @@ def main(argv=None) -> None:
 
     if _uses_label_blind_contacts(model_name):
         _label_blind_contact_scale(args.lambda_intra, args.lambda_inter)
+    cooperativity = _validate_cooperativity(args.cooperativity, model_name)
 
     # Validate the fitted single-chain normalization.  The label-blind saturation
     # Hamiltonian uses M*N total beads at evaluation time, while N remains the
@@ -1285,7 +1375,10 @@ def main(argv=None) -> None:
           f"T in [{Ts.min():.4g}, {Ts.max():.4g}] ({temp_source})")
     print(f"Model: {model_name} — {_spec['description']}")
     print(f"Single-chain contact potential: {_spec['potential_definition']}")
-    print(f"Multichain potential: {_multichain_potential_definition(model_name)}")
+    print(f"Multichain potential: "
+          f"{_multichain_potential_definition(model_name, cooperativity)}")
+    if _uses_label_blind_contacts(model_name):
+        print(f"Cooperativity rule: {cooperativity}")
     print(f"m_ref = {int(_spec['m_ref'])}")
     print(f"Parameter source: {parameter_source}"
           + (f" ({fit_summary_json})" if fit_summary_json else ""))
@@ -1417,8 +1510,10 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         # Contact-potential contract: the Hamiltonian this snapshot file was
         # produced under, stated in full rather than implied by the model name.
         "potential_kind": str(spec["potential_kind"]),
-        "quadratic_contact_scope": _contact_scope(model_name),
-        "nonlinear_contact_scope": _contact_scope(model_name),
+        "quadratic_contact_scope": _contact_scope(model_name,
+                                                  args.cooperativity),
+        "nonlinear_contact_scope": _contact_scope(model_name,
+                                                  args.cooperativity),
         "interchain_contact_model": _interchain_contact_model(model_name),
         "quadratic_normalization": (
             "m_chain^2/(2*N)"
@@ -1429,7 +1524,8 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
             if spec["potential_normalization"] is not None else "null"),
         "m_ref": int(spec["m_ref"]),
         "multichain_potential_definition":
-            _multichain_potential_definition(model_name),
+            _multichain_potential_definition(model_name, args.cooperativity),
+        "cooperativity": str(args.cooperativity),
         "runtime_chain_length": int(args.N),
         "fit_chain_length": (int(fit_chain_length)
                              if fit_chain_length is not None else "null"),
@@ -1522,8 +1618,9 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         # single-chain u_contact and multichain_potential_definition the assembled
         # multi-chain potential.
         "potential_kind": str(spec["potential_kind"]),
-        "quadratic_contact_scope": _contact_scope(model_name),
-        "nonlinear_contact_scope": _contact_scope(model_name),
+        "quadratic_contact_scope": _contact_scope(model_name, cooperativity),
+        "nonlinear_contact_scope": _contact_scope(model_name, cooperativity),
+        "cooperativity": str(cooperativity),
         "interchain_contact_model": _interchain_contact_model(model_name),
         "quadratic_normalization": (
             "m_chain^2/(2*N)"
@@ -1532,7 +1629,7 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "potential_normalization": spec["potential_normalization"],
         "m_ref": int(spec["m_ref"]),
         "multichain_potential_definition":
-            _multichain_potential_definition(model_name),
+            _multichain_potential_definition(model_name, cooperativity),
         "runtime_chain_length": int(N),
         "fit_chain_length": (int(fit_chain_length)
                              if fit_chain_length is not None else None),
@@ -1630,18 +1727,31 @@ def _qt_lambda_modes() -> None:
     b = remd.reduced_bias(*(("hs", [400.0, 1.3], 340.0, 320.0, 80.0)))
     # (0,0): athermal -> u == 0 for any counts.
     assert reduced_potential_counts(c, 340.0, *args_common, 0.0, 0.0) == 0.0
-    # Unequal scales are rejected because they distinguish contact classes.
-    for li, lin in ((1.0, 0.0), (0.0, 1.0), (0.5, 0.25)):
+    # hs is LINEAR, so the intra/inter split carries through exactly and the two
+    # scales are INDEPENDENT: (1,0) is the collapse-only control and (0,1) the
+    # association-only control of the three-model pilot.
+    u10 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 0.0)
+    assert abs(u10 - b * c.intra) < 1e-9
+    u01 = reduced_potential_counts(c, 340.0, *args_common, 0.0, 1.0)
+    assert abs(u01 - b * c.inter) < 1e-9
+    for li, lin in ((1.0, 0.0), (0.0, 1.0), (0.5, 0.25), (1.0, 1.0)):
+        u = reduced_potential_counts(c, 340.0, *args_common, li, lin)
+        assert abs(u - b * (li * c.intra + lin * c.inter)) < 1e-12
+    # (1,1): the equal-contact null model.
+    u11 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 1.0)
+    assert abs(u11 - b * (c.intra + c.inter)) < 1e-9
+    # The nonlinear saturating model still requires one common scale.
+    sat_args = ("saturating_cooperative_contact", [400.0, 1.3, 0.6, 0.35],
+                320.0, 80.0)
+    for li, lin in ((1.0, 0.0), (0.0, 1.0)):
         try:
-            reduced_potential_counts(c, 340.0, *args_common, li, lin)
+            reduced_contact_potential_state(state, 340.0, *sat_args, li, lin)
         except ValueError:
             pass
         else:  # pragma: no cover - the guard is the point of this check
-            raise AssertionError("hs accepted unequal contact scales")
-    # (1,1): all contacts use the same Hamiltonian.
-    u11 = reduced_potential_counts(c, 340.0, *args_common, 1.0, 1.0)
-    assert abs(u11 - b * (c.intra + c.inter)) < 1e-9
-    print("  quick-test label-blind contact scale: PASSED")
+            raise AssertionError("saturating accepted unequal contact scales")
+    print("  quick-test lambda control modes (hs split, saturating common): "
+          "PASSED")
 
 
 def _qt_generalized_swap() -> None:

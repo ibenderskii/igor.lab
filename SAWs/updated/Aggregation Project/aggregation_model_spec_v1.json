@@ -1,17 +1,32 @@
 {
   "model_name": "multichain_lattice_aggregation",
-  "spec_revision": 3,
+  "spec_revision": 4,
   "schema_version": 4,
   "multichain_output_schema_version": 4,
   "model_api_version": 3,
   "description": "Minimal scientifically valid multi-chain lattice-polymer aggregation model. Extends the validated single-chain ISAW replica-exchange architecture (remd_uniform_chain_2_new.py) to M identical self-avoiding chains in a periodic cubic box, reusing the single-chain fitted contact free energy without refitting. This document is the model/software CONTRACT; it deliberately does NOT hard-code one set of runtime parameters (M, N, L, temperatures, lambda values). Those are chosen per run and recorded in each run's output metadata.",
-
   "spec_revision_history": [
-    {"spec_revision": 1, "model_api_version": 1, "change": "Initial contract. The reduced potential was fixed to a single linear form u = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter]."},
-    {"spec_revision": 2, "model_api_version": 3, "change": "The authoritative reduced potential delegates the intrachain term to the selected model's single-chain potential while keeping interchain contacts linear."},
-    {"spec_revision": 3, "model_api_version": 3, "change": "hs and saturating_cooperative_contact now apply their complete single-chain Hamiltonian to m_total = m_intra + m_inter, normalized by total beads M*N when required. Unequal intra/inter lambda values are rejected for these models. Contact-quadratic models retain the revision-2 split rule."}
+    {
+      "spec_revision": 1,
+      "model_api_version": 1,
+      "change": "Initial contract. The reduced potential was fixed to a single linear form u = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter]."
+    },
+    {
+      "spec_revision": 2,
+      "model_api_version": 3,
+      "change": "The authoritative reduced potential delegates the intrachain term to the selected model's single-chain potential while keeping interchain contacts linear."
+    },
+    {
+      "spec_revision": 3,
+      "model_api_version": 3,
+      "change": "hs and saturating_cooperative_contact now apply their complete single-chain Hamiltonian to m_total = m_intra + m_inter, normalized by total beads M*N when required. Unequal intra/inter lambda values are rejected for these models. Contact-quadratic models retain the revision-2 split rule."
+    },
+    {
+      "spec_revision": 4,
+      "model_api_version": 3,
+      "change": "Corrects revision 3, which incorrectly required lambda_intra == lambda_inter for hs. hs is LINEAR in the contact count, so u = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter] is an exact Hamiltonian for INDEPENDENT lambdas and reduces to the label-blind form when they are equal; forcing equality removed the (1,0) collapse-only and (0,1) association-only controls without any physical justification. Only saturating_cooperative_contact is nonlinear in m and still requires one common contact scale. Also documents the saturating model's cooperativity rule ('global', default, unchanged; or 'local', per-monomer contact degree)."
+    }
   ],
-
   "system": {
     "number_of_chains_symbol": "M",
     "number_of_chains_meaning": "number of identical, connected self-avoiding chains simulated simultaneously",
@@ -25,13 +40,11 @@
     "minimum_box_size": 3,
     "minimum_box_size_reason": "L < 3 creates ambiguous nearest-neighbor wrapping (a bead's +d and -d neighbor sites can coincide); such boxes are rejected."
   },
-
   "volume_fraction": {
     "symbol": "phi",
     "definition": "phi = M * N / L^3",
     "meaning": "monomer volume fraction: fraction of the L^3 lattice sites occupied by beads. Must satisfy phi <= 1 (M*N <= L^3)."
   },
-
   "coordinates": {
     "unwrapped": {
       "role": "AUTHORITATIVE representation for chain connectivity and per-chain geometry (radius of gyration).",
@@ -51,10 +64,40 @@
       "global_id_inverse": "chain_index = global_id // N ; monomer_index = global_id % N"
     }
   },
-
   "contacts": {
     "authoritative_statement": "Raw lattice contact counts m_intra and m_inter are AUTHORITATIVE. Every contact is counted exactly once, canonicalized as the unordered global-ID pair (min_id, max_id).",
-    "nearest_neighbor_directions": [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],
+    "nearest_neighbor_directions": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        -1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        -1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ],
+      [
+        0,
+        0,
+        -1
+      ]
+    ],
     "m_intra": {
       "symbol": "m_intra",
       "definition": "number of unique nonbonded nearest-neighbor contacts between beads on the SAME chain (wrapped nearest neighbors), counted once per unordered pair.",
@@ -72,12 +115,10 @@
     },
     "counting_rule": "For every occupied bead, examine its six wrapped nearest-neighbor sites, retrieve any neighboring bead owner, canonicalize the pair as (min_id, max_id) so it is counted exactly once, classify as intra (same chain) or inter (different chains), and exclude covalently bonded same-chain neighbors. Integer counts throughout."
   },
-
   "contact_offset": {
     "statement": "Any molecular-to-lattice contact offset stored in the single-chain fit is excluded from the raw multi-chain contact counts and Hamiltonian.",
     "reason": "The offset was fitted for single-chain intrachain contact-number support alignment during free-energy fitting; it must not be applied to interchain contacts or to raw lattice counts used for sampling."
   },
-
   "contact_normalization": {
     "purpose": "Raw m_intra and m_inter are extensive, globally-unique contact-PAIR counts and remain the Hamiltonian variables. Intensive per-chain normalizations (dividing by the number of chains M) are added for ANALYSIS ONLY so runs with different M can be compared. They do not modify sampling, energy, or acceptance.",
     "definitions": {
@@ -94,37 +135,60 @@
     "scope": "Comparisons across M should use the normalized quantities IN ADDITION to the raw totals. Normalization removes the leading extensive dependence on chain number only; it does NOT remove all finite-size or concentration effects.",
     "invariance": "Normalized contacts, like raw contacts, are never rescaled by rg_scale (they are counts, not lengths)."
   },
-
   "reduced_potential": {
-    "equation": "For hs and saturating_cooperative_contact: u(X,T) = lambda_contact * u_contact(m_total,T;M*N) + kappa_bend*n_bend_total, where m_total = m_intra + m_inter and lambda_contact = lambda_intra = lambda_inter.",
+    "equation": "Linear models (hs): u(X,T) = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter] + kappa_bend*n_bend_total, with INDEPENDENT lambdas. saturating_cooperative_contact: u(X,T) = lambda_contact*u_contact(m_total,T;M*N) + kappa_bend*n_bend_total, with lambda_contact = lambda_intra = lambda_inter. Contact-quadratic models: lambda_intra*sum_alpha u_contact(m_intra_alpha,T;N) + lambda_inter*b(T)*m_inter + kappa_bend*n_bend_total.",
     "sampling_weight": "P(X | T) proportional to exp(-u(X, T))",
-    "structure": "The hs and saturation models have one label-blind contact term plus a separate bending term. Contact-quadratic models retain the older per-chain intrachain term plus linear interchain term.",
-
+    "structure": "Contact term plus a separate additive bending term. The contact term takes one of three forms according to potential_kind: a linear intra/inter split with independent lambdas, a label-blind term in m_total for the nonlinear saturating model, or the retained per-chain intrachain plus linear interchain rule for the contact-quadratic family. No term is folded into another.",
+    "linear_split_contact_term": {
+      "models": [
+        "hs"
+      ],
+      "equation": "b(T) * [lambda_intra * m_intra + lambda_inter * m_inter]",
+      "delegation": "b(T) is the selected model's own reduced_bias, taken unchanged from the single-chain fit. The multi-chain layer never refits it.",
+      "independent_lambdas": "lambda_intra and lambda_inter are INDEPENDENT. Exactness follows from linearity of u_contact in m; see label_blindness_criterion.",
+      "move_delta_rule": "b(T) * [lambda_intra * d_intra + lambda_inter * d_inter], exact for any move because the potential is linear in both counts.",
+      "normalization": "None. The linear model needs no chain length; N is recorded as provenance only.",
+      "reduction": "At lambda_intra == lambda_inter == lambda this is identically lambda * b(T) * m_total, i.e. the label-blind equal-contact null model."
+    },
     "label_blind_contact_term": {
-      "models": ["hs", "saturating_cooperative_contact"],
+      "models": [
+        "saturating_cooperative_contact"
+      ],
       "equation": "lambda_contact * u_contact(m_intra + m_inter, T; M*N)",
       "delegation": "u_contact is the selected model's complete single-chain contact potential, taken unchanged from reduced_contact_potential.",
       "supported_potential_kinds": {
-        "linear": "u_contact(m,T;N) = b(T)*m",
         "saturating_cooperative": "u_contact(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)] with q = m/N"
       },
-      "identity_invariance": "Only m_total enters. Repartitioning a fixed number of contacts between intra- and interchain classes or among chains cannot change the energy.",
+      "why_label_blind": "u_contact is NONLINEAR in m, so the intra/inter split cannot be carried through it and unequal lambda values are rejected.",
+      "identity_invariance": "Under cooperativity='global', only m_total enters: repartitioning a fixed number of contacts between intra- and interchain classes or among chains cannot change the energy.",
       "move_delta_rule": "lambda_contact * [u_contact(m_total + d_intra + d_inter,T;M*N) - u_contact(m_total,T;M*N)]",
-      "normalization": "For saturation, q = m_total/(M*N), preserving an intensive contact density and an extensive total potential."
+      "normalization": "For cooperativity='global', q = m_total/(M*N), preserving an intensive contact density and an extensive total potential.",
+      "cooperativity_rule": {
+        "modes": [
+          "global",
+          "local"
+        ],
+        "default": "global",
+        "global": "Unchanged. The fitted single-chain Hamiltonian is applied once to m_total with M*N beads. At small q the cooperative term is -A0*m_total^2/(M*N), an all-to-all coupling between every pair of contacts in the box: non-additive over non-interacting chains and blind to WHERE the contacts are.",
+        "local": "u = lambda_contact * [b(T)*m_total - A0*sum_i g(k_i)] with g(k) = kappa^2/(1 + (kappa/q_sat)^2), kappa = k/2, and k_i the nonbonded contact degree of monomer i counting BOTH intra- and interchain neighbours. Since sum_i k_i = 2*m_total, kappa is the local analogue of q = m/N; at uniform degree k_i = 2m/N the sum reproduces the fitted single-chain cooperative term EXACTLY with the same A0 and q_sat, so no refit is involved. Being a sum of strictly local terms it is exactly additive over separated chains.",
+        "applicability": "cooperativity applies ONLY to saturating_cooperative_contact; any other model rejects a non-default value.",
+        "nesting": "At A0 = 0 both modes reduce to lambda_contact*b(T)*m_total bit for bit."
+      }
     },
-
     "contact_quadratic_legacy_rule": {
-      "models": ["hs_m2_const", "hs_m2_hs"],
+      "models": [
+        "hs_m2_const",
+        "hs_m2_hs"
+      ],
       "equation": "lambda_intra * sum_alpha u_contact(m_intra_alpha,T;N) + lambda_inter * b(T) * m_inter",
-      "scope": "Unchanged by revision 3. The quadratic correction remains per-chain and intrachain only."
+      "scope": "Unchanged since revision 2. The quadratic correction remains per-chain and intrachain only; lambda_intra and lambda_inter stay independent.",
+      "prohibited": "u_contact MUST NOT be evaluated at the summed intrachain count or at m_intra + m_inter. Because u_contact is nonlinear, two states with equal total intrachain contacts but different per-chain allocations have genuinely different potentials, and collapsing them manufactures artificial cross-chain coupling."
     },
-
     "bending_term": {
       "equation": "kappa_bend * n_bend_total",
       "independence": "The fixed reduced bending penalty is a SEPARATE additive term, never absorbed into any contact model. It is independent of lambda_intra and lambda_inter: setting both lambdas to zero disables the contact interactions but does NOT disable bending when kappa_bend != 0.",
       "default": "kappa_bend = 0 reproduces the contacts-only sampler exactly."
     },
-
     "b_of_T": {
       "meaning": "reduced contact bias b(T) for the selected contact-bias model, loaded with the SAME semantics as remd_uniform_chain_2_new.py (MODEL_REGISTRY, fitted params, Tref, Tscale).",
       "loading": "Loaded through the existing fit_summary.json and model-registry interfaces (resolve_model_params / load_fit_summary_json). Fitted parameters are never modified or refit.",
@@ -136,39 +200,58 @@
       "definition": "effective_energy = T * u",
       "label": "temperature-dependent EFFECTIVE energy (reported for compatibility only; the reduced potential u is the canonical sampling quantity). It is NOT a temperature-independent microscopic energy."
     },
-    "canonical_sampling_quantity": "reduced potential u"
+    "canonical_sampling_quantity": "reduced potential u",
+    "label_blindness_criterion": "A model may carry independent lambda_intra and lambda_inter if and only if its single-chain u_contact is LINEAR in m. Linearity makes the split exact: b(T)*[l_i*m_intra + l_e*m_inter] is a well-defined Hamiltonian for any (l_i, l_e) and equals l*u_contact(m_total) at l_i = l_e = l, so label-blindness is a special case of the split, not a constraint on it. When u_contact is nonlinear, u_contact(m_intra) + u_contact(m_inter) != u_contact(m_total) and no canonical class-resolved lambda exists, so a single common contact scale is required."
   },
-
   "lambda_controls": {
     "lambda_intra": {
-      "meaning": "coupling multiplier on the COMPLETE per-chain intrachain contact potential (the whole u_contact, including any nonlinear term), not on the contact count",
+      "meaning": "coupling multiplier on the intrachain contact term: b(T)*m_intra for the linear models, and the COMPLETE per-chain u_contact (including its nonlinear part) for the contact-quadratic models",
       "default": 1.0
     },
     "lambda_inter": {
-      "meaning": "coupling multiplier on the linear interchain contact term b(T)*m_inter",
+      "meaning": "coupling multiplier on the interchain contact term b(T)*m_inter",
       "default": 1.0
     },
-    "independence": "For hs and saturating_cooperative_contact the two values must be equal and form lambda_contact; unequal values are rejected. Contact-quadratic models retain independent multipliers.",
+    "independence": "Independent for every model whose u_contact is linear in m (hs) and for the contact-quadratic family. Only saturating_cooperative_contact requires lambda_intra == lambda_inter, because it is nonlinear in m; unequal values are rejected there. See reduced_potential.label_blindness_criterion.",
     "note": "Equal zero values disable contact energy but leave bending in force.",
     "control_modes": {
-      "full_transferability": {"lambda_intra": 1, "lambda_inter": 1, "meaning": "null model: a monomer-monomer contact has the same effective free energy whether intra- or interchain (DEFAULT)."},
-      "independent_collapse": {"lambda_intra": 1, "lambda_inter": 0, "meaning": "available only for the retained contact-quadratic comparison models."},
-      "interchain_attraction_only": {"lambda_intra": 0, "lambda_inter": 1, "meaning": "available only for the retained contact-quadratic comparison models."},
-      "athermal_control": {"lambda_intra": 0, "lambda_inter": 0, "meaning": "no contact energy; all valid configurations have equal reduced potential."}
-    }
+      "full_transferability": {
+        "lambda_intra": 1,
+        "lambda_inter": 1,
+        "meaning": "null model: a monomer-monomer contact has the same effective free energy whether intra- or interchain (DEFAULT). Available for every model."
+      },
+      "independent_collapse": {
+        "lambda_intra": 1,
+        "lambda_inter": 0,
+        "meaning": "collapse-only control: interchain contacts carry no free energy. Available for hs and for the contact-quadratic models; rejected by saturating_cooperative_contact."
+      },
+      "interchain_attraction_only": {
+        "lambda_intra": 0,
+        "lambda_inter": 1,
+        "meaning": "association-only control: intrachain contacts carry no free energy. Available for hs and for the contact-quadratic models; rejected by saturating_cooperative_contact."
+      },
+      "athermal_control": {
+        "lambda_intra": 0,
+        "lambda_inter": 0,
+        "meaning": "no contact energy; all valid configurations have equal reduced potential. Available for every model."
+      }
+    },
+    "pilot_controls": "The three-control aggregation pilot is (1,1) equal-contact null, (1,0) collapse-only and (0,1) association-only, run under hs. All three are reachable because hs is linear."
   },
-
   "replica_exchange": {
     "swap_rule": "log_accept = u(X_i, T_i) + u(X_j, T_j) - u(X_j, T_i) - u(X_i, T_j)",
-    "swap_rule_note": "The swap evaluates the same state-aware potential as local moves. For hs and saturation, only m_total enters; contact classification is irrelevant.",
+    "swap_rule_note": "The swap evaluates the same state-aware potential as local moves. For saturating_cooperative_contact under cooperativity='global' only m_total enters and contact classification is irrelevant; for hs and the contact-quadratic models the classified counts enter through lambda_intra and lambda_inter.",
     "bending_cancels": "The fixed reduced bending penalty is temperature-independent and identical within each state, so kappa_bend*(n_i + n_j - n_j - n_i) = 0: it cancels exactly and never enters the swap criterion. There is a single swap rule for all three potential families.",
     "temperatures": "Temperatures are fixed to lanes; complete MultiChainState objects are exchanged between adjacent lanes with even/odd alternation."
   },
-
   "sweep_conventions": {
     "local_sweep": {
       "definition": "1 local sweep = M * N local move proposals",
-      "local_moves": ["end", "crankshaft", "pivot"]
+      "local_moves": [
+        "end",
+        "crankshaft",
+        "pivot"
+      ]
     },
     "translation_sweep": {
       "definition": "1 translation sweep = M whole-chain translation proposals"
@@ -180,15 +263,26 @@
     ],
     "interface": "The run is parameterized by local_sweeps_per_swap and translation_sweeps_per_swap (NOT a single ambiguous absolute steps_per_swap). Both the sweep counts and the actual per-cycle proposal counts are recorded in output metadata."
   },
-
   "moves": {
     "local": [
-      {"name": "end", "description": "move one selected-chain end bead to a random empty neighbor of its anchor bead"},
-      {"name": "crankshaft", "description": "local corner/kink flip of one interior selected-chain bead about the axis through its two neighbors"},
-      {"name": "pivot", "description": "rotate a selected-chain tail about a randomly chosen pivot bead using a proper cubic lattice rotation"}
+      {
+        "name": "end",
+        "description": "move one selected-chain end bead to a random empty neighbor of its anchor bead"
+      },
+      {
+        "name": "crankshaft",
+        "description": "local corner/kink flip of one interior selected-chain bead about the axis through its two neighbors"
+      },
+      {
+        "name": "pivot",
+        "description": "rotate a selected-chain tail about a randomly chosen pivot bead using a proper cubic lattice rotation"
+      }
     ],
     "collective": [
-      {"name": "chain_translation", "description": "translate every bead of one selected chain by one of the six lattice unit vectors; symmetric proposal; own current sites ignored during the interchain collision test; intrachain contacts are exactly preserved and only interchain contacts involving the translated chain are recomputed"}
+      {
+        "name": "chain_translation",
+        "description": "translate every bead of one selected chain by one of the six lattice unit vectors; symmetric proposal; own current sites ignored during the interchain collision test; intrachain contacts are exactly preserved and only interchain contacts involving the translated chain are recomputed"
+      }
     ],
     "invariants": [
       "preserve linear connectivity (unit bonds in unwrapped coordinates)",
@@ -198,37 +292,65 @@
       "null proposals (identical to current state) are not counted as state-changing acceptances"
     ]
   },
-
   "move_counters": {
-    "columns": ["proposed", "geometrically_valid", "state_changing", "metropolis_accepted"],
-    "categories": ["pivot", "crankshaft", "end", "chain_translation"]
+    "columns": [
+      "proposed",
+      "geometrically_valid",
+      "state_changing",
+      "metropolis_accepted"
+    ],
+    "categories": [
+      "pivot",
+      "crankshaft",
+      "end",
+      "chain_translation"
+    ]
   },
-
   "contact_updates": {
     "debug_path": "Recompute full_contact_counts for every geometrically valid trial state (exact oracle).",
     "production_path": "Local delta-contact algorithm: enumerate incident canonical contact pairs before the move, build/update a temporary occupancy for the trial, enumerate incident pairs after, canonicalize IDs, determine removed/added intra/inter contacts (deduplicated when multiple moved beads share a contact), and update cached counts.",
     "translation_optimization": "Whole-chain translation cannot change intrachain contacts; only interchain contacts involving the translated chain are recomputed.",
     "debug_assertion": "An environment-controlled assertion (MULTICHAIN_DEBUG_CONTACTS, analogous to ISAW_DEBUG_CONTACTS) compares cached counts against full_contact_counts after every accepted move."
   },
-
   "observables": {
     "per_chain_geometry": {
-      "quantities": ["Rg2 (per chain)", "Rg (per chain)"],
+      "quantities": [
+        "Rg2 (per chain)",
+        "Rg (per chain)"
+      ],
       "coordinates": "computed from UNWRAPPED coordinates",
-      "per_cycle_records": ["mean per-chain Rg", "mean per-chain Rg2", "std of per-chain Rg across chains", "optional full per-chain Rg vector in diagnostic output"],
+      "per_cycle_records": [
+        "mean per-chain Rg",
+        "mean per-chain Rg2",
+        "std of per-chain Rg across chains",
+        "optional full per-chain Rg vector in diagnostic output"
+      ],
       "rg_scale_note": "rg_scale is applied only to OUTPUT length quantities, never to sampling. Fields suffixed _lattice are raw lattice lengths; the same field without _lattice equals rg_scale times the lattice value (rg_scale**2 for squared lengths). The std of per-chain Rg follows this rule: std_chain_rg_lattice_post is unscaled, std_chain_rg_post = rg_scale * std_chain_rg_lattice_post; init_mean_chain_rg_lattice is unscaled, init_mean_chain_rg = rg_scale * init_mean_chain_rg_lattice."
     },
-    "contacts": ["m_intra", "m_inter", "m_total", "f_inter"],
-    "contacts_per_chain": ["m_intra_per_chain", "m_inter_pairs_per_chain", "m_inter_incidences_per_chain", "m_total_pairs_per_chain"],
+    "contacts": [
+      "m_intra",
+      "m_inter",
+      "m_total",
+      "f_inter"
+    ],
+    "contacts_per_chain": [
+      "m_intra_per_chain",
+      "m_inter_pairs_per_chain",
+      "m_inter_incidences_per_chain",
+      "m_total_pairs_per_chain"
+    ],
     "chain_cluster_graph": {
       "nodes": "chains",
       "edge_rule": "connect two chains when they share at least cluster_contact_threshold interchain contacts",
       "cluster_contact_threshold_default": 1,
-      "records": ["number of connected components", "largest cluster size s_max", "largest cluster fraction f_max = s_max / M"],
+      "records": [
+        "number of connected components",
+        "largest cluster size s_max",
+        "largest cluster fraction f_max = s_max / M"
+      ],
       "note": "This is an explicit chain-level graph built from interchain contact pairs; it is NOT the single-chain bead-level contact-graph S_max."
     }
   },
-
   "outputs": {
     "canonical": [
       "<prefix>_results.csv",
@@ -243,93 +365,196 @@
       "<prefix>_configurations.h5"
     ],
     "results_csv_columns": [
-      "T", "u_mean", "effective_energy_mean",
-      "m_intra_mean", "m_inter_mean", "m_total_mean",
-      "m_intra_per_chain_mean", "m_intra_per_chain_std",
-      "m_inter_pairs_per_chain_mean", "m_inter_pairs_per_chain_std",
-      "m_inter_incidences_per_chain_mean", "m_inter_incidences_per_chain_std",
+      "T",
+      "u_mean",
+      "effective_energy_mean",
+      "m_intra_mean",
+      "m_inter_mean",
+      "m_total_mean",
+      "m_intra_per_chain_mean",
+      "m_intra_per_chain_std",
+      "m_inter_pairs_per_chain_mean",
+      "m_inter_pairs_per_chain_std",
+      "m_inter_incidences_per_chain_mean",
+      "m_inter_incidences_per_chain_std",
       "m_total_pairs_per_chain_mean",
-      "Rg_mean", "Rg2_mean", "f_inter_mean",
-      "largest_cluster_size_mean", "largest_cluster_fraction_mean",
-      "std_chain_rg_mean", "std_chain_rg_mean_lattice", "n_clusters_mean",
-      "local_acceptance_rate", "translation_acceptance_rate"
+      "Rg_mean",
+      "Rg2_mean",
+      "f_inter_mean",
+      "largest_cluster_size_mean",
+      "largest_cluster_fraction_mean",
+      "std_chain_rg_mean",
+      "std_chain_rg_mean_lattice",
+      "n_clusters_mean",
+      "local_acceptance_rate",
+      "translation_acceptance_rate"
     ],
     "npz_keys": [
-      "Ts", "m_intra_vals", "P_m_intra", "m_inter_vals", "P_m_inter",
-      "rg_edges", "rg_centers", "P_mean_chain_rg",
-      "chain_rg_edges", "chain_rg_centers", "P_chain_rg",
-      "fmax_edges", "fmax_centers", "P_fmax",
-      "model metadata", "multi-chain run metadata", "schema_version"
+      "Ts",
+      "m_intra_vals",
+      "P_m_intra",
+      "m_inter_vals",
+      "P_m_inter",
+      "rg_edges",
+      "rg_centers",
+      "P_mean_chain_rg",
+      "chain_rg_edges",
+      "chain_rg_centers",
+      "P_chain_rg",
+      "fmax_edges",
+      "fmax_centers",
+      "P_fmax",
+      "model metadata",
+      "multi-chain run metadata",
+      "schema_version"
     ],
     "distribution_semantics": {
       "P_mean_chain_rg": "cycle-level distribution of the MEAN per-chain Rg across chains.",
       "P_chain_rg": "distribution of POOLED individual-chain Rg samples (all chains, all post-burn-in cycles); resolves homogeneous collapse vs mixed expanded/collapsed chains. Semantically distinct from P_mean_chain_rg."
     },
     "diagnostics": {
-      "files": ["<prefix>_diagnostics.json", "<prefix>_convergence.csv", "<prefix>_round_trips.csv", "<prefix>_walker_occupancy.csv", "<prefix>_diagnostic_trajectories.npz"],
-      "reused_from_single_chain": ["integrated_autocorr_time", "early_late_drift", "block_mean_stability", "analyze_walker_trajectory"],
-      "diagnosed_observables": ["u", "m_intra", "m_inter", "mean_chain_rg", "n_clusters", "largest_cluster_size", "largest_cluster_fraction", "m_intra_per_chain", "m_inter_pairs_per_chain"],
-      "central_observables": ["m_intra (single-chain collapse)", "m_inter (interchain association)", "largest_cluster_fraction (collective aggregation)"],
+      "files": [
+        "<prefix>_diagnostics.json",
+        "<prefix>_convergence.csv",
+        "<prefix>_round_trips.csv",
+        "<prefix>_walker_occupancy.csv",
+        "<prefix>_diagnostic_trajectories.npz"
+      ],
+      "reused_from_single_chain": [
+        "integrated_autocorr_time",
+        "early_late_drift",
+        "block_mean_stability",
+        "analyze_walker_trajectory"
+      ],
+      "diagnosed_observables": [
+        "u",
+        "m_intra",
+        "m_inter",
+        "mean_chain_rg",
+        "n_clusters",
+        "largest_cluster_size",
+        "largest_cluster_fraction",
+        "m_intra_per_chain",
+        "m_inter_pairs_per_chain"
+      ],
+      "central_observables": [
+        "m_intra (single-chain collapse)",
+        "m_inter (interchain association)",
+        "largest_cluster_fraction (collective aggregation)"
+      ],
       "central_observables_note": "Warnings are raised on the raw extensive central observables only; the per-chain normalized series are deterministic transforms and would raise duplicate warnings.",
-      "diagnostic_trajectory_normalized_keys": ["m_intra_per_chain_post", "m_inter_pairs_per_chain_post", "m_inter_incidences_per_chain_post", "m_total_pairs_per_chain_post", "std_chain_rg_lattice_post", "std_chain_rg_post"],
-      "multichain_specific_thresholds": ["min_translation_acceptance_rate"]
+      "diagnostic_trajectory_normalized_keys": [
+        "m_intra_per_chain_post",
+        "m_inter_pairs_per_chain_post",
+        "m_inter_incidences_per_chain_post",
+        "m_total_pairs_per_chain_post",
+        "std_chain_rg_lattice_post",
+        "std_chain_rg_post"
+      ],
+      "multichain_specific_thresholds": [
+        "min_translation_acceptance_rate"
+      ]
     }
   },
-
   "snapshot_format": {
     "coordinate_dimensions": "(snapshot, temperature_lane, chain, monomer, xyz)",
     "coordinate_dtype_default": "int32",
     "coordinate_dtype_note": "Production snapshots default to int32. The writer allocates the coordinate dtype once from the first snapshot and cannot widen it later, so it never auto-selects int16; int16 remains available only for explicit, size-bounded use. Coordinate canonicalization keeps unwrapped magnitudes bounded so int32 does not overflow.",
     "stored_fields": [
-      "coordinates", "walker_id", "m_intra", "m_inter",
-      "mean_chain_rg2", "largest_cluster_size", "temperatures",
-      "M", "N", "L", "schema_version", "model_params",
-      "lambda_intra", "lambda_inter", "snapshot_stride", "completion_marker"
+      "coordinates",
+      "walker_id",
+      "m_intra",
+      "m_inter",
+      "mean_chain_rg2",
+      "largest_cluster_size",
+      "temperatures",
+      "M",
+      "N",
+      "L",
+      "schema_version",
+      "model_params",
+      "lambda_intra",
+      "lambda_inter",
+      "snapshot_stride",
+      "completion_marker"
     ],
     "note": "The single-chain HDF5 schema (T, bead, xyz) is NOT reused for multi-chain coordinates; chain identity is explicit."
   },
-
   "initialization": {
     "independent_walkers": "Each REMD temperature lane begins from its OWN independently generated dispersed state, using deterministic per-lane seeds init_seed = seed + INITIALIZATION_SEED_STRIDE * lane (stride 1000003, distinct from the per-cycle sweep-seed strides). Initialization occurs in the main process so serial and multiprocessing runs share identical starting states.",
-    "recorded_initial_observables": ["init_seed", "init_m_intra", "init_m_inter", "init_mean_chain_rg_lattice", "init_mean_chain_rg", "init_largest_cluster_size"]
+    "recorded_initial_observables": [
+      "init_seed",
+      "init_m_intra",
+      "init_m_inter",
+      "init_mean_chain_rg_lattice",
+      "init_mean_chain_rg",
+      "init_largest_cluster_size"
+    ]
   },
-
   "metadata_requirements": [
-    "M", "N", "L", "volume_fraction", "lambda_intra", "lambda_inter",
-    "model_name", "model_params", "param_names", "Tref", "Tscale",
-    "seed", "temperature_ladder", "schema_version",
-    "multichain_output_schema_version", "snapshot_schema_version",
+    "M",
+    "N",
+    "L",
+    "volume_fraction",
+    "lambda_intra",
+    "lambda_inter",
+    "model_name",
+    "model_params",
+    "param_names",
+    "Tref",
+    "Tscale",
+    "seed",
+    "temperature_ladder",
+    "schema_version",
+    "multichain_output_schema_version",
+    "snapshot_schema_version",
     "model_api_version",
-    "local_sweeps_per_swap", "translation_sweeps_per_swap",
-    "local_proposals_per_cycle", "translation_proposals_per_cycle",
-    "cluster_contact_threshold", "parameter_source", "fit_summary_json",
-    "initialization_seeds", "initial_states",
-    "coordinate_canonicalization_enabled", "snapshot_coordinate_dtype",
-    "diagnostics_enabled", "diagnostic_thresholds", "output_files",
-    "kappa_bend", "bending_enabled", "bend_definition",
-    "potential_kind", "potential_definition", "potential_normalization",
-    "m_ref", "multichain_potential_definition",
-    "quadratic_contact_scope", "nonlinear_contact_scope",
-    "interchain_contact_model", "quadratic_normalization",
-    "runtime_chain_length", "fit_chain_length"
+    "local_sweeps_per_swap",
+    "translation_sweeps_per_swap",
+    "local_proposals_per_cycle",
+    "translation_proposals_per_cycle",
+    "cluster_contact_threshold",
+    "parameter_source",
+    "fit_summary_json",
+    "initialization_seeds",
+    "initial_states",
+    "coordinate_canonicalization_enabled",
+    "snapshot_coordinate_dtype",
+    "diagnostics_enabled",
+    "diagnostic_thresholds",
+    "output_files",
+    "kappa_bend",
+    "bending_enabled",
+    "bend_definition",
+    "potential_kind",
+    "potential_definition",
+    "potential_normalization",
+    "m_ref",
+    "multichain_potential_definition",
+    "quadratic_contact_scope",
+    "nonlinear_contact_scope",
+    "interchain_contact_model",
+    "quadratic_normalization",
+    "runtime_chain_length",
+    "fit_chain_length"
   ],
-
   "potential_metadata_contract": {
     "purpose": "A run's outputs must state the Hamiltonian that was actually sampled, so a reader never has to reconstruct it from the model name.",
     "potential_kind": "one of linear, contact_quadratic, saturating_cooperative",
     "potential_definition": "the exact single-chain u_contact(m,T;N) that was sampled, verbatim from the model registry",
-    "multichain_potential_definition": "the exact assembled multi-chain potential, including whether it is label-blind or uses the retained split contact-quadratic rule",
+    "multichain_potential_definition": "the exact assembled multi-chain potential: the linear intra/inter split, the label-blind saturating form (global or local cooperativity), or the retained contact-quadratic split rule",
     "potential_normalization": "what the chain length was used for: empty for linear models, 'm^2/(2N)' for contact_quadratic, 'q = m/N' for saturating_cooperative",
     "quadratic_normalization": "'m_chain^2/(2*N)' for contact_quadratic ONLY; empty/null for linear AND for saturating_cooperative, which has no m^2/(2N) term",
     "m_ref": "contact-number reference used to center q; 0 for every model, recorded explicitly rather than left implicit",
-    "nonlinear_contact_scope": "'all_contacts_global' for hs and saturation; 'intra_per_chain' for contact-quadratic models",
-    "interchain_contact_model": "'same_single_chain_potential' for hs and saturation; 'linear_coefficient_only' for retained split models",
+    "nonlinear_contact_scope": "'linear_intra_inter_split' for hs; 'all_contacts_global' or 'all_contacts_local_degree' for saturating_cooperative_contact according to the cooperativity rule; 'intra_per_chain' for contact-quadratic models",
+    "interchain_contact_model": "'same_linear_coefficient_independent_lambda' for hs; 'same_single_chain_potential' for saturating_cooperative_contact; 'linear_coefficient_only' for the retained split models",
     "runtime_chain_length": "the physical beads per chain N; the label-blind multichain definition states the M*N normalization explicitly",
     "fit_chain_length": "the N the model was FIT at (provenance only; -1/null when not recorded)",
     "model_specific_parameters": "Models with named domain parameters record them alongside the packed model_params vector: saturating_cooperative_contact writes A0 and q_sat.",
-    "additivity_rule": "New contract fields are ADDITIVE. Existing field names, types and values are never repurposed, so readers written against an earlier revision keep working."
+    "additivity_rule": "New contract fields are ADDITIVE. Existing field names, types and values are never repurposed, so readers written against an earlier revision keep working.",
+    "quadratic_contact_scope": "mirror of nonlinear_contact_scope, retained for readers written against earlier revisions",
+    "cooperativity": "'global' or 'local'; recorded on every run and always 'global' for models other than saturating_cooperative_contact"
   },
-
   "scope_notes": [
     "This is the minimum scientifically valid multi-chain simulator to test whether the single-chain contact free energy predicts aggregation.",
     "No PNIPAM-specific extensions beyond the transferability null model are introduced.",
