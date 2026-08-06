@@ -417,9 +417,9 @@ def learn_log_density(
                     "Wang-Landau learning exhausted --wl_max_steps before "
                     f"convergence at log_f={log_f:.3g}. Required contact levels "
                     f"below --wl_min_visits in the current stage: {missing.tolist()}. "
-                    "Increase the limit, lower --m_max only with scientific "
-                    "justification, or explicitly list a verified internal gap "
-                    "with --excluded_contact_levels."
+                    "Increase the limit. If a deficient contact level is believed "
+                    "unreachable, verify the geometry independently; only verified "
+                    "internal gaps may be listed with --excluded_contact_levels."
                 )
             for _ in range(block):
                 chain, occupied, contact, _, was_accepted = metropolis_step(
