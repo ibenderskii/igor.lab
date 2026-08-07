@@ -206,9 +206,12 @@ out-of-range mass is never silently discarded and renormalized away.
    with only the baseline changed.  Report how support, fitted parameters,
    residuals, and chain-length transferability change.
 
-The script's built-in `--self-test` performs steps 1 and 2.  Steps 4 and 5 need
-the project production data and should be treated as the scientific acceptance
-test.
+The script's built-in `--self-test` performs steps 1 through 3.
+`run_wl_pilot.py` performs steps 4 and 5 in the mandatory order N=30, N=44,
+then N=60, stopping after any failed gate.  Its `--dry-run` mode prints all
+commands and the measured-throughput wall-time estimate without creating
+outputs.  The production pilot needs the project data and should be treated as
+the scientific acceptance test.
 
 ## 8. Recommended first production workflow
 
@@ -217,3 +220,13 @@ using the exact geometric `m_max` selected automatically for each chain length.
 Run with checkpointing, multiple fixed-weight workers, and a production length
 sufficient for repeated window round trips.  Retain the direct athermal baseline
 as an independent bulk comparison rather than replacing or deleting it.
+
+Preview the complete gated workflow with:
+
+```bash
+python run_wl_pilot.py --dry-run
+```
+
+Run it by removing `--dry-run`.  A failure to reach the declared upper contact
+level is reported as evidence for separately reviewed pull moves; the runner
+never lowers `m_cover` to manufacture a passing result.
