@@ -47,6 +47,7 @@ import random
 import sys
 import tempfile
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import permutations, product
 from pathlib import Path
@@ -54,6 +55,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
+from baseline_grids import (
+    LEGACY_BASELINE_FILES,
+    assert_within_grid,
+    fixed_c_edges,
+    fixed_rg_edges,
+    legacy_rg_grid,
+    rod_rg,
+)
 from target_support import (
     CONTACT_OFFSETS,
     flat_level,
@@ -70,6 +79,10 @@ NN_VECS: Tuple[Vec, ...] = (
     (0, -1, 0), (0, 0, 1), (0, 0, -1),
 )
 BEND_DEFINITION = "number of 90-degree turns among the N-2 internal vertices"
+RAW_SAMPLES_WARNING = (
+    "These arrays are systematic importance resamples with duplicates; do not "
+    "use them for variance or error-bar estimation. Use c_blocked_stderr."
+)
 TIER_EXCLUDED = np.int8(0)
 TIER_COVERAGE = np.int8(1)
 TIER_FLAT = np.int8(2)
@@ -897,6 +910,49 @@ def systematic_resample(weights: np.ndarray, rng: np.random.Generator) -> np.nda
     return np.searchsorted(cumulative, positions, side="right")
 
 
+def blocked_contact_stderr(
+    worker_contacts: Sequence[np.ndarray],
+    log_g: np.ndarray,
+    m_min: int,
+    m_cover: int,
+    n_blocks: int,
+) -> Tuple[np.ndarray, int]:
+    """Estimate the standard error of P0(m) from per-worker batch means.
+
+    Each non-overlapping block is reweighted and self-normalized independently.
+    Blocks are pooled across independent workers, and their between-block sample
+    variance is divided by the number of blocks.  This accounts for within-chain
+    autocorrelation when blocks are long relative to the correlation time; it
+    does not include uncertainty in the learned bias itself.
+    """
+    if n_blocks < 2:
+        raise ValueError("n_blocks must be at least 2")
+    n_levels = m_cover - m_min + 1
+    estimates: List[np.ndarray] = []
+    for worker_id, values in enumerate(worker_contacts):
+        contacts = np.asarray(values, dtype=np.int64)
+        if contacts.size < 2:
+            raise ValueError(
+                f"production worker {worker_id} has fewer than two recorded samples"
+            )
+        if np.any((contacts < m_min) | (contacts > m_cover)):
+            raise ValueError(
+                f"production worker {worker_id} has contacts outside the declared window"
+            )
+        for block in np.array_split(contacts, min(n_blocks, contacts.size)):
+            weights = normalized_importance_weights(block, log_g, m_min)
+            estimates.append(
+                np.bincount(
+                    block - m_min, weights=weights, minlength=n_levels
+                )[:n_levels]
+            )
+    batches = np.asarray(estimates, dtype=np.float64)
+    if batches.shape[0] < 2:
+        raise ValueError("batch-means error estimation requires at least two blocks")
+    stderr = batches.std(axis=0, ddof=1) / math.sqrt(batches.shape[0])
+    return stderr, int(batches.shape[0])
+
+
 def build_distributions(
     contacts: np.ndarray,
     radii: np.ndarray,
@@ -905,23 +961,33 @@ def build_distributions(
     m_min: int,
     rg_bins: int,
     no_joint: bool,
+    *,
+    n_beads: Optional[int] = None,
+    m_cover: Optional[int] = None,
+    rg_edges: Optional[np.ndarray] = None,
+    grid_source: Optional[str] = None,
+    grid_search_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     if contacts.size == 0 or contacts.size != radii.size or contacts.size != bends.size:
         raise RuntimeError("production sample arrays are empty or have inconsistent lengths")
     if not np.all(np.isfinite(radii)):
         raise RuntimeError("non-finite Rg production samples")
+    if m_cover is None:
+        m_cover = int(contacts.max())
+    if m_cover < m_min:
+        raise ValueError("m_cover must be at least m_min")
     weights = normalized_importance_weights(contacts, log_g, m_min)
-    c_min = int(contacts.min())
-    c_max = int(contacts.max())
-    c_edges = np.arange(c_min - 0.5, c_max + 1.5, 1.0, dtype=np.float64)
-    c_full = np.arange(c_min, c_max + 1, dtype=np.int64)
-    c_mass = np.bincount(contacts - c_min, weights=weights, minlength=c_full.size)
-    production_c_counts_full = np.bincount(
-        contacts - c_min, minlength=c_full.size
-    )
-    positive = c_mass > 0.0
-    c_vals = c_full[positive]
-    c_prob = c_mass[positive]
+    c_edges = fixed_c_edges(m_min, m_cover)
+    c_vals = np.arange(m_min, m_cover + 1, dtype=np.int64)
+    assert_within_grid(contacts, c_edges, "contact")
+    c_prob = np.bincount(
+        contacts - m_min, weights=weights, minlength=c_vals.size
+    )[:c_vals.size].astype(np.float64)
+    production_c_counts = np.bincount(
+        contacts - m_min, minlength=c_vals.size
+    )[:c_vals.size].astype(np.int64)
+    if not math.isclose(float(c_prob.sum()), 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise RuntimeError("contact histogram lost probability mass")
     c_prob /= c_prob.sum()
     # Raw visits from the biased fixed-weight production run.  These are not
     # athermal counts, but because every sample in one contact level carries the
@@ -930,26 +996,60 @@ def build_distributions(
     # in the compact tail it is orders of magnitude smaller than the number of
     # samples actually backing the bin, which would report the best-sampled
     # levels as the worst.
-    production_c_counts = production_c_counts_full[positive].astype(np.int64)
-    # Naive independent-count diagnostic only.  This is not a standard error:
-    # it ignores autocorrelation, self-normalized importance weighting, and
-    # uncertainty in the learned Wang-Landau bias.
-    c_naive_count_error = 1.0 / np.sqrt(production_c_counts.astype(np.float64))
+    # Superseded by c_blocked_stderr for error estimation.  This remains only a
+    # raw coverage indicator and ignores autocorrelation and reweighting.
+    c_naive_count_error = np.full(c_vals.size, np.inf, dtype=np.float64)
+    visited = production_c_counts > 0
+    c_naive_count_error[visited] = 1.0 / np.sqrt(
+        production_c_counts[visited].astype(np.float64)
+    )
 
-    rg_min, rg_max = float(radii.min()), float(radii.max())
-    pad = 1e-9 if rg_max <= rg_min else 0.02 * (rg_max - rg_min)
-    rg_edges = np.linspace(rg_min - pad, rg_max + pad, rg_bins + 1)
+    legacy_edges = np.array([], dtype=np.float64)
+    legacy_source = ""
+    search_dir = Path(__file__).resolve().parent if grid_search_dir is None else grid_search_dir
+    if rg_edges is None and n_beads in LEGACY_BASELINE_FILES:
+        legacy_edges, width, _ = legacy_rg_grid(int(n_beads), search_dir)
+        rg_edges = fixed_rg_edges(int(n_beads), search_dir)
+        resolved_grid_source = "legacy_extended"
+        legacy_source = LEGACY_BASELINE_FILES[int(n_beads)]
+    elif rg_edges is None:
+        if n_beads is None:
+            raise ValueError("n_beads is required when rg_edges is not supplied")
+        rg_min, rg_max = float(radii.min()), float(radii.max())
+        pad = 1e-9 if rg_max <= rg_min else 0.02 * (rg_max - rg_min)
+        upper = max(rg_max + pad, rod_rg(int(n_beads)))
+        rg_edges = np.linspace(rg_min - pad, upper, rg_bins + 1)
+        width = float(np.median(np.diff(rg_edges)))
+        resolved_grid_source = "adaptive"
+        warnings.warn(
+            f"N={n_beads} has no registered legacy Rg grid; using a run-dependent "
+            "adaptive grid padded to the rod maximum",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    else:
+        rg_edges = np.asarray(rg_edges, dtype=np.float64)
+        width = float(np.median(np.diff(rg_edges)))
+        resolved_grid_source = grid_source or "provided"
+    rg_edges = np.asarray(rg_edges, dtype=np.float64)
+    rg_out_of_range_count = assert_within_grid(radii, rg_edges, "Rg")
     rg_prob, _ = np.histogram(radii, bins=rg_edges, weights=weights)
     rg_prob = rg_prob.astype(np.float64)
+    if not math.isclose(float(rg_prob.sum()), 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise RuntimeError("Rg histogram lost probability mass")
     rg_prob /= rg_prob.sum()
 
     if no_joint:
         crg_prob = np.array([[]], dtype=np.float64)
     else:
+        assert_within_grid(contacts, c_edges, "joint contact")
+        assert_within_grid(radii, rg_edges, "joint Rg")
         crg_prob, _, _ = np.histogram2d(
             contacts.astype(np.float64), radii, bins=(c_edges, rg_edges), weights=weights
         )
         crg_prob = crg_prob.astype(np.float64)
+        if not math.isclose(float(crg_prob.sum()), 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise RuntimeError("joint histogram lost probability mass")
         crg_prob /= crg_prob.sum()
 
     bend_vals = np.unique(bends)
@@ -961,7 +1061,7 @@ def build_distributions(
         marginal_m_error = float("nan")
         marginal_rg_error = float("nan")
     else:
-        marginal_m_error = float(np.max(np.abs(crg_prob.sum(axis=1) - c_mass)))
+        marginal_m_error = float(np.max(np.abs(crg_prob.sum(axis=1) - c_prob)))
         marginal_rg_error = float(np.max(np.abs(crg_prob.sum(axis=0) - rg_prob)))
 
     return {
@@ -972,6 +1072,11 @@ def build_distributions(
         "c_naive_count_error": c_naive_count_error,
         "c_edges": c_edges,
         "rg_edges": rg_edges,
+        "rg_grid_source": resolved_grid_source,
+        "legacy_rg_edges": legacy_edges,
+        "legacy_grid_source": legacy_source,
+        "rg_grid_width": width,
+        "rg_out_of_range_count": rg_out_of_range_count,
         "rg_prob": rg_prob,
         "crg_prob": crg_prob,
         "bend_vals": bend_vals,
@@ -1050,7 +1155,17 @@ def run_self_test() -> int:
     contacts = np.concatenate([result["contact_samples"] for result in results])
     radii = np.concatenate([result["rg_samples"] for result in results])
     bends = np.concatenate([result["bend_samples"] for result in results])
-    built = build_distributions(contacts, radii, bends, learned["log_g"], m_min, 24, False)
+    built = build_distributions(
+        contacts,
+        radii,
+        bends,
+        learned["log_g"],
+        m_min,
+        24,
+        False,
+        n_beads=n_beads,
+        m_cover=m_max,
+    )
     observed = np.zeros(m_max - m_min + 1)
     observed[built["c_vals"] - m_min] = built["c_prob"]
     exact = np.zeros_like(observed)
@@ -1219,6 +1334,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="store an athermal importance-resampled c/Rg/bend sample set",
     )
     parser.add_argument("--no_save_raw_samples", dest="save_raw_samples", action="store_false")
+    parser.add_argument(
+        "--legacy_sample_aliases", action="store_true",
+        help="also write deprecated c_samples/rg_samples/bend_samples aliases",
+    )
+    parser.add_argument(
+        "--n_blocks", type=int, default=20,
+        help="non-overlapping batch-means blocks per production worker",
+    )
     parser.add_argument("--self-test", action="store_true", help="run exact small-chain validation")
     return parser.parse_args(argv)
 
@@ -1385,6 +1508,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min_production_round_trips must be nonnegative")
     if args.min_production_samples_per_level < 1:
         raise ValueError("--min_production_samples_per_level must be positive")
+    if args.n_blocks < 2:
+        raise ValueError("--n_blocks must be at least 2")
+    if args.legacy_sample_aliases and not args.save_raw_samples:
+        raise ValueError("--legacy_sample_aliases requires raw-sample saving")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1514,8 +1641,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "output was not written"
         )
     built = build_distributions(
-        contacts, radii, bends, learned["log_g"], args.m_min, args.rg_bins, args.no_joint
+        contacts,
+        radii,
+        bends,
+        learned["log_g"],
+        args.m_min,
+        args.rg_bins,
+        args.no_joint,
+        n_beads=args.N,
+        m_cover=args.m_cover,
     )
+    c_blocked_stderr, blocked_batch_count = blocked_contact_stderr(
+        [result["contact_samples"] for result in results],
+        learned["log_g"],
+        args.m_min,
+        args.m_cover,
+        args.n_blocks,
+    )
+    built["c_blocked_stderr"] = c_blocked_stderr
     weights = built.pop("weights")
     ess = effective_sample_size(weights)
     total_round_trips = sum(result["round_trips"] for result in results)
@@ -1564,12 +1707,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_samples=int(contacts.size), accepted_moves_per_worker=accepted_per_worker,
         acceptance_ratios_per_worker=acceptance_per_worker,
         combined_acceptance_ratio=float(total_accepted / total_attempted),
-        rg_bins=int(args.rg_bins), samples_per_worker=samples_per_worker,
+        rg_bins=int(np.asarray(built["rg_edges"]).size - 1),
+        requested_rg_bins=int(args.rg_bins), samples_per_worker=samples_per_worker,
         per_worker_m_mean=np.asarray(per_worker_m_mean),
         per_worker_rg_mean=np.asarray(per_worker_rg_mean),
         kappa_bend=0.0, bending_enabled=False, bend_definition=BEND_DEFINITION,
         sampler="wang_landau_fixed_weight_reweighted",
-        raw_samples_resampled=bool(args.save_raw_samples),
+        raw_samples_resampled=True,
+        raw_samples_available=bool(args.save_raw_samples),
+        raw_samples_warning=RAW_SAMPLES_WARNING,
+        raw_samples_unique_fraction=float("nan"),
+        n_blocks_per_worker=int(args.n_blocks),
+        c_blocked_batch_count=int(blocked_batch_count),
         wl_m_values=np.arange(args.m_min, args.m_max + 1, dtype=np.int64),
         wl_log_g=np.asarray(learned["log_g"], dtype=np.float64),
         wl_seed=int(args.wl_seed), wl_initial_log_f=float(args.wl_initial_log_f),
@@ -1618,9 +1767,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         resampled_indices = systematic_resample(
             weights, np.random.default_rng(args.base_seed + 10_000_019)
         )
-        save["c_samples"] = contacts[resampled_indices]
-        save["rg_samples"] = radii[resampled_indices]
-        save["bend_samples"] = bends[resampled_indices]
+        save["raw_samples_unique_fraction"] = float(
+            np.unique(resampled_indices).size / resampled_indices.size
+        )
+        save["c_samples_resampled"] = contacts[resampled_indices]
+        save["rg_samples_resampled"] = radii[resampled_indices]
+        save["bend_samples_resampled"] = bends[resampled_indices]
+        if args.legacy_sample_aliases:
+            save["c_samples"] = save["c_samples_resampled"]
+            save["rg_samples"] = save["rg_samples_resampled"]
+            save["bend_samples"] = save["bend_samples_resampled"]
     np.savez_compressed(output_path, **save)
 
     print("\n=== Reweighted athermal result ===")

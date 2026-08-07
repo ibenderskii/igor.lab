@@ -169,13 +169,24 @@ The NPZ contains the athermal, reweighted versions of the existing fields:
 - `N`, `T`, `eps`, worker seeds and sampling controls;
 - acceptance, worker means, bend summaries, and optional raw samples.
 
-The stored raw `c_samples`, `rg_samples`, and `bend_samples` are obtained by
-systematic importance resampling, so their semantics remain athermal rather than
-multicanonical.  The weighted histograms, not the resampled arrays, are the
-authoritative output.  `c_counts` is constructed from the same athermal
-resampled contacts.  The raw fixed-weight visit counts are stored separately as
-`production_c_counts`.  `wl_*` and importance-diagnostic fields are additive
-and can be ignored by legacy readers.
+The optional arrays `c_samples_resampled`, `rg_samples_resampled`, and
+`bend_samples_resampled` are systematic importance resamples and therefore
+contain duplicates.  They must not be used for variance or error-bar
+estimation.  The deprecated names `c_samples`, `rg_samples`, and `bend_samples`
+are written only with `--legacy_sample_aliases`.  The script does not write a
+`c_counts` field.
+
+The weighted histograms are authoritative.  `production_c_counts` stores raw
+fixed-weight visits, `c_naive_count_error` is retained only as a coverage
+indicator, and `c_blocked_stderr` is the per-level batch-means standard error
+that accounts for within-chain autocorrelation when blocks are sufficiently
+long.  Raw-sample provenance and duplicate fraction are recorded explicitly.
+
+For N=30, 44, and 60, `rg_edges` retains the historical grid verbatim and
+extends it on the same spacing to cover the compact-cluster reference and exact
+rod limit.  Contact edges always span the complete declared window, including
+zero-mass levels.  Histogramming raises if any sample falls outside either grid;
+out-of-range mass is never silently discarded and renormalized away.
 
 ## 7. Validation sequence
 
