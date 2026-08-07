@@ -62,9 +62,19 @@ every attempted move, accepted or rejected, update the occupied bin:
 \log\hat g(m_{current})+\log f.
 \]
 
-When every requested contact level has at least `wl_min_visits` visits and the
-minimum-to-mean histogram ratio is at least `wl_flatness`, reset the histogram
-and halve `log(f)`.  Continue until `log(f) <= wl_final_log_f`.
+The declared window has three tiers.  Tier 2 is required to reach
+`wl_min_visits` and the `wl_flatness` minimum-to-mean ratio.  Tier 1 is excluded
+from that ratio but must reach `wl_min_cover_visits`.  Tier 0 is outside the
+declared window or is an independently verified internal gap.  The default
+boundary between tiers 2 and 1 is derived from the worst-temperature molecular
+target tail; the default tier-1 ceiling remains the exact geometric maximum.
+
+With the default halving schedule, reset the histogram and halve `log(f)` after
+the tier-specific checks pass.  The optional Belardinelli-Pereyra schedule uses
+the cumulative Monte Carlo time `t = attempted_moves / included_levels`; its
+time origin is never reset between stages.  After the initial coverage stages,
+`log(f)=1/t` is updated after every attempted move without a histogram-flatness
+criterion.
 
 The adaptive samples are never used in the reported baseline.  Stage
 checkpoints contain the current chain, density estimate, next modification
@@ -107,12 +117,18 @@ baseline.  The script uses verified maxima 30, 50, and 74 automatically for
 `N=30`, `44`, and `60`; other chain lengths require an externally verified
 exact maximum.
 
-By default, the learning stage requires every integer contact level from `0`
-through `m_max` to be visited and flat.  A finite simulation is never used to
-classify an unvisited level as geometrically unreachable.  Known internal gaps
-may be supplied with `--excluded_contact_levels`, but only after independent
-geometric verification.  If learning or production ever encounters an excluded
-level, the run fails and writes no output.
+By default, every integer contact level from `0` through `m_max` remains in the
+window, but only the target-supported tier must be flat.  The coverage tier is
+still required to reach its minimum visit count.  A finite simulation is never
+used to classify an unvisited level as geometrically unreachable.  Known
+internal gaps may be supplied with `--excluded_contact_levels`, but only after
+independent geometric verification.  If learning or production ever encounters
+an excluded internal level, the run fails and writes no output.
+
+Tail truncation is off by default.  It is enabled only by an explicit `m_cover`
+or nonzero `cover_tail_threshold`, is printed as a declared conditional window,
+and records the omitted molecular target mass.  Its omitted athermal mass
+cannot be estimated from the truncated run itself.
 
 If the requested ceiling is unreachable or an unlisted internal gap exists, the
 run stops at `wl_max_steps` and reports the deficient bins.  The user must then
@@ -138,11 +154,11 @@ The output records:
   one-dimensional distributions.
 
 At least one summed production round trip is required by default.  Production
-must also record at least `min_production_samples_per_level` samples in every
-required contact level, with a default minimum of one.  A serious production
-run should increase both checks and inspect the worker-to-worker means.  A flat
-adaptive histogram alone is not evidence of adequate fixed-weight production
-mixing.
+must also meet the tier-specific minimum counts before output is written:
+`wl_min_visits` in tier 2 and `wl_min_cover_visits` in tier 1, with
+`min_production_samples_per_level` retained as an optional stricter common
+floor.  A flat adaptive histogram alone is not evidence of adequate
+fixed-weight production mixing.
 
 ## 6. Output compatibility
 
@@ -185,8 +201,8 @@ test.
 
 ## 8. Recommended first production workflow
 
-Pilot the 44-mer before the 60-mer, using the exact geometric `m_max` selected
-automatically for each chain length.  Run with checkpointing, multiple fixed-weight
-workers, and a production length sufficient for repeated window round trips.
-Retain the direct athermal baseline as an independent bulk comparison rather than
-replacing or deleting it.
+Pilot the 30-mer first as the end-to-end smoke test, then the 44-mer and 60-mer,
+using the exact geometric `m_max` selected automatically for each chain length.
+Run with checkpointing, multiple fixed-weight workers, and a production length
+sufficient for repeated window round trips.  Retain the direct athermal baseline
+as an independent bulk comparison rather than replacing or deleting it.
