@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import sys
 import tempfile
@@ -61,6 +62,7 @@ from baseline_grids import (
     fixed_c_edges,
     fixed_rg_edges,
     legacy_rg_grid,
+    min_compact_rg,
     rod_rg,
 )
 from target_support import (
@@ -1155,17 +1157,19 @@ def run_self_test() -> int:
     contacts = np.concatenate([result["contact_samples"] for result in results])
     radii = np.concatenate([result["rg_samples"] for result in results])
     bends = np.concatenate([result["bend_samples"] for result in results])
-    built = build_distributions(
-        contacts,
-        radii,
-        bends,
-        learned["log_g"],
-        m_min,
-        24,
-        False,
-        n_beads=n_beads,
-        m_cover=m_max,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        built = build_distributions(
+            contacts,
+            radii,
+            bends,
+            learned["log_g"],
+            m_min,
+            24,
+            False,
+            n_beads=n_beads,
+            m_cover=m_max,
+        )
     observed = np.zeros(m_max - m_min + 1)
     observed[built["c_vals"] - m_min] = built["c_prob"]
     exact = np.zeros_like(observed)
@@ -1225,12 +1229,224 @@ def run_self_test() -> int:
     except RuntimeError:
         gap_learn_ok = False
     checks["learning converges on a gapped window"] = gap_learn_ok
+
+    skips: List[str] = []
+    auto_dir = Path(__file__).resolve().parent
+
+    target_expectations = {
+        30: (29, 30, 20, 25),
+        44: (43, 50, 39, 49),
+        60: (59, 74, 66, 74),
+    }
+    target_paths = {
+        n: auto_dir / f"remd_distributions_{n}mer.npz"
+        for n in target_expectations
+    }
+    if all(path.exists() for path in target_paths.values()):
+        target_levels_ok = True
+        for n, (offset, maximum, expected_1e2, expected_1e3) in target_expectations.items():
+            support = load_target_contact_support(target_paths[n], offset)
+            target_levels_ok &= flat_level(support, 1e-2, maximum) == expected_1e2
+            target_levels_ok &= flat_level(support, 1e-3, maximum) == expected_1e3
+        checks["target-derived tier levels match N=30/44/60 regressions"] = target_levels_ok
+    else:
+        skips.append("target-derived tier levels (REMD NPZ files absent)")
+
+    tiered_tvd = float("inf")
+    try:
+        tiered_window = make_contact_tiers(0, 2, 0, 2)
+        tiered_learned = learn_log_density(
+            n_beads=6,
+            m_min=0,
+            m_max=2,
+            seed=1711,
+            initial_log_f=1.0,
+            final_log_f=1e-3,
+            flatness=0.8,
+            min_visits=100,
+            min_cover_visits=5,
+            check_every=500,
+            max_steps=1_000_000,
+            tier=tiered_window,
+            progress=False,
+        )
+        tiered_results = [
+            run_production_chain(
+                i, 9100 + i, tiered_learned["chain"], tiered_learned["log_g"],
+                0, 2, 150_000, 0.1, 5, False, tiered_window,
+            )
+            for i in range(2)
+        ]
+        tiered_contacts = np.concatenate(
+            [result["contact_samples"] for result in tiered_results]
+        )
+        tiered_radii = np.concatenate(
+            [result["rg_samples"] for result in tiered_results]
+        )
+        tiered_bends = np.concatenate(
+            [result["bend_samples"] for result in tiered_results]
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            tiered_built = build_distributions(
+                tiered_contacts,
+                tiered_radii,
+                tiered_bends,
+                tiered_learned["log_g"],
+                0,
+                24,
+                False,
+                n_beads=6,
+                m_cover=2,
+            )
+        tiered_exact = np.zeros(3, dtype=np.float64)
+        tiered_exact[exact_values] = exact_prob
+        tiered_tvd = 0.5 * float(
+            np.abs(tiered_built["c_prob"] - tiered_exact).sum()
+        )
+        tiered_ok = tiered_tvd < 0.03
+    except (RuntimeError, ValueError):
+        tiered_ok = False
+    checks["coverage-only tier preserves exact N=6 P(m)"] = tiered_ok
+
+    legacy_paths = [
+        auto_dir / LEGACY_BASELINE_FILES[n] for n in (30, 44, 60)
+    ]
+    if all(path.exists() for path in legacy_paths):
+        subset_ok = True
+        for n in (30, 44, 60):
+            legacy, _, _ = legacy_rg_grid(n, auto_dir)
+            emitted = fixed_rg_edges(n, auto_dir)
+            matches = np.flatnonzero(np.isclose(emitted, legacy[0], atol=1e-12))
+            subset_ok &= bool(matches.size)
+            if matches.size:
+                start = int(matches[0])
+                subset_ok &= bool(np.allclose(
+                    emitted[start:start + legacy.size], legacy,
+                    rtol=0.0, atol=1e-12,
+                ))
+            subset_ok &= emitted[0] <= min_compact_rg(n)
+            subset_ok &= emitted[-1] >= rod_rg(n)
+        checks["legacy Rg grids are exact subsets of extended grids"] = subset_ok
+    else:
+        skips.append("legacy Rg grid subset checks (baseline NPZ files absent)")
+
+    try:
+        assert_within_grid(np.array([-0.1]), np.array([0.0, 1.0]), "test")
+        guard_raised = False
+    except ValueError:
+        guard_raised = True
+    checks["out-of-range histogram guard raises"] = guard_raised
+    checks["normal distribution build has zero Rg drops"] = (
+        built["rg_out_of_range_count"] == 0
+    )
+
+    missing_tier = make_contact_tiers(0, 2, 2, 2)
+    missing_result = run_production_chain(
+        0,
+        8181,
+        [(i, 0, 0) for i in range(6)],
+        np.array([0.0, 0.0, 1000.0]),
+        0,
+        2,
+        2000,
+        0.0,
+        1,
+        False,
+        missing_tier,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        missing_built = build_distributions(
+            missing_result["contact_samples"],
+            missing_result["rg_samples"],
+            missing_result["bend_samples"],
+            np.array([0.0, 0.0, 1000.0]),
+            0,
+            12,
+            False,
+            n_beads=6,
+            m_cover=2,
+        )
+    checks["declared contact axis survives a missed high level"] = (
+        np.array_equal(missing_built["c_vals"], np.arange(3))
+        and np.array_equal(missing_built["c_edges"], np.arange(-0.5, 3.5))
+        and missing_built["c_prob"][2] == 0.0
+    )
+
+    blocked_stderr, _ = blocked_contact_stderr(
+        [result["contact_samples"] for result in results],
+        learned["log_g"],
+        m_min,
+        m_max,
+        10,
+    )
+    resampled_indices = systematic_resample(
+        built["weights"], np.random.default_rng(12345)
+    )
+    unique_fraction = np.unique(resampled_indices).size / resampled_indices.size
+    with tempfile.TemporaryDirectory() as temporary:
+        short_path = Path(temporary) / "self_test_baseline.npz"
+        np.savez_compressed(
+            short_path,
+            c_vals=built["c_vals"],
+            c_prob=built["c_prob"],
+            c_edges=built["c_edges"],
+            rg_edges=built["rg_edges"],
+            rg_prob=built["rg_prob"],
+            crg_prob=built["crg_prob"],
+            production_c_counts=built["production_c_counts"],
+            c_blocked_stderr=blocked_stderr,
+            c_samples_resampled=contacts[resampled_indices],
+            rg_samples_resampled=radii[resampled_indices],
+            bend_samples_resampled=bends[resampled_indices],
+            raw_samples_resampled=True,
+            raw_samples_unique_fraction=unique_fraction,
+            raw_samples_warning=RAW_SAMPLES_WARNING,
+        )
+        with np.load(short_path, allow_pickle=False) as emitted:
+            provenance_ok = (
+                "c_samples" not in emitted.files
+                and "c_samples_resampled" in emitted.files
+                and float(emitted["raw_samples_unique_fraction"]) < 1.0
+                and emitted["c_blocked_stderr"].shape == emitted["c_vals"].shape
+                and np.all(
+                    emitted["c_blocked_stderr"][emitted["production_c_counts"] > 1]
+                    > 0.0
+                )
+            )
+        checks["resampled-array provenance and blocked errors are explicit"] = provenance_ok
+
+        matplotlib_dir = Path(temporary) / "matplotlib"
+        matplotlib_dir.mkdir()
+        os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_dir))
+        try:
+            from fit_lattice_contact_model_2 import build_baseline_mass_on_integer
+        except ImportError:
+            skips.append("fitter baseline round trip (fitter import unavailable)")
+        else:
+            try:
+                round_trip = build_baseline_mass_on_integer(
+                    np.arange(m_min, m_max + 1), short_path
+                )
+                fitter_ok = (
+                    round_trip.shape == (m_max - m_min + 1,)
+                    and abs(float(round_trip.sum()) - 1.0) < 1e-12
+                    and np.array_equal(built["c_vals"], np.arange(m_min, m_max + 1))
+                )
+            except Exception:
+                fitter_ok = False
+            checks["fitter loads the declared zero-preserving contact support"] = fitter_ok
+
     print(f"  exact P(m)       = {dict(zip(exact_values.tolist(), exact_prob.tolist()))}")
     print(f"  estimated P(m)   = {dict(zip(built['c_vals'].tolist(), built['c_prob'].tolist()))}")
     print(f"  contact TVD      = {total_variation:.6g}")
+    print(f"  tiered contact TVD = {tiered_tvd:.6g}")
     print(f"  mean Rg rel.err  = {relative_rg_error:.6g}")
     for description, passed in checks.items():
         print(f"  {'PASS' if passed else 'FAIL'}: {description}")
+    for description in skips:
+        print(f"  SKIP: {description}")
     if all(checks.values()):
         print("SELF-TEST PASSED")
         return 0
