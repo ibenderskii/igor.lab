@@ -62,9 +62,19 @@ every attempted move, accepted or rejected, update the occupied bin:
 \log\hat g(m_{current})+\log f.
 \]
 
-When every requested contact level has at least `wl_min_visits` visits and the
-minimum-to-mean histogram ratio is at least `wl_flatness`, reset the histogram
-and halve `log(f)`.  Continue until `log(f) <= wl_final_log_f`.
+The declared window has three tiers.  Tier 2 is required to reach
+`wl_min_visits` and the `wl_flatness` minimum-to-mean ratio.  Tier 1 is excluded
+from that ratio but must reach `wl_min_cover_visits`.  Tier 0 is outside the
+declared window or is an independently verified internal gap.  The default
+boundary between tiers 2 and 1 is derived from the worst-temperature molecular
+target tail; the default tier-1 ceiling remains the exact geometric maximum.
+
+With the default halving schedule, reset the histogram and halve `log(f)` after
+the tier-specific checks pass.  The optional Belardinelli-Pereyra schedule uses
+the cumulative Monte Carlo time `t = attempted_moves / included_levels`; its
+time origin is never reset between stages.  After the initial coverage stages,
+`log(f)=1/t` is updated after every attempted move without a histogram-flatness
+criterion.
 
 The adaptive samples are never used in the reported baseline.  Stage
 checkpoints contain the current chain, density estimate, next modification
@@ -107,12 +117,18 @@ baseline.  The script uses verified maxima 30, 50, and 74 automatically for
 `N=30`, `44`, and `60`; other chain lengths require an externally verified
 exact maximum.
 
-By default, the learning stage requires every integer contact level from `0`
-through `m_max` to be visited and flat.  A finite simulation is never used to
-classify an unvisited level as geometrically unreachable.  Known internal gaps
-may be supplied with `--excluded_contact_levels`, but only after independent
-geometric verification.  If learning or production ever encounters an excluded
-level, the run fails and writes no output.
+By default, every integer contact level from `0` through `m_max` remains in the
+window, but only the target-supported tier must be flat.  The coverage tier is
+still required to reach its minimum visit count.  A finite simulation is never
+used to classify an unvisited level as geometrically unreachable.  Known
+internal gaps may be supplied with `--excluded_contact_levels`, but only after
+independent geometric verification.  If learning or production ever encounters
+an excluded internal level, the run fails and writes no output.
+
+Tail truncation is off by default.  It is enabled only by an explicit `m_cover`
+or nonzero `cover_tail_threshold`, is printed as a declared conditional window,
+and records the omitted molecular target mass.  Its omitted athermal mass
+cannot be estimated from the truncated run itself.
 
 If the requested ceiling is unreachable or an unlisted internal gap exists, the
 run stops at `wl_max_steps` and reports the deficient bins.  The user must then
@@ -138,11 +154,11 @@ The output records:
   one-dimensional distributions.
 
 At least one summed production round trip is required by default.  Production
-must also record at least `min_production_samples_per_level` samples in every
-required contact level, with a default minimum of one.  A serious production
-run should increase both checks and inspect the worker-to-worker means.  A flat
-adaptive histogram alone is not evidence of adequate fixed-weight production
-mixing.
+must also meet the tier-specific minimum counts before output is written:
+`wl_min_visits` in tier 2 and `wl_min_cover_visits` in tier 1, with
+`min_production_samples_per_level` retained as an optional stricter common
+floor.  A flat adaptive histogram alone is not evidence of adequate
+fixed-weight production mixing.
 
 ## 6. Output compatibility
 
@@ -153,13 +169,24 @@ The NPZ contains the athermal, reweighted versions of the existing fields:
 - `N`, `T`, `eps`, worker seeds and sampling controls;
 - acceptance, worker means, bend summaries, and optional raw samples.
 
-The stored raw `c_samples`, `rg_samples`, and `bend_samples` are obtained by
-systematic importance resampling, so their semantics remain athermal rather than
-multicanonical.  The weighted histograms, not the resampled arrays, are the
-authoritative output.  `c_counts` is constructed from the same athermal
-resampled contacts.  The raw fixed-weight visit counts are stored separately as
-`production_c_counts`.  `wl_*` and importance-diagnostic fields are additive
-and can be ignored by legacy readers.
+The optional arrays `c_samples_resampled`, `rg_samples_resampled`, and
+`bend_samples_resampled` are systematic importance resamples and therefore
+contain duplicates.  They must not be used for variance or error-bar
+estimation.  The deprecated names `c_samples`, `rg_samples`, and `bend_samples`
+are written only with `--legacy_sample_aliases`.  The script does not write a
+`c_counts` field.
+
+The weighted histograms are authoritative.  `production_c_counts` stores raw
+fixed-weight visits, `c_naive_count_error` is retained only as a coverage
+indicator, and `c_blocked_stderr` is the per-level batch-means standard error
+that accounts for within-chain autocorrelation when blocks are sufficiently
+long.  Raw-sample provenance and duplicate fraction are recorded explicitly.
+
+For N=30, 44, and 60, `rg_edges` retains the historical grid verbatim and
+extends it on the same spacing to cover the compact-cluster reference and exact
+rod limit.  Contact edges always span the complete declared window, including
+zero-mass levels.  Histogramming raises if any sample falls outside either grid;
+out-of-range mass is never silently discarded and renormalized away.
 
 ## 7. Validation sequence
 
@@ -179,14 +206,27 @@ and can be ignored by legacy readers.
    with only the baseline changed.  Report how support, fitted parameters,
    residuals, and chain-length transferability change.
 
-The script's built-in `--self-test` performs steps 1 and 2.  Steps 4 and 5 need
-the project production data and should be treated as the scientific acceptance
-test.
+The script's built-in `--self-test` performs steps 1 through 3.
+`run_wl_pilot.py` performs steps 4 and 5 in the mandatory order N=30, N=44,
+then N=60, stopping after any failed gate.  Its `--dry-run` mode prints all
+commands and the measured-throughput wall-time estimate without creating
+outputs.  The production pilot needs the project data and should be treated as
+the scientific acceptance test.
 
 ## 8. Recommended first production workflow
 
-Pilot the 44-mer before the 60-mer, using the exact geometric `m_max` selected
-automatically for each chain length.  Run with checkpointing, multiple fixed-weight
-workers, and a production length sufficient for repeated window round trips.
-Retain the direct athermal baseline as an independent bulk comparison rather than
-replacing or deleting it.
+Pilot the 30-mer first as the end-to-end smoke test, then the 44-mer and 60-mer,
+using the exact geometric `m_max` selected automatically for each chain length.
+Run with checkpointing, multiple fixed-weight workers, and a production length
+sufficient for repeated window round trips.  Retain the direct athermal baseline
+as an independent bulk comparison rather than replacing or deleting it.
+
+Preview the complete gated workflow with:
+
+```bash
+python run_wl_pilot.py --dry-run
+```
+
+Run it by removing `--dry-run`.  A failure to reach the declared upper contact
+level is reported as evidence for separately reviewed pull moves; the runner
+never lowers `m_cover` to manufacture a passing result.
