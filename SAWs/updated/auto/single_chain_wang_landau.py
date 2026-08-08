@@ -49,6 +49,7 @@ import sys
 import tempfile
 import time
 import warnings
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import permutations, product
 from pathlib import Path
@@ -85,6 +86,9 @@ RAW_SAMPLES_WARNING = (
     "These arrays are systematic importance resamples with duplicates; do not "
     "use them for variance or error-bar estimation. Use c_blocked_stderr."
 )
+# Cubic-lattice self-avoiding-walk connective constant; sets the analytic scale
+# N*ln(mu) of the learned log-density across a full contact window.
+SAW_CONNECTIVE_CONSTANT = 4.684
 TIER_EXCLUDED = np.int8(0)
 TIER_COVERAGE = np.int8(1)
 TIER_FLAT = np.int8(2)
@@ -332,6 +336,10 @@ def _save_checkpoint(
     tier: np.ndarray,
     schedule: str,
     one_over_t_mode: bool,
+    one_over_t_trigger_reason: str,
+    one_over_t_round_trips: int,
+    visits_since_start: np.ndarray,
+    visits_since_one_over_t: np.ndarray,
     stage_records: np.ndarray,
     learning_wall_seconds: float,
 ) -> None:
@@ -356,6 +364,14 @@ def _save_checkpoint(
             wl_tier=np.asarray(tier, dtype=np.int8),
             wl_schedule=np.array(schedule),
             one_over_t_mode=np.array(one_over_t_mode, dtype=bool),
+            wl_one_over_t_trigger=np.array(one_over_t_trigger_reason),
+            wl_one_over_t_round_trips=np.array(
+                one_over_t_round_trips, dtype=np.int64
+            ),
+            wl_visits_since_start=np.asarray(visits_since_start, dtype=np.int64),
+            wl_visits_since_one_over_t=np.asarray(
+                visits_since_one_over_t, dtype=np.int64
+            ),
             wl_stage_records=np.asarray(stage_records, dtype=WL_STAGE_DTYPE),
             learning_wall_seconds=np.array(learning_wall_seconds, dtype=np.float64),
         )
@@ -448,6 +464,21 @@ def _validate_tier(tier: np.ndarray, expected_size: int) -> np.ndarray:
     return tier
 
 
+def _resume_histogram(saved: Any, key: str, expected_size: int) -> np.ndarray:
+    """Load a checkpointed visit histogram, validating it like ``wl_tier``."""
+    if key not in saved:
+        return np.zeros(expected_size, dtype=np.int64)
+    histogram = np.asarray(saved[key], dtype=np.int64)
+    if histogram.shape != (expected_size,):
+        raise ValueError(
+            f"checkpoint {key} shape does not match the requested contact "
+            f"window: saved={histogram.shape}, requested={(expected_size,)}"
+        )
+    if np.any(histogram < 0):
+        raise ValueError(f"checkpoint {key} contains negative visit counts")
+    return histogram
+
+
 def _included_limits(tier: np.ndarray, m_min: int) -> Tuple[int, int]:
     included = np.flatnonzero(tier > TIER_EXCLUDED)
     if included.size == 0:
@@ -462,6 +493,120 @@ def _slowest_levels(histogram: np.ndarray, tier: np.ndarray, m_min: int) -> np.n
     count = min(3, order.size)
     levels[:count] = order[:count] + m_min
     return levels
+
+
+def _report_log_g_spread(
+    log_g: np.ndarray, included: np.ndarray, n_beads: int, progress: bool
+) -> Tuple[float, float]:
+    """Report the learned bias amplitude against its analytic scale.
+
+    ``log g(m)`` spans roughly ``N ln(mu)`` over the whole window, with ``mu``
+    the cubic-lattice self-avoiding-walk connective constant.  A spread far
+    above that is dominated by accumulation noise rather than by the density of
+    states, which is the signature of a bias that was frozen before the window
+    was properly covered.  This is advisory: the production support and round
+    trip gates remain the hard checks.
+    """
+    values = log_g[included]
+    spread = float(values.max() - values.min())
+    reference = float(n_beads * math.log(SAW_CONNECTIVE_CONSTANT))
+    if progress:
+        print(
+            f"learned log_g spread over included levels: {spread:.3g} "
+            f"(analytic scale N*ln(mu)={reference:.3g})",
+            flush=True,
+        )
+    if spread > 10.0 * reference:
+        print(
+            f"WARNING: learned log_g spread {spread:.6g} exceeds ten times the "
+            f"analytic scale {reference:.6g}; the bias is likely dominated by "
+            "accumulation noise rather than the density of states. Inspect "
+            "wl_visits_since_one_over_t before trusting the frozen weights.",
+            flush=True,
+        )
+    return spread, reference
+
+
+def _coverage_satisfied(
+    range_covered: bool,
+    min_flat: int,
+    min_coverage: int,
+    tier: np.ndarray,
+    min_visits: int,
+    min_cover_visits: int,
+) -> bool:
+    """Return whether a visit histogram meets the coverage requirement."""
+    return bool(
+        range_covered
+        and min_flat >= min_visits
+        and (
+            not np.any(tier == TIER_COVERAGE)
+            or min_coverage >= min_cover_visits
+        )
+    )
+
+
+def _report_cap_reconciliation(
+    *,
+    stage_steps: int,
+    elapsed: float,
+    max_steps: int,
+    max_seconds: float,
+    elapsed_total: float,
+    progress: bool,
+) -> None:
+    """Report which of the step and time caps actually binds this run.
+
+    Neither cap is altered.  A step cap far beyond what the time cap permits is
+    dead code, and silently leaving it in place hides which limit stops the run.
+    """
+    if elapsed <= 0.0 or not math.isfinite(max_seconds):
+        return
+    rate = stage_steps / elapsed
+    remaining_seconds = max(max_seconds - elapsed_total, 0.0)
+    time_implied_steps = rate * remaining_seconds
+    binding = "--wl_max_steps" if max_steps <= time_implied_steps else "--wl_max_seconds"
+    if progress:
+        print(
+            f"[WL] measured rate={rate:.0f} steps/s; --wl_max_seconds permits "
+            f"about {time_implied_steps:.3g} further steps versus "
+            f"--wl_max_steps={max_steps:.3g}; binding cap is {binding}",
+            flush=True,
+        )
+    if max_steps > 2.0 * time_implied_steps:
+        warnings.warn(
+            f"--wl_max_steps={max_steps:.3g} is unreachable within "
+            f"--wl_max_seconds={max_seconds:.6g}: at the measured "
+            f"{rate:.0f} steps/s the time cap permits only about "
+            f"{time_implied_steps:.3g} further steps. --wl_max_seconds is the "
+            "operative limit; neither value has been changed.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def one_over_t_trigger(
+    log_f: float, inverse_time: float, stage_steps: int, stall_steps: int
+) -> Tuple[bool, str]:
+    """Decide whether to enter the asymptotic ``1/t`` phase.
+
+    Two independent conditions enter the phase.  The stall trigger fires when a
+    refinement stage has run ``stall_steps`` attempted moves without completing;
+    this is the operative one, because a stage that cannot reach coverage is
+    exactly the situation the ``1/t`` schedule exists to escape.  The
+    Belardinelli-Pereyra trigger fires when ``log_f`` has fallen to or below
+    ``1/t``, after which the halving schedule would drive the modification
+    factor below the level where the error stops decreasing.
+
+    The stall is tested first so that its reason is reported when both hold.
+    Returns ``(fire, reason)`` with reason in
+    ``{"", "stall", "belardinelli_pereyra"}``.
+    """
+    if stage_steps >= stall_steps:
+        return True, "stall"
+    if log_f <= inverse_time:
+        return True, "belardinelli_pereyra"
+    return False, ""
 
 
 def _stage_visit_statistics(
@@ -494,8 +639,10 @@ def learn_log_density(
     max_steps: int,
     min_cover_visits: int = 50,
     max_seconds: float = math.inf,
+    max_seconds_scope: str = "cumulative",
     max_steps_per_stage: int = 1_000_000_000,
     schedule: str = "halving",
+    stage_stall_steps: int = 50_000_000,
     checkpoint_every_seconds: float = 1800.0,
     tier: Optional[np.ndarray] = None,
     checkpoint: Optional[Path] = None,
@@ -508,10 +655,23 @@ def learn_log_density(
     in both included tiers.  The Belardinelli-Pereyra schedule uses cumulative
     time per included level and drops the flatness-ratio requirement during its
     pre-asymptotic coverage stages and continuous ``1/t`` phase.
+
+    Once the ``1/t`` phase begins there are no further stages, so per-stage
+    coverage is no longer meaningful.  Coverage is then judged against a visit
+    histogram that is reset at the moment the phase begins, which requires the
+    frozen bias to have been exercised over the whole included window at its
+    final resolution rather than once per refinement stage.
     """
     if schedule not in {"halving", "one_over_t"}:
         raise ValueError("schedule must be 'halving' or 'one_over_t'")
-    if min(min_visits, min_cover_visits, check_every, max_steps, max_steps_per_stage) < 1:
+    if max_seconds_scope not in {"cumulative", "per_invocation"}:
+        raise ValueError(
+            "max_seconds_scope must be 'cumulative' or 'per_invocation'"
+        )
+    if min(
+        min_visits, min_cover_visits, check_every, max_steps,
+        max_steps_per_stage, stage_stall_steps,
+    ) < 1:
         raise ValueError("WL visit/check/step controls must be positive")
     if max_seconds <= 0.0 or checkpoint_every_seconds <= 0.0:
         raise ValueError("WL time controls must be positive")
@@ -525,9 +685,13 @@ def learn_log_density(
         accepted = 0
         previous_round_trips = 0
         one_over_t_mode = False
+        one_over_t_reason = ""
         stage_records: List[Any] = []
         historical_wall = 0.0
         saved_tier = None
+        visits_since_start = np.zeros(m_max - m_min + 1, dtype=np.int64)
+        visits_since_one_over_t = np.zeros(m_max - m_min + 1, dtype=np.int64)
+        one_over_t_trips_before = 0
     else:
         with np.load(resume_checkpoint, allow_pickle=False) as saved:
             saved_n = int(saved["N"])
@@ -547,9 +711,23 @@ def learn_log_density(
             accepted = int(saved["accepted_moves"])
             previous_round_trips = int(saved["round_trips"])
             one_over_t_mode = bool(saved["one_over_t_mode"]) if "one_over_t_mode" in saved else False
+            one_over_t_reason = (
+                str(saved["wl_one_over_t_trigger"])
+                if "wl_one_over_t_trigger" in saved else ""
+            )
             historical_wall = (
                 float(saved["learning_wall_seconds"])
                 if "learning_wall_seconds" in saved else 0.0
+            )
+            visits_since_start = _resume_histogram(
+                saved, "wl_visits_since_start", log_g.size
+            )
+            visits_since_one_over_t = _resume_histogram(
+                saved, "wl_visits_since_one_over_t", log_g.size
+            )
+            one_over_t_trips_before = (
+                int(saved["wl_one_over_t_round_trips"])
+                if "wl_one_over_t_round_trips" in saved else 0
             )
             stage_records = (
                 list(np.asarray(saved["wl_stage_records"], dtype=WL_STAGE_DTYPE))
@@ -591,6 +769,11 @@ def learn_log_density(
     tracker.observe(contact)
     t0 = time.time()
     last_checkpoint_time = t0
+    # Round trips completed in the 1/t phase are counted from the moment it is
+    # entered; a resumed 1/t run carries its earlier total in
+    # ``one_over_t_trips_before``.
+    entry_round_trips = tracker.round_trips
+    reported_cap_reconciliation = False
 
     def checkpoint_now(current_log_f: float) -> None:
         if checkpoint is None:
@@ -611,6 +794,13 @@ def learn_log_density(
             tier=tier,
             schedule=schedule,
             one_over_t_mode=one_over_t_mode,
+            one_over_t_trigger_reason=one_over_t_reason,
+            one_over_t_round_trips=(
+                one_over_t_trips_before + (tracker.round_trips - entry_round_trips)
+                if one_over_t_mode else 0
+            ),
+            visits_since_start=visits_since_start,
+            visits_since_one_over_t=visits_since_one_over_t,
             stage_records=np.asarray(stage_records, dtype=WL_STAGE_DTYPE),
             learning_wall_seconds=historical_wall + (time.time() - t0),
         )
@@ -638,12 +828,18 @@ def learn_log_density(
             }
             for index in slow
         ]
+        per_invocation = time.time() - t0
         return RuntimeError(
             f"Wang-Landau learning reached {cap_name} at stage "
             f"{stages_completed + 1}, log_f={log_f:.6g}. "
             f"Slowest levels: {slow_text}. Highest m reached this stage: "
             f"{highest_m} (first reached at stage step {highest_first_step}). "
-            f"Stage elapsed={elapsed:.1f}s, rate={rate:.1f} steps/s. {suggestion}"
+            f"Stage elapsed={elapsed:.1f}s, rate={rate:.1f} steps/s. "
+            f"Elapsed cumulative={historical_wall + per_invocation:.1f}s "
+            f"(this invocation={per_invocation:.1f}s, "
+            f"prior invocations={historical_wall:.1f}s); "
+            f"--wl_max_seconds_scope={max_seconds_scope}. "
+            f"mode={'1/t' if one_over_t_mode else schedule}. {suggestion}"
         )
 
     finished = False
@@ -657,7 +853,14 @@ def learn_log_density(
         highest_m = int(contact)
         highest_first_step = 0
         while True:
-            elapsed_total = time.time() - t0
+            per_invocation_elapsed = time.time() - t0
+            # A resumed run keeps spending the same budget it started with.
+            # Without the historical term every resume restarts the clock and
+            # total learning time is unbounded.
+            elapsed_total = (
+                historical_wall + per_invocation_elapsed
+                if max_seconds_scope == "cumulative" else per_invocation_elapsed
+            )
             if elapsed_total >= max_seconds:
                 raise cap_failure(
                     "--wl_max_seconds",
@@ -666,7 +869,12 @@ def learn_log_density(
                     highest_first_step,
                 )
             overall_remaining = max_steps - total_steps
-            stage_remaining = max_steps_per_stage - stage_steps
+            # The 1/t phase is continuous, so there are no stages for
+            # --wl_max_steps_per_stage to bound.
+            stage_remaining = (
+                overall_remaining if one_over_t_mode
+                else max_steps_per_stage - stage_steps
+            )
             block = min(check_every, overall_remaining, stage_remaining)
             if block <= 0:
                 if overall_remaining <= 0:
@@ -701,9 +909,14 @@ def learn_log_density(
                     highest_m = int(contact)
                     highest_first_step = int(stage_steps)
                 if one_over_t_mode:
-                    log_f = included_count / float(total_steps)
+                    # A running minimum, not a plain assignment: 1/t is
+                    # recomputed every step, so assigning it directly would let
+                    # log_f climb back up whenever 1/t still exceeds it.
+                    log_f = min(log_f, included_count / float(total_steps))
+                    visits_since_one_over_t[index] += 1
                 log_g[index] += log_f
                 histogram[index] += 1
+                visits_since_start[index] += 1
                 tracker.observe(contact)
 
             now = time.time()
@@ -711,16 +924,23 @@ def learn_log_density(
                 checkpoint_now(log_f)
                 last_checkpoint_time = now
 
+            if not reported_cap_reconciliation:
+                reported_cap_reconciliation = True
+                _report_cap_reconciliation(
+                    stage_steps=stage_steps,
+                    elapsed=now - stage_start,
+                    max_steps=max_steps,
+                    max_seconds=max_seconds,
+                    elapsed_total=elapsed_total,
+                    progress=progress,
+                )
+
             ratio, min_flat, min_coverage, range_covered = _stage_visit_statistics(
                 histogram, tier
             )
-            coverage_ok = (
-                range_covered
-                and min_flat >= min_visits
-                and (
-                    not np.any(tier == TIER_COVERAGE)
-                    or min_coverage >= min_cover_visits
-                )
+            coverage_ok = _coverage_satisfied(
+                range_covered, min_flat, min_coverage, tier,
+                min_visits, min_cover_visits,
             )
             stage_complete = coverage_ok and (
                 schedule == "one_over_t" or ratio >= flatness
@@ -736,9 +956,50 @@ def learn_log_density(
                     flush=True,
                 )
 
+            # The switch is evaluated on every check block, not only when a
+            # stage completes.  A stage that never completes is precisely the
+            # stall the 1/t schedule exists to escape, so gating the switch on
+            # stage completion made the option unreachable.
+            if schedule == "one_over_t" and not one_over_t_mode:
+                inverse_time = included_count / float(total_steps)
+                fire, reason = one_over_t_trigger(
+                    log_f, inverse_time, stage_steps, stage_stall_steps
+                )
+                if fire:
+                    one_over_t_mode = True
+                    one_over_t_reason = reason
+                    log_f = min(log_f, inverse_time)
+                    # Coverage restarts here: the frozen bias must be exercised
+                    # over the whole window at its final resolution, not merely
+                    # at some coarser log_f earlier in the run.
+                    visits_since_one_over_t[:] = 0
+                    entry_round_trips = tracker.round_trips
+                    if progress:
+                        uncovered = (
+                            np.flatnonzero(included & (histogram == 0)) + m_min
+                        ).tolist()
+                        print(
+                            f"[WL] entering 1/t mode via {reason} trigger at stage "
+                            f"{stages_completed + 1}: stage_steps={stage_steps}, "
+                            f"log_f={log_f:.6g}, 1/t={inverse_time:.6g}, "
+                            f"levels still uncovered this stage: {uncovered}",
+                            flush=True,
+                        )
+                    break
+
             if one_over_t_mode:
-                log_f = included_count / float(total_steps)
-                if log_f > final_log_f or not coverage_ok:
+                log_f = min(log_f, included_count / float(total_steps))
+                trips_since_entry = one_over_t_trips_before + (
+                    tracker.round_trips - entry_round_trips
+                )
+                (
+                    ratio, min_flat, min_coverage, range_covered
+                ) = _stage_visit_statistics(visits_since_one_over_t, tier)
+                coverage_ok = _coverage_satisfied(
+                    range_covered, min_flat, min_coverage, tier,
+                    min_visits, min_cover_visits,
+                )
+                if log_f > final_log_f or not coverage_ok or trips_since_entry < 1:
                     continue
                 stage_records.append(
                     (
@@ -777,23 +1038,16 @@ def learn_log_density(
                 )
             )
             stages_completed += 1
-            next_log_f = 0.5 * log_f
             log_g -= log_g[0]
-            if schedule == "one_over_t":
-                inverse_time = included_count / float(total_steps)
-                # The refinement factor must remain monotone at the switch.
-                if next_log_f <= inverse_time <= log_f:
-                    one_over_t_mode = True
-                    log_f = inverse_time
-                else:
-                    log_f = next_log_f
-            else:
-                log_f = next_log_f
+            log_f = 0.5 * log_f
             checkpoint_now(log_f)
             last_checkpoint_time = time.time()
             break
 
     log_g -= log_g[0]
+    spread, spread_reference = _report_log_g_spread(
+        log_g, included, n_beads, progress
+    )
     return {
         "log_g": log_g,
         "chain": chain,
@@ -807,6 +1061,15 @@ def learn_log_density(
         "tier": tier,
         "active": included,
         "one_over_t_mode": one_over_t_mode,
+        "one_over_t_trigger": one_over_t_reason,
+        "one_over_t_round_trips": (
+            one_over_t_trips_before + (tracker.round_trips - entry_round_trips)
+            if one_over_t_mode else 0
+        ),
+        "visits_since_start": visits_since_start,
+        "visits_since_one_over_t": visits_since_one_over_t,
+        "log_g_spread": spread,
+        "log_g_spread_reference": spread_reference,
     }
 
 
@@ -1511,10 +1774,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--wl_check_every", type=int, default=100_000)
     parser.add_argument("--wl_max_steps", type=int, default=10_000_000_000)
     parser.add_argument("--wl_max_seconds", type=float, default=21_600.0)
+    parser.add_argument(
+        "--wl_max_seconds_scope", choices=("cumulative", "per_invocation"),
+        default="cumulative",
+        help="whether --wl_max_seconds bounds total learning time across "
+             "resumes or only the current invocation",
+    )
     parser.add_argument("--wl_max_steps_per_stage", type=int, default=1_000_000_000)
     parser.add_argument(
         "--wl_schedule", choices=("halving", "one_over_t"), default="halving",
         help="density-refinement schedule",
+    )
+    parser.add_argument(
+        "--wl_stage_stall_steps", type=int, default=50_000_000,
+        help="attempted moves in one incomplete stage after which the "
+             "one_over_t schedule enters its asymptotic 1/t phase",
     )
     parser.add_argument(
         "--checkpoint_every_seconds", type=float, default=1800.0,
@@ -1709,6 +1983,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.wl_check_every,
         args.wl_max_steps,
         args.wl_max_steps_per_stage,
+        args.wl_stage_stall_steps,
     ) < 1:
         raise ValueError("WL visit/check/step controls must be positive")
     if args.wl_max_seconds <= 0.0 or args.checkpoint_every_seconds <= 0.0:
@@ -1779,8 +2054,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         check_every=args.wl_check_every,
         max_steps=args.wl_max_steps,
         max_seconds=args.wl_max_seconds,
+        max_seconds_scope=args.wl_max_seconds_scope,
         max_steps_per_stage=args.wl_max_steps_per_stage,
         schedule=args.wl_schedule,
+        stage_stall_steps=args.wl_stage_stall_steps,
         checkpoint_every_seconds=args.checkpoint_every_seconds,
         tier=tier,
         checkpoint=checkpoint,
@@ -1789,7 +2066,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         f"WL complete: stages={learned['stages_completed']} "
         f"steps={learned['attempted_steps']} round_trips={learned['round_trips']} "
-        f"wall={learned['wall_time']:.1f}s",
+        f"wall={learned['wall_time']:.1f}s "
+        f"mode={'1/t' if learned['one_over_t_mode'] else args.wl_schedule}"
+        + (
+            f" (entered via {learned['one_over_t_trigger']} trigger, "
+            f"{learned['one_over_t_round_trips']} round trips since)"
+            if learned["one_over_t_mode"] else ""
+        ),
         flush=True,
     )
 
@@ -1951,6 +2234,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wl_learning_round_trips=int(learned["round_trips"]),
         wl_learning_wall_seconds=float(learned["wall_time"]),
         wl_one_over_t_mode=bool(learned["one_over_t_mode"]),
+        wl_one_over_t_trigger=str(learned["one_over_t_trigger"]),
+        wl_one_over_t_round_trips=int(learned["one_over_t_round_trips"]),
+        wl_stage_stall_steps=int(args.wl_stage_stall_steps),
+        wl_max_seconds_scope=str(args.wl_max_seconds_scope),
+        wl_visits_since_start=np.asarray(
+            learned["visits_since_start"], dtype=np.int64
+        ),
+        wl_visits_since_one_over_t=np.asarray(
+            learned["visits_since_one_over_t"], dtype=np.int64
+        ),
+        wl_log_g_spread=float(learned["log_g_spread"]),
+        wl_log_g_spread_reference=float(learned["log_g_spread_reference"]),
         wl_stages_completed=int(learned["stages_completed"]),
         wl_stage_records=np.asarray(learned["stage_records"]),
         production_geometrically_valid_per_worker=valid_per_worker,

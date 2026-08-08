@@ -95,6 +95,32 @@ class WangLandauPilotTests(unittest.TestCase):
             with self.assertRaisesRegex(AcceptanceFailure, "evidence gate for W8"):
                 _validate_wl_output(path)
 
+    def test_dry_run_reports_both_caps_and_flags_the_conflict(self) -> None:
+        """The step and time caps must be reported separately.
+
+        The single "estimated WL wall cap" line silently added production time
+        to the learning budget, reporting 8.92 h for N=44 while
+        --wl_max_seconds was 6.0 h, and hid the fact that --wl_max_steps is an
+        order of magnitude beyond anything the time cap permits.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            args = parse_args([
+                "--dry_run", "--chains", "44", "--models", "hs",
+                "--skip_bootstrap", "--outdir", str(Path(temporary) / "out"),
+            ])
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                self.assertEqual(_dry_run(args), 0)
+            text = captured.getvalue()
+
+        self.assertIn("WL step cap: --wl_max_steps=1e+10 = 72.91 h", text)
+        self.assertIn("WL time cap: --wl_max_seconds=21600 = 6.00 h", text)
+        self.assertIn("binding WL cap: --wl_max_seconds", text)
+        self.assertIn("CONFLICT", text)
+        self.assertIn("12.2x", text)
+        # The misleading conflated figure must be gone.
+        self.assertNotIn("estimated WL wall cap", text)
+
     def test_dry_run_creates_no_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             outdir = Path(temporary) / "not_created"

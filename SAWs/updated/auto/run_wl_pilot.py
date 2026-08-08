@@ -128,8 +128,10 @@ def _wl_command(args: argparse.Namespace, n_beads: int, output_dir: Path) -> Lis
         "--wl_check_every", str(args.wl_check_every),
         "--wl_max_steps", str(args.wl_max_steps),
         "--wl_max_seconds", str(args.wl_max_seconds),
+        "--wl_max_seconds_scope", args.wl_max_seconds_scope,
         "--wl_max_steps_per_stage", str(args.wl_max_steps_per_stage),
         "--wl_schedule", args.wl_schedule,
+        "--wl_stage_stall_steps", str(args.wl_stage_stall_steps),
         "--checkpoint_every_seconds", str(args.checkpoint_every_seconds),
         "--checkpoint", str(output_dir / "learning_checkpoint.npz"),
         "--n_blocks", str(args.n_blocks),
@@ -639,6 +641,7 @@ def _write_report(summary: Mapping[str, Any], path: Path) -> None:
 
 def _dry_run(args: argparse.Namespace) -> int:
     total_seconds = 0.0
+    conflicts: List[int] = []
     for n_beads in args.chains:
         info = CHAIN_INFO[n_beads]
         chain_dir = args.outdir / f"N{n_beads}"
@@ -646,14 +649,40 @@ def _dry_run(args: argparse.Namespace) -> int:
         wl_command = _wl_command(args, n_beads, wl_dir)
         print(f"N={n_beads}")
         print(f"  {_command_text(wl_command)}")
-        learning = min(args.wl_max_seconds, args.wl_max_steps / info["throughput"])
-        production = args.steps_per_worker / info["throughput"]
-        estimate = learning + production
-        total_seconds += estimate
-        print(
-            f"  estimated WL wall cap: {estimate / 3600.0:.2f} h "
-            f"({info['throughput'] / 1000.0:.1f}k attempted moves/s/core)"
+        throughput = info["throughput"]
+        # The two WL caps are reported separately.  Summing learning and
+        # production into one number labelled a "WL wall cap" hid the fact that
+        # the step cap is unreachable within the time cap.
+        step_cap_seconds = args.wl_max_steps / throughput
+        time_implied_steps = args.wl_max_seconds * throughput
+        binding = (
+            "--wl_max_steps" if args.wl_max_steps <= time_implied_steps
+            else "--wl_max_seconds"
         )
+        learning = min(args.wl_max_seconds, step_cap_seconds)
+        production = args.steps_per_worker / throughput
+        total_seconds += learning + production
+        print(
+            f"  throughput: {throughput / 1000.0:.1f}k attempted moves/s/core"
+        )
+        print(
+            f"  WL step cap: --wl_max_steps={args.wl_max_steps:.3g} "
+            f"= {step_cap_seconds / 3600.0:.2f} h"
+        )
+        print(
+            f"  WL time cap: --wl_max_seconds={args.wl_max_seconds:.6g} "
+            f"= {args.wl_max_seconds / 3600.0:.2f} h "
+            f"= {time_implied_steps:.3g} steps"
+        )
+        print(f"  binding WL cap: {binding} ({learning / 3600.0:.2f} h)")
+        if args.wl_max_steps > 2.0 * time_implied_steps:
+            conflicts.append(n_beads)
+            print(
+                f"  CONFLICT: --wl_max_steps is {args.wl_max_steps / time_implied_steps:.1f}x "
+                "beyond what --wl_max_seconds permits, so it can never bind. "
+                "--wl_max_seconds is the operative limit."
+            )
+        print(f"  estimated production wall: {production / 3600.0:.2f} h")
         config = json.loads((AUTO_DIR / info["config"]).read_text())
         target = AUTO_DIR / info["target"]
         legacy = AUTO_DIR / info["legacy"]
@@ -673,7 +702,16 @@ def _dry_run(args: argparse.Namespace) -> int:
                     chain_dir / "fits" / model / label,
                 )
                 print(f"  {_command_text(command)}")
-    print(f"Estimated WL-only wall cap across requested chains: {total_seconds / 3600.0:.2f} h")
+    print(
+        "Estimated learning-plus-production wall across requested chains: "
+        f"{total_seconds / 3600.0:.2f} h"
+    )
+    if conflicts:
+        print(
+            "Step and time caps conflict for N="
+            f"{', '.join(str(n) for n in conflicts)}; --wl_max_steps is "
+            "unreachable there and --wl_max_seconds is what stops the run."
+        )
     print("Fit and bootstrap time is not included in this estimate.")
     return 0
 
@@ -703,8 +741,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--wl_check_every", type=int, default=100_000)
     parser.add_argument("--wl_max_steps", type=int, default=10_000_000_000)
     parser.add_argument("--wl_max_seconds", type=float, default=21_600.0)
+    parser.add_argument(
+        "--wl_max_seconds_scope", choices=("cumulative", "per_invocation"),
+        default="cumulative",
+    )
     parser.add_argument("--wl_max_steps_per_stage", type=int, default=1_000_000_000)
     parser.add_argument("--wl_schedule", choices=("halving", "one_over_t"), default="halving")
+    parser.add_argument("--wl_stage_stall_steps", type=int, default=50_000_000)
     parser.add_argument("--checkpoint_every_seconds", type=float, default=1800.0)
     parser.add_argument("--n_blocks", type=int, default=20)
     parser.add_argument("--min_crossval_samples", type=int, default=100)
