@@ -93,15 +93,17 @@ class WangLandauTierTests(unittest.TestCase):
             flatness=0.9,
             min_visits=1,
             min_cover_visits=1,
-            check_every=200,
+            check_every=100,
             max_steps=100_000,
             max_seconds=30.0,
             max_steps_per_stage=100_000,
             schedule="one_over_t",
-            # Enter the 1/t phase through the stall trigger, which is the one
-            # that fires in production.  The assertions below exercise the 1/t
+            # Only the Belardinelli-Pereyra crossing enters the 1/t phase, so
+            # the stall is disabled here.  At these tiny modification factors
+            # the crossing happens on the first check block: log_f=0.02 is
+            # already below 1/t = 3/100.  The assertions exercise the 1/t
             # machinery itself, not the trigger that reached it.
-            stage_stall_steps=200,
+            stage_stall_steps=10**9,
             checkpoint_every_seconds=1000.0,
             tier=tier,
             progress=False,
@@ -181,12 +183,14 @@ class OneOverTTriggerTests(unittest.TestCase):
 
 
 class OneOverTActivationTests(unittest.TestCase):
-    def test_stall_activates_one_over_t(self) -> None:
-        """A stage that cannot finish must escape into the 1/t phase.
+    def test_stall_relaxes_stages_without_entering_one_over_t(self) -> None:
+        """A stage that cannot finish must escape -- by relaxing, not freezing.
 
         This is the regression guard for the switch having been gated on stage
-        completion, which made --wl_schedule one_over_t unreachable: the same
-        run returns one_over_t_mode False without the fix.
+        completion, which made --wl_schedule one_over_t inert: the same run
+        finishes no stage at all without the fix.  The escape is the relaxed
+        stage-advancement criterion; the 1/t rate law is *not* adopted, because
+        a stall gives no reason to believe log_f and 1/t are comparable.
         """
         tier = make_contact_tiers(0, 2, 2, 2)
         result = _quiet(
@@ -197,13 +201,85 @@ class OneOverTActivationTests(unittest.TestCase):
             tier=tier,
             **N6_LEARNING,
         )
-        self.assertTrue(result["one_over_t_mode"])
-        self.assertEqual(result["one_over_t_trigger"], "stall")
+        self.assertTrue(result["stall_relaxed"])
+        self.assertFalse(result["one_over_t_mode"])
+        self.assertEqual(result["one_over_t_trigger"], "")
+        self.assertGreater(result["stall_relaxed_step"], 0)
         self.assertLessEqual(result["next_log_f"], N6_LEARNING["final_log_f"])
-        # Termination requires coverage measured after the switch, plus a round
-        # trip, so the post-entry histogram cannot be empty.
-        self.assertGreater(int(result["visits_since_one_over_t"].min()), 0)
-        self.assertGreaterEqual(result["one_over_t_round_trips"], 1)
+        # Advancement is judged from the histogram reset at the stall, so it
+        # must show the unrelaxed per-level counts.
+        self.assertGreaterEqual(
+            int(result["visits_since_stall"].min()), N6_LEARNING["min_visits"]
+        )
+
+    def test_stall_entry_does_not_reduce_log_f(self) -> None:
+        """The stall must never adopt 1/t as the refinement factor.
+
+        Measured at N=44: the stall fired at 3M steps where 1/t was 1.7e-5,
+        already below final_log_f, so clamping log_f to it ended learning after
+        3M steps of adaptation and froze a bias the chain had barely begun to
+        build.  The condition is reproduced here in miniature -- the stall
+        budget is below ``min_visits``, so the stage provably cannot finish
+        first, and 1/t at the stall is an order of magnitude under final_log_f.
+        """
+        tier = make_contact_tiers(0, 2, 2, 2)
+        samples: list = []
+        entries: list = []
+        original_save = wl._save_checkpoint
+        original_trigger = wl.one_over_t_trigger
+
+        def save_spy(path, **kwargs):
+            samples.append(
+                (int(kwargs["attempted_steps"]), float(kwargs["next_log_f"]))
+            )
+            return original_save(path, **kwargs)
+
+        def trigger_spy(log_f, inverse_time, stage_steps, stall_steps):
+            fire, reason = original_trigger(
+                log_f, inverse_time, stage_steps, stall_steps
+            )
+            if fire:
+                entries.append((reason, log_f, inverse_time))
+            return fire, reason
+
+        controls = dict(N6_LEARNING)
+        controls.pop("checkpoint_every_seconds")
+        controls["final_log_f"] = 1e-2
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(wl, "_save_checkpoint", save_spy), \
+                    mock.patch.object(wl, "one_over_t_trigger", trigger_spy):
+                result = _quiet(
+                    learn_log_density,
+                    schedule="one_over_t",
+                    stage_stall_steps=3_000,
+                    max_steps_per_stage=10_000_000,
+                    # Sample log_f on every check block, not only per stage.
+                    checkpoint_every_seconds=1e-9,
+                    checkpoint=Path(temporary) / "stall_entry.npz",
+                    tier=tier,
+                    **controls,
+                )
+
+        self.assertTrue(result["stall_relaxed"])
+        self.assertFalse(result["one_over_t_mode"])
+
+        reason, log_f_at_entry, inverse_time_at_entry = entries[0]
+        self.assertEqual(reason, "stall")
+        # The exact condition that made the old behaviour fatal.
+        self.assertLess(inverse_time_at_entry, controls["final_log_f"])
+        self.assertGreater(log_f_at_entry / inverse_time_at_entry, 100.0)
+
+        # log_f is untouched at entry: across the whole run it either holds or
+        # halves.  The pre-patch code divided it by more than 100 right here.
+        for (_, earlier), (_, later) in zip(samples, samples[1:]):
+            self.assertIn(round(later / earlier, 12), (1.0, 0.5))
+
+        # And learning continues afterwards rather than freezing.
+        after = [
+            value for steps, value in samples
+            if steps >= result["stall_relaxed_step"]
+        ]
+        self.assertLess(min(after), max(after))
 
     def test_belardinelli_pereyra_activates_one_over_t(self) -> None:
         """With the stall disabled, log_f <= 1/t is what enters the phase."""
@@ -228,6 +304,12 @@ class OneOverTActivationTests(unittest.TestCase):
     def test_log_f_is_monotone_non_increasing(self) -> None:
         """1/t is recomputed every step, so log_f must be a running minimum."""
         tier = make_contact_tiers(0, 2, 2, 2)
+        controls = dict(N6_LEARNING)
+        controls.pop("checkpoint_every_seconds")
+        controls.update(
+            final_log_f=1e-5, min_visits=100, check_every=5000,
+            max_steps=5_000_000,
+        )
         observed: list = []
         original = wl._save_checkpoint
 
@@ -237,12 +319,10 @@ class OneOverTActivationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(wl, "_save_checkpoint", spy):
-                controls = dict(N6_LEARNING)
-                controls.pop("checkpoint_every_seconds")
-                _quiet(
+                result = _quiet(
                     learn_log_density,
                     schedule="one_over_t",
-                    stage_stall_steps=3_000,
+                    stage_stall_steps=10**9,
                     max_steps_per_stage=10_000_000,
                     # Checkpoint on every check block so log_f is sampled
                     # throughout the run rather than only at the end.
@@ -251,22 +331,35 @@ class OneOverTActivationTests(unittest.TestCase):
                     tier=tier,
                     **controls,
                 )
+        # The running minimum only matters once 1/t drives log_f.
+        self.assertTrue(result["one_over_t_mode"])
         self.assertGreater(len(observed), 5)
         for earlier, later in zip(observed, observed[1:]):
             self.assertLessEqual(later, earlier)
 
 
 class StallEscapeTests(unittest.TestCase):
-    def test_one_over_t_escapes_a_stage_halving_cannot_finish(self) -> None:
-        """At an identical budget, halving dies where 1/t completes."""
+    def test_relaxation_escapes_a_budget_halving_cannot_finish(self) -> None:
+        """At an identical budget, halving dies where the relaxation completes.
+
+        Halving re-earns the full per-level visit requirement in every one of
+        its 14 stages.  The relaxation earns it once, cumulatively, and then
+        only requires each stage to spend its stall budget -- 55k attempted
+        moves against halving's 224k for the same 14 stages and the same final
+        log_f.  The global cap here sits between the two.
+
+        The per-stage step cap is deliberately left generous: stall relaxation
+        widens the stage-advancement criterion and nothing else, so
+        --wl_max_steps_per_stage still binds exactly as it does under halving.
+        """
         tier = make_contact_tiers(0, 2, 2, 2)
         controls = dict(N6_LEARNING)
-        controls["flatness"] = 0.999
-        shared = dict(max_steps_per_stage=5000, tier=tier, **controls)
+        controls["max_steps"] = 100_000
+        shared = dict(max_steps_per_stage=10_000_000, tier=tier, **controls)
 
         with self.assertRaises(RuntimeError) as caught:
             _quiet(learn_log_density, schedule="halving", **shared)
-        self.assertIn("--wl_max_steps_per_stage", str(caught.exception))
+        self.assertIn("--wl_max_steps", str(caught.exception))
 
         escaped = _quiet(
             learn_log_density,
@@ -274,17 +367,19 @@ class StallEscapeTests(unittest.TestCase):
             stage_stall_steps=3_000,
             **shared,
         )
-        self.assertTrue(escaped["one_over_t_mode"])
-        self.assertEqual(escaped["one_over_t_trigger"], "stall")
+        self.assertTrue(escaped["stall_relaxed"])
+        self.assertFalse(escaped["one_over_t_mode"])
+        self.assertLessEqual(escaped["next_log_f"], controls["final_log_f"])
+        self.assertLess(escaped["attempted_steps"], controls["max_steps"])
 
     def test_unreachable_level_still_fails_loudly(self) -> None:
         """A geometric gap must fail in both schedules, never silently pass.
 
         Exact enumeration shows the 8-bead SAW reaches m=5 but not m=4, so an
-        all-flat window can never be covered.  Because coverage is judged from
-        a histogram reset when the 1/t phase begins, escaping the stall does
-        not manufacture coverage the run never achieved; it still fails, and it
-        names the starved level.
+        all-flat window can never be covered.  The stall relaxation widens the
+        flatness ratio to visited levels only, but never the per-level coverage
+        counts, so it cannot manufacture coverage the run never achieved; it
+        still fails, and it still names the starved level.
         """
         tier = make_contact_tiers(0, 5, 5, 5)
         shared = dict(
@@ -307,53 +402,68 @@ class StallEscapeTests(unittest.TestCase):
             )
         message = str(one_over_t.exception)
         self.assertIn("'m': 4", message)
-        # It escaped the stall; it simply could not cover an impossible level.
-        self.assertIn("mode=1/t", message)
+        # The relaxation did engage; it simply cannot cover an impossible level.
+        self.assertIn("mode=one_over_t/stall_relaxed", message)
 
 
 class OneOverTEstimatorTests(unittest.TestCase):
     def test_reweighting_still_matches_exact_enumeration(self) -> None:
         """The schedule must not disturb the frozen-weight estimator.
 
-        The reweighted P(m) is consistent for any frozen log_g, so learning
-        through the 1/t phase must still reproduce the exact 3534-walk
-        six-bead enumeration.
+        The reweighted P(m) is consistent for any frozen log_g, so neither
+        escape route may disturb it: both must still reproduce the exact
+        3534-walk six-bead enumeration.
         """
         tier = make_contact_tiers(0, 2, 2, 2)
-        learned = _quiet(
-            learn_log_density,
-            schedule="one_over_t",
-            stage_stall_steps=3_000,
-            max_steps_per_stage=10_000_000,
-            tier=tier,
-            **N6_LEARNING,
-        )
-        self.assertTrue(learned["one_over_t_mode"])
-
         exact_values, exact_prob, exact_radii = enumerate_rooted_saws(6)
         self.assertEqual(exact_radii.size, 3534)
-        results = [
-            run_production_chain(
-                worker_id=i, seed=9000 + i, initial_chain=learned["chain"],
-                log_g=learned["log_g"], m_min=0, m_max=2, steps=250_000,
-                burnin=0.1, sample_every=5, progress=False,
-                tier=learned["tier"],
-            )
-            for i in range(2)
-        ]
-        contacts = np.concatenate([r["contact_samples"] for r in results])
-        radii = np.concatenate([r["rg_samples"] for r in results])
-        bends = np.concatenate([r["bend_samples"] for r in results])
-        built = _quiet(
-            build_distributions, contacts, radii, bends, learned["log_g"],
-            0, 24, False, n_beads=6, m_cover=2,
+
+        belardinelli = dict(N6_LEARNING)
+        belardinelli.update(
+            final_log_f=1e-5, min_visits=100, check_every=5000,
+            max_steps=5_000_000,
         )
-        observed = np.zeros(3)
-        observed[built["c_vals"]] = built["c_prob"]
-        exact = np.zeros(3)
-        exact[exact_values] = exact_prob
-        total_variation = 0.5 * float(np.abs(observed - exact).sum())
-        self.assertLess(total_variation, 0.03)
+        routes = {
+            "stall_relaxed": (dict(N6_LEARNING), 3_000, "stall_relaxed"),
+            "belardinelli_pereyra": (belardinelli, 10**9, "one_over_t_mode"),
+        }
+        for name, (controls, stall_steps, expected_flag) in routes.items():
+            with self.subTest(route=name):
+                learned = _quiet(
+                    learn_log_density,
+                    schedule="one_over_t",
+                    stage_stall_steps=stall_steps,
+                    max_steps_per_stage=10_000_000,
+                    tier=tier,
+                    **controls,
+                )
+                self.assertTrue(learned[expected_flag])
+
+                results = [
+                    run_production_chain(
+                        worker_id=i, seed=9000 + i,
+                        initial_chain=learned["chain"],
+                        log_g=learned["log_g"], m_min=0, m_max=2,
+                        steps=250_000, burnin=0.1, sample_every=5,
+                        progress=False, tier=learned["tier"],
+                    )
+                    for i in range(2)
+                ]
+                contacts = np.concatenate(
+                    [r["contact_samples"] for r in results]
+                )
+                radii = np.concatenate([r["rg_samples"] for r in results])
+                bends = np.concatenate([r["bend_samples"] for r in results])
+                built = _quiet(
+                    build_distributions, contacts, radii, bends,
+                    learned["log_g"], 0, 24, False, n_beads=6, m_cover=2,
+                )
+                observed = np.zeros(3)
+                observed[built["c_vals"]] = built["c_prob"]
+                exact = np.zeros(3)
+                exact[exact_values] = exact_prob
+                total_variation = 0.5 * float(np.abs(observed - exact).sum())
+                self.assertLess(total_variation, 0.03)
 
 
 class WallClockCapTests(unittest.TestCase):
@@ -367,8 +477,10 @@ class WallClockCapTests(unittest.TestCase):
             attempted_steps=0, accepted_moves=0, round_trips=0, seed=5,
             tier=tier, schedule="halving", one_over_t_mode=False,
             one_over_t_trigger_reason="", one_over_t_round_trips=0,
+            stall_relaxed=False, stall_relaxed_step=0,
             visits_since_start=np.zeros(3, dtype=np.int64),
             visits_since_one_over_t=np.zeros(3, dtype=np.int64),
+            visits_since_stall=np.zeros(3, dtype=np.int64),
             stage_records=np.zeros(0, dtype=WL_STAGE_DTYPE),
             learning_wall_seconds=seconds,
         )

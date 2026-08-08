@@ -338,8 +338,11 @@ def _save_checkpoint(
     one_over_t_mode: bool,
     one_over_t_trigger_reason: str,
     one_over_t_round_trips: int,
+    stall_relaxed: bool,
+    stall_relaxed_step: int,
     visits_since_start: np.ndarray,
     visits_since_one_over_t: np.ndarray,
+    visits_since_stall: np.ndarray,
     stage_records: np.ndarray,
     learning_wall_seconds: float,
 ) -> None:
@@ -368,10 +371,13 @@ def _save_checkpoint(
             wl_one_over_t_round_trips=np.array(
                 one_over_t_round_trips, dtype=np.int64
             ),
+            wl_stall_relaxed=np.array(stall_relaxed, dtype=bool),
+            wl_stall_relaxed_step=np.array(stall_relaxed_step, dtype=np.int64),
             wl_visits_since_start=np.asarray(visits_since_start, dtype=np.int64),
             wl_visits_since_one_over_t=np.asarray(
                 visits_since_one_over_t, dtype=np.int64
             ),
+            wl_visits_since_stall=np.asarray(visits_since_stall, dtype=np.int64),
             wl_stage_records=np.asarray(stage_records, dtype=WL_STAGE_DTYPE),
             learning_wall_seconds=np.array(learning_wall_seconds, dtype=np.float64),
         )
@@ -521,7 +527,8 @@ def _report_log_g_spread(
             f"WARNING: learned log_g spread {spread:.6g} exceeds ten times the "
             f"analytic scale {reference:.6g}; the bias is likely dominated by "
             "accumulation noise rather than the density of states. Inspect "
-            "wl_visits_since_one_over_t before trusting the frozen weights.",
+            "wl_visits_since_one_over_t and wl_visits_since_stall against "
+            "wl_visits_since_start before trusting the frozen weights.",
             flush=True,
         )
     return spread, reference
@@ -609,6 +616,32 @@ def one_over_t_trigger(
     return False, ""
 
 
+def _mode_label(schedule: str, one_over_t_mode: bool, stall_relaxed: bool) -> str:
+    """Name the refinement law currently in force, for logs and failures."""
+    if one_over_t_mode:
+        return "1/t"
+    if stall_relaxed:
+        return f"{schedule}/stall_relaxed"
+    return schedule
+
+
+def _visited_flatness_ratio(histogram: np.ndarray, tier: np.ndarray) -> float:
+    """Minimum-to-mean visit ratio over the tier-2 levels actually visited.
+
+    A stall-relaxed stage cannot use the ordinary ratio: one level the chain
+    never reaches drives ``min`` to zero and pins the ratio at zero forever.
+    Restricting the ratio to visited levels still requires the reachable part
+    of the window to be flat, while the unvisited levels remain governed by the
+    cumulative coverage counts, which are never relaxed.
+    """
+    flat_counts = histogram[tier == TIER_FLAT]
+    visited = flat_counts[flat_counts > 0]
+    if visited.size == 0:
+        return 0.0
+    mean_visited = float(visited.mean())
+    return float(visited.min()) / mean_visited if mean_visited else 0.0
+
+
 def _stage_visit_statistics(
     histogram: np.ndarray, tier: np.ndarray
 ) -> Tuple[float, int, int, bool]:
@@ -661,6 +694,17 @@ def learn_log_density(
     histogram that is reset at the moment the phase begins, which requires the
     frozen bias to have been exercised over the whole included window at its
     final resolution rather than once per refinement stage.
+
+    The two triggers that can end the halving phase are not interchangeable.
+    The Belardinelli-Pereyra crossing is rate-neutral by construction -- at the
+    crossing ``log_f`` and ``1/t`` are equal -- so adopting ``1/t`` as the
+    refinement factor there is continuous, and it enters the ``1/t`` phase.  A
+    stall carries no such guarantee: when it fires, ``1/t`` is typically orders
+    of magnitude below ``log_f``, so adopting it would collapse the refinement
+    factor and freeze a barely-learned bias.  The stall therefore does *not*
+    enter the ``1/t`` phase and does not touch ``log_f``.  It only relaxes how
+    a stage is permitted to advance, and halving continues normally with the
+    Belardinelli-Pereyra trigger still armed.
     """
     if schedule not in {"halving", "one_over_t"}:
         raise ValueError("schedule must be 'halving' or 'one_over_t'")
@@ -686,11 +730,14 @@ def learn_log_density(
         previous_round_trips = 0
         one_over_t_mode = False
         one_over_t_reason = ""
+        stall_relaxed = False
+        stall_relaxed_step = 0
         stage_records: List[Any] = []
         historical_wall = 0.0
         saved_tier = None
         visits_since_start = np.zeros(m_max - m_min + 1, dtype=np.int64)
         visits_since_one_over_t = np.zeros(m_max - m_min + 1, dtype=np.int64)
+        visits_since_stall = np.zeros(m_max - m_min + 1, dtype=np.int64)
         one_over_t_trips_before = 0
     else:
         with np.load(resume_checkpoint, allow_pickle=False) as saved:
@@ -719,11 +766,22 @@ def learn_log_density(
                 float(saved["learning_wall_seconds"])
                 if "learning_wall_seconds" in saved else 0.0
             )
+            stall_relaxed = (
+                bool(saved["wl_stall_relaxed"])
+                if "wl_stall_relaxed" in saved else False
+            )
+            stall_relaxed_step = (
+                int(saved["wl_stall_relaxed_step"])
+                if "wl_stall_relaxed_step" in saved else 0
+            )
             visits_since_start = _resume_histogram(
                 saved, "wl_visits_since_start", log_g.size
             )
             visits_since_one_over_t = _resume_histogram(
                 saved, "wl_visits_since_one_over_t", log_g.size
+            )
+            visits_since_stall = _resume_histogram(
+                saved, "wl_visits_since_stall", log_g.size
             )
             one_over_t_trips_before = (
                 int(saved["wl_one_over_t_round_trips"])
@@ -799,8 +857,11 @@ def learn_log_density(
                 one_over_t_trips_before + (tracker.round_trips - entry_round_trips)
                 if one_over_t_mode else 0
             ),
+            stall_relaxed=stall_relaxed,
+            stall_relaxed_step=stall_relaxed_step,
             visits_since_start=visits_since_start,
             visits_since_one_over_t=visits_since_one_over_t,
+            visits_since_stall=visits_since_stall,
             stage_records=np.asarray(stage_records, dtype=WL_STAGE_DTYPE),
             learning_wall_seconds=historical_wall + (time.time() - t0),
         )
@@ -839,7 +900,8 @@ def learn_log_density(
             f"(this invocation={per_invocation:.1f}s, "
             f"prior invocations={historical_wall:.1f}s); "
             f"--wl_max_seconds_scope={max_seconds_scope}. "
-            f"mode={'1/t' if one_over_t_mode else schedule}. {suggestion}"
+            f"mode={_mode_label(schedule, one_over_t_mode, stall_relaxed)}. "
+            f"{suggestion}"
         )
 
     finished = False
@@ -914,6 +976,8 @@ def learn_log_density(
                     # log_f climb back up whenever 1/t still exceeds it.
                     log_f = min(log_f, included_count / float(total_steps))
                     visits_since_one_over_t[index] += 1
+                if stall_relaxed:
+                    visits_since_stall[index] += 1
                 log_g[index] += log_f
                 histogram[index] += 1
                 visits_since_start[index] += 1
@@ -952,7 +1016,7 @@ def learn_log_density(
                     f"min_tier2={min_flat} min_tier1={min_coverage} "
                     f"range={range_covered} highest_m={highest_m} "
                     f"round_trips={previous_round_trips + tracker.round_trips} "
-                    f"mode={'1/t' if one_over_t_mode else schedule}",
+                    f"mode={_mode_label(schedule, one_over_t_mode, stall_relaxed)}",
                     flush=True,
                 )
 
@@ -962,10 +1026,23 @@ def learn_log_density(
             # stage completion made the option unreachable.
             if schedule == "one_over_t" and not one_over_t_mode:
                 inverse_time = included_count / float(total_steps)
+                # The stall can only fire once; after it does, its relaxation is
+                # already in force.  Suppressing it by zeroing the step count --
+                # rather than by discarding the trigger's answer -- keeps the
+                # Belardinelli-Pereyra crossing armed, which the trigger would
+                # otherwise never report while the stall condition also holds.
                 fire, reason = one_over_t_trigger(
-                    log_f, inverse_time, stage_steps, stage_stall_steps
+                    log_f,
+                    inverse_time,
+                    0 if stall_relaxed else stage_steps,
+                    stage_stall_steps,
                 )
-                if fire:
+                uncovered = (
+                    np.flatnonzero(included & (histogram == 0)) + m_min
+                ).tolist()
+                if fire and reason == "belardinelli_pereyra":
+                    # Rate-neutral by construction: log_f and 1/t are equal at
+                    # the crossing, so adopting 1/t changes nothing abruptly.
                     one_over_t_mode = True
                     one_over_t_reason = reason
                     log_f = min(log_f, inverse_time)
@@ -975,9 +1052,6 @@ def learn_log_density(
                     visits_since_one_over_t[:] = 0
                     entry_round_trips = tracker.round_trips
                     if progress:
-                        uncovered = (
-                            np.flatnonzero(included & (histogram == 0)) + m_min
-                        ).tolist()
                         print(
                             f"[WL] entering 1/t mode via {reason} trigger at stage "
                             f"{stages_completed + 1}: stage_steps={stage_steps}, "
@@ -986,6 +1060,30 @@ def learn_log_density(
                             flush=True,
                         )
                     break
+                if fire and reason == "stall":
+                    # A stall carries no rate-neutrality guarantee.  When it
+                    # fires, 1/t is typically orders of magnitude below log_f --
+                    # measured at N=44, a stall at 3M steps gives 1/t = 1.7e-5
+                    # against log_f = 1.0, already below final_log_f -- so
+                    # adopting it would end learning after 3M steps of
+                    # adaptation and freeze a bias the chain had barely begun to
+                    # build.  Keep log_f, keep halving; relax only how a stage
+                    # is permitted to advance.
+                    stall_relaxed = True
+                    stall_relaxed_step = total_steps
+                    visits_since_stall[:] = 0
+                    if progress:
+                        print(
+                            f"[WL] stall relaxation engaged at stage "
+                            f"{stages_completed + 1}: stage_steps={stage_steps}, "
+                            f"log_f={log_f:.6g} (unchanged; 1/t={inverse_time:.6g} "
+                            "is NOT adopted), halving continues, coverage now "
+                            "judged cumulatively from this step. Levels still "
+                            f"uncovered this stage: {uncovered}",
+                            flush=True,
+                        )
+                    # Deliberately no break: log_f is unchanged, so the stage
+                    # continues and the relaxed criterion is applied below.
 
             if one_over_t_mode:
                 log_f = min(log_f, included_count / float(total_steps))
@@ -1020,6 +1118,22 @@ def learn_log_density(
                 finished = True
                 checkpoint_now(log_f)
                 break
+
+            # Stall relaxation widens stage advancement; it never narrows it, so
+            # a stage that satisfies the ordinary criterion still advances at
+            # once.  The relaxed path costs a full stall budget per stage, and
+            # its coverage counts -- unlike its flatness ratio -- are the
+            # unrelaxed ones, merely accumulated since the stall rather than
+            # since the start of the stage.  A level the chain genuinely cannot
+            # reach therefore still blocks every stage and still fails loudly.
+            if stall_relaxed and not stage_complete and stage_steps >= stage_stall_steps:
+                (
+                    _, stall_min_flat, stall_min_coverage, stall_range_covered
+                ) = _stage_visit_statistics(visits_since_stall, tier)
+                stage_complete = _coverage_satisfied(
+                    stall_range_covered, stall_min_flat, stall_min_coverage,
+                    tier, min_visits, min_cover_visits,
+                ) and _visited_flatness_ratio(histogram, tier) >= flatness
 
             if not stage_complete:
                 continue
@@ -1066,8 +1180,11 @@ def learn_log_density(
             one_over_t_trips_before + (tracker.round_trips - entry_round_trips)
             if one_over_t_mode else 0
         ),
+        "stall_relaxed": stall_relaxed,
+        "stall_relaxed_step": stall_relaxed_step,
         "visits_since_start": visits_since_start,
         "visits_since_one_over_t": visits_since_one_over_t,
+        "visits_since_stall": visits_since_stall,
         "log_g_spread": spread,
         "log_g_spread_reference": spread_reference,
     }
@@ -1788,7 +1905,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--wl_stage_stall_steps", type=int, default=50_000_000,
         help="attempted moves in one incomplete stage after which the "
-             "one_over_t schedule enters its asymptotic 1/t phase",
+             "one_over_t schedule relaxes stage advancement: coverage is then "
+             "judged cumulatively and flatness only over visited tier-2 "
+             "levels. log_f is not reduced and halving continues; only the "
+             "Belardinelli-Pereyra crossing enters the 1/t phase",
     )
     parser.add_argument(
         "--checkpoint_every_seconds", type=float, default=1800.0,
@@ -2067,11 +2187,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"WL complete: stages={learned['stages_completed']} "
         f"steps={learned['attempted_steps']} round_trips={learned['round_trips']} "
         f"wall={learned['wall_time']:.1f}s "
-        f"mode={'1/t' if learned['one_over_t_mode'] else args.wl_schedule}"
+        f"mode={_mode_label(args.wl_schedule, learned['one_over_t_mode'], learned['stall_relaxed'])}"
         + (
             f" (entered via {learned['one_over_t_trigger']} trigger, "
             f"{learned['one_over_t_round_trips']} round trips since)"
             if learned["one_over_t_mode"] else ""
+        )
+        + (
+            f" (stall relaxation engaged at step {learned['stall_relaxed_step']}; "
+            "log_f was not reduced and halving continued)"
+            if learned["stall_relaxed"] else ""
         ),
         flush=True,
     )
@@ -2238,11 +2363,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wl_one_over_t_round_trips=int(learned["one_over_t_round_trips"]),
         wl_stage_stall_steps=int(args.wl_stage_stall_steps),
         wl_max_seconds_scope=str(args.wl_max_seconds_scope),
+        wl_stall_relaxed=bool(learned["stall_relaxed"]),
+        wl_stall_relaxed_step=int(learned["stall_relaxed_step"]),
         wl_visits_since_start=np.asarray(
             learned["visits_since_start"], dtype=np.int64
         ),
         wl_visits_since_one_over_t=np.asarray(
             learned["visits_since_one_over_t"], dtype=np.int64
+        ),
+        wl_visits_since_stall=np.asarray(
+            learned["visits_since_stall"], dtype=np.int64
         ),
         wl_log_g_spread=float(learned["log_g_spread"]),
         wl_log_g_spread_reference=float(learned["log_g_spread_reference"]),

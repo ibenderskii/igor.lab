@@ -72,9 +72,33 @@ target tail; the default tier-1 ceiling remains the exact geometric maximum.
 With the default halving schedule, reset the histogram and halve `log(f)` after
 the tier-specific checks pass.  The optional Belardinelli-Pereyra schedule uses
 the cumulative Monte Carlo time `t = attempted_moves / included_levels`; its
-time origin is never reset between stages.  After the initial coverage stages,
-`log(f)=1/t` is updated after every attempted move without a histogram-flatness
-criterion.
+time origin is never reset between stages.
+
+That schedule can leave the halving phase by either of two triggers, and the
+two are not interchangeable.
+
+- **Belardinelli-Pereyra crossing**, `log(f) <= 1/t`.  The two quantities are
+  equal at the crossing, so adopting `log(f)=1/t` there is rate-neutral.  This
+  enters the asymptotic phase: `log(f)=1/t` is thereafter recomputed after every
+  attempted move as a running minimum, without a histogram-flatness criterion.
+  Coverage is then judged against a visit histogram reset at entry, so the bias
+  that is ultimately frozen must have been exercised over the whole included
+  window at its final resolution.
+- **Stage stall**, `--wl_stage_stall_steps` attempted moves in one incomplete
+  stage.  A stall gives no reason to believe `log(f)` and `1/t` are comparable;
+  at a stall `1/t` is typically orders of magnitude smaller, so adopting it
+  would collapse the modification factor and freeze a barely-learned density.
+  The stall therefore leaves `log(f)` untouched and halving continues.  It
+  relaxes only how a stage may advance: coverage is judged against a visit
+  histogram reset at the stall rather than per stage, and the flatness ratio is
+  taken over the tier-2 levels actually visited.  The per-level minimum visit
+  counts are never relaxed, so a level the chain cannot reach still blocks every
+  stage and still fails loudly with its per-level counts.  The
+  Belardinelli-Pereyra trigger stays armed, so a stall-relaxed run can still
+  cross into the asymptotic phase later.
+
+The wall-clock cap `--wl_max_seconds` is cumulative across resumes by default;
+`--wl_max_seconds_scope per_invocation` restores per-invocation accounting.
 
 The adaptive samples are never used in the reported baseline.  Stage
 checkpoints contain the current chain, density estimate, next modification
