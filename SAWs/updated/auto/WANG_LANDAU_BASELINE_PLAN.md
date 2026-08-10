@@ -25,15 +25,25 @@ contact levels.  It does not redefine the physical baseline.
 
 ## 2. Markov-chain validity
 
-The script uses the same three move families as the direct athermal sampler:
+The script uses four move families.  The first three are shared with the direct
+athermal sampler:
 
 1. proper cubic pivot rotations of the tail;
-2. local 90-degree crankshaft flips;
-3. symmetric end moves.
+2. local 90-degree corner flips (kink jumps, one bead across a corner);
+3. symmetric end moves;
+4. Lesh-Mitzenmacher-Whitesides pull moves, at probability
+   `--pull_move_weight` (default 0.25).
 
-Move families are chosen with fixed probabilities, and each valid proposal has
-a reverse proposal with the same probability.  The proposal kernel is therefore
-symmetric.  Self-intersecting proposals are rejected.
+Families are chosen with fixed, state-independent probabilities.  That
+independence is required: a mixture weight that varied with the contact number
+or the chain density would not cancel in the acceptance ratio and would leave an
+uncorrected factor in `q`.  Self-intersecting proposals are rejected.
+
+The first three families are symmetric — each valid proposal has a reverse
+proposal of equal probability — but pull moves are not, so the kernel as a whole
+is *not* symmetric and a Hastings term is mandatory.  Every move function
+therefore returns its own `log q(X'\to X) - log q(X\to X')`, which is exactly
+zero for families 1-3.
 
 For a frozen estimate `log_g_hat(m)`, the multicanonical conformation weight is
 
@@ -41,14 +51,57 @@ For a frozen estimate `log_g_hat(m)`, the multicanonical conformation weight is
 W(X)=W(m(X))=\exp[-\log \hat g(m(X))].
 \]
 
-The Metropolis acceptance probability is consequently
+The Metropolis-Hastings acceptance probability is consequently
 
 \[
 a(X\to X')=\min\left(1,
+\frac{q(X'\to X)}{q(X\to X')}
 \exp[\log\hat g(m(X))-\log\hat g(m(X'))]\right).
 \]
 
-This satisfies detailed balance for the frozen-weight production distribution.
+Each family satisfies detailed balance with respect to the frozen-weight
+production distribution, and a mixture of such kernels with state-independent
+weights satisfies it too.  No accounting across families is needed: `q` is never
+summed over the several families that could produce the same `X'`.
+
+### Pull moves and reversibility
+
+A pull move is anchored at one bead and propagates a vacancy along the backbone,
+so it can relocate a bead whose own neighbours are all occupied.  Neither a
+corner flip nor an end move can do that, and pivot acceptance falls to
+approximately zero in dense conformations, so pull moves are what supplies
+mobility in the compact region of the contact window.
+
+Their proposal ratio is obtained by enumeration, never by a hand-derived count:
+the deduplicated catalog is built at `X` and again at the proposed `X'`, giving
+`q(X\to X')=1/n_f` and `q(X'\to X)=1/n_r`, hence a term `log(n_f) - log(n_r)`.
+
+The move set is **not** closed under inversion.  Lesh, Mitzenmacher and
+Whitesides claimed reversibility, but the proof is wrong: Györffy, Závodszky and
+Szilágyi (arXiv:1210.0495, *J. Comput. Chem.* 2013) showed some pull moves have
+no inverse pull move, which biases estimated parameters.  Measured in this
+implementation, single-bead outcomes always invert while multi-bead outcomes do
+so only about 60% of the time.
+
+The sampler therefore rejects any pull proposal whose inverse is absent from the
+reverse catalog.  Writing `R` for the set of ordered pairs that are mutually
+reachable — symmetric by construction — this gives
+
+\[
+\pi(X)T(X\to X')=\mathbf{1}[(X,X')\in R]\,
+\min\!\left(\frac{\pi(X)}{n_f},\frac{\pi(X')}{n_r}\right),
+\]
+
+which is symmetric under exchange of `X` and `X'`, so detailed balance holds
+exactly.  Rejected proposals are ordinary self-loops and cost only efficiency;
+35-55% of pull proposals are discarded this way.  Note that `n_f` and `n_r`
+remain the *full* catalog sizes — the irreversible members stay proposable and
+are merely never accepted, so removing them from the counts would destroy the
+balance this restores.
+
+Omitting the rejection is not a small effect.  On the exactly enumerable N=6
+test it moves the sampled `P(m=0)` from 0.712 to 0.493 against an exact 0.712,
+a total variation distance of 0.219 rather than 0.002.
 
 ## 3. Two strictly separated phases
 
@@ -216,7 +269,11 @@ out-of-range mass is never silently discarded and renormalized away.
 
 1. **Move invariants:** verify self-avoidance, unit bonds, 23 proper
    non-identity rotations, and exact incremental contact deltas against full
-   recounts.
+   recounts.  `tests/test_wl_moves.py` additionally checks that every accepted
+   pull move has its inverse in the reverse catalog, that a pull-move chain
+   reproduces the exact N=6 frozen-weight distribution, and that
+   `--pull_move_weight 0` is bit-identical to the sampler that predates pull
+   moves.
 2. **Exact small-chain validation:** enumerate every rooted six-bead 3D SAW
    (3,534 walks), run learning plus frozen production, and compare estimated
    `P(m)` and mean `Rg` with enumeration.
@@ -252,5 +309,71 @@ python run_wl_pilot.py --dry-run
 ```
 
 Run it by removing `--dry-run`.  A failure to reach the declared upper contact
-level is reported as evidence for separately reviewed pull moves; the runner
-never lowers `m_cover` to manufacture a passing result.
+level is reported as evidence; the runner never lowers `m_cover` to manufacture
+a passing result.
+
+To measure whether pull moves restore re-reachability of the compact window for
+a given chain length, use
+
+```bash
+python single_chain_wang_landau.py --pull_move_probe --N 44 \
+    --wl_schedule halving --pull_move_probe_steps 8000000
+```
+
+The probe first drives a chain to a genuine stage-1 completion — the same
+flatness and visit criterion the learner uses, not merely first coverage — then
+replays that one warmed state with and without pull moves from an identical
+random stream.  It reports the spread of the warmed `log_g` against the analytic
+scale `N ln(mu)` and warns loudly when the spread is too small to represent the
+state that actually starves, because a result measured from a mildly inflated
+bias is not evidence either way.  It is far too slow for CI and is not run by
+the test suite.
+
+Both arms are judged on the full stage criterion — per-level minimum visits and
+the tier-2 flatness ratio — not on first coverage.  Touching every level once is
+a much weaker bar than a stage has to clear, and it is not the bar that fails: a
+starving stage has already reached the top of the window and still cannot
+accumulate the minimum counts there.
+
+#### Measured status
+
+The N=44 warm-up reproduces the reference stage-1 exit closely: 7.3M steps,
+min/mean 0.870 against a reference 0.868, `min_tier2` 124543.  Its `log_g`
+spread is 20395 against an analytic scale of 67.9, roughly 300 times, so by
+bias amplitude alone it is the pathological regime.
+
+Nevertheless **neither arm starves on that state**: both meet the stage
+criterion at 500,000 steps, with minimum per-level visits of 8159 with pull
+moves and 8876 without.  The stage-1 exit state is therefore *not* the state
+that fails at stage 3, and bias amplitude alone does not reproduce the failure —
+the stage-3 starvation must also depend on the halved `log_f` and on the shape
+`log_g` takes after two refinement stages, not merely on how large it has grown.
+
+The acceptance question in the pull-move brief — whether a repeat sweep reaches
+`m=50` in fewer than the 7.5M steps stage 3 fails in — is therefore **not yet
+demonstrated for N=44**.  Answering it needs a genuine stage-3 checkpoint fed to
+`--pull_move_probe_log_g`; no such checkpoint exists in the repository yet.
+
+At N=30 the same probe does discriminate, and shows pull moves working as
+intended.  From a warmed state (900k steps, spread 1428 against a scale of
+46.3), the stage criterion is met at 100,000 steps with pull moves against
+500,000 without, a factor of 5.  The effect is concentrated exactly where the
+argument for pull moves predicts: the first hit of `m=29` falls from step
+401,013 to step 77, and of `m=28` from 53,485 to 170.
+
+#### Throughput, and the honest trade
+
+Cost at `--pull_move_weight 0.25`: **15x** slower per attempted move at N=30 and
+**22x** at N=44.  This is inherent rather than an implementation defect — an
+accepted pull move builds the full catalog twice, once forward and once to
+obtain `n_r` — and it has not been traded away, because approximating either
+count would break the proposal ratio.
+
+The consequence must not be glossed over.  At N=30 pull moves need 5x fewer
+steps but 15x more time per step, so reaching the same stage criterion took
+20.9s with them against 6.8s without: **a 5x mixing gain and a 3x wall-clock
+loss on the same state.**  Steps measure mixing; wall clock is what a run
+actually spends.  Pull moves are therefore worth their cost only where the
+pull-free chain cannot complete a stage at all — which is precisely the reported
+N=44 stage-3 failure, and precisely the case not yet reproducible here.  The
+default weight has not been tuned against probe outcomes.

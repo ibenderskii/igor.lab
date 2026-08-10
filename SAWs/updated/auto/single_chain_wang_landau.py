@@ -23,11 +23,23 @@ The optional Belardinelli-Pereyra schedule uses cumulative Monte Carlo time
 ``t = attempted_moves / included_levels``.  The time origin is never reset at a
 refinement stage.  This is essential to the asymptotic ``1/t`` schedule.
 
+Four move families are used: pivot rotations, corner flips, end moves, and
+Lesh-Mitzenmacher-Whitesides pull moves.  Only the pull moves can relocate a
+bead whose neighbours are all occupied, which is what makes the compact end of
+the contact window re-reachable after the bias has been built up.  They are not
+a symmetric proposal, and the move set is not closed under inversion, so they
+carry an explicit Hastings ratio and irreversible proposals are rejected; see
+``attempt_pull_move`` for the derivation and for why it is not optional.
+
 Project probes measured about 50.8k, 38.1k, and 29.9k attempted moves per
-second per learning core for N=30, 44, and 60.  Learning is single-process while
-production is parallel, so the default final modification factor is 1e-4 and
-the learning caps are deliberately generous.  This changes the quality of the
-bias estimate, not the limiting target of the frozen-weight reweighting step.
+second per learning core for N=30, 44, and 60.  Those figures predate pull
+moves, which cost an extra catalog build per proposal and are substantially
+slower per attempted move at the default ``--pull_move_weight``; the achieved
+rate is printed in the progress line and stored as
+``wl_learning_steps_per_second``.  Learning is single-process while production
+is parallel, so the default final modification factor is 1e-4 and the learning
+caps are deliberately generous.  This changes the quality of the bias estimate,
+not the limiting target of the frozen-weight reweighting step.
 
 The output preserves the distribution fields used by
 ``single_uniform_chain2_athermal_dists_joint.py``:
@@ -81,6 +93,16 @@ NN_VECS: Tuple[Vec, ...] = (
     (1, 0, 0), (-1, 0, 0), (0, 1, 0),
     (0, -1, 0), (0, 0, 1), (0, 0, -1),
 )
+# The four unit vectors perpendicular to each lattice direction.  Pull-move
+# enumeration needs this set once per candidate anchor, so it is tabulated
+# rather than recomputed as six dot products every time.
+PERPENDICULAR: Dict[Vec, Tuple[Vec, ...]] = {
+    bond: tuple(
+        vector for vector in NN_VECS
+        if bond[0] * vector[0] + bond[1] * vector[1] + bond[2] * vector[2] == 0
+    )
+    for bond in NN_VECS
+}
 BEND_DEFINITION = "number of 90-degree turns among the N-2 internal vertices"
 RAW_SAMPLES_WARNING = (
     "These arrays are systematic importance resamples with duplicates; do not "
@@ -171,8 +193,9 @@ def contact_delta_from_occupancy(old_occupied: Set[Vec], new_occupied: Set[Vec])
     For a connected N-bead chain, ``m`` equals the number of occupied nearest-
     neighbour lattice edges minus the fixed ``N-1`` bonded edges.  We can
     therefore update ``m`` from the occupancy symmetric difference without
-    rescanning the whole chain.  This makes crankshaft and end proposals O(1)
-    while retaining an exact update for pivots.
+    rescanning the whole chain.  This makes corner-flip and end proposals O(1)
+    while retaining an exact update for pivots, and it is exact for the
+    arbitrary multi-bead symmetric differences a pull move produces.
     """
     removed = old_occupied - new_occupied
     added = new_occupied - old_occupied
@@ -209,9 +232,18 @@ def count_bends(chain: Sequence[Vec]) -> int:
     return bends
 
 
+# Every move function returns ``(valid, chain, occupied, log_q_ratio)`` with
+#
+#     log_q_ratio = log q(X'->X) - log q(X->X')
+#
+# the Hastings correction its own proposal kernel requires.  The three local
+# families below are self-inverse or closed under inversion at fixed proposal
+# probability, so their ratio is exactly zero; pull moves are not, and compute
+# theirs by enumeration.  Keeping the term in the shared signature is what stops
+# a future move family from silently inheriting a symmetry it does not have.
 def attempt_pivot(
     chain: List[Vec], occupied: Set[Vec], rng: random.Random
-) -> Tuple[bool, List[Vec], Set[Vec]]:
+) -> Tuple[bool, List[Vec], Set[Vec], float]:
     pivot_index = rng.randrange(1, len(chain) - 1)
     head = chain[: pivot_index + 1]
     pivot = chain[pivot_index]
@@ -221,46 +253,261 @@ def attempt_pivot(
     for site in chain[pivot_index + 1 :]:
         moved = add(pivot, apply_rot(matrix, sub(site, pivot)))
         if moved in new_occupied:
-            return False, chain, occupied
+            return False, chain, occupied, 0.0
         new_tail.append(moved)
         new_occupied.add(moved)
-    return True, head + new_tail, new_occupied
+    # ROT_MATS is the full set of 23 non-identity proper cubic rotations, which
+    # is closed under inversion, so the reverse rotation about the same index is
+    # drawn with the same probability.
+    return True, head + new_tail, new_occupied, 0.0
 
 
-def attempt_crankshaft(
+def attempt_corner_flip(
     chain: List[Vec], occupied: Set[Vec], rng: random.Random
-) -> Tuple[bool, List[Vec], Set[Vec]]:
+) -> Tuple[bool, List[Vec], Set[Vec], float]:
+    """Move one bead across a 90-degree corner (a kink jump).
+
+    This is not a crankshaft: a crankshaft rotates a two-bead segment about the
+    axis through its neighbours.  Exactly one bead moves here.
+    """
     index = rng.randrange(1, len(chain) - 1)
     previous, current, following = chain[index - 1], chain[index], chain[index + 1]
     first = sub(current, previous)
     second = sub(following, current)
     dot = first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
     if first not in NN_VECS or second not in NN_VECS or dot != 0:
-        return False, chain, occupied
+        return False, chain, occupied, 0.0
     replacement = add(previous, second)
     if replacement in occupied:
-        return False, chain, occupied
+        return False, chain, occupied, 0.0
     new_chain = chain.copy()
     new_chain[index] = replacement
-    return True, new_chain, (occupied - {current}) | {replacement}
+    # Self-inverse: flipping the same index back reverses it, and the index is
+    # drawn uniformly either way.
+    return True, new_chain, (occupied - {current}) | {replacement}, 0.0
 
 
 def attempt_end_move(
     chain: List[Vec], occupied: Set[Vec], rng: random.Random
-) -> Tuple[bool, List[Vec], Set[Vec]]:
+) -> Tuple[bool, List[Vec], Set[Vec], float]:
     end = 0 if rng.random() < 0.5 else len(chain) - 1
     anchor = 1 if end == 0 else len(chain) - 2
     old_site = chain[end]
     occupied_without_old = occupied - {old_site}
     replacement = add(chain[anchor], rng.choice(NN_VECS))
     if replacement == old_site or replacement in occupied_without_old:
-        return False, chain, occupied
+        return False, chain, occupied, 0.0
     new_chain = chain.copy()
     new_chain[end] = replacement
-    return True, new_chain, occupied_without_old | {replacement}
+    # Symmetric: the same end and the same anchor propose the old site back with
+    # probability 1/6, the probability that placed the new one.
+    return True, new_chain, occupied_without_old | {replacement}, 0.0
 
 
-MOVE_FUNCS = (attempt_pivot, attempt_crankshaft, attempt_end_move)
+MOVE_FUNCS = (attempt_pivot, attempt_corner_flip, attempt_end_move)
+
+# A pull-move outcome, listing only the beads whose positions change, as
+# ``((index, new_site), ...)`` sorted by index.  Descriptors rather than rebuilt
+# chains keep enumeration O(pull length) per candidate instead of O(N).
+PullOutcome = Tuple[Tuple[int, Vec], ...]
+
+
+def _pull_move_catalog(
+    chain: Sequence[Vec], occupied: Set[Vec]
+) -> Dict[PullOutcome, None]:
+    """Return every distinct Lesh-Mitzenmacher-Whitesides pull move from a state.
+
+    A pull move is anchored at bead ``i`` and propagates a vacancy along the
+    backbone in one index direction, so it can relocate a bead whose own
+    neighbours are all occupied.  That is what pivots and corner flips cannot do,
+    and why the compact region of the contact window is otherwise hard to
+    re-enter once the Wang-Landau bias has been built up.
+
+    With ``toward`` the index direction the vacancy propagates and
+    ``nbr = i - toward`` the bead on the opposite side of the anchor:
+
+    * ``b = chain[nbr] - chain[i]`` is the anchor bond and ``v`` ranges over the
+      four unit vectors perpendicular to it;
+    * ``L = chain[nbr] + v`` must be unoccupied, which makes ``L`` a
+      face-diagonal neighbour of ``chain[i]`` and ``(chain[i], chain[nbr], L, C)``
+      a unit square;
+    * ``C = chain[i] + v``.
+
+    Three cases produce a move.  ``i`` terminal on the propagation side: bead
+    ``i`` alone moves to ``L``.  ``C == chain[i + toward]``: bead ``i`` alone
+    moves to ``L``, which is degenerate with a corner flip but is still a legal
+    member of this catalog -- dropping it would change the catalog size and hence
+    every proposal ratio taken from it.  ``C`` unoccupied: bead ``i`` moves to
+    ``L``, bead ``i + toward`` moves to ``C``, and the vacancy propagates until
+    the chain reconnects.
+
+    The catalog is deduplicated, because distinct ``(i, toward, v)`` triples can
+    occasionally yield the same conformation and ``q = 1/len(catalog)`` is only
+    exact once each reachable outcome appears exactly once.
+
+    This catalog is *not* closed under inversion.  See ``attempt_pull_move`` for
+    what that means and how it is handled; it is a property of the move set, not
+    of this implementation.
+    """
+    n_beads = len(chain)
+    outcomes: Dict[PullOutcome, None] = {}
+    for anchor in range(n_beads):
+        for toward in (-1, 1):
+            neighbour = anchor - toward
+            if not 0 <= neighbour < n_beads:
+                continue
+            bond = sub(chain[neighbour], chain[anchor])
+            perpendicular = PERPENDICULAR.get(bond)
+            if perpendicular is None:
+                continue
+            for offset in perpendicular:
+                pulled = add(chain[neighbour], offset)
+                if pulled in occupied:
+                    continue
+                corner = add(chain[anchor], offset)
+                follower = anchor + toward
+                if not 0 <= follower < n_beads:
+                    # Case A: the anchor is the terminal bead on the propagation
+                    # side, so nothing behind it needs to move.
+                    outcomes[((anchor, pulled),)] = None
+                    continue
+                if corner == chain[follower]:
+                    # Case B: the square is already closed by the follower.
+                    outcomes[((anchor, pulled),)] = None
+                    continue
+                if corner in occupied:
+                    continue
+                # Case C: pull the anchor and its follower, then propagate the
+                # vacancy backwards until the chain reconnects.  ``vacated``
+                # tracks the sites released so far: a newly assigned position is
+                # legal only if it is free in the current state or has just been
+                # released.  This is enforced here rather than assumed, so that
+                # self-avoidance is an invariant of the catalog; a candidate that
+                # violates it is dropped instead of emitted.
+                moves: List[Tuple[int, Vec]] = [(anchor, pulled), (follower, corner)]
+                vacated = {chain[anchor], chain[follower]}
+                assigned = {pulled, corner}
+                broken = False
+                index = anchor + 2 * toward
+                while 0 <= index < n_beads:
+                    previous_new = moves[-1][1]
+                    if sub(chain[index], previous_new) in NN_VECS:
+                        break
+                    replacement = chain[index - 2 * toward]
+                    if replacement in assigned or (
+                        replacement in occupied and replacement not in vacated
+                    ):
+                        broken = True
+                        break
+                    moves.append((index, replacement))
+                    vacated.add(chain[index])
+                    assigned.add(replacement)
+                    index += toward
+                if broken:
+                    continue
+                outcomes[tuple(sorted(moves))] = None
+    return outcomes
+
+
+def enumerate_pull_moves(
+    chain: Sequence[Vec], occupied: Set[Vec]
+) -> List[PullOutcome]:
+    """Return the deduplicated pull-move catalog of a state as a list.
+
+    Order is the enumeration order and is deterministic.  See
+    ``_pull_move_catalog`` for the geometry.
+    """
+    return list(_pull_move_catalog(chain, occupied))
+
+
+def reverse_pull_outcome(
+    chain: Sequence[Vec], outcome: PullOutcome
+) -> PullOutcome:
+    """Return the descriptor that undoes ``outcome`` applied to ``chain``.
+
+    The two states differ on exactly the indices ``outcome`` names, so the
+    inverse is those same indices carrying their original positions.
+    """
+    return tuple(sorted((index, chain[index]) for index, _ in outcome))
+
+
+def apply_pull_move(
+    chain: Sequence[Vec], occupied: Set[Vec], outcome: PullOutcome
+) -> Tuple[List[Vec], Set[Vec]]:
+    """Apply a pull-move descriptor, returning fresh chain and occupancy sets."""
+    new_chain = list(chain)
+    new_occupied = set(occupied)
+    # Every vacated site is released before any new site is claimed.  Interleaving
+    # the two would erase a bead that moved into a site another bead just left.
+    for index, _ in outcome:
+        new_occupied.discard(chain[index])
+    for index, site in outcome:
+        new_chain[index] = site
+        new_occupied.add(site)
+    return new_chain, new_occupied
+
+
+def attempt_pull_move(
+    chain: List[Vec], occupied: Set[Vec], rng: random.Random
+) -> Tuple[bool, List[Vec], Set[Vec], float]:
+    """Propose a uniformly chosen pull move and return its Hastings ratio.
+
+    The proposal is uniform over the forward catalog, so ``q(X->X') = 1/n_f``
+    and ``q(X'->X) = 1/n_r`` with ``n_f`` and ``n_r`` the deduplicated catalog
+    sizes at ``X`` and ``X'``.  Therefore
+
+        q(X'->X) / q(X->X') = (1/n_r) / (1/n_f) = n_f / n_r
+
+    and the returned term is ``log(n_f) - log(n_r)``.  The sign is easy to
+    invert: the *forward* count is in the numerator.
+
+    That formula presumes the reverse move exists at all, and for pull moves on
+    a rectangular lattice it does not always exist.  Lesh, Mitzenmacher and
+    Whitesides claimed the move set was reversible, but the proof is wrong:
+    Gyorffy, Zavodszky and Szilagyi (arXiv:1210.0495, J. Comput. Chem. 2013)
+    showed some pull moves have no inverse pull move, "which leads to biases in
+    the parameters estimated from the simulations".  Measured here, single-bead
+    outcomes always invert, while multi-bead outcomes invert only about 60% of
+    the time -- so this is a property of the move set, not of this code.
+
+    The cheapest correct repair is to reject the proposal outright whenever the
+    inverse is absent.  Let ``R`` be the set of ordered pairs ``(X, X')`` with
+    ``X'`` in the catalog of ``X`` *and* ``X`` in the catalog of ``X'``.  ``R``
+    is symmetric by construction.  Proposing uniformly from the full catalog and
+    rejecting every proposal outside ``R`` gives, for ``X != X'``,
+
+        pi(X) T(X->X') = 1[(X,X') in R] * min(pi(X)/n_f, pi(X')/n_r)
+
+    which is symmetric under exchanging ``X`` and ``X'``, so detailed balance
+    holds exactly.  The rejected proposals are ordinary self-loops and cost only
+    efficiency.  Note ``n_f`` and ``n_r`` remain the *full* catalog sizes: the
+    irreversible members are still proposable, just never accepted, so removing
+    them from the counts would break the very balance this restores.
+
+    This costs nothing extra -- the reverse catalog is already built to obtain
+    ``n_r``, so the repair is one membership test.  Gyorffy et al. instead extend
+    the move set until it is closed under inversion, which wastes fewer
+    proposals but is a larger change than this sampler needs.
+
+    No accounting across move types is needed.  A mixture of kernels that each
+    satisfy detailed balance with respect to pi also satisfies detailed balance
+    with respect to pi, provided the mixture weights do not depend on the state.
+    Each move type therefore needs only its own correct ratio, and we never sum
+    ``q`` over the several move types that could produce the same ``X'``.
+    """
+    catalog_forward = _pull_move_catalog(chain, occupied)
+    if not catalog_forward:
+        return False, chain, occupied, 0.0
+    forward_count = len(catalog_forward)
+    outcome = list(catalog_forward)[rng.randrange(forward_count)]
+    proposed_chain, proposed_occupied = apply_pull_move(chain, occupied, outcome)
+    catalog_reverse = _pull_move_catalog(proposed_chain, proposed_occupied)
+    if reverse_pull_outcome(chain, outcome) not in catalog_reverse:
+        # Irreversible proposal: no inverse pull move exists, so accepting it at
+        # any ratio would violate detailed balance.  Reject as a self-loop.
+        return False, chain, occupied, 0.0
+    log_q_ratio = math.log(forward_count) - math.log(len(catalog_reverse))
+    return True, proposed_chain, proposed_occupied, log_q_ratio
 
 
 def validate_chain(chain: Sequence[Vec]) -> None:
@@ -279,20 +526,38 @@ def metropolis_step(
     m_min: int,
     m_max: int,
     rng: random.Random,
+    pull_move_weight: float = 0.0,
 ) -> Tuple[List[Vec], Set[Vec], int, bool, bool]:
     """Take one fixed-bias proposal.
 
-    Returns ``chain, occupied, contact, geometrically_valid, accepted``.  The
-    proposal kernels are symmetric, so no Hastings proposal-ratio term appears.
+    Returns ``chain, occupied, contact, geometrically_valid, accepted``.  Each
+    move type carries its own proposal ratio, returned as ``log_q_ratio`` and
+    added to the log acceptance: the three local families are symmetric and
+    return zero, while pull moves return the Hastings term their asymmetric
+    catalog requires.
+
+    ``pull_move_weight`` is the probability of proposing a pull move, with the
+    remainder split evenly among the three local families.  It must not depend
+    on the state -- not on the contact number, the chain density, or anything
+    else -- or the mixture weight fails to cancel in the ratio above and leaves
+    an uncorrected factor in ``q``.
     """
-    move = rng.choice(MOVE_FUNCS)
-    valid, proposed_chain, proposed_occupied = move(chain, occupied, rng)
+    # Short-circuit rather than compare against a drawn variate: at weight 0.0
+    # this consumes no random number, so the stream is bit-identical to a build
+    # with no pull moves at all.
+    if pull_move_weight > 0.0 and rng.random() < pull_move_weight:
+        move = attempt_pull_move
+    else:
+        move = rng.choice(MOVE_FUNCS)
+    valid, proposed_chain, proposed_occupied, log_q_ratio = move(chain, occupied, rng)
     if not valid:
         return chain, occupied, contact, False, False
     proposed_contact = contact + contact_delta_from_occupancy(occupied, proposed_occupied)
     if proposed_contact < m_min or proposed_contact > m_max:
         return chain, occupied, contact, True, False
-    log_acceptance = float(log_g[contact - m_min] - log_g[proposed_contact - m_min])
+    log_acceptance = float(
+        log_g[contact - m_min] - log_g[proposed_contact - m_min]
+    ) + log_q_ratio
     if log_acceptance >= 0.0 or rng.random() < math.exp(log_acceptance):
         return proposed_chain, proposed_occupied, proposed_contact, True, True
     return chain, occupied, contact, True, False
@@ -335,6 +600,7 @@ def _save_checkpoint(
     seed: int,
     tier: np.ndarray,
     schedule: str,
+    pull_move_weight: float,
     one_over_t_mode: bool,
     one_over_t_trigger_reason: str,
     one_over_t_round_trips: int,
@@ -366,6 +632,7 @@ def _save_checkpoint(
             original_seed=np.array(seed, dtype=np.int64),
             wl_tier=np.asarray(tier, dtype=np.int8),
             wl_schedule=np.array(schedule),
+            wl_pull_move_weight=np.array(pull_move_weight, dtype=np.float64),
             one_over_t_mode=np.array(one_over_t_mode, dtype=bool),
             wl_one_over_t_trigger=np.array(one_over_t_trigger_reason),
             wl_one_over_t_round_trips=np.array(
@@ -676,6 +943,7 @@ def learn_log_density(
     max_steps_per_stage: int = 1_000_000_000,
     schedule: str = "halving",
     stage_stall_steps: int = 50_000_000,
+    pull_move_weight: float = 0.0,
     checkpoint_every_seconds: float = 1800.0,
     tier: Optional[np.ndarray] = None,
     checkpoint: Optional[Path] = None,
@@ -719,6 +987,8 @@ def learn_log_density(
         raise ValueError("WL visit/check/step controls must be positive")
     if max_seconds <= 0.0 or checkpoint_every_seconds <= 0.0:
         raise ValueError("WL time controls must be positive")
+    if not 0.0 <= pull_move_weight <= 1.0:
+        raise ValueError("pull_move_weight must lie in [0, 1]")
 
     if resume_checkpoint is None:
         chain: List[Vec] = [(i, 0, 0) for i in range(n_beads)]
@@ -802,6 +1072,14 @@ def learn_log_density(
                         "checkpoint WL schedule does not match the requested run: "
                         f"saved={saved_schedule}, requested={schedule}"
                     )
+            if "wl_pull_move_weight" in saved:
+                saved_pull_weight = float(saved["wl_pull_move_weight"])
+                if saved_pull_weight != pull_move_weight:
+                    raise ValueError(
+                        "checkpoint pull-move weight does not match the requested "
+                        f"run: saved={saved_pull_weight}, "
+                        f"requested={pull_move_weight}"
+                    )
         validate_chain(chain)
 
     if tier is None:
@@ -851,6 +1129,7 @@ def learn_log_density(
             seed=seed,
             tier=tier,
             schedule=schedule,
+            pull_move_weight=pull_move_weight,
             one_over_t_mode=one_over_t_mode,
             one_over_t_trigger_reason=one_over_t_reason,
             one_over_t_round_trips=(
@@ -954,7 +1233,8 @@ def learn_log_density(
                 )
             for _ in range(block):
                 chain, occupied, contact, _, was_accepted = metropolis_step(
-                    chain, occupied, contact, log_g, m_min, included_high, rng
+                    chain, occupied, contact, log_g, m_min, included_high, rng,
+                    pull_move_weight,
                 )
                 total_steps += 1
                 stage_steps += 1
@@ -1010,12 +1290,18 @@ def learn_log_density(
                 schedule == "one_over_t" or ratio >= flatness
             )
             if progress:
+                # Pull moves cost an extra catalog build per proposal, so the
+                # achieved rate is printed to keep that cost visible rather than
+                # buried in the wall-clock cap.
+                stage_elapsed = now - stage_start
+                stage_rate = stage_steps / stage_elapsed if stage_elapsed > 0 else 0.0
                 print(
                     f"[WL stage {stages_completed + 1}] log_f={log_f:.6g} "
                     f"steps={stage_steps} min/mean={ratio:.3f} "
                     f"min_tier2={min_flat} min_tier1={min_coverage} "
                     f"range={range_covered} highest_m={highest_m} "
                     f"round_trips={previous_round_trips + tracker.round_trips} "
+                    f"steps_per_s={stage_rate:.0f} "
                     f"mode={_mode_label(schedule, one_over_t_mode, stall_relaxed)}",
                     flush=True,
                 )
@@ -1162,6 +1448,7 @@ def learn_log_density(
     spread, spread_reference = _report_log_g_spread(
         log_g, included, n_beads, progress
     )
+    learning_wall = historical_wall + (time.time() - t0)
     return {
         "log_g": log_g,
         "chain": chain,
@@ -1170,7 +1457,11 @@ def learn_log_density(
         "stages_completed": stages_completed,
         "stage_records": np.asarray(stage_records, dtype=WL_STAGE_DTYPE),
         "round_trips": previous_round_trips + tracker.round_trips,
-        "wall_time": historical_wall + (time.time() - t0),
+        "wall_time": learning_wall,
+        # Cumulative across resumes, as both terms are, so the ratio stays a fair
+        # average rather than a snapshot of the final invocation.
+        "steps_per_second": (total_steps / learning_wall) if learning_wall > 0 else 0.0,
+        "pull_move_weight": float(pull_move_weight),
         "next_log_f": log_f,
         "tier": tier,
         "active": included,
@@ -1202,6 +1493,7 @@ def run_production_chain(
     sample_every: int,
     progress: bool = True,
     tier: Optional[np.ndarray] = None,
+    pull_move_weight: float = 0.0,
 ) -> Dict[str, Any]:
     rng = random.Random(seed)
     chain = [tuple(site) for site in initial_chain]
@@ -1230,7 +1522,8 @@ def run_production_chain(
 
     for step in range(1, steps + 1):
         chain, occupied, contact, valid, was_accepted = metropolis_step(
-            chain, occupied, contact, log_g, m_min, included_high, rng
+            chain, occupied, contact, log_g, m_min, included_high, rng,
+            pull_move_weight,
         )
         if tier[contact - m_min] == TIER_EXCLUDED:
             raise RuntimeError(
@@ -1498,6 +1791,316 @@ def enumerate_rooted_saws(n_beads: int) -> Tuple[np.ndarray, np.ndarray, np.ndar
     return values, counts / counts.sum(), r
 
 
+def _probe_sweep(
+    *,
+    chain: List[Vec],
+    occupied: Set[Vec],
+    contact: int,
+    log_g: np.ndarray,
+    m_min: int,
+    m_max: int,
+    tier: np.ndarray,
+    rng: random.Random,
+    steps: int,
+    pull_move_weight: float,
+    log_f: float,
+    flatness: float,
+    min_visits: int,
+    min_cover_visits: int,
+    check_every: int,
+) -> Dict[str, Any]:
+    """Run a fixed-``log_f`` Wang-Landau sweep and record when levels are first hit.
+
+    This deliberately does not go through ``learn_log_density``: the probe needs
+    per-level first-hit steps and a frozen refinement factor, and neither is a
+    concern of the production learner.  The stage logic, schedules, triggers and
+    budgets there are untouched.
+    """
+    log_g = np.asarray(log_g, dtype=np.float64).copy()
+    included = tier > TIER_EXCLUDED
+    histogram = np.zeros(log_g.size, dtype=np.int64)
+    first_hit = np.full(log_g.size, -1, dtype=np.int64)
+    highest_m = contact
+    covered_step = -1
+    stage_step = -1
+    step = 0
+    start = time.time()
+    while step < steps:
+        for _ in range(min(check_every, steps - step)):
+            chain, occupied, contact, _, _ = metropolis_step(
+                chain, occupied, contact, log_g, m_min, m_max, rng, pull_move_weight
+            )
+            step += 1
+            index = contact - m_min
+            log_g[index] += log_f
+            histogram[index] += 1
+            if first_hit[index] < 0:
+                first_hit[index] = step
+            if contact > highest_m:
+                highest_m = contact
+            if covered_step < 0 and not np.any(included & (histogram == 0)):
+                covered_step = step
+        # Touching every level once is a far weaker bar than a stage actually
+        # has to clear, and it is not the bar that fails: a starving stage has
+        # visited the top of the window and still cannot accumulate the minimum
+        # counts there.  So the stage criterion itself is the headline number.
+        ratio, min_flat, min_coverage, range_covered = _stage_visit_statistics(
+            histogram, tier
+        )
+        if stage_step < 0 and _coverage_satisfied(
+            range_covered, min_flat, min_coverage, tier, min_visits, min_cover_visits
+        ) and ratio >= flatness:
+            stage_step = step
+            break
+    elapsed = time.time() - start
+    return {
+        "first_hit": first_hit,
+        "histogram": histogram,
+        "highest_m": highest_m,
+        "covered_step": covered_step,
+        "stage_step": stage_step,
+        "min_visits_in_window": int(histogram[included].min()) if included.any() else 0,
+        "steps_run": step,
+        "wall_seconds": elapsed,
+        "steps_per_second": (step / elapsed) if elapsed > 0 else 0.0,
+    }
+
+
+def _probe_warm_up(
+    *,
+    n_beads: int,
+    m_min: int,
+    m_max: int,
+    tier: np.ndarray,
+    rng: random.Random,
+    flatness: float,
+    min_visits: int,
+    min_cover_visits: int,
+    max_steps: int,
+    check_every: int,
+) -> Dict[str, Any]:
+    """Drive a fixed-``log_f`` chain until real stage-1 completion criteria hold.
+
+    Terminating on first coverage would be the wrong state: coverage happens far
+    earlier and leaves ``log_g`` only mildly inflated, which is not the state
+    that starves.  The criterion here is the one ``learn_log_density`` itself
+    uses to complete a stage -- the tier-2 flatness ratio together with the
+    per-tier minimum visit counts -- reusing ``_stage_visit_statistics`` and
+    ``_coverage_satisfied`` rather than restating it.
+    """
+    chain: List[Vec] = [(i, 0, 0) for i in range(n_beads)]
+    occupied = set(chain)
+    contact = contact_count(chain, occupied)
+    log_g = np.zeros(m_max - m_min + 1, dtype=np.float64)
+    histogram = np.zeros(log_g.size, dtype=np.int64)
+    steps = 0
+    start = time.time()
+    while steps < max_steps:
+        for _ in range(min(check_every, max_steps - steps)):
+            chain, occupied, contact, _, _ = metropolis_step(
+                chain, occupied, contact, log_g, m_min, m_max, rng, 0.0
+            )
+            index = contact - m_min
+            log_g[index] += 1.0
+            histogram[index] += 1
+            steps += 1
+        ratio, min_flat, min_coverage, range_covered = _stage_visit_statistics(
+            histogram, tier
+        )
+        complete = _coverage_satisfied(
+            range_covered, min_flat, min_coverage, tier, min_visits, min_cover_visits
+        ) and ratio >= flatness
+        print(
+            f"[probe warm-up] steps={steps} min/mean={ratio:.3f} "
+            f"min_tier2={min_flat} min_tier1={min_coverage} "
+            f"range={range_covered} rate={steps / max(time.time() - start, 1e-9):.0f}/s",
+            flush=True,
+        )
+        if complete:
+            break
+    return {
+        "chain": chain,
+        "occupied": occupied,
+        "contact": contact,
+        "log_g": log_g,
+        "steps": steps,
+        "completed": bool(complete),
+    }
+
+
+def run_pull_move_probe(args: argparse.Namespace) -> int:
+    """Measure whether pull moves restore re-reachability of the compact window.
+
+    Reaching the top of the window once is not the question -- the existing
+    sampler already does that in its first stages.  The question is whether the
+    window can be swept *again* after ``log_g`` has been built up, which is where
+    an N=44 run starves.  So the probe first drives a chain to a genuine
+    stage-1 completion, then replays the same warmed state twice with and
+    without pull moves.
+    """
+    validate_common_args(args)
+    resolve_m_max(args)
+    m_min, m_max = int(args.m_min), int(args.m_max)
+    tier = np.full(m_max - m_min + 1, TIER_FLAT, dtype=np.int8)
+    print(
+        f"=== pull-move probe: N={args.N} window [{m_min}, {m_max}] "
+        f"weight={args.pull_move_weight} ===",
+        flush=True,
+    )
+
+    rng = random.Random(args.wl_seed)
+    if args.pull_move_probe_log_g:
+        source = Path(args.pull_move_probe_log_g)
+        with np.load(source, allow_pickle=False) as saved:
+            if int(saved["N"]) != args.N:
+                raise ValueError(
+                    f"checkpoint N={int(saved['N'])} does not match --N={args.N}"
+                )
+            log_g = np.asarray(saved["log_g"], dtype=np.float64).copy()
+            chain = [tuple(map(int, row)) for row in np.asarray(saved["chain"])]
+        validate_chain(chain)
+        occupied = set(chain)
+        contact = contact_count(chain, occupied)
+        warm_steps = 0
+        print(f"loaded built-up log_g from {source}", flush=True)
+    else:
+        warm = _probe_warm_up(
+            n_beads=args.N, m_min=m_min, m_max=m_max, tier=tier, rng=rng,
+            flatness=args.wl_flatness, min_visits=args.wl_min_visits,
+            min_cover_visits=args.wl_min_cover_visits,
+            max_steps=args.pull_move_probe_steps, check_every=args.wl_check_every,
+        )
+        if not warm["completed"]:
+            print(
+                "WARNING: warm-up hit its step budget before satisfying the "
+                "stage-1 criterion, so log_g is less built up than a real "
+                "stage-1 exit. Raise --pull_move_probe_steps.",
+                flush=True,
+            )
+        chain, occupied = warm["chain"], warm["occupied"]
+        contact, log_g = warm["contact"], warm["log_g"]
+        warm_steps = warm["steps"]
+
+    spread, reference = _report_log_g_spread(
+        log_g, tier > TIER_EXCLUDED, int(args.N), True
+    )
+    if spread < 10.0 * reference:
+        print(
+            "\n*** WARNING: the probe has NOT reproduced the failure state. ***\n"
+            f"    log_g spread {spread:.6g} is below ten times the analytic "
+            f"scale {reference:.6g}. The starving N=44 stage-3 state has a "
+            "spread far above that; a bias this mild is not the regime pull "
+            "moves are meant to rescue, so whatever the arms below report is "
+            "NOT evidence either way. Warm up longer before drawing a "
+            "conclusion.\n",
+            flush=True,
+        )
+
+    # Both arms replay one identical warmed state, including the random stream.
+    # Paired replay is far more sensitive than two independent runs, and the
+    # warm-up is paid once.
+    snapshot_state = rng.getstate()
+    arms: Dict[float, Dict[str, Any]] = {}
+    for weight in (0.0, float(args.pull_move_weight)):
+        arm_rng = random.Random()
+        arm_rng.setstate(snapshot_state)
+        arms[weight] = _probe_sweep(
+            chain=list(chain), occupied=set(occupied), contact=contact,
+            log_g=log_g, m_min=m_min, m_max=m_max, tier=tier, rng=arm_rng,
+            steps=args.pull_move_probe_steps, pull_move_weight=weight,
+            log_f=1.0, flatness=args.wl_flatness,
+            min_visits=args.wl_min_visits,
+            min_cover_visits=args.wl_min_cover_visits,
+            check_every=args.wl_check_every,
+        )
+
+    top_levels = list(range(max(m_min, m_max - 4), m_max + 1))
+    print(f"\nwarm-up steps: {warm_steps}", flush=True)
+    for weight, result in arms.items():
+        label = "without pull moves" if weight == 0.0 else f"pull_move_weight={weight}"
+        covered = result["covered_step"]
+        staged = result["stage_step"]
+        print(
+            f"\n[{label}]\n"
+            f"  steps run        : {result['steps_run']}\n"
+            f"  steps/s          : {result['steps_per_second']:.0f}\n"
+            f"  wall seconds     : {result['wall_seconds']:.1f}\n"
+            f"  highest m        : {result['highest_m']}\n"
+            f"  first coverage   : "
+            + (f"step {covered}" if covered > 0 else "NOT COVERED") + "\n"
+            f"  stage criterion  : "
+            + (f"met at step {staged}" if staged > 0 else "NOT MET") + "\n"
+            f"  min visits/level : {result['min_visits_in_window']} "
+            f"(need {args.wl_min_visits})",
+            flush=True,
+        )
+        for level in top_levels:
+            step = int(result["first_hit"][level - m_min])
+            print(
+                f"    m={level:<3d} first hit: "
+                + (f"step {step}" if step > 0 else "never"),
+                flush=True,
+            )
+
+    baseline, treated = arms[0.0], arms[float(args.pull_move_weight)]
+    print("\n=== verdict ===", flush=True)
+    if float(args.pull_move_weight) == 0.0:
+        print("both arms ran at weight 0.0; nothing to compare.", flush=True)
+        return 0
+    # The stage criterion is the bar that a starving stage fails, so it decides
+    # the verdict; first coverage is reported alongside but is much weaker.
+    treated_stage, baseline_stage = treated["stage_step"], baseline["stage_step"]
+    if treated_stage > 0 and baseline_stage <= 0:
+        print(
+            f"pull moves met the stage criterion in {treated_stage} steps; the "
+            "pull-free arm did not meet it at all within the budget.",
+            flush=True,
+        )
+    elif treated_stage > 0 and baseline_stage > 0:
+        print(
+            f"both arms met the stage criterion: {treated_stage} steps with pull "
+            f"moves, {baseline_stage} without.",
+            flush=True,
+        )
+        if treated_stage < baseline_stage:
+            print(
+                f"pull moves needed {baseline_stage / treated_stage:.1f}x fewer "
+                f"steps, but cost {treated['wall_seconds']:.1f}s against "
+                f"{baseline['wall_seconds']:.1f}s of wall clock. The step count "
+                "is the mixing measure; the wall clock is what a run actually "
+                "spends.",
+                flush=True,
+            )
+        else:
+            print(
+                "pull moves were no faster in steps. Neither arm starved on "
+                "this state, so it does not discriminate: the state is not the "
+                "one that fails, whatever its log_g spread.",
+                flush=True,
+            )
+    else:
+        print(
+            f"neither arm met the stage criterion within "
+            f"{args.pull_move_probe_steps} steps "
+            f"(min visits/level {treated['min_visits_in_window']} with pull "
+            f"moves versus {baseline['min_visits_in_window']} without, "
+            f"need {args.wl_min_visits}). At --pull_move_weight "
+            f"{args.pull_move_weight} this is insufficient on the measured "
+            "state. Reported as measured; the default has NOT been tuned to "
+            "make this pass.",
+            flush=True,
+        )
+    if baseline["steps_per_second"] > 0:
+        print(
+            f"throughput cost: {treated['steps_per_second']:.0f} vs "
+            f"{baseline['steps_per_second']:.0f} steps/s "
+            f"({baseline['steps_per_second'] / max(treated['steps_per_second'], 1e-9):.2f}x "
+            "slower per attempted move).",
+            flush=True,
+        )
+    return 0
+
+
 def run_self_test() -> int:
     print("Self-test: exact enumeration and reweighted WL production")
     n_beads = 6
@@ -1575,7 +2178,7 @@ def run_self_test() -> int:
     delta_contact = 0
     delta_updates_agree = True
     for _ in range(5000):
-        valid, candidate, candidate_occupied = delta_rng.choice(MOVE_FUNCS)(
+        valid, candidate, candidate_occupied, _ = delta_rng.choice(MOVE_FUNCS)(
             delta_chain, delta_occupied, delta_rng
         )
         if not valid:
@@ -1911,6 +2514,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
              "Belardinelli-Pereyra crossing enters the 1/t phase",
     )
     parser.add_argument(
+        "--pull_move_weight", type=float, default=0.25,
+        help="probability of proposing a Lesh-Mitzenmacher-Whitesides pull move; "
+             "the remainder is split evenly among pivot, corner-flip and end "
+             "moves. Pull moves relocate a bead whose neighbours are all "
+             "occupied, which the local moves cannot do, at the cost of an "
+             "extra catalog build per proposal. 0.0 reproduces the move mix "
+             "used before pull moves existed, bit for bit",
+    )
+    parser.add_argument(
         "--checkpoint_every_seconds", type=float, default=1800.0,
         help="checkpoint timer within a WL stage",
     )
@@ -1953,6 +2565,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="non-overlapping batch-means blocks per production worker",
     )
     parser.add_argument("--self-test", action="store_true", help="run exact small-chain validation")
+    parser.add_argument(
+        "--pull_move_probe", action="store_true",
+        help="measure re-reachability of the compact window with and without "
+             "pull moves from one warmed log_g, then exit. Not a unit test: it "
+             "is far too slow for CI. Use --wl_schedule halving",
+    )
+    parser.add_argument(
+        "--pull_move_probe_steps", type=int, default=10_000_000,
+        help="step budget for the probe warm-up and for each measured arm",
+    )
+    parser.add_argument(
+        "--pull_move_probe_log_g", type=str, default=None,
+        help="optional WL checkpoint supplying a real built-up log_g and chain, "
+             "skipping the probe's own warm-up",
+    )
     return parser.parse_args(argv)
 
 
@@ -2097,6 +2724,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("require --wl_initial_log_f > --wl_final_log_f > 0")
     if not 0.0 < args.wl_flatness <= 1.0:
         raise ValueError("--wl_flatness must lie in (0,1]")
+    if not 0.0 <= args.pull_move_weight <= 1.0:
+        raise ValueError("--pull_move_weight must lie in [0,1]")
     if min(
         args.wl_min_visits,
         args.wl_min_cover_visits,
@@ -2129,6 +2758,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         return run_self_test()
+    if args.pull_move_probe:
+        return run_pull_move_probe(args)
     if args.show_contact_upper_bound:
         validate_common_args(args)
         return report_contact_upper_bound(args)
@@ -2178,6 +2809,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_steps_per_stage=args.wl_max_steps_per_stage,
         schedule=args.wl_schedule,
         stage_stall_steps=args.wl_stage_stall_steps,
+        pull_move_weight=args.pull_move_weight,
         checkpoint_every_seconds=args.checkpoint_every_seconds,
         tier=tier,
         checkpoint=checkpoint,
@@ -2220,6 +2852,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.sample_every,
                 True,
                 tier,
+                args.pull_move_weight,
             )
             for i in range(args.n_workers)
         ]
@@ -2353,11 +2986,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wl_max_seconds=float(args.wl_max_seconds),
         wl_max_steps_per_stage=int(args.wl_max_steps_per_stage),
         wl_schedule=str(args.wl_schedule),
+        wl_pull_move_weight=float(args.pull_move_weight),
         checkpoint_every_seconds=float(args.checkpoint_every_seconds),
         wl_learning_steps=int(learned["attempted_steps"]),
         wl_learning_accepted_moves=int(learned["accepted_moves"]),
         wl_learning_round_trips=int(learned["round_trips"]),
         wl_learning_wall_seconds=float(learned["wall_time"]),
+        wl_learning_steps_per_second=float(learned["steps_per_second"]),
         wl_one_over_t_mode=bool(learned["one_over_t_mode"]),
         wl_one_over_t_trigger=str(learned["one_over_t_trigger"]),
         wl_one_over_t_round_trips=int(learned["one_over_t_round_trips"]),
