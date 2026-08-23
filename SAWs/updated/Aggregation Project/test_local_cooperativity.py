@@ -348,7 +348,9 @@ def test_serial_and_multiprocessing_are_bit_identical(mode):
 
 def test_default_cooperativity_is_global_and_unchanged():
     """Existing runs must be untouched: the default rule is still the old one."""
-    assert rmc.DEFAULT_COOPERATIVITY == "global"
+    assert rmc._validate_cooperativity(
+        rmc.DEFAULT_COOPERATIVITY, SAT
+    ) == "global"
     state = mcs.initialize_dispersed_state(3, 8, 12, seed=5)
     T = 330.0
     explicit = rmc.reduced_contact_potential_state(
@@ -359,6 +361,18 @@ def test_default_cooperativity_is_global_and_unchanged():
         state.counts.intra + state.counts.inter, T, SAT, SAT_P, TREF, TSCALE,
         state.n_chains * state.chain_length)
     assert explicit == default == legacy
+
+    metadata = {}
+    rmc.attach_metadata(
+        metadata, M=3, N=8, L=12, Ts=np.array([300.0, 340.0]), seed=5,
+        model_name=SAT, param_names=["h_b", "s_b", "A0", "q_sat"],
+        model_params=SAT_P, Tref=TREF, Tscale=TSCALE, lambda_intra=1.0,
+        lambda_inter=1.0, local_sweeps_per_swap=1,
+        translation_sweeps_per_swap=1, n_cycles=1, burnin_frac=0.5,
+        cluster_contact_threshold=1, parameter_source="test",
+        fit_summary_json="",
+    )
+    assert metadata["cooperativity"] == "global"
 
 
 def test_local_run_records_its_rule_in_metadata():

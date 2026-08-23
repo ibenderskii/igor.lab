@@ -2,33 +2,33 @@
 """
 Self-contained replica exchange Monte Carlo for the lattice polymer model.
 
-Sampling rule:  P(C|T) ∝ exp[-u(C,T)],  u(C,T) = m(C) * b(T)
-Implied energy: H(C;T) = T * u(C,T) = m(C) * T * b(T)
+Sampling rule:  P(C|T) ∝ exp[-u(C,T)]
+Implied energy: H(C;T) = T * u(C,T)
 
-where m(C) is the non-bonded contact count and b(T) is a model-specific
-reduced contact bias.  The supported b(T) models mirror
-fit_lattice_contact_model.py: hs, tc_scale, hs_quadratic, poly2, poly3,
-heat_capacity (see MODEL_REGISTRY).  The default model is hs:
+where m(C) is the nonbonded contact count and b(T) is a model-specific reduced
+contact bias.  Every historical linear model has u(C,T)=m(C)*b(T).  The model
+registry mirrors fit_lattice_contact_model.py and the default model is hs:
 
     b(T) = h/T - s
 
-Contact potentials nonlinear in m
----------------------------------
-Three of the registry entries do not stop at u = b(T)*m, and for them the
-sampled weight is exp[-u_contact(m,T;N)] with the FULL potential:
+Nonlinear and configuration-dependent contact potentials
+--------------------------------------------------------
+Four registry entries do not stop at u = b(T)*m.  Their full potentials are:
 
     hs_m2_const, hs_m2_hs      u = b(T)*m + kappa(T)*m^2/(2N)
     saturating_cooperative_contact
                                u = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],
                                q = m/N,  m_ref = 0,  b(T) = h_b/T - s_b
+    local_coordination_saturation
+                               u = b(T)*m - A0*sum_i q_i^2/[1+(q_i/q_sat)^2],
+                               q_i = k_i/2,  m = (1/2)*sum_i k_i
 
-A0 >= 0 and q_sat > 0 are temperature-independent; A0 = 0 reproduces the hs
-potential bit for bit, so an A0 = 0 run reproduces the seeded hs trajectory
-exactly.  These models need the chain length N (for the m^2/(2N) or q = m/N
-normalization); the sampler always uses the RUNTIME N and records the fit-time
-chain length separately.  Local-move acceptance, the generalized swap criterion,
-the recorded energies and the derived observables all evaluate the full
-potential -- never a b(T)*delta_m shortcut.  The optional bending penalty
+A0 >= 0 and q_sat > 0 are temperature-independent; A0 = 0 reproduces hs bit for
+bit in both saturation models.  The three scalar nonlinear models use runtime N
+for m^2/(2N) or q=m/N.  The local model instead uses the complete degree state
+and q_i=k_i/2, without a global m/N denominator.  Local-move acceptance, the
+generalized swap criterion, recorded energies and derived observables all
+evaluate the full potential -- never a b(T)*delta_m shortcut.  The bending term
 kappa_bend*n_bend stays a separate additive term and is never folded into a
 contact model.
 
@@ -328,6 +328,18 @@ SATURATING_COOPERATIVE_DEFINITION = (
     "q = m/N,  m_ref = 0,  A0 >= 0 and q_sat > 0 (both temperature-independent)"
 )
 
+# Configuration-local cooperative potential.  Unlike the historical
+# saturating_cooperative_contact model, this model never reduces a conformation
+# to the global contact fraction m/N.  Each bead contributes according to its
+# own non-bonded nearest-neighbour coordination k_i (0..6), with q_i = k_i/2.
+# A0 = 0 removes the local term exactly and recovers the hs potential.
+LOCAL_COORDINATION_DEFINITION = (
+    "u(X,T) = (h_b/T - s_b)*m(X) - A0*sum_i["
+    "q_i^2/(1 + (q_i/q_sat)^2)],  q_i = k_i/2,  "
+    "k_i = nonbonded nearest-neighbour degree of bead i,  A0 >= 0, q_sat > 0"
+)
+LOCAL_COORDINATION_OBSERVABLE = "nonbonded_contact_degree_histogram_0_6"
+
 
 def _q_zero(params, T, Tref, Tscale):
     """Quadratic coefficient of a purely linear contact potential: exactly 0."""
@@ -414,6 +426,22 @@ MODEL_REGISTRY = {
             "(saturating cooperative attraction; A0 >= 0, q_sat > 0)"
         ),
     },
+    "local_coordination_saturation": {
+        "param_names": ["h_b", "s_b", "A0", "q_sat"],
+        "raw_b_fn": _b_hs,
+        "potential_kind": "local_coordination_saturation",
+        "quadratic_normalization": None,
+        "potential_normalization": "q_i = k_i/2",
+        "potential_definition": LOCAL_COORDINATION_DEFINITION,
+        "m_ref": M_REF_DEFAULT,
+        "requires_chain_length": False,
+        "configuration_dependent": True,
+        "state_observable": LOCAL_COORDINATION_OBSERVABLE,
+        "description": (
+            "u(X,T) = (h_b/T - s_b)*m(X) - A0*sum_i "
+            "q_i^2/(1+(q_i/q_sat)^2), q_i=k_i/2"
+        ),
+    },
 }
 
 # Linear models carry no curvature in m and need no chain length.  Filling the
@@ -429,6 +457,8 @@ for _spec in MODEL_REGISTRY.values():
     # definition, and m^2/(2N) is the only normalization that ever needed N.
     _spec.setdefault("potential_definition", _spec["description"])
     _spec.setdefault("potential_normalization", _spec["quadratic_normalization"])
+    _spec.setdefault("configuration_dependent", False)
+    _spec.setdefault("state_observable", "contact_count")
 del _spec
 
 
@@ -447,7 +477,10 @@ del _spec
 #       v2 model keeps its parameters, its potential, and its sampled
 #       trajectories bit for bit; the four pre-existing contract keys are
 #       unchanged, so a v2-era comparator that reads only those keys still works.
-MODEL_API_VERSION = 3
+#   v4: adds local_coordination_saturation, whose state observable is the
+#       per-bead nonbonded degree histogram rather than contact_count alone.
+#       Existing potential kernels and parameter orderings are unchanged.
+MODEL_API_VERSION = 4
 
 # Output-schema version for the distributions NPZ / run summary / snapshot files.
 # Bump when the set of stored keys or their semantics change.
@@ -472,7 +505,7 @@ def get_model_contract() -> dict:
     ``potential_definition`` is the authoritative statement of the potential;
     ``quadratic_normalization`` names the m^2/(2N) convention specifically and is
     None for every model that does not use it, while ``potential_normalization``
-    is the generic label for whatever the chain length is used for.
+    names the model's generic state normalization (which need not involve N).
     """
     return {
         "model_api_version": MODEL_API_VERSION,
@@ -485,6 +518,8 @@ def get_model_contract() -> dict:
                 "potential_definition": str(spec["potential_definition"]),
                 "potential_normalization": spec["potential_normalization"],
                 "m_ref": int(spec["m_ref"]),
+                "configuration_dependent": bool(spec["configuration_dependent"]),
+                "state_observable": str(spec["state_observable"]),
             }
             for name, spec in MODEL_REGISTRY.items()
         },
@@ -560,6 +595,27 @@ def validated_saturating_params(params):
     return A0, q_sat
 
 
+def local_coordination_sum(coordination_hist, q_sat: float) -> float:
+    """Return sum_i q_i^2/[1+(q_i/q_sat)^2] from a k=0..6 histogram."""
+    hist = np.asarray(coordination_hist)
+    if hist.shape != (7,):
+        raise ValueError(
+            "local_coordination_saturation requires a length-7 nonbonded "
+            f"degree histogram for k=0..6, got shape {hist.shape}"
+        )
+    if not np.issubdtype(hist.dtype, np.integer):
+        if not np.all(np.isfinite(hist)) or not np.all(hist == np.rint(hist)):
+            raise ValueError("coordination histogram entries must be finite integers")
+        hist = np.rint(hist).astype(np.int64)
+    else:
+        hist = hist.astype(np.int64, copy=False)
+    if np.any(hist < 0):
+        raise ValueError("coordination histogram entries must be nonnegative")
+    q = 0.5 * np.arange(7, dtype=float)
+    r = q / float(q_sat)
+    return float(np.dot(hist, (q * q) / (1.0 + r * r)))
+
+
 # ---------------------------------------------------------------------------
 # Scalar potential kernels, one per potential_kind
 # ---------------------------------------------------------------------------
@@ -614,6 +670,12 @@ def reduced_contact_potential(
     """
     spec = MODEL_REGISTRY[model_name]
     kind = str(spec["potential_kind"])
+    if bool(spec.get("configuration_dependent")):
+        raise ValueError(
+            f"model {model_name!r} cannot be evaluated from contact count m alone; "
+            f"it requires {spec['state_observable']}. Use "
+            "reduced_contact_potential_state instead."
+        )
     b = reduced_bias(model_name, params, float(T), Tref, Tscale)
     if kind == "linear":
         return _u_linear_value(b, m)
@@ -628,6 +690,55 @@ def reduced_contact_potential(
         f"model {model_name!r} declares potential_kind {kind!r}, which this "
         f"sampler cannot evaluate. Known kinds: {sorted(POTENTIAL_BUILDERS)}"
     )
+
+
+def reduced_contact_potential_state(
+    m, coordination_hist, T, model_name, params, Tref, Tscale, n_beads=None
+) -> float:
+    """State-aware contact potential for both scalar and local models.
+
+    Legacy models delegate to :func:`reduced_contact_potential` unchanged.  The
+    local model additionally validates the exact graph identity
+    ``sum_k k*h_k == 2*m`` before evaluating its per-bead saturation term.
+    """
+    spec = MODEL_REGISTRY[model_name]
+    if not bool(spec.get("configuration_dependent")):
+        return reduced_contact_potential(
+            m, T, model_name, params, Tref, Tscale, n_beads
+        )
+    if str(spec["potential_kind"]) != "local_coordination_saturation":
+        raise ValueError(
+            f"no state-aware kernel for potential_kind {spec['potential_kind']!r}"
+        )
+    hist = np.asarray(coordination_hist)
+    if hist.shape != (7,):
+        raise ValueError(
+            "local_coordination_saturation requires a length-7 nonbonded "
+            f"degree histogram, got shape {hist.shape}"
+        )
+    if not np.all(np.isfinite(hist)) or not np.all(hist == np.rint(hist)):
+        raise ValueError("coordination histogram entries must be finite integers")
+    hist = np.rint(hist).astype(np.int64)
+    if np.any(hist < 0):
+        raise ValueError("coordination histogram entries must be nonnegative")
+    if n_beads is not None and int(hist.sum()) != int(n_beads):
+        raise ValueError(
+            f"coordination histogram contains {int(hist.sum())} beads, expected "
+            f"{int(n_beads)}"
+        )
+    degree_sum = int(np.dot(np.arange(7, dtype=np.int64), hist))
+    m_int = int(round(float(m)))
+    if float(m) != float(m_int) or degree_sum != 2 * m_int:
+        raise ValueError(
+            "coordination histogram/contact mismatch: "
+            f"sum(k*h_k)={degree_sum}, 2*m={2 * float(m):g}"
+        )
+    A0, q_sat = validated_saturating_params(params)
+    b = reduced_bias(model_name, params, float(T), Tref, Tscale)
+    u_lin = _u_linear_value(b, m)
+    if A0 == 0.0:
+        return u_lin
+    return u_lin - A0 * local_coordination_sum(hist, q_sat)
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +799,11 @@ def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
     fails loudly here instead of silently sampling some other potential.
     """
     spec = MODEL_REGISTRY[model_name]
+    if bool(spec.get("configuration_dependent")):
+        raise ValueError(
+            f"model {model_name!r} requires {spec['state_observable']} and cannot "
+            "be represented by u(params, T, m). Use make_contact_state_u_fn."
+        )
     kind = str(spec["potential_kind"])
     try:
         build = POTENTIAL_BUILDERS[kind]
@@ -698,6 +814,18 @@ def make_contact_u_fn(model_name, Tref, Tscale, n_beads=None):
         ) from None
     n = validate_chain_length(model_name, n_beads)
     return build(spec, Tref, Tscale, None if n is None else float(n))
+
+
+def make_contact_state_u_fn(model_name, Tref, Tscale, n_beads=None):
+    """Return ``u(params, T, m, coordination_hist)`` for any model."""
+    validate_chain_length(model_name, n_beads)
+
+    def u_fn(params, T, m, coordination_hist=None):
+        return reduced_contact_potential_state(
+            m, coordination_hist, T, model_name, params, Tref, Tscale, n_beads
+        )
+
+    return u_fn
 
 
 def require_linear_contact_potential(model_name: str) -> None:
@@ -739,7 +867,8 @@ def reduced_potential(m, T, model_name, params, Tref, Tscale) -> float:
 
 
 def reduced_potential_bending(
-    m, T, model_name, params, Tref, Tscale, kappa_bend=0.0, n_bend=0, n_beads=None
+    m, T, model_name, params, Tref, Tscale, kappa_bend=0.0, n_bend=0,
+    n_beads=None, coordination_hist=None,
 ) -> float:
     """Full reduced potential u(X,T) = u_contact(m,T;N) + kappa_bend*n_bend.
 
@@ -755,7 +884,9 @@ def reduced_potential_bending(
     models and required by every model whose normalization needs N.
     """
     return (
-        reduced_contact_potential(m, T, model_name, params, Tref, Tscale, n_beads)
+        reduced_contact_potential_state(
+            m, coordination_hist, T, model_name, params, Tref, Tscale, n_beads
+        )
         + float(kappa_bend) * float(n_bend)
     )
 
@@ -787,6 +918,15 @@ def energy_from_contacts(m, T, model_name, params, Tref, Tscale, n_beads=None) -
     )
 
 
+def energy_from_state(
+    m, coordination_hist, T, model_name, params, Tref, Tscale, n_beads=None
+) -> float:
+    """Model-implied contact energy from the complete required state."""
+    return float(T) * reduced_contact_potential_state(
+        m, coordination_hist, T, model_name, params, Tref, Tscale, n_beads
+    )
+
+
 def energy(
     chain: List[Vec],
     occ: set,
@@ -804,10 +944,13 @@ def energy(
     contact-quadratic models add the T*kappa(T)*m^2/(2N) term.  The runtime chain
     length N is taken from ``chain`` for the m^2/(2N) normalization.
     """
+    if MODEL_REGISTRY[model_name]["configuration_dependent"]:
+        m, hist = contact_count_and_coordination_histogram(chain, occ)
+        return energy_from_state(
+            m, hist, T, model_name, params, Tref, Tscale, n_beads=len(chain)
+        )
     m = contact_count(chain, occ)
-    return energy_from_contacts(
-        m, T, model_name, params, Tref, Tscale, n_beads=len(chain)
-    )
+    return energy_from_contacts(m, T, model_name, params, Tref, Tscale, len(chain))
 
 
 def contact_count(chain: List[Vec], occ: set) -> float:
@@ -822,6 +965,40 @@ def contact_count(chain: List[Vec], occ: set) -> float:
             if nbr in occ and nbr not in (prev, nxt):
                 m += 1
     return 0.5 * m
+
+
+def contact_count_and_coordination_histogram(
+    chain: List[Vec], occ: set
+) -> tuple[int, tuple[int, ...]]:
+    """Return contact count and the per-bead nonbonded degree histogram k=0..6.
+
+    Covalent predecessor/successor sites are excluded exactly as in
+    :func:`contact_count`.  Each nonbonded edge contributes to the degrees of
+    both endpoint beads, so ``sum(k*h_k) == 2*m`` by construction.
+    """
+    hist = [0] * 7
+    degree_sum = 0
+    N = len(chain)
+    for i, r in enumerate(chain):
+        prev = chain[i - 1] if i > 0 else None
+        nxt = chain[i + 1] if i < N - 1 else None
+        degree = 0
+        for v in NN_VECS:
+            nbr = _add(r, v)
+            if nbr in occ and nbr not in (prev, nxt):
+                degree += 1
+        hist[degree] += 1
+        degree_sum += degree
+    if degree_sum % 2:
+        raise RuntimeError(
+            f"nonbonded coordination degree sum must be even, got {degree_sum}"
+        )
+    return degree_sum // 2, tuple(hist)
+
+
+def coordination_histogram(chain: List[Vec], occ: set) -> tuple[int, ...]:
+    """Per-bead nonbonded nearest-neighbour degree histogram for k=0..6."""
+    return contact_count_and_coordination_histogram(chain, occ)[1]
 
 
 def radius_of_gyration(chain: List[Vec]) -> float:
@@ -977,6 +1154,9 @@ class ChainState:
     E:     float
     m:     int
     n_bend: int = 0
+    # Populated only for configuration-dependent contact models.  Keeping it
+    # None for every legacy model preserves their state, hot path and RNG use.
+    coordination_hist: tuple[int, ...] | None = None
 
     @classmethod
     def initial_straight(
@@ -984,12 +1164,21 @@ class ChainState:
     ) -> "ChainState":
         chain = [(i, 0, 0) for i in range(N)]
         occ   = set(chain)
-        m = int(round(contact_count(chain, occ)))  # straight chain => 0
+        needs_hist = bool(MODEL_REGISTRY[model_name]["configuration_dependent"])
+        if needs_hist:
+            m, coordination_hist = contact_count_and_coordination_histogram(chain, occ)
+        else:
+            m = int(round(contact_count(chain, occ)))  # straight chain => 0
+            coordination_hist = None
         return cls(
             chain=chain, occ=occ,
-            E=energy_from_contacts(m, T, model_name, params, Tref, Tscale, n_beads=N),
+            E=energy_from_state(
+                m, coordination_hist, T, model_name, params, Tref, Tscale,
+                n_beads=N,
+            ),
             m=m,
             n_bend=0,  # straight chain => no bends
+            coordination_hist=coordination_hist,
         )
 
 
@@ -1026,6 +1215,24 @@ def swap_log_accept(
         + reduced_contact_potential(m_j, T_j, model_name, params, Tref, Tscale, n_beads)
         - reduced_contact_potential(m_j, T_i, model_name, params, Tref, Tscale, n_beads)
         - reduced_contact_potential(m_i, T_j, model_name, params, Tref, Tscale, n_beads)
+    )
+
+
+def swap_log_accept_state(
+    m_i: float, hist_i, m_j: float, hist_j,
+    T_i: float, T_j: float,
+    model_name: str, params, Tref: float, Tscale: float, n_beads=None,
+) -> float:
+    """Generalized swap ratio using every observable required by the model."""
+    return (
+        reduced_contact_potential_state(
+            m_i, hist_i, T_i, model_name, params, Tref, Tscale, n_beads)
+        + reduced_contact_potential_state(
+            m_j, hist_j, T_j, model_name, params, Tref, Tscale, n_beads)
+        - reduced_contact_potential_state(
+            m_j, hist_j, T_i, model_name, params, Tref, Tscale, n_beads)
+        - reduced_contact_potential_state(
+            m_i, hist_i, T_j, model_name, params, Tref, Tscale, n_beads)
     )
 
 
@@ -1113,9 +1320,11 @@ def mc_sweep(
         accept if du <= 0 or rand < exp(-du).
     The contact difference is evaluated through the full potential -- it is NOT
     approximated as b(T)*dm -- so the m^2/(2N) curvature of the contact-quadratic
-    models and the saturating q-dependence of saturating_cooperative_contact are
-    both honoured exactly.  ``n_beads`` is the runtime chain length used in that
-    normalization; when omitted it defaults to the current chain length.
+    models, the saturating q-dependence of saturating_cooperative_contact, and
+    the complete degree state of local_coordination_saturation are honoured
+    exactly.  ``n_beads`` is the runtime chain length used by scalar nonlinear
+    normalizations and to validate the local degree histogram; when omitted it
+    defaults to the current chain length.
     For linear models it is ignored and du is bit-identical to the historical
     du = u_new - u_old criterion, so kappa_bend = 0 reproduces old seeded sampling
     exactly (the bend term contributes 0.0 and draws no extra random numbers) and
@@ -1125,10 +1334,11 @@ def mc_sweep(
     state = replica.state
     counters = replica.move_counters
     kappa_bend = float(kappa_bend)
-    # Runtime chain length for the m^2/(2N) or q = m/N normalization (every model
-    # nonlinear in m); ignored by linear models.  The chain length is invariant
-    # under every local move, so the cached value is stable for the whole sweep.
+    # Runtime chain length for m^2/(2N), q=m/N, or validation that a local degree
+    # histogram contains one entry per bead.  It is invariant under every local
+    # move, so the cached value is stable for the whole sweep.
     N = int(n_beads) if n_beads is not None else len(state.chain)
+    needs_hist = bool(MODEL_REGISTRY[model_name]["configuration_dependent"])
 
     for _ in range(steps):
         replica.local_prop += 1
@@ -1149,12 +1359,23 @@ def mc_sweep(
 
         # state.m is the *old* contact count; recompute only the trial config.
         m_old = state.m
-        u_old = reduced_contact_potential(
-            m_old, T, model_name, params, Tref, Tscale, N)
-
-        m_new = int(round(contact_count(chain_new, occ_new)))
-        u_new = reduced_contact_potential(
-            m_new, T, model_name, params, Tref, Tscale, N)
+        if needs_hist:
+            hist_old = state.coordination_hist
+            if hist_old is None:
+                raise RuntimeError(
+                    "configuration-dependent ChainState is missing coordination_hist"
+                )
+            m_new, hist_new = contact_count_and_coordination_histogram(
+                chain_new, occ_new
+            )
+        else:
+            hist_old = None
+            hist_new = None
+            m_new = int(round(contact_count(chain_new, occ_new)))
+        u_old = reduced_contact_potential_state(
+            m_old, hist_old, T, model_name, params, Tref, Tscale, N)
+        u_new = reduced_contact_potential_state(
+            m_new, hist_new, T, model_name, params, Tref, Tscale, N)
 
         # Bending penalty is a fixed reduced (dimensionless) term; it is NOT
         # folded into state.E, which stays the contact energy in model units.
@@ -1165,9 +1386,10 @@ def mc_sweep(
             state.chain = chain_new
             state.occ   = occ_new
             state.m     = m_new
+            state.coordination_hist = hist_new
             state.n_bend = state.n_bend + dn_bend
-            state.E     = energy_from_contacts(
-                m_new, T, model_name, params, Tref, Tscale, N)
+            state.E     = energy_from_state(
+                m_new, hist_new, T, model_name, params, Tref, Tscale, N)
             replica.local_acc += 1
             if state_changing:
                 counters[move_idx, 3] += 1               # accepted (state-changing)
@@ -1196,8 +1418,10 @@ def attempt_swap(
     N = int(n_beads) if n_beads is not None else len(rep_a.state.chain)
     m_a = rep_a.state.m
     m_b = rep_b.state.m
-    log_acc = swap_log_accept(
-        m_a, m_b, rep_a.T, rep_b.T, model_name, params, Tref, Tscale, N
+    log_acc = swap_log_accept_state(
+        m_a, rep_a.state.coordination_hist,
+        m_b, rep_b.state.coordination_hist,
+        rep_a.T, rep_b.T, model_name, params, Tref, Tscale, N,
     )
 
     accepted = log_acc >= 0 or random.random() < math.exp(log_acc)
@@ -1205,6 +1429,9 @@ def attempt_swap(
         rep_a.state.chain, rep_b.state.chain = rep_b.state.chain, rep_a.state.chain
         rep_a.state.occ,   rep_b.state.occ   = rep_b.state.occ,   rep_a.state.occ
         rep_a.state.m,     rep_b.state.m     = rep_b.state.m,     rep_a.state.m
+        rep_a.state.coordination_hist, rep_b.state.coordination_hist = (
+            rep_b.state.coordination_hist, rep_a.state.coordination_hist
+        )
         # n_bend travels with the configuration, exactly like m.  (The bending
         # term itself is temperature-independent and cancels in swap_log_accept,
         # so it never enters the swap criterion -- but the cached count must
@@ -1212,12 +1439,12 @@ def attempt_swap(
         rep_a.state.n_bend, rep_b.state.n_bend = rep_b.state.n_bend, rep_a.state.n_bend
         # Recompute each lane's energy from the (now swapped) stored contact
         # number rather than recounting contacts.
-        rep_a.state.E = energy_from_contacts(
-            rep_a.state.m, rep_a.T, model_name, params, Tref, Tscale, N
-        )
-        rep_b.state.E = energy_from_contacts(
-            rep_b.state.m, rep_b.T, model_name, params, Tref, Tscale, N
-        )
+        rep_a.state.E = energy_from_state(
+            rep_a.state.m, rep_a.state.coordination_hist,
+            rep_a.T, model_name, params, Tref, Tscale, N)
+        rep_b.state.E = energy_from_state(
+            rep_b.state.m, rep_b.state.coordination_hist,
+            rep_b.T, model_name, params, Tref, Tscale, N)
     return accepted
 
 
@@ -4103,7 +4330,7 @@ def run_saturating_cooperative_quick_test() -> None:
         assert a.C_traj == c.C_traj and a.n_bend_traj == c.n_bend_traj
     print("  quick-test saturating-cooperative serial/mp determinism: PASSED")
 
-    # -- Test 8: fit-summary round-trip + explicit v3/v4 API-version gate ------
+    # -- Test 8: fit-summary round-trip + explicit old/future API-version gate --
     with tempfile.TemporaryDirectory() as tmp:
         summ = {
             "model_api_version": 3,
@@ -4130,18 +4357,18 @@ def run_saturating_cooperative_quick_test() -> None:
         assert np.allclose(loaded["params"], [700.0, 2.4, A0_t, qs_t])
         assert loaded["kappa_bend"] == 0.25
         assert loaded["fit_chain_length"] == 30
-        # A v3 summary is exactly the current version and must load; a v4 summary
-        # is newer than this sampler understands and must be refused.
-        assert MODEL_API_VERSION == 3
-        p4 = os.path.join(tmp, "v4.json")
+        # A v3 summary remains supported; a v5 summary is newer than this v4
+        # sampler and must be refused.
+        assert MODEL_API_VERSION == 4
+        p4 = os.path.join(tmp, "v5.json")
         with open(p4, "w") as fh:
-            json.dump({**summ, "model_api_version": 4}, fh)
+            json.dump({**summ, "model_api_version": 5}, fh)
         try:
             load_fit_summary_json(p4)
         except ValueError as exc:
             assert "newer" in str(exc), str(exc)
         else:
-            raise AssertionError("a v4 fit summary was accepted")
+            raise AssertionError("a v5 fit summary was accepted")
         # An out-of-domain parameter set is refused at load time.
         p_bad = os.path.join(tmp, "bad.json")
         with open(p_bad, "w") as fh:
@@ -4173,7 +4400,7 @@ def run_saturating_cooperative_quick_test() -> None:
         )
         assert dist["N"] == N and dist["n_beads"] == N
         assert dist["fit_chain_length"] == 30
-        assert dist["model_api_version"] == 3
+        assert dist["model_api_version"] == 4
         reps_xfer, _, _ = run_remd(
             model_name=m_name, params=m_params, kappa_bend=0.25,
             seed=5, n_workers=1, **run_kw)
@@ -4541,7 +4768,9 @@ def validate_model_params(
 
         checked.append(value_float)
 
-    if str(MODEL_REGISTRY[model_name]["potential_kind"]) == "saturating_cooperative":
+    if str(MODEL_REGISTRY[model_name]["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         try:
             validated_saturating_params(checked)
         except ValueError as exc:
@@ -4769,10 +4998,9 @@ def load_fit_summary_json(path: str) -> dict:
                 f"got {kappa_bend!r}"
             )
 
-    # Optional chain length the model was FIT at.  The bending-/quadratic-aware
-    # fitter records ``fit_chain_length`` so a contact-quadratic model can be
-    # transferred to a run at a different chain length: the sampler always uses
-    # the RUNTIME N in m^2/(2N) but records the fit-time value for provenance.
+    # Optional chain length the model was FIT at.  Scalar nonlinear models use
+    # runtime N in their normalization when transferred; local coordination
+    # keeps q_i=k_i/2 unchanged.  The fit-time value is retained as provenance.
     # Legacy summaries lack the field and read as None.  A value of -1 is the
     # fitter's "not recorded" sentinel and is normalized back to None.
     fit_chain_length = summary.get("fit_chain_length", None)
@@ -5064,7 +5292,11 @@ def attach_model_metadata(
     dist["potential_definition"] = str(spec["potential_definition"])
     dist["potential_normalization"] = str(spec["potential_normalization"] or "")
     dist["m_ref"] = int(spec["m_ref"])
-    if str(spec["potential_kind"]) == "saturating_cooperative":
+    dist["configuration_dependent"] = bool(spec["configuration_dependent"])
+    dist["state_observable"] = str(spec["state_observable"])
+    if str(spec["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         A0, q_sat = validated_saturating_params(model_params)
         dist["A0"] = float(A0)
         dist["q_sat"] = float(q_sat)
@@ -5657,35 +5889,45 @@ def main() -> None:
     if fit_summary_json is not None:
         _summary = load_fit_summary_json(fit_summary_json)
         summary_kappa = _summary["kappa_bend"]
-        # Chain length the model was fit at (None for legacy summaries).  The
-        # sampler ALWAYS uses the runtime --N in m^2/(2N); this is provenance
-        # only, and a mismatch is permitted (chain-length transfer is allowed).
+        # Chain length the model was fit at (None for legacy summaries).  This
+        # is provenance and a mismatch is permitted.  Scalar nonlinear models
+        # use runtime --N in their normalization; the local coordination model
+        # instead uses q_i=k_i/2, which is independent of chain length.
         fit_chain_length = _summary["fit_chain_length"]
         kappa_bend = resolve_kappa_bend(
             args.kappa_bend, summary_kappa, True, source=fit_summary_json)
     else:
         kappa_bend = resolve_kappa_bend(args.kappa_bend, None, False)
     bending_enabled = bool(kappa_bend != 0.0)
+    _model_spec = MODEL_REGISTRY[model_name]
     if (
         fit_chain_length is not None
         and int(fit_chain_length) != int(args.N)
-        and MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+        and _model_spec["potential_kind"] != "linear"
     ):
-        _norm = (
-            MODEL_REGISTRY[model_name]["potential_normalization"] or "normalization"
-        )
-        print(
-            f"  [note] model {model_name} (nonlinear in m) fit at chain length "
-            f"{fit_chain_length} is being run at N={int(args.N)}; the runtime N "
-            f"is used in {_norm}. Both are recorded in the run summary."
-        )
+        if bool(_model_spec["configuration_dependent"]):
+            print(
+                f"  [note] model {model_name} fit at chain length "
+                f"{fit_chain_length} is being run at N={int(args.N)}; its "
+                "per-monomer q_i=k_i/2 definition and fitted parameters are "
+                "unchanged. Both chain lengths are recorded in the run summary."
+            )
+        else:
+            _norm = _model_spec["potential_normalization"] or "normalization"
+            print(
+                f"  [note] model {model_name} (nonlinear in m) fit at chain length "
+                f"{fit_chain_length} is being run at N={int(args.N)}; the runtime N "
+                f"is used in {_norm}. Both are recorded in the run summary."
+            )
 
     print(
         f"REMD: {nT} replicas, T in [{Tmin_resolved:.6g}, {Tmax_resolved:.6g}], "
         f"{args.n_cycles} cycles x {args.steps_per_swap} steps = {total_steps} steps/replica"
     )
     print(f"Model: {model_name} — {MODEL_REGISTRY[model_name]['description']}")
-    if str(MODEL_REGISTRY[model_name]["potential_kind"]) == "saturating_cooperative":
+    if str(MODEL_REGISTRY[model_name]["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         print(f"Potential: {MODEL_REGISTRY[model_name]['potential_definition']}")
         print(f"m_ref = {int(MODEL_REGISTRY[model_name]['m_ref'])}")
     print(f"Parameter source: {parameter_source}")
@@ -6016,11 +6258,15 @@ def main() -> None:
         "Tscale": float(Tscale),
         "potential_kind": str(MODEL_REGISTRY[model_name]["potential_kind"]),
         "quadratic_normalization": MODEL_REGISTRY[model_name]["quadratic_normalization"],
-        # Additive: the exact potential sampled, what the chain length normalized,
-        # and the reference contact number the potential is measured from.
+        # Additive: the exact potential sampled, its state normalization, and
+        # the reference contact number the potential is measured from.
         "potential_definition": str(MODEL_REGISTRY[model_name]["potential_definition"]),
         "potential_normalization": MODEL_REGISTRY[model_name]["potential_normalization"],
         "m_ref": int(MODEL_REGISTRY[model_name]["m_ref"]),
+        "configuration_dependent": bool(
+            MODEL_REGISTRY[model_name]["configuration_dependent"]
+        ),
+        "state_observable": str(MODEL_REGISTRY[model_name]["state_observable"]),
         "fit_chain_length": (
             None if fit_chain_length is None else int(fit_chain_length)
         ),
@@ -6086,7 +6332,9 @@ def main() -> None:
         run_summary["diagnostics_warnings"] = diagnostics_result["warnings"]
     if model_name == "heat_capacity":
         run_summary["T0"] = float(Tref)
-    if str(MODEL_REGISTRY[model_name]["potential_kind"]) == "saturating_cooperative":
+    if str(MODEL_REGISTRY[model_name]["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         # Named alongside the positional params list, mirroring the fitter's
         # fit_summary.json, so a consumer never has to know the registry order.
         _A0, _q_sat = validated_saturating_params(model_params)

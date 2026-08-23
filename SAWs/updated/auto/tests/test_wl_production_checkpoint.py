@@ -52,6 +52,14 @@ def _run(**overrides):
     return run_production_chain(**settings)
 
 
+def _rewrite_checkpoint(path: Path, *, version: int, drop=()) -> None:
+    """Rewrite a test checkpoint without pickle or private zip manipulation."""
+    with np.load(path, allow_pickle=False) as saved:
+        payload = {name: saved[name] for name in saved.files if name not in drop}
+    payload["checkpoint_version"] = np.array(version, dtype=np.int64)
+    np.savez_compressed(path, **payload)
+
+
 class RngStateRoundTripTests(unittest.TestCase):
     """``random.Random`` state must survive an ``allow_pickle=False`` NPZ.
 
@@ -117,6 +125,10 @@ class ProductionResumeTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(resumed["rg_samples"], whole["rg_samples"])
         np.testing.assert_array_equal(resumed["bend_samples"], whole["bend_samples"])
+        np.testing.assert_array_equal(
+            resumed["coordination_histogram_samples"],
+            whole["coordination_histogram_samples"],
+        )
         self.assertEqual(resumed["accepted_moves"], whole["accepted_moves"])
         self.assertEqual(
             resumed["geometrically_valid_moves"], whole["geometrically_valid_moves"]
@@ -171,6 +183,22 @@ class ProductionResumeTests(unittest.TestCase):
                 tier=make_contact_tiers(0, M_MAX - 1, M_MAX - 1, M_MAX - 1),
                 resume_path=path,
             )
+
+    def test_resume_refuses_v1_checkpoint_that_already_has_samples(self) -> None:
+        path = production_checkpoint_path(self.stem, 0)
+        _run(steps=200, sample_every=20, checkpoint_path=path)
+        _rewrite_checkpoint(
+            path, version=1, drop=("coordination_histogram_samples",)
+        )
+        with self.assertRaisesRegex(ValueError, "predates local coordination"):
+            _run(resume_path=path)
+
+    def test_resume_refuses_unknown_future_checkpoint_version(self) -> None:
+        path = production_checkpoint_path(self.stem, 0)
+        _run(steps=200, checkpoint_path=path)
+        _rewrite_checkpoint(path, version=3)
+        with self.assertRaisesRegex(ValueError, "unsupported.*version"):
+            _run(resume_path=path)
 
 
 if __name__ == "__main__":

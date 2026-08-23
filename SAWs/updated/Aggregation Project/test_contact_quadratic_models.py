@@ -495,7 +495,7 @@ def test_saturating_cooperative_contact_is_in_every_contract():
         assert "A0*q^2/(1 + (q/q_sat)^2)" in e["potential_definition"], who
 
 
-def test_v3_fit_summary_loads_and_v4_is_rejected(tmp_path):
+def test_current_fit_summary_loads_and_future_version_is_rejected(tmp_path):
     """End-to-end version gate on a summary the fitter actually wrote.
 
     A summary written by the current fitter must load in the sampler unchanged;
@@ -519,7 +519,7 @@ def test_v3_fit_summary_loads_and_v4_is_rejected(tmp_path):
     )
     summary_path = out / "fit_summary.json"
     summary = json.loads(summary_path.read_text())
-    assert summary["model_api_version"] == 3 == remd.MODEL_API_VERSION
+    assert summary["model_api_version"] == fit.MODEL_API_VERSION == remd.MODEL_API_VERSION
 
     loaded = remd.load_fit_summary_json(str(summary_path))
     assert loaded["model_name"] == "saturating_cooperative_contact"
@@ -541,8 +541,10 @@ def test_v3_fit_summary_loads_and_v4_is_rejected(tmp_path):
                     loaded["Tref"], loaded["Tscale"], N_BEADS)
             ) < 1e-12, (T, m)
 
-    future = tmp_path / "v4_summary.json"
-    future.write_text(json.dumps({**summary, "model_api_version": 4}))
+    future = tmp_path / "future_summary.json"
+    future.write_text(json.dumps({
+        **summary, "model_api_version": fit.MODEL_API_VERSION + 1
+    }))
     with pytest.raises(ValueError, match="newer"):
         remd.load_fit_summary_json(str(future))
 

@@ -35,8 +35,9 @@ cost it bit-for-bit equivalence with the historical linear arithmetic.
 
 ### The fix
 
-`LABEL_BLIND_CONTACT_MODELS` now contains only
-`saturating_cooperative_contact`. `hs` (and every other linear model) takes the
+`LABEL_BLIND_CONTACT_MODELS` now contains only the two saturation models,
+`saturating_cooperative_contact` and `local_coordination_saturation`. `hs` (and
+every other linear model) takes the
 exact historical `b(T)*(l_i*d_intra + l_e*d_inter)` path. The metadata follows:
 `nonlinear_contact_scope = "linear_intra_inter_split"`,
 `interchain_contact_model = "same_linear_coefficient_independent_lambda"`.
@@ -139,10 +140,19 @@ order-independent by construction and faster besides.
 
 ### Scope
 
-- Default is `global`. Nothing existing changes; `saturating_cooperative_model_spec.json` still describes the default rule accurately.
-- `local` is refused for any model without `A0`/`q_sat`, and unequal lambdas are still refused under both rules.
-- Implemented at the *multichain* level, not as a new registry model. The choice of multichain rule is a multichain decision; the single-chain fitters, the model registry, and the contract-parity machinery are untouched.
-- Fitting: the local form is not a function of `m` alone, so it cannot be fitted by contact-number histogram reweighting against the existing athermal baseline. It transfers the mean-field parameters. A dedicated fit would need a baseline joint in `sum_i g(k_i)`; that is a separate piece of work and is not claimed here.
+- The historical `saturating_cooperative_contact` model still defaults to
+  `global`; its existing physics and optional `local` interpretation are
+  unchanged.
+- The added registry model `local_coordination_saturation` uses this local
+  Hamiltonian as its fitted physics. It defaults to `local` and explicitly
+  rejects `global`, so a fit can never be reinterpreted as the old box-average
+  model.
+- `local` is refused for models without `A0`/`q_sat`, and unequal lambdas are
+  still refused for both label-blind saturation models.
+- The new Wang-Landau baseline stores the joint distribution of the full degree
+  histogram `(h_0,...,h_6)`, so `local_coordination_saturation` can now be fit
+  directly rather than inferred from a contact-count-only baseline. See
+  `LOCAL_COORDINATION_SATURATION.md` for the handoff workflow.
 
 ### Smoke run (M=4, N=12, L=14, 60 cycles)
 

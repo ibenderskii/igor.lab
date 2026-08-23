@@ -42,9 +42,8 @@ TREF, TSCALE = 320.0, 80.0
 TEMPS = np.linspace(280.0, 360.0, 9)
 N_BEADS = 30
 
-# The three copies of the fitter that must declare an identical model contract.
+# The two project copies in scope must declare an identical model contract.
 FITTER_COPIES = {
-    "isaw": os.path.join(UPDATED, "ISAW Project", "fit_lattice_contact_model_2.py"),
     "aggregation": os.path.join(
         UPDATED, "Aggregation Project", "fit_lattice_contact_model_2.py"
     ),
@@ -464,7 +463,7 @@ def _load_module(name, path):
     return module
 
 
-def test_the_three_fitter_copies_are_byte_identical():
+def test_the_project_fitter_copies_are_byte_identical():
     digests = {}
     for name, path in FITTER_COPIES.items():
         assert os.path.exists(path), path
@@ -480,11 +479,11 @@ def test_model_contract_is_identical_across_every_fitter_copy():
     }
     contracts["fit_to_dat"] = dat.get_model_contract()
 
-    reference = contracts["isaw"]
+    reference = contracts["aggregation"]
     for name, contract in contracts.items():
         assert contract == reference, name
 
-    assert reference["model_api_version"] == 3
+    assert reference["model_api_version"] == 4
     assert MODEL in reference["models"]
 
 
@@ -523,16 +522,21 @@ def test_every_model_carries_the_new_contract_keys():
         assert contract[name]["quadratic_normalization"] == "m^2/(2N)", name
 
 
-def test_generic_potential_api_covers_all_three_kinds():
-    """The builder table is the extension point; no kind is special-cased away."""
+def test_generic_potential_api_covers_every_scalar_kind():
+    """Scalar builders cover scalar models; state models declare that distinction."""
     for mod in (fit, dat):
         assert set(mod.POTENTIAL_BUILDERS) == {
             "linear", "contact_quadratic", "saturating_cooperative",
         }
-        kinds = {
-            str(spec["potential_kind"]) for spec in mod.MODEL_REGISTRY.values()
+        scalar_kinds = {
+            str(spec["potential_kind"])
+            for spec in mod.MODEL_REGISTRY.values()
+            if not spec["configuration_dependent"]
         }
-        assert kinds <= set(mod.POTENTIAL_BUILDERS), kinds
+        assert scalar_kinds <= set(mod.POTENTIAL_BUILDERS), scalar_kinds
+        local = mod.MODEL_REGISTRY["local_coordination_saturation"]
+        assert local["configuration_dependent"] is True
+        assert local["state_observable"] == "nonbonded_contact_degree_histogram_0_6"
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +600,7 @@ def test_fit_summary_and_npz_record_the_saturating_contract(tmp_path):
     )
 
     summary = json.loads((out / "fit_summary.json").read_text())
-    assert summary["model_api_version"] == 3
+    assert summary["model_api_version"] == fit.MODEL_API_VERSION == 4
     assert summary["model"] == MODEL
     assert summary["potential_kind"] == "saturating_cooperative"
     assert summary["potential_normalization"] == "q = m/N"

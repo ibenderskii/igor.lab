@@ -3,11 +3,12 @@
 
 Model
 -----
-P_model(m|T) ∝ P0(m) * exp[-u_contact(m, T; N)]
+P_model(X|T) ∝ P0(X) * exp[-u_contact(X, T)]
 
-where P0(m) is the athermal (T→∞) baseline from a SAW / lattice simulation.
-For every model below except the three nonlinear ones the contact potential is
-linear in m,
+where P0 is the athermal (T→∞) baseline from a SAW / lattice simulation.
+For the legacy scalar models X is the contact count m.  For the local
+coordination model X also contains the nonbonded degree histogram.  The six
+historical linear models use
 
     u_contact(m, T; N) = b(T) * m
 
@@ -79,6 +80,20 @@ saturating_cooperative_contact
                 the q normalization rather than for an m^2/(2N) term: this model
                 has no kappa(T), and no quadratic-coefficient plot is drawn
                 for it.
+
+Local coordination saturation model
+-----------------------------------
+This distinct model saturates the attraction at each monomer rather than in the
+global contact fraction.  For nonbonded nearest-neighbour degree k_i,
+
+local_coordination_saturation
+              u_contact(X,T) = (h_b/T - s_b)*m(X)
+                               - A0*sum_i q_i^2/[1+(q_i/q_sat)^2]
+              q_i = k_i/2,  m(X) = (1/2)*sum_i k_i
+
+The athermal baseline must therefore contain the complete degree-state table;
+P0(m) alone is insufficient.  A0 = 0 recovers hs exactly.  q_i does not contain
+a global m/N normalization.
 
 Why validation loss matters
 ---------------------------
@@ -611,6 +626,194 @@ def _get_baseline_integer_range(baseline_npz: str) -> Tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Local-coordination baseline state table
+# ---------------------------------------------------------------------------
+
+def load_local_coordination_baseline(
+    b_data,
+    n_beads: Optional[int],
+    m_centers: np.ndarray,
+    rg_edges: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Load and strictly validate the sparse state statistics for the local model.
+
+    The Wang-Landau production baseline stores unique degree histograms and
+    their unbiased masses.  This is the minimum sufficient statistic for
+    evaluating arbitrary q_sat without retaining every sampled conformation.
+    Optional sparse (state, Rg-bin) mass records support the existing Rg fit.
+    """
+    required = {
+        "local_coord_schema_version",
+        "local_coord_degree_values",
+        "local_coord_histograms",
+        "local_coord_contact_counts",
+        "local_coord_state_mass",
+    }
+    missing = sorted(required.difference(b_data.files))
+    if missing:
+        raise ValueError(
+            "model 'local_coordination_saturation' requires a Wang-Landau "
+            "baseline with local coordination state statistics; missing keys: "
+            + ", ".join(missing)
+        )
+    version = int(np.asarray(b_data["local_coord_schema_version"]).reshape(()))
+    if version != LOCAL_COORD_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported local_coord_schema_version {version}; expected "
+            f"{LOCAL_COORD_SCHEMA_VERSION}"
+        )
+    degrees = np.asarray(b_data["local_coord_degree_values"])
+    if degrees.shape != (7,) or not np.array_equal(degrees, np.arange(7)):
+        raise ValueError("local_coord_degree_values must be exactly [0,1,2,3,4,5,6]")
+
+    hist_raw = np.asarray(b_data["local_coord_histograms"])
+    contacts_raw = np.asarray(b_data["local_coord_contact_counts"])
+    state_mass = np.asarray(b_data["local_coord_state_mass"], dtype=float)
+    if hist_raw.ndim != 2 or hist_raw.shape[1] != 7 or hist_raw.shape[0] == 0:
+        raise ValueError("local_coord_histograms must have nonempty shape (S, 7)")
+    S = hist_raw.shape[0]
+    if contacts_raw.shape != (S,) or state_mass.shape != (S,):
+        raise ValueError(
+            "local coordination contacts and state mass must both have shape (S,)"
+        )
+    if not np.all(np.isfinite(hist_raw)) or not np.all(hist_raw == np.rint(hist_raw)):
+        raise ValueError("local_coord_histograms must contain finite integers")
+    hist = np.rint(hist_raw).astype(np.int64)
+    if np.any(hist < 0):
+        raise ValueError("local_coord_histograms must be nonnegative")
+    inferred_sizes = hist.sum(axis=1)
+    if not np.all(inferred_sizes == inferred_sizes[0]) or inferred_sizes[0] < 2:
+        raise ValueError("every local coordination histogram must contain one common N >= 2")
+    inferred_n = int(inferred_sizes[0])
+    if n_beads is not None and inferred_n != int(n_beads):
+        raise ValueError(
+            f"local coordination histograms contain N={inferred_n} beads, but "
+            f"baseline/CLI metadata resolve to N={int(n_beads)}"
+        )
+    if not np.all(np.isfinite(contacts_raw)) or not np.all(
+        contacts_raw == np.rint(contacts_raw)
+    ):
+        raise ValueError("local_coord_contact_counts must contain finite integers")
+    contacts = np.rint(contacts_raw).astype(np.int64)
+    if np.any(contacts < 0):
+        raise ValueError("local_coord_contact_counts must be nonnegative")
+    degree_sum = hist @ np.arange(7, dtype=np.int64)
+    if np.any(degree_sum % 2) or not np.array_equal(degree_sum, 2 * contacts):
+        raise ValueError(
+            "local coordination graph identity failed: each row must satisfy "
+            "sum_k k*h_k = 2*m"
+        )
+    if not np.all(np.isfinite(state_mass)) or np.any(state_mass < 0.0):
+        raise ValueError("local_coord_state_mass must be finite and nonnegative")
+    mass_sum = float(state_mass.sum())
+    if not np.isclose(mass_sum, 1.0, rtol=0.0, atol=1e-10):
+        raise ValueError(f"local_coord_state_mass must sum to 1, got {mass_sum:.17g}")
+    if np.unique(hist, axis=0).shape[0] != S:
+        raise ValueError("local_coord_histograms contains duplicate state rows")
+
+    m_centers = np.asarray(m_centers, dtype=float)
+    if not np.all(np.isfinite(m_centers)) or not np.all(
+        m_centers == np.rint(m_centers)
+    ):
+        raise ValueError("local coordination fitting requires integer contact centers")
+    center_to_index = {int(round(v)): i for i, v in enumerate(m_centers)}
+    try:
+        contact_bin_index = np.array(
+            [center_to_index[int(m)] for m in contacts], dtype=np.int64
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"local coordination state contact m={int(exc.args[0])} is outside "
+            "the fitted contact grid"
+        ) from None
+
+    state_contact_mass = np.bincount(
+        contact_bin_index, weights=state_mass, minlength=m_centers.size
+    )
+    if "c_vals" in b_data.files and "c_prob" in b_data.files:
+        c_vals = _validated_integer_contacts(b_data["c_vals"], "baseline c_vals")
+        c_prob = np.asarray(b_data["c_prob"], dtype=float)
+        if c_prob.shape != c_vals.shape or not np.all(np.isfinite(c_prob)):
+            raise ValueError("baseline c_prob must be finite and match c_vals")
+        expected = np.zeros_like(state_contact_mass)
+        for m, mass in zip(c_vals, c_prob):
+            if int(m) in center_to_index:
+                expected[center_to_index[int(m)]] += float(mass)
+        if expected.sum() <= 0.0:
+            raise ValueError("baseline c_prob has no mass on the fitted contact grid")
+        expected /= expected.sum()
+        if not np.allclose(state_contact_mass, expected, rtol=0.0, atol=1e-10):
+            raise ValueError(
+                "local coordination state masses do not reproduce baseline c_prob"
+            )
+
+    sparse_keys = {
+        "local_coord_rg_state_index",
+        "local_coord_rg_bin_index",
+        "local_coord_rg_joint_mass",
+    }
+    present_sparse = sparse_keys.intersection(b_data.files)
+    if present_sparse and present_sparse != sparse_keys:
+        raise ValueError(
+            "local coordination Rg statistics are incomplete; require all of "
+            + ", ".join(sorted(sparse_keys))
+        )
+    out: Dict[str, Any] = {
+        "schema_version": version,
+        "n_beads": inferred_n,
+        "histograms": hist,
+        "contacts": contacts,
+        "state_mass": state_mass,
+        "contact_bin_index": contact_bin_index,
+        "state_contact_mass": state_contact_mass,
+        "has_rg_joint": False,
+        "rg_state_index": None,
+        "rg_bin_index": None,
+        "rg_joint_mass": None,
+        "n_rg_bins": 0,
+    }
+    if present_sparse:
+        state_idx_raw = np.asarray(b_data["local_coord_rg_state_index"])
+        rg_idx_raw = np.asarray(b_data["local_coord_rg_bin_index"])
+        joint_mass = np.asarray(b_data["local_coord_rg_joint_mass"], dtype=float)
+        R = joint_mass.size
+        if state_idx_raw.shape != (R,) or rg_idx_raw.shape != (R,):
+            raise ValueError("local coordination sparse Rg arrays must share shape (R,)")
+        if not np.all(state_idx_raw == np.rint(state_idx_raw)) or not np.all(
+            rg_idx_raw == np.rint(rg_idx_raw)
+        ):
+            raise ValueError("local coordination sparse Rg indices must be integers")
+        state_idx = np.rint(state_idx_raw).astype(np.int64)
+        rg_idx = np.rint(rg_idx_raw).astype(np.int64)
+        if np.any(state_idx < 0) or np.any(state_idx >= S):
+            raise ValueError("local_coord_rg_state_index is out of range")
+        if rg_edges is None:
+            if "rg_edges" not in b_data.files:
+                raise ValueError("local coordination Rg statistics require rg_edges")
+            rg_edges = np.asarray(b_data["rg_edges"], dtype=float)
+        n_rg = int(np.asarray(rg_edges).size - 1)
+        if n_rg < 1 or np.any(rg_idx < 0) or np.any(rg_idx >= n_rg):
+            raise ValueError("local_coord_rg_bin_index is out of range")
+        if not np.all(np.isfinite(joint_mass)) or np.any(joint_mass < 0.0):
+            raise ValueError("local_coord_rg_joint_mass must be finite and nonnegative")
+        if not np.isclose(joint_mass.sum(), 1.0, rtol=0.0, atol=1e-10):
+            raise ValueError("local_coord_rg_joint_mass must sum to 1")
+        state_marginal = np.bincount(state_idx, weights=joint_mass, minlength=S)
+        if not np.allclose(state_marginal, state_mass, rtol=0.0, atol=1e-10):
+            raise ValueError(
+                "local coordination sparse Rg marginal does not reproduce state mass"
+            )
+        out.update({
+            "has_rg_joint": True,
+            "rg_state_index": state_idx,
+            "rg_bin_index": rg_idx,
+            "rg_joint_mass": joint_mass,
+            "n_rg_bins": n_rg,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Loss functions
 # ---------------------------------------------------------------------------
 
@@ -666,12 +869,14 @@ def _rg_loss_sum(
 #
 #     P_model(m|T) ∝ P0(m) * exp[-u_contact(m, T; N)]
 #
-# Three potential families are supported, selected by potential_kind:
+# Four potential families are supported, selected by potential_kind:
 #
 #   "linear"                 u = b(T) * m
 #   "contact_quadratic"      u = b(T) * m + kappa(T) * m^2/(2N)
 #   "saturating_cooperative" u = N * [b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],
 #                            q = m/N
+#   "local_coordination_saturation"
+#                            u = b(T)*m - A0*sum_i g(k_i), q_i = k_i/2
 #
 # b(T) is the reduced bias (linear contact coupling) and kappa(T) the quadratic
 # coefficient, which is identically zero for every model whose potential_kind is
@@ -685,13 +890,14 @@ def _rg_loss_sum(
 # raw_b_fn(params, T, Tref, Tscale) -> float
 # raw_q_fn(params, T, Tref, Tscale) -> float   (0.0 unless contact_quadratic)
 # derived_Tc(params) -> float | None  (or None if not meaningful for that model)
-# potential_kind: "linear" | "contact_quadratic" | "saturating_cooperative"
+# potential_kind: "linear" | "contact_quadratic" | "saturating_cooperative" |
+#                 "local_coordination_saturation"
 # quadratic_normalization: QUADRATIC_NORMALIZATION for the contact_quadratic
 #     models, None for every other kind (it names the m^2/(2N) convention
 #     specifically, not "whatever this model divides by")
-# potential_normalization: the generic label for what the chain length is used
-#     for -- None when N is not needed, else QUADRATIC_NORMALIZATION or
-#     Q_NORMALIZATION.  This is what user-facing messages should quote.
+# potential_normalization: the generic state normalization label -- None for
+#     linear models, QUADRATIC_NORMALIZATION or Q_NORMALIZATION for scalar
+#     nonlinear models, and q_i=k_i/2 for local coordination.
 # potential_definition: the exact potential, as a string, recorded in the model
 #     contract and in every fit output so a fitted parameter can never be
 #     reinterpreted against a different convention
@@ -714,6 +920,14 @@ SATURATING_COOPERATIVE_DEFINITION = (
     "u(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],  b(T) = h_b/T - s_b,  "
     "q = m/N,  m_ref = 0,  A0 >= 0 and q_sat > 0 (both temperature-independent)"
 )
+
+LOCAL_COORDINATION_DEFINITION = (
+    "u(X,T) = (h_b/T - s_b)*m(X) - A0*sum_i["
+    "q_i^2/(1 + (q_i/q_sat)^2)],  q_i = k_i/2,  "
+    "k_i = nonbonded nearest-neighbour degree of bead i,  A0 >= 0, q_sat > 0"
+)
+LOCAL_COORDINATION_OBSERVABLE = "nonbonded_contact_degree_histogram_0_6"
+LOCAL_COORD_SCHEMA_VERSION = 1
 
 
 def _q_zero(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
@@ -896,6 +1110,27 @@ MODEL_REGISTRY: Dict[str, Dict] = {
             "(saturating cooperative attraction; A0 >= 0, q_sat > 0)"
         ),
     },
+    "local_coordination_saturation": {
+        "param_names": ["h_b", "s_b", "A0", "q_sat"],
+        "x0": [750.0, 2.8, 0.0, 0.35],
+        "bounds": [
+            (-2000.0, 2000.0), (-10.0, 10.0), (0.0, 20.0), (0.02, 2.0),
+        ],
+        "raw_b_fn": _b_hs,
+        "derived_Tc": None,
+        "potential_kind": "local_coordination_saturation",
+        "quadratic_normalization": None,
+        "potential_normalization": "q_i = k_i/2",
+        "potential_definition": LOCAL_COORDINATION_DEFINITION,
+        "m_ref": M_REF_DEFAULT,
+        "requires_chain_length": False,
+        "configuration_dependent": True,
+        "state_observable": LOCAL_COORDINATION_OBSERVABLE,
+        "description": (
+            "u(X,T) = (h_b/T - s_b)*m(X) - A0*sum_i "
+            "q_i^2/(1+(q_i/q_sat)^2), q_i=k_i/2"
+        ),
+    },
 }
 
 # Linear models carry no curvature in m and need no chain length.  Filling the
@@ -911,6 +1146,8 @@ for _spec in MODEL_REGISTRY.values():
     # definition, and m^2/(2N) is the only normalization that ever needed N.
     _spec.setdefault("potential_definition", _spec["description"])
     _spec.setdefault("potential_normalization", _spec["quadratic_normalization"])
+    _spec.setdefault("configuration_dependent", False)
+    _spec.setdefault("state_observable", "contact_count")
 del _spec
 
 
@@ -929,7 +1166,9 @@ del _spec
 #       v2 model keeps its parameters, its potential, and its numerical output
 #       bit for bit; the four pre-existing contract keys are unchanged, so a
 #       v2-era comparator that reads only those keys still works.
-MODEL_API_VERSION = 3
+#   v4: adds local_coordination_saturation and identifies each model's complete
+#       state observable.  All pre-existing potentials remain unchanged.
+MODEL_API_VERSION = 4
 
 
 def get_model_contract() -> dict:
@@ -942,7 +1181,7 @@ def get_model_contract() -> dict:
     ``potential_definition`` is the authoritative statement of the potential;
     ``quadratic_normalization`` names the m^2/(2N) convention specifically and is
     None for every model that does not use it, while ``potential_normalization``
-    is the generic label for whatever the chain length is used for.
+    names the model's generic state normalization (which need not involve N).
     """
     return {
         "model_api_version": MODEL_API_VERSION,
@@ -955,6 +1194,8 @@ def get_model_contract() -> dict:
                 "potential_definition": str(spec["potential_definition"]),
                 "potential_normalization": spec["potential_normalization"],
                 "m_ref": int(spec["m_ref"]),
+                "configuration_dependent": bool(spec["configuration_dependent"]),
+                "state_observable": str(spec["state_observable"]),
             }
             for name, spec in MODEL_REGISTRY.items()
         },
@@ -1129,6 +1370,11 @@ def make_contact_u_fn(
     reweighting path -- contacts, joint Rg, Rg prediction -- uses one potential.
     """
     spec = MODEL_REGISTRY[model_name]
+    if bool(spec.get("configuration_dependent")):
+        raise ValueError(
+            f"model {model_name!r} requires {spec['state_observable']} and cannot "
+            "be represented by u(params, T, m). Use make_contact_state_u_fn."
+        )
     kind = str(spec["potential_kind"])
     try:
         build = POTENTIAL_BUILDERS[kind]
@@ -1139,6 +1385,44 @@ def make_contact_u_fn(
         ) from None
     n = validate_chain_length(model_name, n_beads)
     return build(spec, Tref, Tscale, None if n is None else float(n))
+
+
+def make_contact_state_u_fn(
+    model_name: str, Tref: float, Tscale: float, n_beads: Optional[int] = None
+) -> Callable[[np.ndarray, float, np.ndarray, np.ndarray], np.ndarray]:
+    """Return the full state potential for the local-coordination model."""
+    spec = MODEL_REGISTRY[model_name]
+    if not bool(spec.get("configuration_dependent")):
+        scalar_u = make_contact_u_fn(model_name, Tref, Tscale, n_beads)
+
+        def legacy_state_u(params, T, contacts, histograms=None):
+            return scalar_u(params, T, contacts)
+
+        return legacy_state_u
+    if str(spec["potential_kind"]) != "local_coordination_saturation":
+        raise ValueError(
+            f"no state-aware kernel for potential_kind {spec['potential_kind']!r}"
+        )
+    raw_b = spec["raw_b_fn"]
+
+    def local_state_u(params, T, contacts, histograms):
+        A0, q_sat = validated_saturating_params(params)
+        contacts_arr = np.asarray(contacts, dtype=float)
+        hist = np.asarray(histograms, dtype=float)
+        if hist.ndim != 2 or hist.shape[1] != 7:
+            raise ValueError(
+                "local coordination state potential requires histograms of shape (S, 7)"
+            )
+        if hist.shape[0] != contacts_arr.size:
+            raise ValueError("coordination histogram/contact state counts differ")
+        u_lin = raw_b(params, T, Tref, Tscale) * contacts_arr
+        if A0 == 0.0:
+            return u_lin
+        q = 0.5 * np.arange(7, dtype=float)
+        g = (q * q) / (1.0 + (q / q_sat) ** 2)
+        return u_lin - A0 * (hist @ g)
+
+    return local_state_u
 
 
 def reduced_contact_potential(
@@ -1211,6 +1495,102 @@ def model_contact_mass(
     return w / Z
 
 
+def local_coordination_state_weights(
+    baseline: Dict[str, Any],
+    T: float,
+    params: np.ndarray,
+    state_u_fn: Callable,
+) -> Tuple[np.ndarray, float]:
+    """Unnormalized reweighted state masses and their partition sum."""
+    p0 = np.asarray(baseline["state_mass"], dtype=float)
+    u = np.asarray(
+        state_u_fn(
+            params, float(T), baseline["contacts"], baseline["histograms"]
+        ),
+        dtype=float,
+    )
+    x = _stabilized_exponent(-u, p0 > 0.0)
+    weights = p0 * np.exp(x)
+    Z = float(weights.sum())
+    if not np.isfinite(Z) or Z <= 0.0:
+        raise FloatingPointError(
+            "local coordination reweighting produced a nonpositive partition sum"
+        )
+    return weights, Z
+
+
+def local_coordination_contact_mass(
+    baseline: Dict[str, Any],
+    T: float,
+    params: np.ndarray,
+    state_u_fn: Callable,
+    n_contact_bins: int,
+) -> np.ndarray:
+    """P(m|T) after reweighting the complete coordination state table."""
+    weights, Z = local_coordination_state_weights(baseline, T, params, state_u_fn)
+    return np.bincount(
+        baseline["contact_bin_index"], weights=weights, minlength=n_contact_bins
+    ) / Z
+
+
+def local_coordination_rg_mass(
+    baseline: Dict[str, Any],
+    T: float,
+    params: np.ndarray,
+    state_u_fn: Callable,
+) -> np.ndarray:
+    """P(Rg|T) from the sparse (coordination-state, Rg-bin) baseline mass."""
+    if not baseline.get("has_rg_joint"):
+        raise ValueError(
+            "local coordination baseline has no sparse state/Rg joint statistics"
+        )
+    p0_state = np.asarray(baseline["state_mass"], dtype=float)
+    u = np.asarray(
+        state_u_fn(
+            params, float(T), baseline["contacts"], baseline["histograms"]
+        ),
+        dtype=float,
+    )
+    x = _stabilized_exponent(-u, p0_state > 0.0)
+    state_factor = np.exp(x)
+    record_weights = baseline["rg_joint_mass"] * state_factor[
+        baseline["rg_state_index"]
+    ]
+    rg_mass = np.bincount(
+        baseline["rg_bin_index"],
+        weights=record_weights,
+        minlength=int(baseline["n_rg_bins"]),
+    )
+    Z = float(rg_mass.sum())
+    if not np.isfinite(Z) or Z <= 0.0:
+        raise FloatingPointError(
+            "local coordination Rg reweighting produced a nonpositive partition sum"
+        )
+    return rg_mass / Z
+
+
+def predict_contact_mass(
+    p0_mass: np.ndarray,
+    m_centers: np.ndarray,
+    T: float,
+    params: np.ndarray,
+    u_fn: Optional[Callable],
+    *,
+    local_baseline: Optional[Dict[str, Any]] = None,
+    state_u_fn: Optional[Callable] = None,
+) -> np.ndarray:
+    """Dispatch contact prediction without weakening the scalar model API."""
+    if local_baseline is not None:
+        if state_u_fn is None:
+            raise ValueError("state_u_fn is required with a local coordination baseline")
+        return local_coordination_contact_mass(
+            local_baseline, T, params, state_u_fn, len(m_centers)
+        )
+    if u_fn is None:
+        raise ValueError("u_fn is required for a scalar contact model")
+    return model_contact_mass(p0_mass, m_centers, T, params, u_fn)
+
+
 def objective(
     params: np.ndarray,
     temps: np.ndarray,
@@ -1262,6 +1642,54 @@ def objective_combined(
     return total
 
 
+def objective_local_coordination(
+    params: np.ndarray,
+    temps: np.ndarray,
+    m_centers: np.ndarray,
+    p_obs_mass: np.ndarray,
+    p0_mass: np.ndarray,
+    local_baseline: Dict[str, Any],
+    state_u_fn: Callable,
+    loss_fn: Callable[[np.ndarray, np.ndarray], float],
+) -> float:
+    """Contact-only objective for the configuration-local model."""
+    total = 0.0
+    for i, T in enumerate(temps):
+        p_mod = predict_contact_mass(
+            p0_mass, m_centers, float(T), params, None,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
+        total += loss_fn(p_obs_mass[i], p_mod)
+    return total
+
+
+def objective_local_coordination_combined(
+    params: np.ndarray,
+    temps: np.ndarray,
+    m_centers: np.ndarray,
+    p_obs_ct: np.ndarray,
+    p0_mass: np.ndarray,
+    p_obs_rg: np.ndarray,
+    local_baseline: Dict[str, Any],
+    state_u_fn: Callable,
+    loss_fn: Callable[[np.ndarray, np.ndarray], float],
+    rg_weight: float,
+) -> float:
+    """Contact plus Rg objective for the configuration-local model."""
+    total = 0.0
+    for i, T in enumerate(temps):
+        p_ct = predict_contact_mass(
+            p0_mass, m_centers, float(T), params, None,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
+        p_rg = local_coordination_rg_mass(
+            local_baseline, float(T), params, state_u_fn
+        )
+        total += loss_fn(p_obs_ct[i], p_ct)
+        total += float(rg_weight) * loss_fn(p_obs_rg[i], p_rg)
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Rg prediction
 # ---------------------------------------------------------------------------
@@ -1299,6 +1727,34 @@ def predict_rg_from_joint(
 
     rg_centers = 0.5 * (rg_edges[:-1] + rg_edges[1:])
     return rg_centers, rg_mass_T
+
+
+def predict_rg_mass(
+    crg_prob: Optional[np.ndarray],
+    c_edges: Optional[np.ndarray],
+    rg_edges: np.ndarray,
+    temps: np.ndarray,
+    params: np.ndarray,
+    u_fn: Optional[Callable],
+    *,
+    local_baseline: Optional[Dict[str, Any]] = None,
+    state_u_fn: Optional[Callable] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Dispatch Rg prediction to the scalar joint or sparse local state joint."""
+    rg_edges = np.asarray(rg_edges, dtype=float)
+    if local_baseline is not None:
+        if state_u_fn is None:
+            raise ValueError("state_u_fn is required with a local coordination baseline")
+        rows = np.array([
+            local_coordination_rg_mass(
+                local_baseline, float(T), params, state_u_fn
+            )
+            for T in np.asarray(temps, dtype=float)
+        ])
+        return 0.5 * (rg_edges[:-1] + rg_edges[1:]), rows
+    if crg_prob is None or c_edges is None or u_fn is None:
+        raise ValueError("scalar Rg prediction requires crg_prob, c_edges and u_fn")
+    return predict_rg_from_joint(crg_prob, c_edges, rg_edges, temps, params, u_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -1411,19 +1867,34 @@ def build_objective(
     m_centers: np.ndarray,
     p_obs_ct_train: np.ndarray,
     p0_mass: np.ndarray,
-    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
+    u_fn: Optional[Callable[[np.ndarray, float, np.ndarray], np.ndarray]],
     loss_fn: Callable[[np.ndarray, np.ndarray], float],
     *,
     crg_prob: Optional[np.ndarray] = None,
     c_edges_joint: Optional[np.ndarray] = None,
     p_obs_rg_train: Optional[np.ndarray] = None,
     rg_weight: float = 1.0,
+    local_baseline: Optional[Dict[str, Any]] = None,
+    state_u_fn: Optional[Callable] = None,
 ) -> Tuple[Callable, Tuple]:
     """Return (objective_fn, args_tuple) for a given training split.
 
     Mirrors the selection used by the primary fit: combined contact+Rg objective
     when fit_rg is True, contact-only objective otherwise.
     """
+    if local_baseline is not None:
+        if state_u_fn is None:
+            raise ValueError("state_u_fn is required for local coordination fitting")
+        if fit_rg:
+            return objective_local_coordination_combined, (
+                train_temps, m_centers, p_obs_ct_train, p0_mass,
+                p_obs_rg_train, local_baseline, state_u_fn, loss_fn,
+                float(rg_weight),
+            )
+        return objective_local_coordination, (
+            train_temps, m_centers, p_obs_ct_train, p0_mass,
+            local_baseline, state_u_fn, loss_fn,
+        )
     if fit_rg:
         obj_args = (
             train_temps, m_centers, p_obs_ct_train, p0_mass,
@@ -1508,13 +1979,19 @@ def per_temp_contact_losses(
     p_obs_mass: np.ndarray,
     p0_mass: np.ndarray,
     params: np.ndarray,
-    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
+    u_fn: Optional[Callable[[np.ndarray, float, np.ndarray], np.ndarray]],
     loss_fn: Callable[[np.ndarray, np.ndarray], float],
+    *,
+    local_baseline: Optional[Dict[str, Any]] = None,
+    state_u_fn: Optional[Callable] = None,
 ) -> np.ndarray:
     """Per-temperature contact loss; summing over a subset reproduces objective()."""
     out = np.empty(len(temps), dtype=float)
     for i, T in enumerate(temps):
-        p_mod = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
+        p_mod = predict_contact_mass(
+            p0_mass, m_centers, float(T), params, u_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
         out[i] = loss_fn(p_obs_mass[i], p_mod)
     return out
 
@@ -1720,6 +2197,8 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
     p0_mass = ctx["p0_mass"]
     b_fn = ctx["b_fn"]
     u_fn = ctx["u_fn"]
+    state_u_fn = ctx.get("state_u_fn")
+    local_baseline = ctx.get("local_baseline")
     loss_fn = ctx["loss_fn"]
     spec = ctx["spec"]
     param_names = ctx["param_names"]
@@ -1780,6 +2259,7 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
             fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
             crg_prob=crg_prob, c_edges_joint=c_edges_joint,
             p_obs_rg_train=p_obs_rg_train, rg_weight=rg_weight,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
 
         rec: Dict[str, Any] = {
@@ -1817,12 +2297,14 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
 
         # Per-temperature losses (all temps), then slice by split.
         ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params, u_fn, loss_fn
+            temps, m_centers, p_obs_mass, p0_mass, params, u_fn, loss_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
         rg_pt = None
         if can_fit_rg:
-            _, rg_mod_mass = predict_rg_from_joint(
-                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, u_fn
+            _, rg_mod_mass = predict_rg_mass(
+                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, u_fn,
+                local_baseline=local_baseline, state_u_fn=state_u_fn,
             )
             rg_pt = per_temp_rg_losses(rg_mod_mass, p_obs_rg_model_grid, loss_fn)
 
@@ -2625,12 +3107,18 @@ def _predicted_means(
     m_centers: np.ndarray,
     p0_mass: np.ndarray,
     params: np.ndarray,
-    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
+    u_fn: Optional[Callable[[np.ndarray, float, np.ndarray], np.ndarray]],
+    *,
+    local_baseline: Optional[Dict[str, Any]] = None,
+    state_u_fn: Optional[Callable] = None,
 ) -> np.ndarray:
     """Predicted mean contacts at every temperature for one parameter set."""
     out = np.empty(temps.size, dtype=float)
     for i, T in enumerate(temps):
-        p = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
+        p = predict_contact_mass(
+            p0_mass, m_centers, float(T), params, u_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
         out[i] = float((m_centers * p).sum())
     return out
 
@@ -2647,6 +3135,8 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     p0_mass = ctx["p0_mass"]
     b_fn = ctx["b_fn"]
     u_fn = ctx["u_fn"]
+    state_u_fn = ctx.get("state_u_fn")
+    local_baseline = ctx.get("local_baseline")
     loss_fn = ctx["loss_fn"]
     spec = ctx["spec"]
     param_names = ctx["param_names"]
@@ -2712,6 +3202,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
             fit_rg, boot_temps_b, m_centers, boot_ct_b, p0_mass, u_fn, loss_fn,
             crg_prob=crg_prob, c_edges_joint=c_edges_joint,
             p_obs_rg_train=boot_rg_b, rg_weight=rg_weight,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
 
         try:
@@ -2725,7 +3216,8 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
 
         # Contact losses on ORIGINAL (non-resampled) temperature sets.
         ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params_b, u_fn, loss_fn
+            temps, m_centers, p_obs_mass, p0_mass, params_b, u_fn, loss_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
         train_loss_b = float(ct_pt[train_idx].sum())
         val_loss_b = float(ct_pt[val_idx].sum()) if has_val else float("nan")
@@ -2733,8 +3225,9 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
 
         rg_train_b = rg_val_b = rg_all_b = float("nan")
         if can_fit_rg:
-            _, rg_mod_b = predict_rg_from_joint(
-                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params_b, u_fn
+            _, rg_mod_b = predict_rg_mass(
+                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params_b, u_fn,
+                local_baseline=local_baseline, state_u_fn=state_u_fn,
             )
             rg_pt = per_temp_rg_losses(rg_mod_b, p_obs_rg_model_grid, loss_fn)
             rg_train_b = float(rg_pt[train_idx].sum())
@@ -2779,7 +3272,10 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
 
         # Prediction bands on the full temperature ladder.
         b_T_list.append(np.array([b_fn(params_b, float(T)) for T in temps]))
-        meanC_list.append(_predicted_means(temps, m_centers, p0_mass, params_b, u_fn))
+        meanC_list.append(_predicted_means(
+            temps, m_centers, p0_mass, params_b, u_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        ))
 
         interval = max(1, args.bootstrap // 5)
         if (bi + 1) % interval == 0 or bi == args.bootstrap - 1:
@@ -3136,6 +3632,8 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
         ctx["p0_mass"], ctx["u_fn"], ctx["loss_fn"],
         crg_prob=ctx["crg_prob"], c_edges_joint=ctx["c_edges_joint"],
         p_obs_rg_train=ctx["p_obs_rg_train"], rg_weight=float(ctx["rg_weight"]),
+        local_baseline=ctx.get("local_baseline"),
+        state_u_fn=ctx.get("state_u_fn"),
     )
 
     print("\nUncertainty diagnostics (local curvature + restart stability):")
@@ -3295,6 +3793,8 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     p0_mass = ctx["p0_mass"]
     b_fn = ctx["b_fn"]
     u_fn = ctx["u_fn"]
+    state_u_fn = ctx.get("state_u_fn")
+    local_baseline = ctx.get("local_baseline")
     loss_fn = ctx["loss_fn"]
     spec = ctx["spec"]
     param_names = ctx["param_names"]
@@ -3346,16 +3846,19 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
             use_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
             crg_prob=crg_prob, c_edges_joint=c_edges_joint,
             p_obs_rg_train=p_obs_rg_train, rg_weight=w,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
         best, obj_val = fit_one_split(obj_fn, obj_args, x0s, bounds)
         params = best.x
         param_path.append(np.asarray(params, dtype=float))
 
         ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params, u_fn, loss_fn
+            temps, m_centers, p_obs_mass, p0_mass, params, u_fn, loss_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
-        _, rg_mod = predict_rg_from_joint(
-            crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, u_fn
+        _, rg_mod = predict_rg_mass(
+            crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params, u_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
         rg_pt = per_temp_rg_losses(rg_mod, p_obs_rg_model_grid, loss_fn)
 
@@ -3399,7 +3902,10 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
                 rec["Tc"] = float(tc)
 
         bT = np.array([b_fn(params, float(T)) for T in temps])
-        predC = _predicted_means(temps, m_centers, p0_mass, params, u_fn)
+        predC = _predicted_means(
+            temps, m_centers, p0_mass, params, u_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
         predRg = rg_scale * (rg_centers_lat[None, :] * rg_mod).sum(axis=1)
         bT_curves.append(bT)
         predC_curves.append(predC)
@@ -4028,6 +4534,14 @@ def main() -> None:
 
     b_data = np.load(args.baseline)
     has_joint_baseline = all(k in b_data.files for k in ("c_edges", "rg_edges", "crg_prob"))
+    is_local_model = bool(MODEL_REGISTRY[args.model]["configuration_dependent"])
+    has_local_rg_baseline = all(k in b_data.files for k in (
+        "rg_edges", "local_coord_rg_state_index", "local_coord_rg_bin_index",
+        "local_coord_rg_joint_mass",
+    ))
+    has_model_rg_baseline = (
+        has_local_rg_baseline if is_local_model else has_joint_baseline
+    )
 
     # Bending penalty: read from the baseline, optionally cross-checked against
     # the CLI. Never fitted, never re-applied during reweighting.
@@ -4036,9 +4550,10 @@ def main() -> None:
     )
     bending_enabled = bool(kappa_bend != 0.0)
 
-    # Chain length: needed only by the nonlinear models, whose curvature term
-    # (m^2/(2N)) or contact fraction (q = m/N) is normalized by it. Resolved
-    # before any fitting so a missing or conflicting N fails immediately.
+    # Chain length: required by the scalar nonlinear normalizations m^2/(2N)
+    # and q=m/N.  The local model infers and validates N from each degree
+    # histogram for provenance, but q_i=k_i/2 does not use N as an energy
+    # normalizer.  Resolve metadata before fitting so conflicts fail early.
     fit_chain_length = resolve_chain_length(
         read_baseline_chain_length(b_data), args.chain_length,
         model_name=args.model, baseline_path=str(args.baseline),
@@ -4083,14 +4598,29 @@ def main() -> None:
 
     print(f"Baseline NPZ: {args.baseline}")
     print(f"  keys:        {list(b_data.files)}")
-    print(f"  Joint P0(m,Rg): {'available (c_edges, rg_edges, crg_prob)' if has_joint_baseline else 'NOT FOUND'}")
+    if is_local_model:
+        _joint_status = (
+            "available (sparse coordination-state/Rg mass)"
+            if has_local_rg_baseline else "NOT FOUND"
+        )
+    else:
+        _joint_status = (
+            "available (c_edges, rg_edges, crg_prob)"
+            if has_joint_baseline else "NOT FOUND"
+        )
+    print(f"  Model-compatible joint baseline: {_joint_status}")
     print(f"  kappa_bend:  {kappa_bend:g} "
           f"({'bending enabled' if bending_enabled else 'no bending penalty'}; "
           f"{BEND_DEFINITION})")
+    if is_local_model:
+        _chain_length_role = "validated against each degree histogram; provenance only"
+    elif potential_normalization:
+        _chain_length_role = f"used for {potential_normalization}"
+    else:
+        _chain_length_role = "not needed by this model"
     print(f"  chain length: "
           + ("not recorded" if fit_chain_length is None else f"{fit_chain_length}")
-          + (f"  (used for {potential_normalization})"
-             if potential_normalization else "  (not needed by this model)"))
+          + f"  ({_chain_length_role})")
     print(f"  potential:   [{potential_kind}]  {potential_definition}")
     print(f"               m_ref = {m_ref}")
 
@@ -4114,7 +4644,7 @@ def main() -> None:
 
     # Rg grid overlap detection
     rg_grid_overlap_pct: Optional[float] = None
-    if has_obs_rg and has_joint_baseline:
+    if has_obs_rg and has_model_rg_baseline:
         _rg_c_arr = np.asarray(d[_rg_centers_key], dtype=float)
         # Baseline rg_edges are in lattice units; scale to observed/comparison units.
         _rg_edges_model_lattice = np.asarray(b_data["rg_edges"], dtype=float)
@@ -4252,7 +4782,23 @@ def main() -> None:
                 "This may affect mapping the joint baseline P0(m,Rg) onto integer contact bins."
             )
 
-    if has_obs_rg and has_joint_baseline:
+    # A local baseline may intentionally omit the legacy dense (m,Rg) table;
+    # its sparse state/Rg table still uses the ordinary rg_edges axis.
+    if has_model_rg_baseline and rg_edges_model_lattice is None:
+        rg_edges_model_lattice = np.asarray(b_data["rg_edges"], dtype=float)
+        if rg_edges_model_lattice.ndim != 1 or len(rg_edges_model_lattice) < 2:
+            raise ValueError("baseline rg_edges must be 1D with at least two entries")
+        if not np.all(np.isfinite(rg_edges_model_lattice)) or np.any(
+            np.diff(rg_edges_model_lattice) <= 0.0
+        ):
+            raise ValueError("baseline rg_edges must be finite and strictly increasing")
+        rg_centers_model_lattice = 0.5 * (
+            rg_edges_model_lattice[:-1] + rg_edges_model_lattice[1:]
+        )
+        rg_edges_model = args.rg_scale * rg_edges_model_lattice
+        rg_centers_model = args.rg_scale * rg_centers_model_lattice
+
+    if has_obs_rg and has_model_rg_baseline:
         # Rebin observed Rg PDFs onto the model Rg grid for loss computation
         p_obs_rg_model_grid = np.array([
             rebin_pdf_to_mass(rg_centers_obs, rg_hists_obs[i], rg_edges_model)
@@ -4260,11 +4806,15 @@ def main() -> None:
         ])
 
     # Validate --fit-rg feasibility
-    can_fit_rg = has_obs_rg and has_joint_baseline
+    can_fit_rg = has_obs_rg and has_model_rg_baseline
     if args.fit_rg and not can_fit_rg:
         missing = []
-        if not has_joint_baseline:
-            missing.append("joint baseline (c_edges, rg_edges, crg_prob)")
+        if not has_model_rg_baseline:
+            missing.append(
+                "model-compatible joint baseline "
+                "(coordination-state/Rg mass for the local model)"
+                if is_local_model else "joint baseline (c_edges, rg_edges, crg_prob)"
+            )
         if not has_obs_rg:
             missing.append("observed Rg histograms (rg_centers, rg_hists)")
         raise ValueError(
@@ -4288,6 +4838,20 @@ def main() -> None:
     # Baseline p0(m) on the same integer grid
     # -----------------------------------------------------------------------
     p0_mass = build_baseline_mass_on_integer(m_centers, args.baseline)
+
+    local_baseline: Optional[Dict[str, Any]] = None
+    if is_local_model:
+        local_baseline = load_local_coordination_baseline(
+            b_data, fit_chain_length, m_centers, rg_edges_model_lattice
+        )
+        fit_chain_length = int(local_baseline["n_beads"])
+        has_model_rg_baseline = bool(local_baseline["has_rg_joint"])
+        can_fit_rg = bool(has_obs_rg and has_model_rg_baseline)
+        if args.fit_rg and not can_fit_rg:
+            raise ValueError(
+                "--fit-rg requested for local_coordination_saturation, but the "
+                "validated sparse coordination-state/Rg baseline is unavailable"
+            )
 
     # -----------------------------------------------------------------------
     # Model setup
@@ -4315,9 +4879,18 @@ def main() -> None:
 
     b_fn = make_b_fn(args.model, Tref, Tscale)
     q_fn = make_q_fn(args.model, Tref, Tscale)
-    # u_fn is what every reweighting path uses. For linear models it evaluates to
-    # exactly b(T)*m, so their numerical results are unchanged.
-    u_fn = make_contact_u_fn(args.model, Tref, Tscale, n_beads=fit_chain_length)
+    # Scalar and state-aware accessors are intentionally separate: the local
+    # model must never be silently collapsed to a function of m alone.
+    if is_local_model:
+        u_fn = None
+        state_u_fn = make_contact_state_u_fn(
+            args.model, Tref, Tscale, n_beads=fit_chain_length
+        )
+    else:
+        u_fn = make_contact_u_fn(
+            args.model, Tref, Tscale, n_beads=fit_chain_length
+        )
+        state_u_fn = None
     loss_fn = _get_loss_fn(args.loss)
 
     # -----------------------------------------------------------------------
@@ -4371,6 +4944,7 @@ def main() -> None:
         args.fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
         crg_prob=crg_prob, c_edges_joint=c_edges_joint,
         p_obs_rg_train=p_obs_rg_train, rg_weight=float(args.rg_weight),
+        local_baseline=local_baseline, state_u_fn=state_u_fn,
     )
 
     best, best_val_obj = fit_one_split(obj_fn, obj_args, x0s, bounds)
@@ -4393,26 +4967,23 @@ def main() -> None:
     # -----------------------------------------------------------------------
     p_mod_mass = np.zeros_like(p_obs_mass)
     for i, T in enumerate(temps):
-        p_mod_mass[i] = model_contact_mass(
-            p0_mass, m_centers, float(T), params_fit, u_fn
+        p_mod_mass[i] = predict_contact_mass(
+            p0_mass, m_centers, float(T), params_fit, u_fn,
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
 
     # -----------------------------------------------------------------------
     # Post-fit contact loss breakdown
     # -----------------------------------------------------------------------
-    train_loss = objective(
-        params_fit, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn
+    contact_losses_all = per_temp_contact_losses(
+        temps, m_centers, p_obs_mass, p0_mass, params_fit, u_fn, loss_fn,
+        local_baseline=local_baseline, state_u_fn=state_u_fn,
     )
+    train_loss = float(contact_losses_all[train_idx].sum())
     val_loss = (
-        objective(
-            params_fit, temps[val_idx], m_centers, p_obs_mass[val_idx],
-            p0_mass, u_fn, loss_fn,
-        )
-        if has_val else float("nan")
+        float(contact_losses_all[val_idx].sum()) if has_val else float("nan")
     )
-    all_loss = objective(
-        params_fit, temps, m_centers, p_obs_mass, p0_mass, u_fn, loss_fn
-    )
+    all_loss = float(contact_losses_all.sum())
 
     print(f"\nContact loss ({args.loss}):")
     print(f"  train      ({len(train_idx):3d} temps) : {train_loss:.6g}")
@@ -4424,17 +4995,19 @@ def main() -> None:
     # Rg prediction (all temperatures, if joint baseline exists)
     # -----------------------------------------------------------------------
     rg_mod_mass: Optional[np.ndarray] = None
-    if has_joint_baseline:
+    if has_model_rg_baseline:
         # Predict on the raw lattice Rg bins (crg_prob is indexed by them),
         # then relabel the axis into scaled/comparison units.  rg_mod_mass is
         # probability mass and is unchanged by the axis scaling.
-        rg_centers_lattice_pred, rg_mod_mass = predict_rg_from_joint(
+        rg_centers_lattice_pred, rg_mod_mass = predict_rg_mass(
             crg_prob=crg_prob,                # type: ignore[arg-type]
             c_edges=c_edges_joint,            # type: ignore[arg-type]
             rg_edges=rg_edges_model_lattice,  # type: ignore[arg-type]
             temps=temps,
             params=params_fit,
             u_fn=u_fn,
+            local_baseline=local_baseline,
+            state_u_fn=state_u_fn,
         )
         rg_centers_model = args.rg_scale * rg_centers_lattice_pred
 
@@ -4479,10 +5052,10 @@ def main() -> None:
                 f"  NOTE: Rg grid overlap is {rg_grid_overlap_pct:.1f}% — "
                 f"losses reflect only the overlapping Rg region."
             )
-    elif has_joint_baseline and not has_obs_rg:
+    elif has_model_rg_baseline and not has_obs_rg:
         print("\nRg scoring: skipped (no observed Rg histograms).")
-    elif has_obs_rg and not has_joint_baseline:
-        print("\nRg scoring: skipped (no joint baseline P0(m,Rg)).")
+    elif has_obs_rg and not has_model_rg_baseline:
+        print("\nRg scoring: skipped (no model-compatible joint baseline).")
 
     # -----------------------------------------------------------------------
     # Per-temperature contact-potential coefficients
@@ -4536,6 +5109,11 @@ def main() -> None:
         ),
         potential_definition=potential_definition,
         m_ref=int(m_ref),
+        configuration_dependent=bool(spec["configuration_dependent"]),
+        state_observable=str(spec["state_observable"]),
+        local_coord_schema_version=(
+            -1 if local_baseline is None else int(local_baseline["schema_version"])
+        ),
         fit_chain_length=(
             -1 if fit_chain_length is None else int(fit_chain_length)
         ),
@@ -4568,7 +5146,7 @@ def main() -> None:
     # The saturating-cooperative amplitude and saturation scale are also written
     # under their own names, so a reader never has to index into params by
     # position to recover the two parameters that define the nonlinearity.
-    if potential_kind == "saturating_cooperative":
+    if potential_kind in {"saturating_cooperative", "local_coordination_saturation"}:
         save_kwargs["A0"] = float(params_fit[2])
         save_kwargs["q_sat"] = float(params_fit[3])
 
@@ -4662,6 +5240,8 @@ def main() -> None:
         "support_overlap_of_remd": int(remd_n),
         "support_overlap_pct": float(overlap_pct),
         "has_joint_baseline": bool(has_joint_baseline),
+        "has_model_compatible_joint_baseline": bool(has_model_rg_baseline),
+        "has_local_coordination_baseline": bool(local_baseline is not None),
         "has_obs_rg": bool(has_obs_rg),
         "rg_grid_overlap_pct": rg_grid_overlap_pct,
         "fit_rg": bool(args.fit_rg),
@@ -4681,6 +5261,11 @@ def main() -> None:
         "potential_normalization": potential_normalization,
         "potential_definition": potential_definition,
         "m_ref": int(m_ref),
+        "configuration_dependent": bool(spec["configuration_dependent"]),
+        "state_observable": str(spec["state_observable"]),
+        "local_coord_schema_version": (
+            None if local_baseline is None else int(local_baseline["schema_version"])
+        ),
         "fit_chain_length": (
             None if fit_chain_length is None else int(fit_chain_length)
         ),
@@ -4707,11 +5292,11 @@ def main() -> None:
     # The saturating-cooperative amplitude and saturation scale are also written
     # under their own names, so a reader never has to index into params by
     # position to recover the two parameters that define the nonlinearity.
-    if potential_kind == "saturating_cooperative":
+    if potential_kind in {"saturating_cooperative", "local_coordination_saturation"}:
         metadata["A0"] = float(params_fit[2])
         metadata["q_sat"] = float(params_fit[3])
 
-    if has_joint_baseline and rg_edges_model_lattice is not None and rg_edges_model is not None:
+    if has_model_rg_baseline and rg_edges_model_lattice is not None and rg_edges_model is not None:
         metadata["rg_model_range_lattice"] = [
             float(rg_edges_model_lattice.min()), float(rg_edges_model_lattice.max())
         ]
@@ -4731,7 +5316,9 @@ def main() -> None:
     # -----------------------------------------------------------------------
     uncertainty_ctx: Dict[str, Any] = {
         "temps": temps, "m_centers": m_centers, "p_obs_mass": p_obs_mass,
-        "p0_mass": p0_mass, "b_fn": b_fn, "u_fn": u_fn, "loss_fn": loss_fn, "spec": spec,
+        "p0_mass": p0_mass, "b_fn": b_fn, "u_fn": u_fn,
+        "state_u_fn": state_u_fn, "local_baseline": local_baseline,
+        "loss_fn": loss_fn, "spec": spec,
         "param_names": param_names, "bounds": bounds, "x0s": x0s,
         "fit_rg": bool(args.fit_rg), "rg_weight": float(args.rg_weight),
         "can_fit_rg": can_fit_rg, "crg_prob": crg_prob,
@@ -4762,7 +5349,9 @@ def main() -> None:
     if args.split_sensitivity:
         ctx: Dict[str, Any] = {
             "temps": temps, "m_centers": m_centers, "p_obs_mass": p_obs_mass,
-            "p0_mass": p0_mass, "b_fn": b_fn, "u_fn": u_fn, "loss_fn": loss_fn,
+            "p0_mass": p0_mass, "b_fn": b_fn, "u_fn": u_fn,
+            "state_u_fn": state_u_fn, "local_baseline": local_baseline,
+            "loss_fn": loss_fn,
             "spec": spec,
             "param_names": param_names, "bounds": bounds, "x0s": x0s,
             "fit_rg": bool(args.fit_rg), "rg_weight": float(args.rg_weight),
@@ -4923,6 +5512,28 @@ def main() -> None:
         fig3s.savefig(p3s, dpi=150, bbox_inches="tight")
         print(f"Saved: {p3s}")
         open_figs.append(fig3s)
+
+    # --- 3d. Per-bead coordination saturation (local model) -----------------
+    if potential_kind == "local_coordination_saturation":
+        A0_local, q_sat_local = validated_saturating_params(params_fit)
+        k_vals = np.arange(7, dtype=float)
+        q_local = 0.5 * k_vals
+        g_vals = (q_local * q_local) / (
+            1.0 + (q_local / q_sat_local) ** 2
+        )
+        fig3l, ax3l = plt.subplots(figsize=(6.0, 4.2))
+        ax3l.plot(k_vals, A0_local * g_vals, "o-", lw=1.8)
+        ax3l.set_xlabel("nonbonded coordination k")
+        ax3l.set_ylabel("A0 g(k)  (subtracted from u)")
+        ax3l.set_xticks(k_vals)
+        ax3l.set_title(
+            f"Local coordination saturation  [q_sat={q_sat_local:.4g}]"
+        )
+        fig3l.tight_layout()
+        p3l = plot_dir / "local_coordination_saturation.png"
+        fig3l.savefig(p3l, dpi=150, bbox_inches="tight")
+        print(f"Saved: {p3l}")
+        open_figs.append(fig3l)
 
     # --- 4. Contact residual heatmap ---
     residuals_ct = p_obs_mass - p_mod_mass   # shape (n_temps, n_m)
