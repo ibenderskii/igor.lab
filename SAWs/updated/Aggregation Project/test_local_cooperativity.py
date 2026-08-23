@@ -262,6 +262,75 @@ def test_delta_cooperative_sum_matches_full_recount(seed):
     mcc.assert_counts_match(state, "after local-cooperativity sweep")
 
 
+@pytest.mark.parametrize("q_sat", [0.05, 0.35, 1.0, 4.0, 50.0])
+def test_delta_cooperative_sum_dense_all_move_types(q_sat):
+    """Stress the incremental oracle in a dense box across every move family."""
+    state = mcs.initialize_dispersed_state(4, 8, 5, seed=19)
+    rng = random.Random(90210)
+    proposers = [mvs.propose_local, mvs.propose_translation,
+                 mvs.propose_reptation, mvs.propose_chain_rotation]
+    seen = set()
+    checked = 0
+    for _ in range(2500):
+        prop = proposers[rng.randrange(len(proposers))](state, rng)
+        if not prop.ok:
+            continue
+        before = mcc.cooperative_sum(state, q_sat)
+        dS = mcc.delta_cooperative_sum(
+            state, prop.moved.keys(), prop.new_sites, q_sat)
+        d = mvs.proposal_delta(state, prop)
+        mvs.apply_proposal(state, prop, d)
+        mcc.assert_cooperative_sum_matches(
+            state, q_sat, before + dS, f"after {prop.move_type}", tol=1e-10)
+        seen.add(prop.move_type)
+        checked += 1
+    assert checked > 200
+    assert {"end", "crankshaft", "pivot", "chain_translation", "reptation",
+            "rotation"} <= seen
+
+
+@pytest.mark.parametrize("q_sat", [0.05, 0.35, 1.0, 4.0, 50.0])
+def test_delta_cooperative_sum_owner_swap_regression(q_sat):
+    """An unchanged occupied site whose owner changes must alter neighbour degree."""
+    coords = np.array([
+        [[0, 0, 0], [1, 0, 0]],
+        [[5, 0, 0], [6, 0, 0]],
+    ], dtype=np.int64)
+    state = mcs.make_state(coords, 12)
+    moved_ids = [0, 2]
+    new_sites = {0: (5, 0, 0), 2: (0, 0, 0)}
+    before = mcc.cooperative_sum(state, q_sat)
+    dS = mcc.delta_cooperative_sum(state, moved_ids, new_sites, q_sat)
+
+    after = state.copy()
+    after.coords_unwrapped[0, 0] = np.array([5, 0, 0])
+    after.coords_unwrapped[1, 0] = np.array([0, 0, 0])
+    after.site_owner = mcs.build_site_owner(after.coords_unwrapped, after.box_size)
+    oracle = mcc.cooperative_sum(after, q_sat)
+    assert oracle - before == pytest.approx(dS, rel=1e-12, abs=1e-12)
+    assert oracle > before
+
+
+def test_debug_contacts_checks_incremental_cooperative_sum(monkeypatch):
+    state = mcs.initialize_dispersed_state(3, 8, 8, seed=23)
+    counters = mvs.new_move_counters()
+    calls = []
+    oracle = mcc.assert_cooperative_sum_matches
+
+    def recording_oracle(*args, **kwargs):
+        calls.append((args, kwargs))
+        return oracle(*args, **kwargs)
+
+    monkeypatch.setattr(mcc, "assert_cooperative_sum_matches", recording_oracle)
+    rmc.mc_sweep(
+        state, counters, 330.0, SAT, SAT_P, TREF, TSCALE,
+        1.0, 1.0, 80, 20, random.Random(77),
+        n_reptation=20, n_rotation=20, debug_contacts=True,
+        cooperativity="local",
+    )
+    assert calls
+
+
 @pytest.mark.parametrize("T", [310.0, 345.0])
 def test_sweep_delta_equals_full_potential_difference(T):
     """The Metropolis du must be the exact change in the sampled potential."""

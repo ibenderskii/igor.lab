@@ -69,11 +69,15 @@ class CoordinationHistogramTests(unittest.TestCase):
             grid_source="unit_test",
             coordination_histograms=hist,
         )
-        self.assertEqual(int(built["local_coord_schema_version"]), 1)
+        self.assertEqual(int(built["local_coord_schema_version"]), 2)
         self.assertLessEqual(built["local_coord_contact_marginal_error"], 1e-12)
         self.assertLessEqual(built["local_coord_state_marginal_error"], 1e-12)
         self.assertLessEqual(built["local_coord_rg_marginal_error"], 1e-12)
         self.assertAlmostEqual(float(built["local_coord_state_mass"].sum()), 1.0)
+        self.assertEqual(
+            int(built["local_coord_state_counts"].sum()), contacts.size
+        )
+        self.assertGreater(float(built["local_coord_state_mass_sq"].sum()), 0.0)
         self.assertAlmostEqual(float(built["local_coord_rg_joint_mass"].sum()), 1.0)
 
     def test_malformed_degree_identity_is_rejected(self) -> None:
@@ -92,6 +96,35 @@ class CoordinationHistogramTests(unittest.TestCase):
                 rg_edges=np.array([0.0, 2.0]),
                 grid_source="unit_test",
                 coordination_histograms=np.array([[4, 0, 0, 0, 0, 0, 0]]),
+            )
+
+    def test_geometrically_impossible_degree_histograms_are_rejected(self) -> None:
+        common = dict(
+            contacts=np.array([3], dtype=np.int64),
+            radii=np.array([1.0]),
+            bends=np.array([0]),
+            log_g=np.zeros(4),
+            m_min=0,
+            rg_bins=2,
+            no_joint=True,
+            n_beads=4,
+            m_cover=3,
+            rg_edges=np.array([0.0, 2.0]),
+            grid_source="unit_test",
+        )
+        with self.assertRaisesRegex(RuntimeError, "h_6"):
+            build_distributions(
+                coordination_histograms=np.array([[3, 0, 0, 0, 0, 0, 1]]),
+                **common,
+            )
+
+        common["contacts"] = np.array([8], dtype=np.int64)
+        common["log_g"] = np.zeros(9)
+        common["m_cover"] = 8
+        with self.assertRaisesRegex(RuntimeError, "h_5"):
+            build_distributions(
+                coordination_histograms=np.array([[0, 0, 0, 1, 0, 3, 0]]),
+                **common,
             )
 
 

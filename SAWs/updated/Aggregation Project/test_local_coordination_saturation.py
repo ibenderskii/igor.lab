@@ -21,13 +21,8 @@ TSCALE = 80.0
 
 def _hist_for(n_beads: int, contacts: int) -> np.ndarray:
     hist = np.zeros(7, dtype=np.int64)
-    full, remainder = divmod(2 * int(contacts), 6)
-    hist[6] = full
-    used = full
-    if remainder:
-        hist[remainder] += 1
-        used += 1
-    hist[0] = int(n_beads) - used
+    hist[1] = 2 * int(contacts)
+    hist[0] = int(n_beads) - hist[1]
     return hist
 
 
@@ -108,11 +103,13 @@ def test_local_baseline_validation_and_reweighting(tmp_path) -> None:
         c_vals=contacts,
         c_prob=state_mass,
         rg_edges=rg_edges,
-        local_coord_schema_version=1,
+        local_coord_schema_version=2,
         local_coord_degree_values=np.arange(7),
         local_coord_histograms=hist,
         local_coord_contact_counts=contacts,
         local_coord_state_mass=state_mass,
+        local_coord_state_mass_sq=state_mass ** 2,
+        local_coord_state_counts=np.ones(5, dtype=np.int64),
         local_coord_rg_state_index=state_idx,
         local_coord_rg_bin_index=rg_idx,
         local_coord_rg_joint_mass=joint,
@@ -130,6 +127,88 @@ def test_local_baseline_validation_and_reweighting(tmp_path) -> None:
     )
     assert contact_mass.sum() == pytest.approx(1.0)
     assert rg_mass.sum() == pytest.approx(1.0)
+    ess = fit.local_coordination_ess(baseline, 320.0, PARAMS, state_u)
+    direct_u = state_u(PARAMS, 320.0, contacts, hist)
+    direct_w = state_mass * np.exp(-(direct_u - direct_u.min()))
+    direct_ess = direct_w.sum() ** 2 / np.sum(direct_w ** 2)
+    assert ess == pytest.approx(direct_ess, rel=1e-12)
+
+
+def test_schema_v1_remains_readable_but_cannot_claim_exact_support(tmp_path) -> None:
+    contacts = np.array([0, 1], dtype=np.int64)
+    hist = np.array([_hist_for(4, m) for m in contacts])
+    path = tmp_path / "legacy.npz"
+    np.savez_compressed(
+        path,
+        local_coord_schema_version=1,
+        local_coord_degree_values=np.arange(7),
+        local_coord_histograms=hist,
+        local_coord_contact_counts=contacts,
+        local_coord_state_mass=np.array([0.5, 0.5]),
+    )
+    with np.load(path) as saved:
+        baseline = fit.load_local_coordination_baseline(
+            saved, 4, contacts.astype(float)
+        )
+    with pytest.raises(ValueError, match="schema_version 2"):
+        fit.require_local_coordination_support_statistics(baseline)
+
+
+def test_orthogonalized_fit_coordinate_is_exact_and_removes_baseline_projection() -> None:
+    hist = np.array([
+        [8, 0, 0, 0, 0, 0, 0],
+        [6, 2, 0, 0, 0, 0, 0],
+        [4, 4, 0, 0, 0, 0, 0],
+        [6, 0, 2, 0, 0, 0, 0],
+        [4, 2, 2, 0, 0, 0, 0],
+    ], dtype=np.int64)
+    contacts = (hist @ np.arange(7) // 2).astype(np.int64)
+    baseline = {
+        "state_mass": np.array([0.15, 0.25, 0.2, 0.2, 0.2]),
+        "histograms": hist,
+        "contacts": contacts,
+    }
+    transform = fit.make_local_coordination_parameter_transform(
+        baseline, fit.MODEL_REGISTRY[MODEL]["bounds"]
+    )
+    physical = np.array([720.0, 2.4, 1.1, 0.7])
+    fit_basis = transform["to_fit"](physical)
+    np.testing.assert_allclose(
+        transform["to_physical"](fit_basis), physical, rtol=0.0, atol=1e-14
+    )
+
+    g_tilde, _ = fit.orthogonalized_local_kernel(baseline, physical[3])
+    S_tilde = hist @ g_tilde
+    p = baseline["state_mass"]
+    m_centered = contacts - p @ contacts
+    S_centered = S_tilde - p @ S_tilde
+    assert p @ (m_centered * S_centered) == pytest.approx(0.0, abs=1e-15)
+
+
+@pytest.mark.parametrize(
+    "bad_hist, message",
+    [
+        (np.array([[3, 0, 0, 0, 0, 0, 1]]), "h_6"),
+        (np.array([[0, 0, 0, 1, 0, 3, 0]]), "h_5"),
+    ],
+)
+def test_loader_rejects_impossible_lattice_degrees(tmp_path, bad_hist, message) -> None:
+    contacts = (bad_hist @ np.arange(7) // 2).astype(np.int64)
+    path = tmp_path / "bad.npz"
+    np.savez_compressed(
+        path,
+        local_coord_schema_version=2,
+        local_coord_degree_values=np.arange(7),
+        local_coord_histograms=bad_hist,
+        local_coord_contact_counts=contacts,
+        local_coord_state_mass=np.array([1.0]),
+        local_coord_state_mass_sq=np.array([1.0]),
+        local_coord_state_counts=np.array([1]),
+    )
+    with np.load(path) as saved, pytest.raises(ValueError, match=message):
+        fit.load_local_coordination_baseline(
+            saved, int(bad_hist.sum()), contacts.astype(float)
+        )
 
 
 def test_multichain_defaults_to_the_fitted_local_hamiltonian() -> None:

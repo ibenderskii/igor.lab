@@ -397,6 +397,24 @@ def cooperative_sum(state: MultiChainState, q_sat: float) -> float:
     return float(total)
 
 
+def assert_cooperative_sum_matches(
+    state: MultiChainState,
+    q_sat: float,
+    expected: float,
+    context: str = "",
+    tol: float = 1e-9,
+) -> None:
+    """Assert an incrementally updated cooperative sum matches the full oracle."""
+    actual = cooperative_sum(state, q_sat)
+    scale = max(1.0, abs(actual), abs(float(expected)))
+    if abs(actual - float(expected)) > float(tol) * scale:
+        suffix = f" {context}" if context else ""
+        raise AssertionError(
+            f"cooperative sum drift: incremental={float(expected)!r} "
+            f"oracle={actual!r} (q_sat={float(q_sat)!r}){suffix}"
+        )
+
+
 def _affected_beads(
     occ: Dict[Site, int], sites: Dict[int, Site], N: int, L: int,
 ) -> set:

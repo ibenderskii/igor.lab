@@ -936,19 +936,15 @@ def ufn_check_chain_lengths(runtime_chain_lengths=None) -> list:
 
 def ufn_check_coordination_histogram(n_beads: int, contacts: int) -> np.ndarray:
     """Deterministic length-7 histogram satisfying sum h=N and sum k*h=2m."""
-    remaining = 2 * int(contacts)
-    if remaining < 0 or remaining > 6 * int(n_beads):
+    contacts = int(contacts)
+    if contacts < 0 or contacts > int(n_beads):
         raise ValueError("contact count is incompatible with a cubic-lattice degree histogram")
     hist = np.zeros(7, dtype=np.int64)
-    full, remainder = divmod(remaining, 6)
-    hist[6] = full
-    used = full
-    if remainder:
-        hist[remainder] += 1
-        used += 1
-    if used > int(n_beads):
-        raise ValueError("synthetic degree histogram uses more than N beads")
-    hist[0] += int(n_beads) - used
+    # Put each contact's two incidences on one degree-2 bead. This is a simple
+    # synthetic sufficient statistic, not a reconstructed conformation, and it
+    # obeys the provable cubic-lattice constraints h6=0 and h5<=2.
+    hist[2] = contacts
+    hist[0] = int(n_beads) - contacts
     return hist
 
 
@@ -5093,7 +5089,7 @@ def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers, n_beads=None)
     extra = {} if n_beads is None else {"n_beads": int(n_beads)}
     np.savez(path, c_edges=c_edges, rg_edges=rg_edges, crg_prob=crg,
              c_vals=np.asarray(m, dtype=int), c_prob=np.asarray(p0, dtype=float),
-             local_coord_schema_version=np.int64(1),
+             local_coord_schema_version=np.int64(2),
              local_coord_degree_values=np.arange(7, dtype=np.int64),
              local_coord_histograms=np.array([
                  ufn_check_coordination_histogram(int(n_beads), int(mi))
@@ -5101,6 +5097,8 @@ def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers, n_beads=None)
              ], dtype=np.int64) if n_beads is not None else np.empty((0, 7), dtype=np.int64),
              local_coord_contact_counts=np.asarray(m, dtype=np.int64),
              local_coord_state_mass=np.asarray(p0, dtype=float),
+             local_coord_state_mass_sq=np.asarray(p0, dtype=float) ** 2 / 1000.0,
+             local_coord_state_counts=np.full(len(m), 1000, dtype=np.int64),
              local_coord_rg_state_index=np.repeat(
                  np.arange(len(m), dtype=np.int64), len(rg_centers)
              ),

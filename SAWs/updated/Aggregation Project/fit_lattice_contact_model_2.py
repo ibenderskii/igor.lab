@@ -131,6 +131,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -657,10 +658,10 @@ def load_local_coordination_baseline(
             + ", ".join(missing)
         )
     version = int(np.asarray(b_data["local_coord_schema_version"]).reshape(()))
-    if version != LOCAL_COORD_SCHEMA_VERSION:
+    if version not in (1, LOCAL_COORD_SCHEMA_VERSION):
         raise ValueError(
-            f"unsupported local_coord_schema_version {version}; expected "
-            f"{LOCAL_COORD_SCHEMA_VERSION}"
+            f"unsupported local_coord_schema_version {version}; supported "
+            f"versions are 1 and {LOCAL_COORD_SCHEMA_VERSION}"
         )
     degrees = np.asarray(b_data["local_coord_degree_values"])
     if degrees.shape != (7,) or not np.array_equal(degrees, np.arange(7)):
@@ -685,6 +686,16 @@ def load_local_coordination_baseline(
     if not np.all(inferred_sizes == inferred_sizes[0]) or inferred_sizes[0] < 2:
         raise ValueError("every local coordination histogram must contain one common N >= 2")
     inferred_n = int(inferred_sizes[0])
+    if np.any(hist[:, 6] != 0):
+        raise ValueError(
+            "local_coord_histograms has h_6 > 0, which is geometrically "
+            "impossible for N >= 2 because every bead has a covalent neighbour"
+        )
+    if np.any(hist[:, 5] > 2):
+        raise ValueError(
+            "local_coord_histograms has h_5 > 2, which is impossible because "
+            "only the two chain ends can reach nonbonded degree 5"
+        )
     if n_beads is not None and inferred_n != int(n_beads):
         raise ValueError(
             f"local coordination histograms contain N={inferred_n} beads, but "
@@ -710,6 +721,43 @@ def load_local_coordination_baseline(
         raise ValueError(f"local_coord_state_mass must sum to 1, got {mass_sum:.17g}")
     if np.unique(hist, axis=0).shape[0] != S:
         raise ValueError("local_coord_histograms contains duplicate state rows")
+
+    state_mass_sq: Optional[np.ndarray] = None
+    state_counts: Optional[np.ndarray] = None
+    if version >= 2:
+        v2_required = {"local_coord_state_mass_sq", "local_coord_state_counts"}
+        missing_v2 = sorted(v2_required.difference(b_data.files))
+        if missing_v2:
+            raise ValueError(
+                "local_coord_schema_version 2 is missing exact-support arrays: "
+                + ", ".join(missing_v2)
+            )
+        state_mass_sq = np.asarray(
+            b_data["local_coord_state_mass_sq"], dtype=float
+        )
+        counts_raw = np.asarray(b_data["local_coord_state_counts"])
+        if state_mass_sq.shape != (S,) or counts_raw.shape != (S,):
+            raise ValueError(
+                "local_coord_state_mass_sq and local_coord_state_counts must "
+                "both have shape (S,)"
+            )
+        if (
+            not np.all(np.isfinite(state_mass_sq))
+            or np.any(state_mass_sq < 0.0)
+            or np.any(state_mass_sq > state_mass * state_mass + 1e-15)
+        ):
+            raise ValueError(
+                "local_coord_state_mass_sq must be finite, nonnegative, and "
+                "no larger than state_mass^2"
+            )
+        if (
+            not np.all(np.isfinite(counts_raw))
+            or not np.all(counts_raw == np.rint(counts_raw))
+        ):
+            raise ValueError("local_coord_state_counts must contain finite integers")
+        state_counts = np.rint(counts_raw).astype(np.int64)
+        if np.any(state_counts <= 0):
+            raise ValueError("local_coord_state_counts must be strictly positive")
 
     m_centers = np.asarray(m_centers, dtype=float)
     if not np.all(np.isfinite(m_centers)) or not np.all(
@@ -764,6 +812,9 @@ def load_local_coordination_baseline(
         "histograms": hist,
         "contacts": contacts,
         "state_mass": state_mass,
+        "state_mass_sq": state_mass_sq,
+        "state_counts": state_counts,
+        "n_samples": None if state_counts is None else int(state_counts.sum()),
         "contact_bin_index": contact_bin_index,
         "state_contact_mass": state_contact_mass,
         "has_rg_joint": False,
@@ -927,7 +978,12 @@ LOCAL_COORDINATION_DEFINITION = (
     "k_i = nonbonded nearest-neighbour degree of bead i,  A0 >= 0, q_sat > 0"
 )
 LOCAL_COORDINATION_OBSERVABLE = "nonbonded_contact_degree_histogram_0_6"
-LOCAL_COORD_SCHEMA_VERSION = 1
+LOCAL_COORD_SCHEMA_VERSION = 2
+LOCAL_COORD_Q_MAX = 2.5
+LOCAL_COORD_Q_MIN_NONZERO = 0.5
+LOCAL_COORD_ESS_MIN = 200.0
+LOCAL_COORD_ESS_FRACTION_MIN = 1e-3
+LOCAL_COORD_CORRELATION_WARNING = 0.99
 
 
 def _q_zero(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
@@ -1519,6 +1575,233 @@ def local_coordination_state_weights(
     return weights, Z
 
 
+def require_local_coordination_support_statistics(
+    baseline: Dict[str, Any],
+) -> None:
+    """Require schema-v2 arrays needed for exact per-sample support metrics."""
+    if baseline.get("state_mass_sq") is None or baseline.get("state_counts") is None:
+        raise ValueError(
+            "fitting local_coordination_saturation with free A0 requires a "
+            "local_coord_schema_version 2 Wang-Landau baseline containing "
+            "local_coord_state_mass_sq and local_coord_state_counts. Version 1 "
+            "remains readable for fixed/manual reweighting, but cannot diagnose "
+            "support in the coordination direction; regenerate the baseline."
+        )
+
+
+def local_coordination_ess(
+    baseline: Dict[str, Any],
+    T: float,
+    params: np.ndarray,
+    state_u_fn: Callable,
+) -> float:
+    """Exact importance-weight ESS retained by the compressed state table.
+
+    This recovers the ordinary per-sample ESS exactly from the schema-v2
+    ``sum(omega_i**2)`` stored for each state. It measures importance-weight
+    support and does not attempt to correct for Markov-chain autocorrelation.
+    """
+    require_local_coordination_support_statistics(baseline)
+    p0 = np.asarray(baseline["state_mass"], dtype=float)
+    q0 = np.asarray(baseline["state_mass_sq"], dtype=float)
+    u = np.asarray(
+        state_u_fn(
+            params, float(T), baseline["contacts"], baseline["histograms"]
+        ),
+        dtype=float,
+    )
+    x = _stabilized_exponent(-u, p0 > 0.0)
+    ex = np.exp(x)
+    numerator = float(p0 @ ex)
+    denominator = float(q0 @ (ex * ex))
+    if not np.isfinite(denominator) or denominator <= 0.0:
+        raise FloatingPointError(
+            "local coordination ESS produced a nonpositive second moment"
+        )
+    return float((numerator * numerator) / denominator)
+
+
+def orthogonalized_local_kernel(
+    baseline: Dict[str, Any], q_sat: float
+) -> Tuple[np.ndarray, float]:
+    """Return ``g-c1*q`` and the baseline projection coefficient ``c1``.
+
+    The transformation is exact because ``sum_i q_i == m`` for every state.
+    It changes optimizer coordinates only, never the physical Hamiltonian.
+    """
+    if not np.isfinite(q_sat) or q_sat <= 0.0:
+        raise ValueError(f"q_sat must be finite and positive, got {q_sat!r}")
+    q = 0.5 * np.arange(7, dtype=float)
+    g = (q * q) / (1.0 + (q / float(q_sat)) ** 2)
+    p = np.asarray(baseline["state_mass"], dtype=float)
+    hist = np.asarray(baseline["histograms"], dtype=float)
+    m = np.asarray(baseline["contacts"], dtype=float)
+    S = hist @ g
+    m_centered = m - float(p @ m)
+    S_centered = S - float(p @ S)
+    var_m = float(p @ (m_centered * m_centered))
+    c1 = 0.0 if var_m <= 0.0 else float(p @ (m_centered * S_centered)) / var_m
+    return g - c1 * q, float(c1)
+
+
+def make_local_coordination_parameter_transform(
+    baseline: Dict[str, Any], bounds: List[Tuple[float, float]]
+) -> Dict[str, Any]:
+    """Build the exact ``s_b <-> s_b_orthogonalized`` fit-coordinate map."""
+    physical_bounds = [tuple(map(float, b)) for b in bounds]
+    q_lo, q_hi = physical_bounds[3]
+    A_lo, A_hi = physical_bounds[2]
+    q_grid = np.geomspace(q_lo, q_hi, 256)
+    c_grid = np.array(
+        [orthogonalized_local_kernel(baseline, q)[1] for q in q_grid],
+        dtype=float,
+    )
+    shifts = np.array(
+        [A * c for A in (A_lo, A_hi) for c in (c_grid.min(), c_grid.max())],
+        dtype=float,
+    )
+    fit_bounds = list(physical_bounds)
+    fit_bounds[1] = (
+        physical_bounds[1][0] + float(shifts.min()),
+        physical_bounds[1][1] + float(shifts.max()),
+    )
+
+    def to_fit(params: np.ndarray) -> np.ndarray:
+        out = np.asarray(params, dtype=float).copy()
+        _, c1 = orthogonalized_local_kernel(baseline, float(out[3]))
+        out[1] = out[1] + out[2] * c1
+        return out
+
+    def to_physical(params: np.ndarray) -> np.ndarray:
+        out = np.asarray(params, dtype=float).copy()
+        _, c1 = orthogonalized_local_kernel(baseline, float(out[3]))
+        out[1] = out[1] - out[2] * c1
+        return out
+
+    return {
+        "to_fit": to_fit,
+        "to_physical": to_physical,
+        "physical_bounds": physical_bounds,
+        "fit_bounds": fit_bounds,
+        "fit_param_names": ["h_b", "s_b_orthogonalized", "A0", "q_sat"],
+    }
+
+
+def local_coordination_diagnostics(
+    baseline: Dict[str, Any],
+    temps: np.ndarray,
+    params: np.ndarray,
+    state_u_fn: Callable,
+) -> Dict[str, Any]:
+    """Per-temperature support and distinguishability diagnostics."""
+    require_local_coordination_support_statistics(baseline)
+    A0, q_sat = validated_saturating_params(params)
+    q = 0.5 * np.arange(7, dtype=float)
+    g = (q * q) / (1.0 + (q / q_sat) ** 2)
+    S = np.asarray(baseline["histograms"], dtype=float) @ g
+    m = np.asarray(baseline["contacts"], dtype=float)
+    n_samples = int(baseline["n_samples"])
+    ess_threshold = max(
+        LOCAL_COORD_ESS_MIN, LOCAL_COORD_ESS_FRACTION_MIN * n_samples
+    )
+    rows: List[Dict[str, Any]] = []
+    for T in np.asarray(temps, dtype=float):
+        state_w, Z = local_coordination_state_weights(
+            baseline, float(T), params, state_u_fn
+        )
+        p = state_w / Z
+        mc = m - float(p @ m)
+        Sc = S - float(p @ S)
+        vm = float(p @ (mc * mc))
+        vS = float(p @ (Sc * Sc))
+        corr = None
+        if vm > 0.0 and vS > 0.0:
+            corr = float(p @ (mc * Sc) / math.sqrt(vm * vS))
+        ess = local_coordination_ess(
+            baseline, float(T), params, state_u_fn
+        )
+        rows.append({
+            "temperature": float(T),
+            "importance_ess": ess,
+            "importance_ess_fraction_of_raw_samples": ess / n_samples,
+            "reliable": bool(ess >= ess_threshold),
+            "corr_S_m": corr,
+        })
+    _, c1 = orthogonalized_local_kernel(baseline, q_sat)
+    warnings_out: List[str] = []
+    if q_sat > 4.0 * LOCAL_COORD_Q_MAX:
+        warnings_out.append(
+            "q_sat is far above the reachable lattice ceiling q_max=2.5; "
+            "g(q) approaches q^2 and q_sat is weakly identified"
+        )
+    if q_sat < 0.5 * LOCAL_COORD_Q_MIN_NONZERO:
+        warnings_out.append(
+            "q_sat is far below the smallest nonzero q_i=0.5; only the product "
+            f"A0*q_sat^2={A0 * q_sat * q_sat:.6g} is well identified"
+        )
+    finite_corr = [abs(r["corr_S_m"]) for r in rows if r["corr_S_m"] is not None]
+    if finite_corr and min(finite_corr) >= LOCAL_COORD_CORRELATION_WARNING:
+        warnings_out.append(
+            "corr_T(sum_i g(q_i), m) is at least 0.99 at every fitted "
+            "temperature; the local term is not distinguishable from hs on "
+            "the sampled support"
+        )
+    if any(not r["reliable"] for r in rows):
+        warnings_out.append(
+            "one or more temperatures fall below the exact importance-ESS "
+            "support threshold and must be excluded from fitting"
+        )
+    return {
+        "q_max_lattice": LOCAL_COORD_Q_MAX,
+        "q_sat_over_q_max": q_sat / LOCAL_COORD_Q_MAX,
+        "A0_q_sat_squared": A0 * q_sat * q_sat,
+        "orthogonalization_c1": c1,
+        "importance_ess_threshold": ess_threshold,
+        "importance_ess_note": (
+            "Exact per-sample importance-weight ESS from schema-v2 state "
+            "second moments; not autocorrelation-adjusted."
+        ),
+        "per_temperature": rows,
+        "warnings": warnings_out,
+    }
+
+
+def local_coordination_coverage_rows(
+    baseline: Dict[str, Any],
+    temps: np.ndarray,
+    params: np.ndarray,
+    state_u_fn: Callable,
+) -> List[Dict[str, Any]]:
+    """Coverage of the reweighted coordination states within each contact level."""
+    require_local_coordination_support_statistics(baseline)
+    contacts = np.asarray(baseline["contacts"], dtype=np.int64)
+    counts = np.asarray(baseline["state_counts"], dtype=np.int64)
+    rows: List[Dict[str, Any]] = []
+    for T in np.asarray(temps, dtype=float):
+        weights, _ = local_coordination_state_weights(
+            baseline, float(T), params, state_u_fn
+        )
+        for m in np.unique(contacts):
+            idx = np.flatnonzero(contacts == m)
+            within = weights[idx]
+            mass = float(within.sum())
+            if mass <= 0.0:
+                continue
+            top_local = int(np.argmax(within))
+            top_state = int(idx[top_local])
+            rows.append({
+                "temperature": float(T),
+                "contacts": int(m),
+                "n_distinct_coordination_states": int(idx.size),
+                "raw_samples_at_contact_level": int(counts[idx].sum()),
+                "top_weighted_state_raw_samples": int(counts[top_state]),
+                "top_weighted_state_fraction_within_contact_level": (
+                    float(weights[top_state]) / mass
+                ),
+            })
+    return rows
+
+
 def local_coordination_contact_mass(
     baseline: Dict[str, Any],
     T: float,
@@ -1912,6 +2195,7 @@ def fit_restarts(
     bounds: List[Tuple[float, float]],
     *,
     maxiter: int = 800,
+    parameter_transform: Optional[Dict[str, Any]] = None,
 ):
     """Run L-BFGS-B from every restart.
 
@@ -1926,21 +2210,48 @@ def fit_restarts(
     best_val_obj = float("inf")
     failed_messages: List[str] = []
     restart_records: List[Dict[str, Any]] = []
+    if parameter_transform is None:
+        to_fit = lambda x: np.asarray(x, dtype=float)
+        to_physical = lambda x: np.asarray(x, dtype=float)
+        fit_bounds = bounds
+        fit_param_names = None
+    else:
+        to_fit = parameter_transform["to_fit"]
+        to_physical = parameter_transform["to_physical"]
+        fit_bounds = parameter_transform["fit_bounds"]
+        fit_param_names = parameter_transform.get("fit_param_names")
+    physical_bounds = np.asarray(bounds, dtype=float)
+
+    def transformed_objective(fit_params: np.ndarray, *args) -> float:
+        physical = np.asarray(to_physical(fit_params), dtype=float)
+        if np.any(physical < physical_bounds[:, 0]) or np.any(
+            physical > physical_bounds[:, 1]
+        ):
+            return float("inf")
+        return float(obj_fn(physical, *args))
+
     for ri, x0 in enumerate(x0s):
+        x0_fit = np.asarray(to_fit(x0), dtype=float)
         res = minimize(
-            obj_fn, x0,
+            transformed_objective, x0_fit,
             args=obj_args,
             method="L-BFGS-B",
-            bounds=bounds,
+            bounds=fit_bounds,
             options={"maxiter": maxiter},
         )
+        fit_x = np.asarray(res.x, dtype=float).copy()
+        physical_x = np.asarray(to_physical(fit_x), dtype=float)
+        res.x_fit_basis = fit_x
+        res.x = physical_x
         restart_records.append({
             "restart_index": ri,
             "success": bool(res.success),
             "objective": float(res.fun) if np.isfinite(res.fun) else None,
             "n_iter": int(res.nit) if hasattr(res, "nit") else None,
             "message": str(res.message),
-            "params": [float(v) for v in np.asarray(res.x, dtype=float)],
+            "params": [float(v) for v in physical_x],
+            "fit_basis_param_names": fit_param_names,
+            "fit_basis_params": [float(v) for v in fit_x],
         })
         if not bool(res.success):
             failed_messages.append(str(res.message))
@@ -1961,6 +2272,7 @@ def fit_one_split(
     bounds: List[Tuple[float, float]],
     *,
     maxiter: int = 800,
+    parameter_transform: Optional[Dict[str, Any]] = None,
 ):
     """Run all restarts and return (best_result, best_objective).
 
@@ -1968,9 +2280,100 @@ def fit_one_split(
     bootstrap all share one optimization pathway.
     """
     best, best_val_obj, _ = fit_restarts(
-        obj_fn, obj_args, x0s, bounds, maxiter=maxiter
+        obj_fn, obj_args, x0s, bounds, maxiter=maxiter,
+        parameter_transform=parameter_transform,
     )
     return best, best_val_obj
+
+
+def run_local_coordination_qsat_profile(
+    outdir: Path,
+    obj_fn: Callable,
+    obj_args: Tuple,
+    x0s: List[np.ndarray],
+    bounds: List[Tuple[float, float]],
+    baseline: Dict[str, Any],
+    fitted_params: np.ndarray,
+) -> Dict[str, Any]:
+    """Refit all other parameters on a fixed q_sat grid and save the profile."""
+    grid = np.array([0.25, 0.40, 0.55, 0.70, 0.85, 1.00, 1.30, 1.80, 2.50])
+    fitted_q = float(fitted_params[3])
+    if not np.any(np.isclose(grid, fitted_q, rtol=0.0, atol=1e-10)):
+        grid = np.sort(np.append(grid, fitted_q))
+    records: List[Dict[str, Any]] = []
+    for q_sat in grid:
+        fixed_bounds = list(bounds)
+        fixed_bounds[3] = (float(q_sat), float(q_sat))
+        transform = make_local_coordination_parameter_transform(
+            baseline, fixed_bounds
+        )
+        starts: List[np.ndarray] = []
+        warm = np.asarray(fitted_params, dtype=float).copy()
+        warm[3] = q_sat
+        starts.append(warm)
+        for x0 in x0s:
+            trial = np.asarray(x0, dtype=float).copy()
+            trial[3] = q_sat
+            starts.append(trial)
+        try:
+            best, value = fit_one_split(
+                obj_fn, obj_args, starts, fixed_bounds,
+                parameter_transform=transform,
+            )
+            rec = {
+                "q_sat": float(q_sat),
+                "objective": float(value),
+                "success": True,
+                "h_b": float(best.x[0]),
+                "s_b": float(best.x[1]),
+                "A0": float(best.x[2]),
+                "orthogonalization_c1": float(
+                    orthogonalized_local_kernel(baseline, q_sat)[1]
+                ),
+            }
+        except RuntimeError as exc:
+            rec = {
+                "q_sat": float(q_sat), "objective": None,
+                "success": False, "message": str(exc),
+            }
+        records.append(rec)
+    finite = [r["objective"] for r in records if r["objective"] is not None]
+    best_value = min(finite) if finite else None
+    for rec in records:
+        rec["delta_objective"] = (
+            None if rec["objective"] is None or best_value is None
+            else float(rec["objective"] - best_value)
+        )
+
+    csv_path = outdir / "local_coordination_qsat_profile.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "q_sat", "objective", "delta_objective", "success",
+                "h_b", "s_b", "A0", "orthogonalization_c1", "message",
+            ],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(records)
+    json_path = outdir / "local_coordination_qsat_profile.json"
+    payload = {
+        "grid": grid.tolist(),
+        "fitted_q_sat": fitted_q,
+        "best_profile_objective": best_value,
+        "records": records,
+        "interpretation": (
+            "A broad interval with delta_objective comparable to the fit/noise "
+            "variation means q_sat should be reported as an interval, not a "
+            "well-determined point estimate."
+        ),
+    }
+    with open(json_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, cls=_NpEncoder, allow_nan=False)
+    print(f"Saved: {csv_path}")
+    print(f"Saved: {json_path}")
+    return payload
 
 
 def per_temp_contact_losses(
@@ -2204,6 +2607,7 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
     param_names = ctx["param_names"]
     bounds = ctx["bounds"]
     x0s = ctx["x0s"]
+    parameter_transform = ctx.get("parameter_transform")
     fit_rg = ctx["fit_rg"]
     rg_weight = float(ctx["rg_weight"])
     can_fit_rg = ctx["can_fit_rg"]
@@ -2274,7 +2678,10 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
         }
 
         try:
-            best, best_obj = fit_one_split(obj_fn, obj_args, x0s, bounds)
+            best, best_obj = fit_one_split(
+                obj_fn, obj_args, x0s, bounds,
+                parameter_transform=parameter_transform,
+            )
         except RuntimeError as exc:
             rec["optimization_success"] = False
             rec["optimization_message"] = str(exc)
@@ -3142,6 +3549,7 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     param_names = ctx["param_names"]
     bounds = ctx["bounds"]
     x0s = ctx["x0s"]
+    parameter_transform = ctx.get("parameter_transform")
     fit_rg = ctx["fit_rg"]
     rg_weight = float(ctx["rg_weight"])
     can_fit_rg = ctx["can_fit_rg"]
@@ -3206,7 +3614,10 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
         )
 
         try:
-            best_b, best_b_val = fit_one_split(obj_fn_b, obj_args_b, x0s, bounds)
+            best_b, best_b_val = fit_one_split(
+                obj_fn_b, obj_args_b, x0s, bounds,
+                parameter_transform=parameter_transform,
+            )
         except (RuntimeError, Exception) as exc:  # noqa: B014 - count all failures
             print(f"  replicate {bi:4d}: FAILED ({exc})")
             n_boot_failed += 1
@@ -3626,6 +4037,7 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
     bounds = ctx["bounds"]
     x0s = ctx["x0s"]
     params_fit = np.asarray(ctx["params_fit"], dtype=float)
+    parameter_transform = ctx.get("parameter_transform")
 
     obj_fn, obj_args = build_objective(
         ctx["fit_rg"], ctx["train_temps"], ctx["m_centers"], ctx["p_obs_ct_train"],
@@ -3639,7 +4051,10 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
     print("\nUncertainty diagnostics (local curvature + restart stability):")
 
     # Restart stability on the primary training objective (deterministic x0s).
-    _, _, restart_records = fit_restarts(obj_fn, obj_args, x0s, bounds)
+    _, _, restart_records = fit_restarts(
+        obj_fn, obj_args, x0s, bounds,
+        parameter_transform=parameter_transform,
+    )
     rs = restart_stability(restart_records)
 
     restart_csv = outdir / "restart_diagnostics.csv"
@@ -3660,13 +4075,25 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
           f"({rs['n_distinct_objectives']} objective level(s))")
 
     # Numerical Hessian (objective curvature) at the optimum.
-    def f(p: np.ndarray) -> float:
-        return float(obj_fn(p, *obj_args))
+    if parameter_transform is None:
+        hessian_names = list(param_names)
+        hessian_params = params_fit
+        hessian_bounds = bounds
+        def f(p: np.ndarray) -> float:
+            return float(obj_fn(p, *obj_args))
+    else:
+        hessian_names = list(parameter_transform["fit_param_names"])
+        hessian_params = np.asarray(
+            parameter_transform["to_fit"](params_fit), dtype=float
+        )
+        hessian_bounds = parameter_transform["fit_bounds"]
+        def f(p: np.ndarray) -> float:
+            return float(obj_fn(parameter_transform["to_physical"](p), *obj_args))
     # The optimizer box is passed so the finite-difference stencil stays inside
     # the model's declared domain (a fit that lands on a bound -- A0 = 0 for
     # saturating_cooperative_contact -- would otherwise be probed outside it).
     H = numerical_hessian(
-        f, params_fit, bounds=MODEL_REGISTRY[ctx["model_name"]]["bounds"])
+        f, hessian_params, bounds=hessian_bounds)
     hdiag = hessian_diagnostics(H)
     print(f"  Hessian eigenvalues: "
           + ", ".join("%.4g" % e for e in hdiag["eigenvalues"])
@@ -3677,8 +4104,8 @@ def run_uncertainty_diagnostics(args: argparse.Namespace, ctx: Dict[str, Any]) -
     payload = {
         "model": ctx["model_name"],
         "loss": ctx["loss_name"],
-        "param_names": list(param_names),
-        "params": [float(v) for v in params_fit],
+        "param_names": hessian_names,
+        "params": [float(v) for v in hessian_params],
         "hessian": {
             "matrix": [[_finite_or_none(float(H[i, j])) for j in range(H.shape[1])]
                        for i in range(H.shape[0])],
@@ -3800,6 +4227,7 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     param_names = ctx["param_names"]
     bounds = ctx["bounds"]
     x0s = ctx["x0s"]
+    parameter_transform = ctx.get("parameter_transform")
     crg_prob = ctx["crg_prob"]
     c_edges_joint = ctx["c_edges_joint"]
     rg_edges_model_lattice = ctx["rg_edges_model_lattice"]
@@ -3848,7 +4276,10 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
             p_obs_rg_train=p_obs_rg_train, rg_weight=w,
             local_baseline=local_baseline, state_u_fn=state_u_fn,
         )
-        best, obj_val = fit_one_split(obj_fn, obj_args, x0s, bounds)
+        best, obj_val = fit_one_split(
+            obj_fn, obj_args, x0s, bounds,
+            parameter_transform=parameter_transform,
+        )
         params = best.x
         param_path.append(np.asarray(params, dtype=float))
 
@@ -4844,6 +5275,7 @@ def main() -> None:
         local_baseline = load_local_coordination_baseline(
             b_data, fit_chain_length, m_centers, rg_edges_model_lattice
         )
+        require_local_coordination_support_statistics(local_baseline)
         fit_chain_length = int(local_baseline["n_beads"])
         has_model_rg_baseline = bool(local_baseline["has_rg_joint"])
         can_fit_rg = bool(has_obs_rg and has_model_rg_baseline)
@@ -4886,11 +5318,15 @@ def main() -> None:
         state_u_fn = make_contact_state_u_fn(
             args.model, Tref, Tscale, n_beads=fit_chain_length
         )
+        parameter_transform = make_local_coordination_parameter_transform(
+            local_baseline, bounds
+        )
     else:
         u_fn = make_contact_u_fn(
             args.model, Tref, Tscale, n_beads=fit_chain_length
         )
         state_u_fn = None
+        parameter_transform = None
     loss_fn = _get_loss_fn(args.loss)
 
     # -----------------------------------------------------------------------
@@ -4934,22 +5370,80 @@ def main() -> None:
         x0 = np.array([rng.uniform(lo, hi) for lo, hi in bounds], dtype=float)
         x0s.append(x0)
 
-    train_temps = temps[train_idx]
-    p_obs_ct_train = p_obs_mass[train_idx]
+    requested_train_idx = train_idx.copy()
+    excluded_low_ess_idx = np.array([], dtype=int)
+    while True:
+        train_temps = temps[train_idx]
+        p_obs_ct_train = p_obs_mass[train_idx]
 
-    # Combined contact + Rg objective when fitting Rg; contact-only otherwise.
-    # p_obs_rg_train is also reused by the bootstrap block below.
-    p_obs_rg_train = p_obs_rg_model_grid[train_idx] if args.fit_rg else None  # type: ignore[index]
-    obj_fn, obj_args = build_objective(
-        args.fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
-        crg_prob=crg_prob, c_edges_joint=c_edges_joint,
-        p_obs_rg_train=p_obs_rg_train, rg_weight=float(args.rg_weight),
-        local_baseline=local_baseline, state_u_fn=state_u_fn,
-    )
+        # Combined contact + Rg objective when fitting Rg; contact-only otherwise.
+        # p_obs_rg_train is also reused by the bootstrap block below.
+        p_obs_rg_train = (
+            p_obs_rg_model_grid[train_idx] if args.fit_rg else None
+        )  # type: ignore[index]
+        obj_fn, obj_args = build_objective(
+            args.fit_rg, train_temps, m_centers, p_obs_ct_train, p0_mass,
+            u_fn, loss_fn, crg_prob=crg_prob, c_edges_joint=c_edges_joint,
+            p_obs_rg_train=p_obs_rg_train, rg_weight=float(args.rg_weight),
+            local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
 
-    best, best_val_obj = fit_one_split(obj_fn, obj_args, x0s, bounds)
+        best, best_val_obj = fit_one_split(
+            obj_fn, obj_args, x0s, bounds,
+            parameter_transform=parameter_transform,
+        )
+        params_fit = np.asarray(best.x, dtype=float)
+        if local_baseline is None:
+            break
+        train_support = local_coordination_diagnostics(
+            local_baseline, train_temps, params_fit, state_u_fn
+        )
+        reliable = np.array(
+            [row["reliable"] for row in train_support["per_temperature"]],
+            dtype=bool,
+        )
+        if np.all(reliable):
+            break
+        newly_excluded = train_idx[~reliable]
+        excluded_low_ess_idx = np.unique(
+            np.concatenate([excluded_low_ess_idx, newly_excluded])
+        ).astype(int)
+        train_idx = train_idx[reliable]
+        if train_idx.size < 2:
+            raise RuntimeError(
+                "local_coordination_saturation has fewer than two training "
+                "temperatures with adequate schema-v2 importance ESS. The "
+                "Wang-Landau baseline does not cover the fitted coordination "
+                "tilt; generate a coordination-biased baseline before fitting."
+            )
+        print(
+            "WARNING: excluding low-support training temperatures and refitting: "
+            + ", ".join(f"{temps[i]:.6g}" for i in newly_excluded)
+        )
 
-    params_fit = best.x
+    local_diagnostics = None
+    local_profile = None
+    local_coverage_rows: List[Dict[str, Any]] = []
+    if local_baseline is not None:
+        local_diagnostics = local_coordination_diagnostics(
+            local_baseline, temps, params_fit, state_u_fn
+        )
+        for message in local_diagnostics["warnings"]:
+            print(f"WARNING: {message}")
+        local_profile = run_local_coordination_qsat_profile(
+            plot_dir, obj_fn, obj_args, x0s, bounds, local_baseline, params_fit
+        )
+        local_coverage_rows = local_coordination_coverage_rows(
+            local_baseline, temps, params_fit, state_u_fn
+        )
+        coverage_path = plot_dir / "local_coordination_coverage.csv"
+        with open(coverage_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=list(local_coverage_rows[0].keys())
+            )
+            writer.writeheader()
+            writer.writerows(local_coverage_rows)
+        print(f"Saved: {coverage_path}")
 
     print("\nBest-fit parameters:")
     for name, val in zip(param_names, params_fit):
@@ -5123,6 +5617,25 @@ def main() -> None:
         linear_coefficient_by_temperature=linear_coefficient_by_temperature,
         quadratic_coefficient_by_temperature=quadratic_coefficient_by_temperature,
     )
+    if local_diagnostics is not None:
+        save_kwargs["local_coord_importance_ess"] = np.array(
+            [r["importance_ess"] for r in local_diagnostics["per_temperature"]],
+            dtype=float,
+        )
+        save_kwargs["local_coord_corr_S_m"] = np.array(
+            [
+                np.nan if r["corr_S_m"] is None else r["corr_S_m"]
+                for r in local_diagnostics["per_temperature"]
+            ],
+            dtype=float,
+        )
+        save_kwargs["local_coord_ess_reliable"] = np.array(
+            [r["reliable"] for r in local_diagnostics["per_temperature"]],
+            dtype=bool,
+        )
+        save_kwargs["local_coord_excluded_low_ess_indices"] = (
+            excluded_low_ess_idx.astype(np.int64)
+        )
     # Rg arrays
     if rg_centers_model is not None:
         # Canonical keys now carry observed/comparison units (scaled).
@@ -5231,6 +5744,8 @@ def main() -> None:
         "temps_train": temps[train_idx].tolist(),
         "temps_val": temps[val_idx].tolist() if has_val else [],
         "train_indices": train_idx.tolist(),
+        "requested_train_indices": requested_train_idx.tolist(),
+        "excluded_low_ess_indices": excluded_low_ess_idx.tolist(),
         "val_indices": val_idx.tolist(),
         "contact_range_native": [float(ct_centers_raw.min()), float(ct_centers_raw.max())],
         "contact_range_shifted": [float(ct_centers_native.min()), float(ct_centers_native.max())],
@@ -5284,6 +5799,32 @@ def main() -> None:
             "the authoritative statement of what was fitted."
         ),
     }
+    if local_diagnostics is not None:
+        metadata["local_coordination_diagnostics"] = local_diagnostics
+        metadata["local_coordination_qsat_profile"] = {
+            "path": "local_coordination_qsat_profile.json",
+            "grid": local_profile["grid"],
+            "best_profile_objective": local_profile["best_profile_objective"],
+        }
+        metadata["local_coordination_coverage"] = {
+            "path": "local_coordination_coverage.csv",
+            "n_rows": len(local_coverage_rows),
+            "minimum_top_weighted_state_raw_samples": min(
+                r["top_weighted_state_raw_samples"]
+                for r in local_coverage_rows
+            ),
+        }
+        if parameter_transform is not None:
+            fit_basis = parameter_transform["to_fit"](params_fit)
+            metadata["fit_parameterization"] = {
+                "kind": "baseline_orthogonalized_local_kernel",
+                "fit_param_names": parameter_transform["fit_param_names"],
+                "fit_params": [float(v) for v in fit_basis],
+                "physical_param_names": list(param_names),
+                "physical_params": [float(v) for v in params_fit],
+                "relation": "s_b = s_b_orthogonalized - A0*c1(q_sat)",
+                "c1": local_diagnostics["orthogonalization_c1"],
+            }
     # For heat_capacity, persist the thermodynamic reference temperature as T0
     # (stored in Tref by this fitter). Keep Tref for backward compatibility.
     if args.model == "heat_capacity":
@@ -5320,6 +5861,7 @@ def main() -> None:
         "state_u_fn": state_u_fn, "local_baseline": local_baseline,
         "loss_fn": loss_fn, "spec": spec,
         "param_names": param_names, "bounds": bounds, "x0s": x0s,
+        "parameter_transform": parameter_transform,
         "fit_rg": bool(args.fit_rg), "rg_weight": float(args.rg_weight),
         "can_fit_rg": can_fit_rg, "crg_prob": crg_prob,
         "c_edges_joint": c_edges_joint,
@@ -5354,6 +5896,7 @@ def main() -> None:
             "loss_fn": loss_fn,
             "spec": spec,
             "param_names": param_names, "bounds": bounds, "x0s": x0s,
+            "parameter_transform": parameter_transform,
             "fit_rg": bool(args.fit_rg), "rg_weight": float(args.rg_weight),
             "can_fit_rg": can_fit_rg, "crg_prob": crg_prob,
             "c_edges_joint": c_edges_joint,

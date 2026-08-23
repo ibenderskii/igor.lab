@@ -586,6 +586,10 @@ def mc_sweep(
             counters[idx, 2] += 1  # state changing
         d_intra, d_inter = mvs.proposal_delta(state, prop)
         d_bends = mvs.proposal_delta_bends(state, prop)
+        S_before = None
+        d_S = 0.0
+        if local_coop and debug_contacts and A0_coop != 0.0:
+            S_before = mcc.cooperative_sum(state, q_sat_coop)
         if local_coop:
             # Local cooperativity: the linear term is exact in the contact
             # delta, and the cooperative term uses the O(moved) change in
@@ -642,6 +646,11 @@ def mc_sweep(
             if debug_contacts:
                 mcc.assert_counts_match(state, f"after {prop.move_type}")
                 mcs.assert_bends_match(state, f"after {prop.move_type}")
+                if S_before is not None:
+                    mcc.assert_cooperative_sum_matches(
+                        state, q_sat_coop, S_before + d_S,
+                        f"after {prop.move_type}",
+                    )
 
     for _ in range(int(n_local)):
         _attempt(mvs.propose_local(state, rng))

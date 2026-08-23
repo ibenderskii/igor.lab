@@ -2055,7 +2055,20 @@ def blocked_contact_stderr(
     return stderr, int(batches.shape[0])
 
 
-LOCAL_COORD_SCHEMA_VERSION = 1
+LOCAL_COORD_SCHEMA_VERSION = 2
+
+
+def _aggregation_roundoff_tolerance(n_samples: int) -> float:
+    """Tolerance for independently accumulated normalized marginals.
+
+    The two paths sum the same nonnegative sample weights in different orders.
+    Their difference is therefore roundoff, whose worst useful scale grows with
+    the number of terms rather than being a fixed property of the model.
+    """
+    return max(
+        1e-12,
+        32.0 * np.finfo(np.float64).eps * math.sqrt(max(1, int(n_samples))),
+    )
 
 
 def build_local_coordination_statistics(
@@ -2082,6 +2095,16 @@ def build_local_coordination_statistics(
         raise RuntimeError(
             "coordination histogram samples must be nonnegative and sum to N"
         )
+    if np.any(hist[:, 6] != 0):
+        raise RuntimeError(
+            "coordination histogram has h_6 > 0, which is impossible for N >= 2: "
+            "every bead has at least one covalent neighbour"
+        )
+    if np.any(hist[:, 5] > 2):
+        raise RuntimeError(
+            "coordination histogram has h_5 > 2, which is impossible: only the "
+            "two chain ends can have five nonbonded neighbours"
+        )
     degree_sum = hist @ np.arange(7, dtype=np.int64)
     if np.any(degree_sum % 2) or not np.array_equal(degree_sum, 2 * contacts):
         raise RuntimeError(
@@ -2091,7 +2114,18 @@ def build_local_coordination_statistics(
     state_mass = np.bincount(
         state_index, weights=weights, minlength=unique_hist.shape[0]
     ).astype(np.float64)
-    state_mass /= state_mass.sum()
+    state_mass_sq = np.bincount(
+        state_index, weights=np.asarray(weights, dtype=np.float64) ** 2,
+        minlength=unique_hist.shape[0],
+    ).astype(np.float64)
+    state_counts = np.bincount(
+        state_index, minlength=unique_hist.shape[0]
+    ).astype(np.int64)
+    total_weight = float(state_mass.sum())
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        raise RuntimeError("local coordination sample weights have nonpositive mass")
+    state_mass /= total_weight
+    state_mass_sq /= total_weight * total_weight
     state_contacts = (
         unique_hist @ np.arange(7, dtype=np.int64)
     ) // 2
@@ -2099,10 +2133,13 @@ def build_local_coordination_statistics(
         state_contacts - m_min, weights=state_mass, minlength=c_prob.size
     )[:c_prob.size]
     contact_error = float(np.max(np.abs(contact_marginal - c_prob)))
-    if contact_error > 1e-12:
+    marginal_tol = _aggregation_roundoff_tolerance(contacts.size)
+    if contact_error > marginal_tol:
         raise RuntimeError(
-            "local coordination state masses do not reproduce P0(m): "
-            f"maximum error {contact_error:.3e}"
+            "local coordination state masses disagree structurally with P0(m), "
+            "beyond accumulation roundoff: "
+            f"maximum error={contact_error:.3e}, tolerance={marginal_tol:.3e}, "
+            f"n_samples={contacts.size}, n_states={unique_hist.shape[0]}"
         )
     out: Dict[str, Any] = {
         "local_coord_schema_version": np.array(
@@ -2112,7 +2149,10 @@ def build_local_coordination_statistics(
         "local_coord_histograms": unique_hist,
         "local_coord_contact_counts": state_contacts.astype(np.int64),
         "local_coord_state_mass": state_mass,
+        "local_coord_state_mass_sq": state_mass_sq,
+        "local_coord_state_counts": state_counts,
         "local_coord_contact_marginal_error": contact_error,
+        "local_coord_marginal_tolerance": marginal_tol,
     }
     if include_rg_joint:
         rg_edges = np.asarray(rg_edges, dtype=np.float64)
@@ -2142,10 +2182,13 @@ def build_local_coordination_statistics(
         expected_rg /= expected_rg.sum()
         state_error = float(np.max(np.abs(state_marginal - state_mass)))
         rg_error = float(np.max(np.abs(rg_marginal - expected_rg)))
-        if state_error > 1e-12 or rg_error > 1e-12:
+        if state_error > marginal_tol or rg_error > marginal_tol:
             raise RuntimeError(
-                "sparse local coordination/Rg joint lost marginal mass: "
-                f"state error={state_error:.3e}, Rg error={rg_error:.3e}"
+                "sparse local coordination/Rg joint disagrees with its marginals "
+                "beyond accumulation roundoff: "
+                f"state error={state_error:.3e}, Rg error={rg_error:.3e}, "
+                f"tolerance={marginal_tol:.3e}, n_samples={contacts.size}, "
+                f"n_states={unique_hist.shape[0]}"
             )
         out.update(
             local_coord_rg_state_index=rg_state_index.astype(np.int64),
