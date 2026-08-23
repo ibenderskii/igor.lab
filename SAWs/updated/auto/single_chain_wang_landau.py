@@ -82,6 +82,7 @@ from target_support import (
     CONTACT_OFFSETS,
     flat_level,
     load_target_contact_support,
+    restrict_to_window,
     support_report,
     tail_mass_above,
 )
@@ -654,6 +655,149 @@ def _save_checkpoint(
             temporary.unlink()
 
 
+def _rng_state_to_arrays(state: Tuple[Any, ...]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split ``random.Random.getstate()`` into pickle-free numeric arrays.
+
+    The state is ``(version, tuple of 625 ints, gauss_next)``.  Checkpoints load
+    with ``allow_pickle=False``, so the tuple is stored as ``uint32`` and the
+    optional ``gauss_next`` as a float with NaN standing for ``None``.
+    """
+    version, keys, gauss_next = state
+    return (
+        np.array(version, dtype=np.int64),
+        np.asarray(keys, dtype=np.uint32),
+        np.array(math.nan if gauss_next is None else gauss_next, dtype=np.float64),
+    )
+
+
+def _rng_state_from_arrays(version: Any, keys: Any, gauss_next: Any) -> Tuple[Any, ...]:
+    """Rebuild a ``random.Random`` state from ``_rng_state_to_arrays`` output."""
+    gauss_value = float(gauss_next)
+    return (
+        int(version),
+        tuple(int(value) for value in np.asarray(keys, dtype=np.uint32)),
+        None if math.isnan(gauss_value) else gauss_value,
+    )
+
+
+def production_checkpoint_path(stem: Path, worker_id: int) -> Path:
+    """Return the per-worker production checkpoint file for a checkpoint stem."""
+    stem = Path(stem)
+    return stem.with_name(f"{stem.stem}_prod_w{worker_id}.npz")
+
+
+def _save_production_checkpoint(
+    path: Path,
+    *,
+    worker_id: int,
+    n_beads: int,
+    m_min: int,
+    m_max: int,
+    log_g: np.ndarray,
+    tier: np.ndarray,
+    chain: Sequence[Vec],
+    contact: int,
+    steps_done: int,
+    accepted: int,
+    geometrically_valid: int,
+    contacts: Sequence[int],
+    radii: Sequence[float],
+    bends: Sequence[int],
+    tracker: RoundTripCounter,
+    rng_state: Tuple[Any, ...],
+) -> None:
+    """Write one worker's production state atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rng_version, rng_keys, rng_gauss = _rng_state_to_arrays(rng_state)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".npz", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        np.savez_compressed(
+            temporary,
+            checkpoint_version=np.array(1, dtype=np.int64),
+            worker_id=np.array(worker_id, dtype=np.int64),
+            N=np.array(n_beads, dtype=np.int64),
+            m_min=np.array(m_min, dtype=np.int64),
+            m_max=np.array(m_max, dtype=np.int64),
+            log_g=np.asarray(log_g, dtype=np.float64),
+            wl_tier=np.asarray(tier, dtype=np.int8),
+            chain=np.asarray(chain, dtype=np.int64),
+            contact=np.array(contact, dtype=np.int64),
+            steps_done=np.array(steps_done, dtype=np.int64),
+            accepted_moves=np.array(accepted, dtype=np.int64),
+            geometrically_valid_moves=np.array(geometrically_valid, dtype=np.int64),
+            contact_samples=np.asarray(contacts, dtype=np.int64),
+            rg_samples=np.asarray(radii, dtype=np.float64),
+            bend_samples=np.asarray(bends, dtype=np.int64),
+            round_trip_phase=np.array(tracker.phase, dtype=np.int64),
+            round_trips=np.array(tracker.round_trips, dtype=np.int64),
+            rng_version=rng_version,
+            rng_keys=rng_keys,
+            rng_gauss_next=rng_gauss,
+        )
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _load_production_checkpoint(
+    path: Path,
+    *,
+    n_beads: int,
+    m_min: int,
+    m_max: int,
+    log_g: np.ndarray,
+    tier: np.ndarray,
+) -> Dict[str, Any]:
+    """Load one worker's production state, refusing any run mismatch.
+
+    A resumed chain restarts its random stream from the saved state, so it is
+    statistically valid but not a bitwise continuation, exactly as for a resumed
+    WL stage.
+    """
+    with np.load(path, allow_pickle=False) as saved:
+        saved_window = (int(saved["N"]), int(saved["m_min"]), int(saved["m_max"]))
+        if saved_window != (n_beads, m_min, m_max):
+            raise ValueError(
+                "production checkpoint N/contact window does not match the "
+                f"requested run: saved={saved_window}, "
+                f"requested={(n_beads, m_min, m_max)}"
+            )
+        if not np.array_equal(np.asarray(saved["log_g"], dtype=np.float64), log_g):
+            raise ValueError(
+                "production checkpoint log_g does not match the frozen weights of "
+                "the requested run"
+            )
+        if not np.array_equal(np.asarray(saved["wl_tier"], dtype=np.int8), tier):
+            raise ValueError(
+                "production checkpoint contact tiers do not match the requested run"
+            )
+        chain = [tuple(map(int, row)) for row in np.asarray(saved["chain"])]
+        saved_contact = int(saved["contact"])
+        state = {
+            "chain": chain,
+            "contact": saved_contact,
+            "steps_done": int(saved["steps_done"]),
+            "accepted": int(saved["accepted_moves"]),
+            "geometrically_valid": int(saved["geometrically_valid_moves"]),
+            "contacts": [int(value) for value in np.asarray(saved["contact_samples"])],
+            "radii": [float(value) for value in np.asarray(saved["rg_samples"])],
+            "bends": [int(value) for value in np.asarray(saved["bend_samples"])],
+            "round_trip_phase": int(saved["round_trip_phase"]),
+            "round_trips": int(saved["round_trips"]),
+            "rng_state": _rng_state_from_arrays(
+                saved["rng_version"], saved["rng_keys"], saved["rng_gauss_next"]
+            ),
+        }
+    validate_chain(chain)
+    if contact_count(chain, set(chain)) != saved_contact:
+        raise ValueError(
+            "production checkpoint contact count disagrees with its stored chain"
+        )
+    return state
+
+
 GEOMETRIC_CONTACT_MAXIMA = {
     # Exact maxima for the chain lengths used by this project.  Each is attained
     # by a compact cubic-lattice shape with a Hamiltonian path.
@@ -676,6 +820,63 @@ def contact_upper_bound(n_beads: int) -> int:
 def geometric_contact_maximum(n_beads: int) -> Optional[int]:
     """Return the verified exact contact maximum, when one is encoded."""
     return GEOMETRIC_CONTACT_MAXIMA.get(n_beads)
+
+
+# Optimal (maximally compact) bounding boxes, from an exact MILP over induced
+# edges plus a Hamiltonian-path check.  Volume may exceed N; the snake is
+# truncated to N sites and the resulting contact count is asserted, never
+# assumed.
+COMPACT_SEED_BOXES = {30: (2, 3, 5), 44: (3, 3, 5), 60: (3, 4, 5)}
+
+
+def _boustrophedon(dims: Tuple[int, int, int]) -> List[Vec]:
+    """Hamiltonian path through a box, as a list of lattice sites.
+
+    Requires an odd extent in the middle axis position, otherwise the
+    layer-to-layer step is not a nearest-neighbour move.  Every optimal box
+    here contains a 5, so an odd extent can always be permuted into place.
+    """
+    odd = [t for t in range(3) if dims[t] % 2 == 1]
+    if not odd:
+        raise ValueError(f"no odd extent in box {dims}; snake is not a path")
+    mid = odd[0]
+    rest = [t for t in range(3) if t != mid]
+    perm = (rest[0], mid, rest[1])
+    a, b, c = dims[perm[0]], dims[perm[1]], dims[perm[2]]
+    path: List[Vec] = []
+    for i in range(a):
+        for jj in range(b):
+            j = jj if i % 2 == 0 else b - 1 - jj
+            for kk in range(c):
+                k = kk if (i + jj) % 2 == 0 else c - 1 - kk
+                cell = [0, 0, 0]
+                cell[perm[0]] = i
+                cell[perm[1]] = j
+                cell[perm[2]] = k
+                path.append(tuple(cell))
+    return path
+
+
+def compact_seed_chain(n_beads: int) -> List[Vec]:
+    """Return a SAW of n_beads with exactly the geometric maximum contacts."""
+    box = COMPACT_SEED_BOXES.get(n_beads)
+    if box is None:
+        raise ValueError(
+            f"no verified compact box encoded for N={n_beads}; supply one only "
+            "after an independent exact-maximum verification"
+        )
+    if box[0] * box[1] * box[2] < n_beads:
+        raise ValueError(f"box {box} cannot hold {n_beads} beads")
+    chain = _boustrophedon(box)[:n_beads]
+    validate_chain(chain)
+    contacts = contact_count(chain, set(chain))
+    expected = geometric_contact_maximum(n_beads)
+    if expected is not None and contacts != expected:
+        raise RuntimeError(
+            f"compact seed for N={n_beads} has m={contacts}, expected the "
+            f"verified geometric maximum {expected}"
+        )
+    return chain
 
 
 def report_contact_upper_bound(args: argparse.Namespace) -> int:
@@ -859,6 +1060,72 @@ def _report_cap_reconciliation(
         )
 
 
+PRODUCTION_PROBE_STEPS = 20_000
+
+
+def _report_production_budget(
+    *,
+    chain: Sequence[Vec],
+    log_g: np.ndarray,
+    m_min: int,
+    tier: np.ndarray,
+    steps_per_worker: int,
+    n_workers: int,
+    pull_move_weight: float,
+    seed: int,
+    max_seconds: float,
+    probe_steps: int = PRODUCTION_PROBE_STEPS,
+) -> float:
+    """Measure the frozen-weight step rate and project the production budget.
+
+    The learning phase reports its binding cap through
+    ``_report_cap_reconciliation``; production had no equivalent, so a wall
+    clock far beyond the partition limit was only discoverable after the run had
+    already been killed.  This runs a short throwaway burst on the frozen
+    ``log_g`` and refuses to launch when the projection exceeds
+    ``--production_max_seconds``.  Returns the measured steps per second.
+    """
+    _, included_high = _included_limits(tier, m_min)
+    probe_chain = [tuple(site) for site in chain]
+    occupied = set(probe_chain)
+    contact = contact_count(probe_chain, occupied)
+    rng = random.Random(seed)
+    probe = max(1, min(probe_steps, steps_per_worker))
+    t0 = time.time()
+    for _ in range(probe):
+        probe_chain, occupied, contact, _, _ = metropolis_step(
+            probe_chain, occupied, contact, log_g, m_min, included_high, rng,
+            pull_move_weight,
+        )
+    elapsed = time.time() - t0
+    if elapsed <= 0.0:
+        return math.inf
+    rate = probe / elapsed
+    per_worker_seconds = steps_per_worker / rate
+    core_seconds = n_workers * per_worker_seconds
+    print(
+        f"[production] measured rate={rate:.0f} steps/s over {probe} probe "
+        f"steps; --steps_per_worker={steps_per_worker:.3g} projects about "
+        f"{per_worker_seconds / 3600.0:.1f} h per worker "
+        f"({per_worker_seconds:.3g} s), {core_seconds / 3600.0:.1f} core-hours "
+        f"over {n_workers} parallel workers",
+        flush=True,
+    )
+    if per_worker_seconds > max_seconds:
+        fitting = int(max_seconds * rate)
+        raise RuntimeError(
+            f"projected per-worker production wall clock "
+            f"{per_worker_seconds:.3g} s ({per_worker_seconds / 3600.0:.1f} h) "
+            f"exceeds --production_max_seconds={max_seconds:.6g} "
+            f"({max_seconds / 3600.0:.1f} h): at the measured {rate:.0f} steps/s "
+            f"only --steps_per_worker={fitting} would fit. Neither value has "
+            "been changed; production was not launched. Use "
+            "--production_checkpoint to run the full budget across several "
+            "invocations instead of shortening it"
+        )
+    return rate
+
+
 def one_over_t_trigger(
     log_f: float, inverse_time: float, stage_steps: int, stall_steps: int
 ) -> Tuple[bool, str]:
@@ -945,6 +1212,7 @@ def learn_log_density(
     stage_stall_steps: int = 50_000_000,
     pull_move_weight: float = 0.0,
     checkpoint_every_seconds: float = 1800.0,
+    init: str = "rod",
     tier: Optional[np.ndarray] = None,
     checkpoint: Optional[Path] = None,
     resume_checkpoint: Optional[Path] = None,
@@ -989,9 +1257,14 @@ def learn_log_density(
         raise ValueError("WL time controls must be positive")
     if not 0.0 <= pull_move_weight <= 1.0:
         raise ValueError("pull_move_weight must lie in [0, 1]")
+    if init not in {"rod", "compact"}:
+        raise ValueError("init must be 'rod' or 'compact'")
 
     if resume_checkpoint is None:
-        chain: List[Vec] = [(i, 0, 0) for i in range(n_beads)]
+        chain: List[Vec] = (
+            compact_seed_chain(n_beads) if init == "compact"
+            else [(i, 0, 0) for i in range(n_beads)]
+        )
         log_g = np.zeros(m_max - m_min + 1, dtype=np.float64)
         log_f = float(initial_log_f)
         stages_completed = 0
@@ -1094,9 +1367,18 @@ def learn_log_density(
     occupied = set(chain)
     contact = contact_count(chain, occupied)
     if not (m_min <= contact <= included_high):
+        # The compact seed sits at the exact geometric maximum by construction,
+        # so it lands outside the window whenever the operator has narrowed the
+        # ceiling below it -- a lowered --m_max, or a declared truncation.
+        detail = (
+            " The compact initializer starts at the geometric maximum, which is "
+            f"above the included ceiling {included_high} here; use --wl_init rod "
+            "for a narrowed window."
+            if init == "compact" and resume_checkpoint is None else ""
+        )
         raise ValueError(
             "initial/checkpoint chain has "
-            f"m={contact}, outside [{m_min}, {included_high}]"
+            f"m={contact}, outside [{m_min}, {included_high}]." + detail
         )
     if tier[contact - m_min] == TIER_EXCLUDED:
         raise ValueError(f"initial/checkpoint chain is at excluded level m={contact}")
@@ -1494,33 +1776,88 @@ def run_production_chain(
     progress: bool = True,
     tier: Optional[np.ndarray] = None,
     pull_move_weight: float = 0.0,
+    checkpoint_path: Optional[Path] = None,
+    checkpoint_every_seconds: float = 1800.0,
+    resume_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    rng = random.Random(seed)
-    chain = [tuple(site) for site in initial_chain]
-    occupied = set(chain)
-    contact = contact_count(chain, occupied)
+    if checkpoint_every_seconds <= 0.0:
+        raise ValueError("checkpoint_every_seconds must be positive")
     if tier is None:
         tier = np.full(log_g.size, TIER_FLAT, dtype=np.int8)
     if log_g.shape != (m_max - m_min + 1,):
         raise ValueError("log_g shape does not match [m_min, m_max]")
     tier = _validate_tier(tier, m_max - m_min + 1)
     included_low, included_high = _included_limits(tier, m_min)
+
+    n_beads = len(initial_chain)
+    rng = random.Random(seed)
+    chain = [tuple(site) for site in initial_chain]
+    steps_done = 0
+    accepted = 0
+    geometrically_valid = 0
+    contacts: List[int] = []
+    radii: List[float] = []
+    bends: List[int] = []
+    tracker = RoundTripCounter(included_low, included_high)
+
+    if resume_path is not None:
+        state = _load_production_checkpoint(
+            resume_path,
+            n_beads=n_beads,
+            m_min=m_min,
+            m_max=m_max,
+            log_g=log_g,
+            tier=tier,
+        )
+        chain = state["chain"]
+        steps_done = state["steps_done"]
+        accepted = state["accepted"]
+        geometrically_valid = state["geometrically_valid"]
+        contacts = state["contacts"]
+        radii = state["radii"]
+        bends = state["bends"]
+        tracker.phase = state["round_trip_phase"]
+        tracker.round_trips = state["round_trips"]
+        rng.setstate(state["rng_state"])
+
+    occupied = set(chain)
+    contact = contact_count(chain, occupied)
     if tier[contact - m_min] == TIER_EXCLUDED:
         raise RuntimeError(
             f"production worker {worker_id} started in excluded contact level "
             f"m={contact}"
         )
+    # Burn-in is measured against the total step budget, so a resumed worker
+    # does not re-burn and discard samples it has already earned.
     burn_steps = int(round(burnin * steps))
-    contacts: List[int] = []
-    radii: List[float] = []
-    bends: List[int] = []
-    accepted = 0
-    geometrically_valid = 0
-    tracker = RoundTripCounter(included_low, included_high)
     t0 = time.time()
+    last_checkpoint_time = t0
     progress_mark = max(1, steps // 10)
 
-    for step in range(1, steps + 1):
+    def checkpoint_now(step: int) -> None:
+        if checkpoint_path is None:
+            return
+        _save_production_checkpoint(
+            checkpoint_path,
+            worker_id=worker_id,
+            n_beads=n_beads,
+            m_min=m_min,
+            m_max=m_max,
+            log_g=log_g,
+            tier=tier,
+            chain=chain,
+            contact=contact,
+            steps_done=step,
+            accepted=accepted,
+            geometrically_valid=geometrically_valid,
+            contacts=contacts,
+            radii=radii,
+            bends=bends,
+            tracker=tracker,
+            rng_state=rng.getstate(),
+        )
+
+    for step in range(steps_done + 1, steps + 1):
         chain, occupied, contact, valid, was_accepted = metropolis_step(
             chain, occupied, contact, log_g, m_min, included_high, rng,
             pull_move_weight,
@@ -1548,6 +1885,13 @@ def run_production_chain(
                 f"round_trips={tracker.round_trips}",
                 flush=True,
             )
+        if (
+            checkpoint_path is not None
+            and time.time() - last_checkpoint_time >= checkpoint_every_seconds
+        ):
+            checkpoint_now(step)
+            last_checkpoint_time = time.time()
+    checkpoint_now(steps)
 
     return {
         "worker_id": worker_id,
@@ -2469,6 +2813,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="target-tail threshold for explicit truncation; 0 keeps the full window",
     )
     parser.add_argument(
+        "--flat_tail_scope", choices=("full", "in_window"), default="full",
+        help="target used when deriving m_flat from --flat_tail_threshold. "
+             "'full' measures the tail against the whole molecular target, "
+             "including mass above m_max that no lattice level can represent. "
+             "'in_window' renormalises to m <= m_max first, so the flat tier is "
+             "not made maximally strict by a remainder it cannot satisfy. This "
+             "changes tier boundaries and therefore needs a deliberate "
+             "sign-off; --cover_tail_threshold is unaffected, since declared "
+             "truncation must report omitted mass against the full target",
+    )
+    parser.add_argument(
         "--target_npz", type=str, default=None,
         help="molecular REMD target used to derive contact tiers",
     )
@@ -2523,6 +2878,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
              "used before pull moves existed, bit for bit",
     )
     parser.add_argument(
+        "--wl_init", choices=("rod", "compact"), default="rod",
+        help="initial learning conformation. 'rod' is the straight chain. "
+             "'compact' seeds a boustrophedon snake through the verified "
+             "optimal bounding box, which starts at the exact geometric m_max "
+             "and removes the search problem of reaching the compact end from "
+             "the rod. Recommended for N=44 and N=60; it does not affect the "
+             "resume path, which never re-seeds",
+    )
+    parser.add_argument(
         "--checkpoint_every_seconds", type=float, default=1800.0,
         help="checkpoint timer within a WL stage",
     )
@@ -2542,6 +2906,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--resume_checkpoint", type=str, default=None,
         help="resume DOS learning from a checkpoint (histogram and RNG stream restart)",
+    )
+    parser.add_argument(
+        "--production_checkpoint", type=str, default=None,
+        help="checkpoint stem for the fixed-weight production phase; worker i "
+             "writes {stem}_prod_w{i}.npz periodically",
+    )
+    parser.add_argument(
+        "--resume_production_checkpoint", type=str, default=None,
+        help="resume every production worker from {stem}_prod_w{i}.npz "
+             "(sample arrays and RNG state restart from the saved state)",
+    )
+    parser.add_argument(
+        "--production_max_seconds", type=float, default=math.inf,
+        help="refuse to launch production when the measured-throughput "
+             "projection of the per-worker wall clock exceeds this; the "
+             "default never refuses",
     )
     parser.add_argument(
         "--min_production_round_trips", type=int, default=1,
@@ -2621,14 +3001,27 @@ def resolve_contact_tiers(args: argparse.Namespace) -> Dict[str, Any]:
     elif explicit_target and not target_path.exists():
         raise FileNotFoundError(f"target REMD NPZ does not exist: {target_path}")
 
+    # The flat tier answers "where does the target still have mass a lattice
+    # level can hold?".  Under 'in_window' the target is renormalised to
+    # m <= m_max first, so the unsatisfiable remainder above the geometric
+    # maximum -- already reported by support_report -- does not also drive
+    # m_flat upward.
+    flat_target = target
+    if target is not None and args.flat_tail_scope == "in_window":
+        flat_target = restrict_to_window(target, args.m_max)
+
     if args.m_flat is not None:
         m_flat = int(args.m_flat)
-    elif target is not None:
-        m_flat = flat_level(target, args.flat_tail_threshold, args.m_max)
-        if not tail_mass_above(target, m_flat) < args.flat_tail_threshold:
+    elif flat_target is not None:
+        m_flat = flat_level(flat_target, args.flat_tail_threshold, args.m_max)
+        clamp_tail = tail_mass_above(flat_target, m_flat)
+        if not clamp_tail < args.flat_tail_threshold:
             print(
                 "WARNING: the requested flat-tail threshold is not reached before "
-                f"the geometric maximum; m_flat is clamped to {args.m_max}.",
+                f"the geometric maximum; m_flat is clamped to {args.m_max}. The "
+                f"worst-temperature {args.flat_tail_scope} tail above m={m_flat} "
+                f"is {clamp_tail:.6g} against --flat_tail_threshold="
+                f"{args.flat_tail_threshold:.6g}.",
                 flush=True,
             )
     else:
@@ -2737,6 +3130,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("WL visit/check/step controls must be positive")
     if args.wl_max_seconds <= 0.0 or args.checkpoint_every_seconds <= 0.0:
         raise ValueError("WL time controls must be positive")
+    if args.production_max_seconds <= 0.0:
+        raise ValueError("--production_max_seconds must be positive")
     if not 0.0 < args.flat_tail_threshold < 1.0:
         raise ValueError("--flat_tail_threshold must lie in (0,1)")
     if not 0.0 <= args.cover_tail_threshold < 1.0:
@@ -2811,6 +3206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stage_stall_steps=args.wl_stage_stall_steps,
         pull_move_weight=args.pull_move_weight,
         checkpoint_every_seconds=args.checkpoint_every_seconds,
+        init=args.wl_init,
         tier=tier,
         checkpoint=checkpoint,
         resume_checkpoint=resume,
@@ -2835,6 +3231,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     worker_seeds = [args.base_seed + i for i in range(args.n_workers)]
     print("=== Frozen-weight production ===", flush=True)
+    production_steps_per_second = _report_production_budget(
+        chain=learned["chain"],
+        log_g=learned["log_g"],
+        m_min=args.m_min,
+        tier=tier,
+        steps_per_worker=args.steps_per_worker,
+        n_workers=args.n_workers,
+        pull_move_weight=args.pull_move_weight,
+        seed=args.base_seed + 20_000_003,
+        max_seconds=args.production_max_seconds,
+    )
+    production_checkpoint = (
+        Path(args.production_checkpoint) if args.production_checkpoint else None
+    )
+    production_resume = (
+        Path(args.resume_production_checkpoint)
+        if args.resume_production_checkpoint else None
+    )
     t0 = time.time()
     results: List[Dict[str, Any]] = []
     with ProcessPoolExecutor(max_workers=args.n_workers) as executor:
@@ -2853,6 +3267,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 True,
                 tier,
                 args.pull_move_weight,
+                (
+                    production_checkpoint_path(production_checkpoint, i)
+                    if production_checkpoint is not None else None
+                ),
+                args.checkpoint_every_seconds,
+                (
+                    production_checkpoint_path(production_resume, i)
+                    if production_resume is not None else None
+                ),
             )
             for i in range(args.n_workers)
         ]
@@ -2986,6 +3409,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wl_max_seconds=float(args.wl_max_seconds),
         wl_max_steps_per_stage=int(args.wl_max_steps_per_stage),
         wl_schedule=str(args.wl_schedule),
+        wl_init=str(args.wl_init),
         wl_pull_move_weight=float(args.pull_move_weight),
         checkpoint_every_seconds=float(args.checkpoint_every_seconds),
         wl_learning_steps=int(learned["attempted_steps"]),
@@ -3013,6 +3437,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wl_log_g_spread_reference=float(learned["log_g_spread_reference"]),
         wl_stages_completed=int(learned["stages_completed"]),
         wl_stage_records=np.asarray(learned["stage_records"]),
+        production_steps_per_second=float(production_steps_per_second),
+        production_max_seconds=float(args.production_max_seconds),
+        production_resumed=bool(args.resume_production_checkpoint),
         production_geometrically_valid_per_worker=valid_per_worker,
         production_round_trips_per_worker=np.asarray(
             [result["round_trips"] for result in results], dtype=np.int64
@@ -3030,6 +3457,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         wl_active_levels=np.asarray(learned["active"], dtype=bool),
         m_flat=int(args.m_flat), m_cover=int(args.m_cover),
         flat_tail_threshold=float(args.flat_tail_threshold),
+        flat_tail_scope=str(args.flat_tail_scope),
         cover_tail_threshold=float(args.cover_tail_threshold),
         target_support_npz=str(tier_info["target_path"]),
         declared_truncation=bool(tier_info["declared_truncation"]),

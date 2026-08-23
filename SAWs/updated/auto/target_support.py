@@ -74,6 +74,35 @@ def load_target_contact_support(
     )
 
 
+def restrict_to_window(
+    support: TargetContactSupport, m_max: int
+) -> TargetContactSupport:
+    """Return the target renormalized to the lattice-representable window.
+
+    Target mass above ``m_max`` sits at contact numbers the lattice cannot
+    realise at all, so a tail measured against the full target charges the flat
+    tier for a remainder no contact level can hold.  ``support_report``
+    already reports that out-of-window mass separately, so counting it in the
+    tail counts it twice.
+    """
+    keep = support.m_axis <= float(m_max) + 0.5
+    if not np.any(keep):
+        raise ValueError(f"the target has no mass at or below m_max={m_max}")
+    restricted = support.P[:, keep]
+    row_sums = restricted.sum(axis=1)
+    if np.any(row_sums <= 0.0):
+        bad = np.flatnonzero(row_sums <= 0.0)
+        raise ValueError(
+            f"restricting to m <= {m_max} leaves zero-mass temperature rows: "
+            f"{bad.tolist()}"
+        )
+    return TargetContactSupport(
+        temps=support.temps.copy(),
+        m_axis=support.m_axis[keep].copy(),
+        P=restricted / row_sums[:, None],
+    )
+
+
 def _tail_by_temperature(support: TargetContactSupport, m: int) -> np.ndarray:
     return support.P[:, support.m_axis > float(m) + 0.5].sum(axis=1)
 

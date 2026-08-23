@@ -159,6 +159,42 @@ factor, and cumulative diagnostics.  A resumed stage restarts its flatness
 histogram and random-number stream, which is statistically valid but not a
 bitwise continuation.
 
+#### Learning initializer
+
+`--wl_init` selects the starting conformation.  The default `rod` is the
+straight chain `[(i,0,0)]`, which is what every earlier run and every golden
+test uses.
+
+`--wl_init compact` instead seeds a boustrophedon snake through the verified
+optimal bounding box, which starts the learner at the exact geometric `m_max`.
+This exists because reaching the compact end of the window from the rod is a
+*search* problem, not a sampling one, and at `N=60` the search does not
+succeed.  The reported probe plateaus at `m=70` after 300,000 steps at
+`log_f=1` and never reaches 71 through 74; an independent repeat here, same
+budget and `--pull_move_weight 0`, got no further than `m=60`, first reached at
+stage step 142,977.  Either way stage 1 never completes and the run hard-fails
+before any refinement.  With the initializer in place the same configuration
+reports `range=True` and `highest_m=74` at the very first check, first reached
+at stage step 0.
+
+The construction is exact, not heuristic.  `m = e(occupied site set) - (N-1)`,
+so any Hamiltonian path on an optimal site set realises `m_max`; the snake is
+such a path provided an odd extent sits in the middle axis position, which
+`_boustrophedon` requires explicitly.  Boxes are encoded only for `N=30`, `44`,
+and `60` (`2x3x5`, `3x3x5`, `3x4x5`); any other chain length is refused rather
+than guessed, and the realised contact count is asserted against the encoded
+geometric maximum on every call, never assumed.  Recommended for `N=44` and
+`N=60`.
+
+Two limits.  The seed sits at `m_max` by construction, so it is out of window
+whenever the ceiling has been narrowed — a lowered `--m_max`, or a declared
+truncation — and learning then refuses to start and names the initializer.  And
+the resume path never re-seeds: `--wl_init` applies only to a fresh run.
+
+Starting *at* the compact end is not the same as being able to *return* to it
+once the bias has built up.  The initializer removes the search problem; pull
+moves remain what makes the compact end re-reachable afterwards.
+
 ### Phase B: fixed-weight production
 
 Freeze `log_g_hat`.  Run independent production chains with unique seeds, a
@@ -184,6 +220,61 @@ This estimator is consistent even when `log_g_hat` is imperfect, because the
 same frozen bias used in production is removed explicitly.  DOS accuracy affects
 mixing and variance, not the limiting target measure.
 
+#### Production budget gate
+
+Learning reports which of its two caps actually binds.  Production now does the
+same before it commits anything.  Immediately before the workers are submitted,
+a short throwaway burst (20,000 steps) runs on the frozen `log_g` from the
+learned chain, and the measured rate, the projected per-worker wall clock, and
+the projected core-hours are printed.
+
+`--production_max_seconds` (default infinite, so the default never refuses)
+turns that projection into a gate: when the projected per-worker wall clock
+exceeds it, the run refuses to launch and reports the `steps_per_worker` that
+would fit.  Neither value is altered and no result is silently shortened —
+the operator chooses between a smaller budget and checkpointed resumption.
+
+At the defaults `--n_workers 12 --steps_per_worker 400000000`, and with the
+workers parallel so wall clock equals per-worker time:
+
+| N  | steps/s (pull 0.25) | per-worker wall clock |
+|----|---------------------|-----------------------|
+| 30 | 2,841               | 39.1 h                |
+| 44 | 1,673               | 66.4 h                |
+| 60 | 951                 | 116.8 h (4.9 days)    |
+
+Against a 36 h partition limit, `N=44` and `N=60` are killed mid-production
+having already paid for a successful learning phase.
+
+#### Production checkpoint and resume
+
+`--production_checkpoint STEM` makes worker `i` write `{STEM}_prod_w{i}.npz`
+every `--checkpoint_every_seconds`, and once more on completion.  Each file is
+written to a temporary name and renamed into place, so a kill mid-write cannot
+corrupt it.  `--resume_production_checkpoint STEM` restarts every worker from
+those files.
+
+Contents are plain numeric arrays, so production checkpoints load with
+`allow_pickle=False` exactly as WL checkpoints do: the chain and its contact
+count, steps completed, accepted and geometrically valid counts, the
+accumulated contact, `Rg` and bend sample arrays, the round-trip counter state,
+and the generator state.  `random.Random.getstate()` is stored as a `uint32`
+array of 625 plus two scalars, with `NaN` standing for an absent cached normal
+variate.
+
+On resume, `N`, the contact window, `log_g` and the tier array are checked
+against the current run and any mismatch is refused, mirroring the WL resume.
+Burn-in is measured against the **total** step budget rather than
+steps-this-invocation, so a resumed worker does not re-burn and discard samples
+it has already earned; this does mean the resume must be given the same
+`--steps_per_worker`, `--burnin` and `--sample_every` as the run it continues.
+
+Unlike a resumed WL stage, a resumed production worker restores the full
+generator state at a step boundary, so it *is* a bitwise continuation of the
+interrupted chain.  `tests/test_wl_production_checkpoint.py` asserts this
+directly: an interrupted-and-resumed worker reproduces the uninterrupted run's
+samples, acceptance count and round trips exactly.
+
 ## 4. Contact-window policy
 
 `m_max` must be the independently verified exact geometric contact maximum for
@@ -206,6 +297,41 @@ Tail truncation is off by default.  It is enabled only by an explicit `m_cover`
 or nonzero `cover_tail_threshold`, is printed as a declared conditional window,
 and records the omitted molecular target mass.  Its omitted athermal mass
 cannot be estimated from the truncated run itself.
+
+### Scope of the flat-tier tail
+
+`--flat_tail_scope` selects the target against which `--flat_tail_threshold` is
+measured when deriving `m_flat`.  The default `full` measures it against the
+whole molecular target, **including** mass sitting above `m_max`.
+
+That inclusion is a defect, not a conservatism.  Mass above the geometric
+maximum is at contact numbers the lattice cannot realise at all — 0.123% at the
+worst temperature for `N=60`, reaching shifted `m` near 82 against `m_max=74` —
+so no choice of `m_flat` can ever satisfy a threshold that charges for it.  The
+tail therefore never crosses, `m_flat` clamps to `m_max`, and every level
+becomes tier 2, making the flatness requirement maximally strict exactly where
+sampling is hardest.  `support_report` already reports that out-of-window mass
+separately, so counting it in the tail counts it twice.
+
+`--flat_tail_scope in_window` renormalises the target to `m <= m_max` before
+computing the tail.  Measured:
+
+| N  | `m_flat` under `full` | `m_flat` under `in_window` | coverage tier |
+|----|-----------------------|----------------------------|----------------|
+| 30 | 25                    | 25                         | unchanged      |
+| 44 | 49                    | 45                         | 46..50         |
+| 60 | clamped to 74         | 72                         | 73..74         |
+
+This is a budget and correctness improvement, not the `N=60` unblock — that is
+`--wl_init compact`.  It **changes `N=44`'s tier boundaries**, so it stays
+opt-in behind the flag and `full` remains the default pending a deliberate
+scientific sign-off.  `--cover_tail_threshold` is deliberately unaffected:
+declared truncation must report its omitted mass against the full target.
+
+The clamp warning is retained under both scopes and now prints the actual
+worst-temperature tail at the clamp point next to the threshold, so the operator
+can see how far off it is.  At `N=60` under `full` the tail is 0.0012288 against
+a threshold of 0.001 — short by 0.00023.
 
 If the requested ceiling is unreachable or an unlisted internal gap exists, the
 run stops at `wl_max_steps` and reports the deficient bins.  The user must then
@@ -273,7 +399,15 @@ out-of-range mass is never silently discarded and renormalized away.
    pull move has its inverse in the reverse catalog, that a pull-move chain
    reproduces the exact N=6 frozen-weight distribution, and that
    `--pull_move_weight 0` is bit-identical to the sampler that predates pull
-   moves.
+   moves.  `tests/test_wl_compact_seed.py` checks that each encoded compact seed
+   is a valid SAW of `N` distinct sites joined by unit steps, that it attains
+   the verified geometric maximum, that it fits inside its declared box, and
+   that an unencoded chain length or a narrowed ceiling is refused rather than
+   guessed at.  `tests/test_wl_production_checkpoint.py` round-trips the
+   generator state through an `allow_pickle=False` NPZ, checks that an
+   interrupted worker resumes as an exact continuation, that burn-in is counted
+   against the total budget, and that a mismatched `log_g` or contact window is
+   refused.
 2. **Exact small-chain validation:** enumerate every rooted six-bead 3D SAW
    (3,534 walks), run learning plus frozen production, and compare estimated
    `P(m)` and mean `Rg` with enumeration.
@@ -301,6 +435,21 @@ using the exact geometric `m_max` selected automatically for each chain length.
 Run with checkpointing, multiple fixed-weight workers, and a production length
 sufficient for repeated window round trips.  Retain the direct athermal baseline
 as an independent bulk comparison rather than replacing or deleting it.
+
+Use `--wl_init compact` for `N=44` and `N=60`; `N=60` does not complete stage 1
+from the rod at all.  Checkpoint both phases and set a production gate matched to
+the partition limit, for example against a 36 h wall:
+
+```bash
+python single_chain_wang_landau.py --N 60 --wl_init compact \
+    --checkpoint runs/n60.npz --production_checkpoint runs/n60 \
+    --production_max_seconds 129600
+```
+
+If the gate refuses, it names the `steps_per_worker` that would fit.  Prefer
+resuming the full budget over shortening it: rerun the same command with
+`--resume_production_checkpoint runs/n60` and the same
+`--steps_per_worker`, `--burnin` and `--sample_every`.
 
 Preview the complete gated workflow with:
 
@@ -360,6 +509,30 @@ intended.  From a warmed state (900k steps, spread 1428 against a scale of
 500,000 without, a factor of 5.  The effect is concentrated exactly where the
 argument for pull moves predicts: the first hit of `m=29` falls from step
 401,013 to step 77, and of `m=28` from 53,485 to 170.
+
+At N=60 the compact initializer and pull moves address two different halves of
+the same problem, and both halves are needed.  Measured over 400,000 steps at
+`log_f=1` from `--wl_init compact`:
+
+| levels 70..74 after 400k steps | m=70 | m=71 | m=72 | m=73 | m=74 |
+|--------------------------------|------|------|------|------|------|
+| `--pull_move_weight 0.25`      | 4080 | 2545 | 0    | 2251 | 3    |
+
+Against `--pull_move_weight 0`, where all of 70 through 73 stand at zero after
+*3M* steps, this is the pull-move argument working exactly as stated: the
+initializer puts the chain at `m=74` at step 0, and pull moves are what let it
+come back after the bias has pushed it away.  `range=True` and `highest_m=74`
+hold from the first check under both weights, so range coverage alone is not
+the discriminating diagnostic here — the per-level counts are.
+
+Stage 1 still does not complete in that budget: `m=72` has no visits and `m=74`
+has three.  **`m=72` must not be read as a geometric gap on this evidence.**
+Section 4 forbids exactly that inference, and nothing in this measurement
+distinguishes an unreachable level from a level of very low density that
+400,000 steps did not resolve; a level sandwiched between two neighbours with
+thousands of visits is a reason to look harder, not a reason to exclude it.
+Excluding it would require an independent geometric verification and
+`--excluded_contact_levels`, never a finite run.
 
 #### Throughput, and the honest trade
 
