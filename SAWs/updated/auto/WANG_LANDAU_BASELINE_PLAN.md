@@ -258,7 +258,10 @@ Contents are plain numeric arrays, so production checkpoints load with
 `allow_pickle=False` exactly as WL checkpoints do: the chain and its contact
 count, steps completed, accepted and geometrically valid counts, the
 accumulated contact, `Rg` and bend sample arrays, the round-trip counter state,
-and the generator state.  `random.Random.getstate()` is stored as a `uint32`
+the per-sample nonbonded coordination histograms, and the generator state.
+Production checkpoint schema version 2 adds those histograms; a version-1
+checkpoint that already contains samples is refused because their missing local
+coordination state cannot be reconstructed. `random.Random.getstate()` is stored as a `uint32`
 array of 625 plus two scalars, with `NaN` standing for an absent cached normal
 variate.
 
@@ -371,6 +374,20 @@ The NPZ contains the athermal, reweighted versions of the existing fields:
 - `c_edges`, `rg_edges`, `rg_prob`, `crg_prob`;
 - `N`, `T`, `eps`, worker seeds and sampling controls;
 - acceptance, worker means, bend summaries, and optional raw samples.
+
+For configuration-local reweighting, every production output also contains a
+validated sparse sufficient statistic:
+
+- `local_coord_histograms`, `local_coord_contact_counts`, and
+  `local_coord_state_mass`;
+- `local_coord_rg_state_index`, `local_coord_rg_bin_index`, and
+  `local_coord_rg_joint_mass` unless `--no-joint` was requested;
+- `local_coord_schema_version = 1` and `local_coord_degree_values = [0,...,6]`.
+
+The rows satisfy `sum_k h_k=N` and `sum_k k*h_k=2*m`; their grouped mass must
+reproduce `c_prob`, and the sparse state/Rg table must reproduce both state and
+Rg marginals. These arrays are production observables only. They do not enter
+Wang-Landau learning, proposal probabilities, or acceptance decisions.
 
 The optional arrays `c_samples_resampled`, `rg_samples_resampled`, and
 `bend_samples_resampled` are systematic importance resamples and therefore

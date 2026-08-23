@@ -188,6 +188,36 @@ def contact_count(chain: Sequence[Vec], occupied: Set[Vec]) -> int:
     return count // 2
 
 
+def coordination_histogram(
+    chain: Sequence[Vec], occupied: Set[Vec]
+) -> np.ndarray:
+    """Per-bead nonbonded nearest-neighbour degree histogram for k=0..6.
+
+    Bonded predecessor/successor sites are excluded exactly as in
+    :func:`contact_count`.  The weighted degree sum is therefore twice the
+    unique nonbonded contact count.
+    """
+    histogram = np.zeros(7, dtype=np.int64)
+    n_beads = len(chain)
+    for i, site in enumerate(chain):
+        previous = chain[i - 1] if i > 0 else None
+        following = chain[i + 1] if i + 1 < n_beads else None
+        degree = 0
+        for direction in NN_VECS:
+            neighbour = add(site, direction)
+            if (
+                neighbour in occupied
+                and neighbour != previous
+                and neighbour != following
+            ):
+                degree += 1
+        histogram[degree] += 1
+    degree_sum = int(np.dot(np.arange(7, dtype=np.int64), histogram))
+    if degree_sum % 2:
+        raise RuntimeError("coordination degree sum is odd; chain is inconsistent")
+    return histogram
+
+
 def contact_delta_from_occupancy(old_occupied: Set[Vec], new_occupied: Set[Vec]) -> int:
     """Return the contact change using only sites added to or removed from occupancy.
 
@@ -705,16 +735,29 @@ def _save_production_checkpoint(
     bends: Sequence[int],
     tracker: RoundTripCounter,
     rng_state: Tuple[Any, ...],
+    coordination_histograms: Optional[Sequence[Sequence[int]]] = None,
 ) -> None:
     """Write one worker's production state atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
     rng_version, rng_keys, rng_gauss = _rng_state_to_arrays(rng_state)
+    coordination_array = np.asarray(
+        [] if coordination_histograms is None else coordination_histograms,
+        dtype=np.int64,
+    )
+    if coordination_array.size == 0:
+        coordination_array = np.empty((0, 7), dtype=np.int64)
+    if coordination_array.ndim != 2 or coordination_array.shape[1] != 7:
+        raise ValueError("checkpoint coordination histograms must have shape (S, 7)")
+    if coordination_array.shape[0] != len(contacts):
+        raise ValueError(
+            "checkpoint coordination histogram count must match contact samples"
+        )
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".npz", delete=False) as handle:
         temporary = Path(handle.name)
     try:
         np.savez_compressed(
             temporary,
-            checkpoint_version=np.array(1, dtype=np.int64),
+            checkpoint_version=np.array(2, dtype=np.int64),
             worker_id=np.array(worker_id, dtype=np.int64),
             N=np.array(n_beads, dtype=np.int64),
             m_min=np.array(m_min, dtype=np.int64),
@@ -729,6 +772,7 @@ def _save_production_checkpoint(
             contact_samples=np.asarray(contacts, dtype=np.int64),
             rg_samples=np.asarray(radii, dtype=np.float64),
             bend_samples=np.asarray(bends, dtype=np.int64),
+            coordination_histogram_samples=coordination_array,
             round_trip_phase=np.array(tracker.phase, dtype=np.int64),
             round_trips=np.array(tracker.round_trips, dtype=np.int64),
             rng_version=rng_version,
@@ -757,6 +801,12 @@ def _load_production_checkpoint(
     WL stage.
     """
     with np.load(path, allow_pickle=False) as saved:
+        checkpoint_version = int(saved["checkpoint_version"])
+        if checkpoint_version not in (1, 2):
+            raise ValueError(
+                "unsupported production checkpoint version "
+                f"{checkpoint_version}; supported versions are 1 and 2"
+            )
         saved_window = (int(saved["N"]), int(saved["m_min"]), int(saved["m_max"]))
         if saved_window != (n_beads, m_min, m_max):
             raise ValueError(
@@ -775,15 +825,36 @@ def _load_production_checkpoint(
             )
         chain = [tuple(map(int, row)) for row in np.asarray(saved["chain"])]
         saved_contact = int(saved["contact"])
+        contacts = [int(value) for value in np.asarray(saved["contact_samples"])]
+        if "coordination_histogram_samples" in saved.files:
+            coordination_histograms = np.asarray(
+                saved["coordination_histogram_samples"], dtype=np.int64
+            )
+        elif contacts:
+            raise ValueError(
+                "production checkpoint predates local coordination observables "
+                "and already contains samples; restart production from the frozen "
+                "Wang-Landau weights"
+            )
+        else:
+            coordination_histograms = np.empty((0, 7), dtype=np.int64)
+        if coordination_histograms.shape != (len(contacts), 7):
+            raise ValueError(
+                "production checkpoint coordination samples do not match contact samples"
+            )
         state = {
             "chain": chain,
             "contact": saved_contact,
             "steps_done": int(saved["steps_done"]),
             "accepted": int(saved["accepted_moves"]),
             "geometrically_valid": int(saved["geometrically_valid_moves"]),
-            "contacts": [int(value) for value in np.asarray(saved["contact_samples"])],
+            "contacts": contacts,
             "radii": [float(value) for value in np.asarray(saved["rg_samples"])],
             "bends": [int(value) for value in np.asarray(saved["bend_samples"])],
+            "coordination_histograms": [
+                row.copy() for row in coordination_histograms
+            ],
+            "checkpoint_version": checkpoint_version,
             "round_trip_phase": int(saved["round_trip_phase"]),
             "round_trips": int(saved["round_trips"]),
             "rng_state": _rng_state_from_arrays(
@@ -1798,6 +1869,7 @@ def run_production_chain(
     contacts: List[int] = []
     radii: List[float] = []
     bends: List[int] = []
+    coordination_histograms: List[np.ndarray] = []
     tracker = RoundTripCounter(included_low, included_high)
 
     if resume_path is not None:
@@ -1816,6 +1888,7 @@ def run_production_chain(
         contacts = state["contacts"]
         radii = state["radii"]
         bends = state["bends"]
+        coordination_histograms = state["coordination_histograms"]
         tracker.phase = state["round_trip_phase"]
         tracker.round_trips = state["round_trips"]
         rng.setstate(state["rng_state"])
@@ -1855,6 +1928,7 @@ def run_production_chain(
             bends=bends,
             tracker=tracker,
             rng_state=rng.getstate(),
+            coordination_histograms=coordination_histograms,
         )
 
     for step in range(steps_done + 1, steps + 1):
@@ -1877,6 +1951,12 @@ def run_production_chain(
                 contacts.append(contact)
                 radii.append(radius_of_gyration(chain))
                 bends.append(count_bends(chain))
+                histogram = coordination_histogram(chain, occupied)
+                if int(np.dot(np.arange(7), histogram)) != 2 * contact:
+                    raise RuntimeError(
+                        "coordination histogram disagrees with production contact count"
+                    )
+                coordination_histograms.append(histogram)
         if progress and step % progress_mark == 0:
             print(
                 f"[production worker {worker_id} seed={seed}] "
@@ -1899,6 +1979,9 @@ def run_production_chain(
         "contact_samples": np.asarray(contacts, dtype=np.int64),
         "rg_samples": np.asarray(radii, dtype=np.float64),
         "bend_samples": np.asarray(bends, dtype=np.int64),
+        "coordination_histogram_samples": np.asarray(
+            coordination_histograms, dtype=np.int64
+        ).reshape((-1, 7)),
         "accepted_moves": accepted,
         "geometrically_valid_moves": geometrically_valid,
         "attempted_moves": steps,
@@ -1972,6 +2055,108 @@ def blocked_contact_stderr(
     return stderr, int(batches.shape[0])
 
 
+LOCAL_COORD_SCHEMA_VERSION = 1
+
+
+def build_local_coordination_statistics(
+    coordination_histograms: np.ndarray,
+    contacts: np.ndarray,
+    radii: np.ndarray,
+    weights: np.ndarray,
+    c_prob: np.ndarray,
+    m_min: int,
+    n_beads: int,
+    rg_edges: np.ndarray,
+    include_rg_joint: bool,
+) -> Dict[str, Any]:
+    """Compress production samples into exact local-coordination fit statistics."""
+    hist_raw = np.asarray(coordination_histograms)
+    if hist_raw.shape != (contacts.size, 7):
+        raise RuntimeError(
+            "coordination histogram samples must have shape (n_samples, 7)"
+        )
+    if not np.all(np.isfinite(hist_raw)) or not np.all(hist_raw == np.rint(hist_raw)):
+        raise RuntimeError("coordination histogram samples must be finite integers")
+    hist = np.rint(hist_raw).astype(np.int64)
+    if np.any(hist < 0) or np.any(hist.sum(axis=1) != int(n_beads)):
+        raise RuntimeError(
+            "coordination histogram samples must be nonnegative and sum to N"
+        )
+    degree_sum = hist @ np.arange(7, dtype=np.int64)
+    if np.any(degree_sum % 2) or not np.array_equal(degree_sum, 2 * contacts):
+        raise RuntimeError(
+            "coordination histograms violate sum_k k*h_k = 2*m"
+        )
+    unique_hist, state_index = np.unique(hist, axis=0, return_inverse=True)
+    state_mass = np.bincount(
+        state_index, weights=weights, minlength=unique_hist.shape[0]
+    ).astype(np.float64)
+    state_mass /= state_mass.sum()
+    state_contacts = (
+        unique_hist @ np.arange(7, dtype=np.int64)
+    ) // 2
+    contact_marginal = np.bincount(
+        state_contacts - m_min, weights=state_mass, minlength=c_prob.size
+    )[:c_prob.size]
+    contact_error = float(np.max(np.abs(contact_marginal - c_prob)))
+    if contact_error > 1e-12:
+        raise RuntimeError(
+            "local coordination state masses do not reproduce P0(m): "
+            f"maximum error {contact_error:.3e}"
+        )
+    out: Dict[str, Any] = {
+        "local_coord_schema_version": np.array(
+            LOCAL_COORD_SCHEMA_VERSION, dtype=np.int64
+        ),
+        "local_coord_degree_values": np.arange(7, dtype=np.int64),
+        "local_coord_histograms": unique_hist,
+        "local_coord_contact_counts": state_contacts.astype(np.int64),
+        "local_coord_state_mass": state_mass,
+        "local_coord_contact_marginal_error": contact_error,
+    }
+    if include_rg_joint:
+        rg_edges = np.asarray(rg_edges, dtype=np.float64)
+        n_rg = rg_edges.size - 1
+        rg_index = np.searchsorted(rg_edges, radii, side="right") - 1
+        # numpy.histogram includes a value exactly equal to the last edge in the
+        # final bin; mirror that convention in the sparse representation.
+        rg_index[rg_index == n_rg] = n_rg - 1
+        if np.any(rg_index < 0) or np.any(rg_index >= n_rg):
+            raise RuntimeError("Rg sample fell outside the sparse local joint grid")
+        pair_code = state_index.astype(np.int64) * n_rg + rg_index.astype(np.int64)
+        unique_code, pair_inverse = np.unique(pair_code, return_inverse=True)
+        joint_mass = np.bincount(
+            pair_inverse, weights=weights, minlength=unique_code.size
+        ).astype(np.float64)
+        joint_mass /= joint_mass.sum()
+        rg_state_index = unique_code // n_rg
+        rg_bin_index = unique_code % n_rg
+        state_marginal = np.bincount(
+            rg_state_index, weights=joint_mass, minlength=unique_hist.shape[0]
+        )
+        rg_marginal = np.bincount(
+            rg_bin_index, weights=joint_mass, minlength=n_rg
+        )
+        expected_rg, _ = np.histogram(radii, bins=rg_edges, weights=weights)
+        expected_rg = expected_rg.astype(np.float64)
+        expected_rg /= expected_rg.sum()
+        state_error = float(np.max(np.abs(state_marginal - state_mass)))
+        rg_error = float(np.max(np.abs(rg_marginal - expected_rg)))
+        if state_error > 1e-12 or rg_error > 1e-12:
+            raise RuntimeError(
+                "sparse local coordination/Rg joint lost marginal mass: "
+                f"state error={state_error:.3e}, Rg error={rg_error:.3e}"
+            )
+        out.update(
+            local_coord_rg_state_index=rg_state_index.astype(np.int64),
+            local_coord_rg_bin_index=rg_bin_index.astype(np.int64),
+            local_coord_rg_joint_mass=joint_mass,
+            local_coord_state_marginal_error=state_error,
+            local_coord_rg_marginal_error=rg_error,
+        )
+    return out
+
+
 def build_distributions(
     contacts: np.ndarray,
     radii: np.ndarray,
@@ -1986,6 +2171,7 @@ def build_distributions(
     rg_edges: Optional[np.ndarray] = None,
     grid_source: Optional[str] = None,
     grid_search_dir: Optional[Path] = None,
+    coordination_histograms: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     if contacts.size == 0 or contacts.size != radii.size or contacts.size != bends.size:
         raise RuntimeError("production sample arrays are empty or have inconsistent lengths")
@@ -2083,7 +2269,7 @@ def build_distributions(
         marginal_m_error = float(np.max(np.abs(crg_prob.sum(axis=1) - c_prob)))
         marginal_rg_error = float(np.max(np.abs(crg_prob.sum(axis=0) - rg_prob)))
 
-    return {
+    result = {
         "weights": weights,
         "c_vals": c_vals,
         "c_prob": c_prob,
@@ -2104,6 +2290,23 @@ def build_distributions(
         "marginal_m_error": marginal_m_error,
         "marginal_rg_error": marginal_rg_error,
     }
+    if coordination_histograms is not None:
+        if n_beads is None:
+            raise ValueError(
+                "n_beads is required when coordination_histograms are supplied"
+            )
+        result.update(build_local_coordination_statistics(
+            coordination_histograms,
+            contacts,
+            radii,
+            weights,
+            c_prob,
+            m_min,
+            int(n_beads),
+            rg_edges,
+            include_rg_joint=not no_joint,
+        ))
+    return result
 
 
 def enumerate_rooted_saws(n_beads: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -2484,6 +2687,9 @@ def run_self_test() -> int:
     contacts = np.concatenate([result["contact_samples"] for result in results])
     radii = np.concatenate([result["rg_samples"] for result in results])
     bends = np.concatenate([result["bend_samples"] for result in results])
+    coordination_histograms = np.concatenate([
+        result["coordination_histogram_samples"] for result in results
+    ], axis=0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         built = build_distributions(
@@ -2496,6 +2702,7 @@ def run_self_test() -> int:
             False,
             n_beads=n_beads,
             m_cover=m_max,
+            coordination_histograms=coordination_histograms,
         )
     observed = np.zeros(m_max - m_min + 1)
     observed[built["c_vals"] - m_min] = built["c_prob"]
@@ -3293,6 +3500,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     contacts = np.concatenate([result["contact_samples"] for result in results])
     radii = np.concatenate([result["rg_samples"] for result in results])
     bends = np.concatenate([result["bend_samples"] for result in results])
+    coordination_histograms = np.concatenate([
+        result["coordination_histogram_samples"] for result in results
+    ], axis=0)
     production_counts_full = np.bincount(
         contacts - args.m_min, minlength=window.size
     )[:window.size]
@@ -3330,6 +3540,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.no_joint,
         n_beads=args.N,
         m_cover=args.m_cover,
+        coordination_histograms=coordination_histograms,
     )
     c_blocked_stderr, blocked_batch_count = blocked_contact_stderr(
         [result["contact_samples"] for result in results],
@@ -3379,7 +3590,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if key not in {"marginal_m_error", "marginal_rg_error"}
     }
     save.update(
-        N=int(args.N), T=float(args.T), eps=float(args.eps),
+        N=int(args.N), n_beads=int(args.N), n_steps=int(args.N) - 1,
+        T=float(args.T), eps=float(args.eps),
         n_workers=int(args.n_workers), steps_per_worker=int(args.steps_per_worker),
         total_attempted_steps=total_attempted, base_seed=int(args.base_seed),
         worker_seeds=np.asarray(worker_seeds, dtype=np.int64),

@@ -132,7 +132,7 @@ BFN_CHECK_T = (250.0, 300.0, 350.0)
 BFN_CHECK_TREF = 300.0
 BFN_CHECK_TSCALE = 100.0
 
-# Numeric FULL-potential cross-check grid.  b(T) cannot distinguish the three
+# Numeric FULL-potential cross-check grid.  b(T) cannot distinguish the four
 # potential families -- it is identical for hs, hs_m2_const and
 # saturating_cooperative_contact at the same (h, s) -- and kappa(T) from raw_q_fn
 # is identically zero for the linear models AND for the saturating-cooperative
@@ -157,12 +157,12 @@ QUICK_TEST_N = 20
 
 # Contract metadata compared field by field between the fitter and the sampler.
 # potential_kind / quadratic_normalization say WHAT family is being reweighted;
-# potential_normalization and m_ref pin the normalization the chain length serves
-# and the contact-number reference.  A disagreement in any of them means the two
-# scripts would be exponentiating different potentials.
+# potential_normalization and m_ref pin the state normalization and the contact
+# reference.  A disagreement means the scripts exponentiate different states.
 CONTRACT_COMPARE_KEYS = (
     "potential_kind", "quadratic_normalization",
     "potential_normalization", "m_ref",
+    "configuration_dependent", "state_observable",
 )
 
 
@@ -255,12 +255,13 @@ REQUIRED_TOP = ("target_remd", "fit_script", "remd_script", "output_root",
                 "models", "baselines")
 # Models exercised end to end by --quick-test.  This is the FULL model registry,
 # not just the linear family: the two contact-quadratic models and the
-# saturating-cooperative model carry the nonlinear-in-m code paths (per-chain
-# m^2/(2N) curvature, saturating cooperative attraction) that a linear-only
-# quick test would never reach.  Kept in registry order.
+# two saturation models carry the nonlinear/state-dependent code paths
+# (per-chain m^2/(2N) curvature, global saturation, and local degree saturation)
+# that a linear-only quick test would never reach. Kept in registry order.
 SUPPORTED_MODELS = ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3",
                     "heat_capacity", "hs_m2_const", "hs_m2_hs",
-                    "saturating_cooperative_contact")
+                    "saturating_cooperative_contact",
+                    "local_coordination_saturation")
 
 # Supported values for the fitter's newer analyses (verified against
 # fit_lattice_contact_model_2.py: build_split_schemes() and the --bootstrap-method
@@ -273,9 +274,9 @@ SUPPORTED_SPLIT_SCHEMES = (
 SUPPORTED_BOOTSTRAP_METHODS = ("temperature",)
 # Parameter names that are "extra" terms whose interval containing zero is a
 # meaningful identifiability signal (a2/a3 polynomial corrections, dCp heat
-# capacity, A0 saturating-cooperative amplitude). Used only for reporting, never
-# for fitting.  A0 is the NESTING parameter of saturating_cooperative_contact:
-# at A0 = 0 the potential collapses exactly onto the linear hs model.
+# capacity, A0 saturation amplitude). Used only for reporting, never for
+# fitting. A0 is the NESTING parameter of both saturation models: at A0 = 0
+# either potential collapses exactly onto the linear hs model.
 EXTRA_TERM_PARAMS = ("a2", "a3", "dCp", "A0")
 
 # Parameters that enter the potential ONLY multiplied by a nesting extra term.
@@ -933,6 +934,24 @@ def ufn_check_chain_lengths(runtime_chain_lengths=None) -> list:
     return sorted(n for n in lengths if n > 0)
 
 
+def ufn_check_coordination_histogram(n_beads: int, contacts: int) -> np.ndarray:
+    """Deterministic length-7 histogram satisfying sum h=N and sum k*h=2m."""
+    remaining = 2 * int(contacts)
+    if remaining < 0 or remaining > 6 * int(n_beads):
+        raise ValueError("contact count is incompatible with a cubic-lattice degree histogram")
+    hist = np.zeros(7, dtype=np.int64)
+    full, remainder = divmod(remaining, 6)
+    hist[6] = full
+    used = full
+    if remainder:
+        hist[remainder] += 1
+        used += 1
+    if used > int(n_beads):
+        raise ValueError("synthetic degree histogram uses more than N beads")
+    hist[0] += int(n_beads) - used
+    return hist
+
+
 def check_model_contracts(fit_mod, remd_mod, log: Logger,
                           runtime_chain_lengths=None) -> dict:
     """Cross-check the fitter's and the sampler's model contracts.
@@ -1034,19 +1053,36 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger,
                 f"requires_chain_length differs for {name!r}: "
                 f"fitter={fneed} remd={rneed}"
             )
-        # Full potential u(m, T; N) -- the authoritative nonlinear check.  A
+        configuration_dependent = bool(
+            fit_contract["models"][name].get("configuration_dependent", False)
+        )
+        # Full potential -- scalar u(m,T;N) for legacy models and the complete
+        # coordination state for a configuration-dependent model.
         # model that needs N is probed at every chain length; one that does not
         # keeps its single N-free pass over a representative contact grid.
-        for n_beads in (n_check if fneed else [None]):
-            m_grid = ufn_check_counts(n_beads if fneed else UFN_CHECK_N[1])
+        n_values = n_check if (fneed or configuration_dependent) else [None]
+        for n_beads in n_values:
+            probe_n = int(n_beads) if n_beads is not None else UFN_CHECK_N[1]
+            m_grid = ufn_check_counts(probe_n)
             for T in BFN_CHECK_T:
                 for m in m_grid:
-                    vf = float(fit_mod.reduced_contact_potential(
-                        m, float(T), name, probe, BFN_CHECK_TREF,
-                        BFN_CHECK_TSCALE, n_beads))
-                    vr = float(remd_mod.reduced_contact_potential(
-                        m, float(T), name, probe, BFN_CHECK_TREF,
-                        BFN_CHECK_TSCALE, n_beads))
+                    if configuration_dependent:
+                        hist = ufn_check_coordination_histogram(probe_n, m)
+                        fit_state_u = fit_mod.make_contact_state_u_fn(
+                            name, BFN_CHECK_TREF, BFN_CHECK_TSCALE, probe_n)
+                        remd_state_u = remd_mod.make_contact_state_u_fn(
+                            name, BFN_CHECK_TREF, BFN_CHECK_TSCALE, probe_n)
+                        vf = float(np.asarray(fit_state_u(
+                            probe, float(T), np.array([m]), hist[None, :]
+                        )).reshape(-1)[0])
+                        vr = float(remd_state_u(probe, float(T), m, hist))
+                    else:
+                        vf = float(fit_mod.reduced_contact_potential(
+                            m, float(T), name, probe, BFN_CHECK_TREF,
+                            BFN_CHECK_TSCALE, n_beads))
+                        vr = float(remd_mod.reduced_contact_potential(
+                            m, float(T), name, probe, BFN_CHECK_TREF,
+                            BFN_CHECK_TSCALE, n_beads))
                     if not np.isclose(vf, vr, rtol=1e-12, atol=1e-12):
                         raise ValueError(
                             f"u(m,T;N) mismatch for {name!r} at T={T}, m={m}, "
@@ -1055,12 +1091,12 @@ def check_model_contracts(fit_mod, remd_mod, log: Logger,
                     n_u_checks += 1
     kinds = sorted({fit_contract["models"][n]["potential_kind"]
                     for n in fit_models})
-    n_nonlinear = sum(
+    n_special = sum(
         1 for name in fit_models
         if fit_contract["models"][name]["potential_kind"] != "linear"
     )
     log(f"Preflight: model contract OK (api v{fit_contract['model_api_version']}, "
-        f"{len(fit_models)} models, {n_nonlinear} nonlinear in m, kinds "
+        f"{len(fit_models)} models, {n_special} nonlinear/configuration-dependent, kinds "
         f"{'/'.join(kinds)}; metadata, b(T), kappa(T) and {n_u_checks} "
         f"u(m,T;N) values equal; chain lengths checked: "
         f"{', '.join(str(n) for n in n_check)}).")
@@ -2583,7 +2619,7 @@ def nested_term_identifiability(fitted_by_param: dict, ci_by_param=None) -> dict
 
     ``NESTED_TERM_DEPENDENTS`` maps a nesting parameter to the parameters that
     enter the potential ONLY multiplied by it.  For
-    ``saturating_cooperative_contact`` that is A0 -> (q_sat,): the potential is
+    either saturation model that is A0 -> (q_sat,): the extra term is
 
         u(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],   q = m/N
 
@@ -5040,10 +5076,9 @@ def _write_synthetic_target(path: Path, temps, m_max=8, n_rg=12, h=300.0, s=1.0)
 def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers, n_beads=None):
     """Joint athermal baseline P0(m, Rg): keys c_edges, rg_edges, crg_prob.
 
-    ``n_beads`` records the chain length the baseline was generated at.  Models
-    that are nonlinear in m need it: the fitter resolves N from this key (or
-    ``--N``) to normalize m^2/(2N) and q = m/N, and refuses to fit without it.
-    Omitting it keeps the historical linear-only baseline shape.
+    ``n_beads`` records the chain length the baseline was generated at.  Scalar
+    nonlinear models use it in m^2/(2N) or q=m/N.  The local model validates it
+    against each state histogram.  Omitting it keeps the historical baseline.
     """
     c_edges = centers_to_edges(m)
     rg_edges = centers_to_edges(rg_centers)
@@ -5058,6 +5093,21 @@ def _write_synthetic_joint_baseline(path: Path, p0, m, rg_centers, n_beads=None)
     extra = {} if n_beads is None else {"n_beads": int(n_beads)}
     np.savez(path, c_edges=c_edges, rg_edges=rg_edges, crg_prob=crg,
              c_vals=np.asarray(m, dtype=int), c_prob=np.asarray(p0, dtype=float),
+             local_coord_schema_version=np.int64(1),
+             local_coord_degree_values=np.arange(7, dtype=np.int64),
+             local_coord_histograms=np.array([
+                 ufn_check_coordination_histogram(int(n_beads), int(mi))
+                 for mi in m
+             ], dtype=np.int64) if n_beads is not None else np.empty((0, 7), dtype=np.int64),
+             local_coord_contact_counts=np.asarray(m, dtype=np.int64),
+             local_coord_state_mass=np.asarray(p0, dtype=float),
+             local_coord_rg_state_index=np.repeat(
+                 np.arange(len(m), dtype=np.int64), len(rg_centers)
+             ),
+             local_coord_rg_bin_index=np.tile(
+                 np.arange(len(rg_centers), dtype=np.int64), len(m)
+             ),
+             local_coord_rg_joint_mass=crg.reshape(-1),
              **extra)
 
 
@@ -5375,8 +5425,11 @@ def _fit_robustness_unit_tests() -> None:
     assert "A0" in EXTRA_TERM_PARAMS
     for pn in ("h_b", "s_b", "A0", "q_sat", "h1", "s1", "kappa2", "h2", "s2"):
         assert pn in _RGW_PARAM_KEYS, pn
-    # The quick test must exercise all three potential families.
-    for mdl in ("hs_m2_const", "hs_m2_hs", "saturating_cooperative_contact"):
+    # The quick test must exercise every scalar and state-dependent potential family.
+    for mdl in (
+        "hs_m2_const", "hs_m2_hs", "saturating_cooperative_contact",
+        "local_coordination_saturation",
+    ):
         assert mdl in SUPPORTED_MODELS, mdl
     print("  suite quick-test contract probes + nested-term identifiability: PASSED")
 
@@ -5682,9 +5735,8 @@ def run_quick_test() -> None:
                 rg_hists=td["rg_hists"],
             )
         target = tmp / "target_Ts.npz"
-        # The runtime chain length is recorded in the baseline so the models that
-        # are nonlinear in m can resolve N for m^2/(2N) and q = m/N; it matches
-        # the REMD "N" below so the fit and the simulation share one chain length.
+        # Record runtime N for scalar nonlinear normalization and local-state
+        # validation.  It matches the REMD N below for one consistent handoff.
         _write_synthetic_joint_baseline(baseline, p0, m, rg_centers,
                                         n_beads=QUICK_TEST_N)
 
@@ -5789,7 +5841,7 @@ def run_quick_test() -> None:
             f"only {n_ok}/{len(SUPPORTED_MODELS)} REMD model runs succeeded"
         )
         print(f"  suite quick-test end-to-end ({n_ok}/{len(SUPPORTED_MODELS)} "
-              f"models simulated across all three potential families, "
+              f"models simulated across all four potential families, "
               f"Rg+plots+report): PASSED")
 
         # --- Diagnostics outputs (diagnostics enabled in the config above) --

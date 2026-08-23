@@ -1,0 +1,43 @@
+{
+  "target_remd": "remd_distributions_30mer.npz",
+  "fit_script": "fit_lattice_contact_model_2.py",
+  "remd_script": "remd_uniform_chain_2_new.py",
+  "output_root": "local_coordination_model_suite_output_30mer",
+  "models": [
+    "local_coordination_saturation"
+  ],
+  "baselines": [
+    {
+      "name": "wang_landau_local_coordination_30mer",
+      "path": "dists/single_chain_wang_landau_N30_workers12_steps400000000_seed42.npz",
+      "contact_offset": 29,
+      "rg_scale": 0.46320503312590167
+    }
+  ],
+  "fit": {
+    "loss": "js",
+    "fit_rg": true,
+    "rg_weight": 0.5,
+    "n_restarts": 8,
+    "seed": 123,
+    "plots": false
+  },
+  "remd": {
+    "N": 30,
+    "steps_per_swap": 1000,
+    "n_cycles": 5000,
+    "rg_bins": 100,
+    "burnin_frac": 0.7,
+    "n_workers": 32,
+    "seeds": [1, 2, 3, 4],
+    "plots": false,
+    "timing": false
+  },
+  "comparison": {
+    "include_rg": true,
+    "rg_weight": 0.7,
+    "temperature_tolerance": 1e-10,
+    "make_plots": true,
+    "seed_averaged_distribution_plots": true
+  }
+}

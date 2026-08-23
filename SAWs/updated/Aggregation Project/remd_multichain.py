@@ -143,7 +143,10 @@ LOCAL_MULTICHAIN_POTENTIAL_DEFINITION = (
 # contact scale is required.  hs is LINEAR, so u = b(T)*(l_i*m_intra +
 # l_e*m_inter) is well defined for independent lambdas and is exactly what the
 # three-control pilot (equal / collapse-only / association-only) needs.
-LABEL_BLIND_CONTACT_MODELS = frozenset(("saturating_cooperative_contact",))
+LABEL_BLIND_CONTACT_MODELS = frozenset((
+    "saturating_cooperative_contact",
+    "local_coordination_saturation",
+))
 
 # Multichain rule for the saturating-cooperative family:
 #   "global" (default, unchanged): u = u_contact(m_total, T; M*N).  The
@@ -152,18 +155,33 @@ LABEL_BLIND_CONTACT_MODELS = frozenset(("saturating_cooperative_contact",))
 #   "local": the cooperativity acts through each monomer's own contact degree,
 #       so it is short ranged and exactly additive over non-interacting chains.
 COOPERATIVITY_MODES = ("global", "local")
-DEFAULT_COOPERATIVITY = "global"
+DEFAULT_COOPERATIVITY = None
 
 
-def _validate_cooperativity(mode: str, model_name: str) -> str:
+def _validate_cooperativity(mode, model_name: str) -> str:
+    """Resolve the multichain cooperativity rule without changing legacy defaults.
+
+    Omitted mode means global for the historical saturation model and local for
+    local_coordination_saturation.  The new model has no global interpretation:
+    an explicit request for one is rejected instead of silently changing its
+    fitted Hamiltonian.
+    """
+    name = str(model_name)
+    if mode is None:
+        return "local" if name == "local_coordination_saturation" else "global"
     m = str(mode)
     if m not in COOPERATIVITY_MODES:
         raise ValueError(
             f"cooperativity must be one of {COOPERATIVITY_MODES}, got {mode!r}")
-    if m == "local" and str(model_name) != "saturating_cooperative_contact":
+    if name == "local_coordination_saturation" and m != "local":
         raise ValueError(
-            f"cooperativity='local' applies only to "
-            f"saturating_cooperative_contact, not {model_name!r}")
+            "local_coordination_saturation requires cooperativity='local'; "
+            "it must not be replaced by the global m/N saturation rule"
+        )
+    if m == "local" and name not in LABEL_BLIND_CONTACT_MODELS:
+        raise ValueError(
+            f"cooperativity='local' applies only to a local-capable saturation "
+            f"model, not {model_name!r}")
     return m
 
 # Scope retained by the contact-quadratic models.  The saturation model reports
@@ -181,14 +199,15 @@ def _label_blind_contact_scale(lambda_intra: float, lambda_inter: float) -> floa
     lin = float(lambda_inter)
     if li != lin:
         raise ValueError(
-            "saturating_cooperative_contact requires "
+            "label-blind saturation models require "
             "lambda_intra == lambda_inter so all contacts use one Hamiltonian")
     return li
 
 
 def _multichain_potential_definition(
-    model_name: str, cooperativity: str = DEFAULT_COOPERATIVITY,
+    model_name: str, cooperativity=DEFAULT_COOPERATIVITY,
 ) -> str:
+    cooperativity = _validate_cooperativity(cooperativity, model_name)
     if _uses_label_blind_contacts(model_name):
         if str(cooperativity) == "local":
             return LOCAL_MULTICHAIN_POTENTIAL_DEFINITION
@@ -199,7 +218,8 @@ def _multichain_potential_definition(
 
 
 def _contact_scope(model_name: str,
-                   cooperativity: str = DEFAULT_COOPERATIVITY) -> str:
+                   cooperativity=DEFAULT_COOPERATIVITY) -> str:
+    cooperativity = _validate_cooperativity(cooperativity, model_name)
     if _uses_label_blind_contacts(model_name):
         return "all_contacts_local_degree" if str(cooperativity) == "local" \
             else "all_contacts_global"
@@ -423,11 +443,11 @@ def swap_log_accept_state(
     evaluated through the shared state-aware contacts-only potential
     :func:`reduced_contact_potential_state`, so whatever nonlinear structure the
     model carries is evaluated with its authoritative scope: global total
-    contacts for saturation and per-chain intrachain contacts for the quadratic
-    family.  The fixed reduced bending penalty is
+    contacts for historical saturation, local degree state for the new model,
+    and per-chain intrachain contacts for the quadratic family. The fixed reduced bending penalty is
     temperature-independent and identical within each state, so it cancels
     exactly (kappa_bend * (n_i + n_j - n_j - n_i) = 0) and is omitted -- there is
-    a single swap rule for all three potential families.  For linear models every
+    a single swap rule for all four potential families. For linear models every
     term is bit-for-bit identical to :func:`swap_log_accept_counts`.
     """
     def u(state, T):
@@ -482,7 +502,7 @@ def attempt_swap(
     reproducibility (serial vs multiprocessing) is preserved.
 
     The generalized rule is evaluated through the shared state-aware potential
-    :func:`swap_log_accept_state`, so it is correct for all three potential
+    :func:`swap_log_accept_state`, so it is correct for all four potential
     families (for linear models it is bit-for-bit identical to the historical
     aggregate-count swap).
     """
@@ -547,10 +567,10 @@ def mc_sweep(
         A0_coop, q_sat_coop = remd.validated_saturating_params(params)
     else:
         A0_coop, q_sat_coop = 0.0, 1.0
-    # Runtime chain length for the per-chain normalization (m^2/(2N) for the
-    # quadratic family, q = m/N for the saturating one); invariant under every
-    # move, so it is read once per sweep.  Every model that is nonlinear in m
-    # scores the intra term from the moved chain's cached m_alpha; linear models
+    # Runtime chain length for per-chain m^2/(2N), global q=m/(M*N), and local
+    # degree bookkeeping.  It is invariant under every move, so it is read once
+    # per sweep.  Scalar nonlinear models score the relevant cached contact
+    # count; local coordination uses the exact changed degrees; linear models
     # keep the exact historical b*delta arithmetic (bit-for-bit).
     N = state.chain_length
     total_beads = int(state.n_chains) * int(N)
@@ -1044,6 +1064,7 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
                     fit_chain_length=None,
                     cooperativity=DEFAULT_COOPERATIVITY) -> dict:
     """Inject full model + run provenance into a distributions/summary dict."""
+    cooperativity = _validate_cooperativity(cooperativity, model_name)
     dist["schema_version"] = int(SCHEMA_VERSION)
     dist["model_api_version"] = int(MODEL_API_VERSION)
     dist["model_name"] = str(model_name)
@@ -1058,8 +1079,8 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     # per-chain-intra / linear-inter definition.
     # potential_definition is the single-chain u_contact actually sampled and
     # multichain_potential_definition is the assembled multi-chain potential;
-    # potential_normalization says what the chain length was used for ("" when it
-    # was not needed) and m_ref is the contact-number reference (0 everywhere).
+    # potential_normalization names the model's state normalization ("" for
+    # linear models) and m_ref is the contact-number reference (0 everywhere).
     spec = remd.MODEL_REGISTRY[model_name]
     dist["potential_kind"] = str(spec["potential_kind"])
     dist["quadratic_contact_scope"] = _contact_scope(model_name, cooperativity)
@@ -1071,9 +1092,13 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["potential_definition"] = str(spec["potential_definition"])
     dist["potential_normalization"] = str(spec["potential_normalization"] or "")
     dist["m_ref"] = int(spec["m_ref"])
+    dist["configuration_dependent"] = bool(spec["configuration_dependent"])
+    dist["state_observable"] = str(spec["state_observable"])
     dist["multichain_potential_definition"] = \
         _multichain_potential_definition(model_name, cooperativity)
-    if str(spec["potential_kind"]) == "saturating_cooperative":
+    if str(spec["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         # Named saturating parameters alongside the packed model_params vector,
         # mirroring the single-chain sampler's convention.
         _A0, _q_sat = remd.validated_saturating_params(model_params)
@@ -1212,8 +1237,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "bending, 0 (default) disables it.")
     ap.add_argument("--cooperativity", type=str, default=DEFAULT_COOPERATIVITY,
                     choices=list(COOPERATIVITY_MODES),
-                    help="multichain rule for saturating_cooperative_contact. "
-                         "'global' (default, unchanged) evaluates the fitted "
+                    help="multichain rule for saturation models. If omitted, "
+                         "the historical model remains global and "
+                         "local_coordination_saturation is local. 'global' "
+                         "evaluates the historical fitted "
                          "single-chain potential once at m_total with M*N beads, "
                          "which couples every contact in the box to every other. "
                          "'local' routes the cooperative term through each "
@@ -1338,6 +1365,9 @@ def main(argv=None) -> None:
     if _uses_label_blind_contacts(model_name):
         _label_blind_contact_scale(args.lambda_intra, args.lambda_inter)
     cooperativity = _validate_cooperativity(args.cooperativity, model_name)
+    # Store the resolved rule so snapshot/run-summary helpers do not serialize
+    # the argparse sentinel None.
+    args.cooperativity = cooperativity
 
     # Validate the fitted single-chain normalization.  The label-blind saturation
     # Hamiltonian uses M*N total beads at evaluation time, while N remains the
@@ -1349,8 +1379,9 @@ def main(argv=None) -> None:
     # already validated in resolve_model_params) and cross-checks any CLI value;
     # without a summary the CLI value applies (default 0.0).  kappa_bend > 0
     # enables bending; there is no separate flag.  The fit summary also carries
-    # ``fit_chain_length`` for provenance; chain-length transfer is permitted (the
-    # sampler always uses the RUNTIME N in m^2/(2N)) with a note on mismatch.
+    # ``fit_chain_length`` for provenance.  Transfer to another N is permitted:
+    # scalar nonlinear models use runtime N in their normalization, while local
+    # coordination uses q_i=k_i/2 independent of N.  A mismatch is noted below.
     fit_chain_length = None
     if fit_summary_json:
         _summary = remd.load_fit_summary_json(fit_summary_json)
@@ -1366,10 +1397,16 @@ def main(argv=None) -> None:
     _spec = remd.MODEL_REGISTRY[model_name]
     if (_spec["potential_kind"] != "linear"
             and fit_chain_length is not None and int(fit_chain_length) != int(N)):
-        print(f"Note: model {model_name} (nonlinear in m) fit at chain length "
-              f"{int(fit_chain_length)} is being run at N={int(N)}; the "
-              f"{_spec['potential_normalization'] or 'normalization'} uses the "
-              f"runtime N (chain-length transfer).")
+        if bool(_spec["configuration_dependent"]):
+            print(f"Note: model {model_name} fit at chain length "
+                  f"{int(fit_chain_length)} is being run at N={int(N)}; its "
+                  "per-monomer q_i=k_i/2 definition and fitted parameters are "
+                  "unchanged. Both chain lengths are recorded.")
+        else:
+            print(f"Note: model {model_name} (nonlinear in m) fit at chain length "
+                  f"{int(fit_chain_length)} is being run at N={int(N)}; the "
+                  f"{_spec['potential_normalization'] or 'normalization'} uses the "
+                  f"runtime N (chain-length transfer).")
     phi = M * N / L ** 3
     print(f"Multi-chain REMD: M={M} N={N} L={L} phi={phi:.4f}, {len(Ts)} lanes "
           f"T in [{Ts.min():.4g}, {Ts.max():.4g}] ({temp_source})")
@@ -1523,6 +1560,8 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
             str(spec["potential_normalization"])
             if spec["potential_normalization"] is not None else "null"),
         "m_ref": int(spec["m_ref"]),
+        "configuration_dependent": bool(spec["configuration_dependent"]),
+        "state_observable": str(spec["state_observable"]),
         "multichain_potential_definition":
             _multichain_potential_definition(model_name, args.cooperativity),
         "cooperativity": str(args.cooperativity),
@@ -1546,7 +1585,9 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         "start_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "end_time": "unknown",
     }
-    if str(spec["potential_kind"]) == "saturating_cooperative":
+    if str(spec["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         _A0, _q_sat = remd.validated_saturating_params(model_params)
         meta["A0"] = float(_A0)
         meta["q_sat"] = float(_q_sat)
@@ -1628,6 +1669,8 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "potential_definition": str(spec["potential_definition"]),
         "potential_normalization": spec["potential_normalization"],
         "m_ref": int(spec["m_ref"]),
+        "configuration_dependent": bool(spec["configuration_dependent"]),
+        "state_observable": str(spec["state_observable"]),
         "multichain_potential_definition":
             _multichain_potential_definition(model_name, cooperativity),
         "runtime_chain_length": int(N),
@@ -1671,7 +1714,9 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "git_commit": remd._git_commit(),
         "output_files": out_files,
     }
-    if str(spec["potential_kind"]) == "saturating_cooperative":
+    if str(spec["potential_kind"]) in {
+        "saturating_cooperative", "local_coordination_saturation"
+    }:
         # Named saturating parameters alongside the packed params list.
         _A0, _q_sat = remd.validated_saturating_params(model_params)
         summary["A0"] = float(_A0)

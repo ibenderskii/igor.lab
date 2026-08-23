@@ -1,9 +1,9 @@
 {
   "model_name": "multichain_lattice_aggregation",
-  "spec_revision": 4,
+  "spec_revision": 5,
   "schema_version": 4,
   "multichain_output_schema_version": 4,
-  "model_api_version": 3,
+  "model_api_version": 4,
   "description": "Minimal scientifically valid multi-chain lattice-polymer aggregation model. Extends the validated single-chain ISAW replica-exchange architecture (remd_uniform_chain_2_new.py) to M identical self-avoiding chains in a periodic cubic box, reusing the single-chain fitted contact free energy without refitting. This document is the model/software CONTRACT; it deliberately does NOT hard-code one set of runtime parameters (M, N, L, temperatures, lambda values). Those are chosen per run and recorded in each run's output metadata.",
   "spec_revision_history": [
     {
@@ -25,6 +25,11 @@
       "spec_revision": 4,
       "model_api_version": 3,
       "change": "Corrects revision 3, which incorrectly required lambda_intra == lambda_inter for hs. hs is LINEAR in the contact count, so u = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter] is an exact Hamiltonian for INDEPENDENT lambdas and reduces to the label-blind form when they are equal; forcing equality removed the (1,0) collapse-only and (0,1) association-only controls without any physical justification. Only saturating_cooperative_contact is nonlinear in m and still requires one common contact scale. Also documents the saturating model's cooperativity rule ('global', default, unchanged; or 'local', per-monomer contact degree)."
+    },
+    {
+      "spec_revision": 5,
+      "model_api_version": 4,
+      "change": "Adds local_coordination_saturation as a distinct fitted model. Its complete state is the nonbonded degree histogram h_0 through h_6 and its Hamiltonian is b(T)*m_total - A0*sum_i g(k_i), with q_i=k_i/2. It always uses local cooperativity, counts intra- and interchain neighbours identically, and requires one common contact scale. The historical saturating_cooperative_contact global default and every pre-existing Hamiltonian are unchanged."
     }
   ],
   "system": {
@@ -136,9 +141,9 @@
     "invariance": "Normalized contacts, like raw contacts, are never rescaled by rg_scale (they are counts, not lengths)."
   },
   "reduced_potential": {
-    "equation": "Linear models (hs): u(X,T) = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter] + kappa_bend*n_bend_total, with INDEPENDENT lambdas. saturating_cooperative_contact: u(X,T) = lambda_contact*u_contact(m_total,T;M*N) + kappa_bend*n_bend_total, with lambda_contact = lambda_intra = lambda_inter. Contact-quadratic models: lambda_intra*sum_alpha u_contact(m_intra_alpha,T;N) + lambda_inter*b(T)*m_inter + kappa_bend*n_bend_total.",
+    "equation": "Linear models (hs): u(X,T) = b(T)*[lambda_intra*m_intra + lambda_inter*m_inter] + kappa_bend*n_bend_total, with INDEPENDENT lambdas. saturating_cooperative_contact: u(X,T) = lambda_contact*u_contact(m_total,T;M*N) + kappa_bend*n_bend_total, with lambda_contact = lambda_intra = lambda_inter. local_coordination_saturation: u(X,T) = lambda_contact*[b(T)*m_total - A0*sum_i g(k_i)] + kappa_bend*n_bend_total, with q_i=k_i/2 and equal lambdas. Contact-quadratic models: lambda_intra*sum_alpha u_contact(m_intra_alpha,T;N) + lambda_inter*b(T)*m_inter + kappa_bend*n_bend_total.",
     "sampling_weight": "P(X | T) proportional to exp(-u(X, T))",
-    "structure": "Contact term plus a separate additive bending term. The contact term takes one of three forms according to potential_kind: a linear intra/inter split with independent lambdas, a label-blind term in m_total for the nonlinear saturating model, or the retained per-chain intrachain plus linear interchain rule for the contact-quadratic family. No term is folded into another.",
+    "structure": "Contact term plus a separate additive bending term. The contact term takes one of four forms according to potential_kind: a linear intra/inter split with independent lambdas, a label-blind term in m_total for the historical saturating model, a sum over local monomer coordination for local_coordination_saturation, or the retained per-chain intrachain plus linear interchain rule for the contact-quadratic family. No term is folded into another.",
     "linear_split_contact_term": {
       "models": [
         "hs"
@@ -175,6 +180,20 @@
         "nesting": "At A0 = 0 both modes reduce to lambda_contact*b(T)*m_total bit for bit."
       }
     },
+    "local_coordination_contact_term": {
+      "models": [
+        "local_coordination_saturation"
+      ],
+      "equation": "lambda_contact * [b(T)*m_total - A0*sum_i q_i^2/(1 + (q_i/q_sat)^2)], with q_i = k_i/2",
+      "state_observable": "nonbonded_contact_degree_histogram_0_6",
+      "degree_definition": "k_i counts nonbonded wrapped nearest-neighbour beads at monomer i. Covalent neighbours are excluded; intrachain and interchain neighbours enter identically; sum_i k_i = 2*m_total.",
+      "fit_transfer": "h_b, s_b, A0 and q_sat are loaded unchanged from the single-chain fit summary. No multichain refit or parameter rescaling is performed.",
+      "cooperativity_rule": "local is the only valid rule and is the omitted-argument default for this model. An explicit global rule is rejected because it would replace the fitted Hamiltonian with a different m_total/(M*N) model.",
+      "move_delta_rule": "lambda_contact * [b(T)*d_total - A0*delta(sum_i g(k_i))], evaluated from the beads whose local neighbourhood changed.",
+      "additivity": "The state potential is a sum of local monomer terms and is exactly additive over non-interacting chains.",
+      "nesting": "At A0 = 0 the cooperative term is skipped and the potential is exactly lambda_contact*b(T)*m_total.",
+      "contact_scale": "lambda_contact = lambda_intra = lambda_inter; unequal values are rejected because the fitted Hamiltonian is label blind."
+    },
     "contact_quadratic_legacy_rule": {
       "models": [
         "hs_m2_const",
@@ -195,7 +214,7 @@
       "scope_note": "b(T) is the FULL potential only for the linear models. For every nonlinear model b(T) is one coefficient of it; potential_definition in the run metadata is the authoritative statement of what was sampled.",
       "single_chain_consistency": "For M = 1 and unit contact scale, u reduces to the original single-chain contact potential plus bending."
     },
-    "nesting": "Each nonlinear family nests the linear one at zero extra amplitude: kappa(T) = 0 for contact_quadratic and A0 = 0 for saturating_cooperative reduce u_contact to b(T)*m. At A0 = 0 the value of q_sat has no effect on the potential at all.",
+    "nesting": "Each nonlinear family nests the linear one at zero extra amplitude: kappa(T) = 0 for contact_quadratic and A0 = 0 for either saturation model reduce u_contact to b(T)*m. At A0 = 0 the value of q_sat has no effect on the potential at all.",
     "effective_energy": {
       "definition": "effective_energy = T * u",
       "label": "temperature-dependent EFFECTIVE energy (reported for compatibility only; the reduced potential u is the canonical sampling quantity). It is NOT a temperature-independent microscopic energy."
@@ -212,7 +231,7 @@
       "meaning": "coupling multiplier on the interchain contact term b(T)*m_inter",
       "default": 1.0
     },
-    "independence": "Independent for every model whose u_contact is linear in m (hs) and for the contact-quadratic family. Only saturating_cooperative_contact requires lambda_intra == lambda_inter, because it is nonlinear in m; unequal values are rejected there. See reduced_potential.label_blindness_criterion.",
+    "independence": "Independent for every model whose u_contact is linear in m (hs) and for the contact-quadratic family. Both saturation models require lambda_intra == lambda_inter because their complete Hamiltonians are label blind; unequal values are rejected. See reduced_potential.label_blindness_criterion.",
     "note": "Equal zero values disable contact energy but leave bending in force.",
     "control_modes": {
       "full_transferability": {
@@ -223,12 +242,12 @@
       "independent_collapse": {
         "lambda_intra": 1,
         "lambda_inter": 0,
-        "meaning": "collapse-only control: interchain contacts carry no free energy. Available for hs and for the contact-quadratic models; rejected by saturating_cooperative_contact."
+        "meaning": "collapse-only control: interchain contacts carry no free energy. Available for hs and for the contact-quadratic models; rejected by both saturation models."
       },
       "interchain_attraction_only": {
         "lambda_intra": 0,
         "lambda_inter": 1,
-        "meaning": "association-only control: intrachain contacts carry no free energy. Available for hs and for the contact-quadratic models; rejected by saturating_cooperative_contact."
+        "meaning": "association-only control: intrachain contacts carry no free energy. Available for hs and for the contact-quadratic models; rejected by both saturation models."
       },
       "athermal_control": {
         "lambda_intra": 0,
@@ -240,8 +259,8 @@
   },
   "replica_exchange": {
     "swap_rule": "log_accept = u(X_i, T_i) + u(X_j, T_j) - u(X_j, T_i) - u(X_i, T_j)",
-    "swap_rule_note": "The swap evaluates the same state-aware potential as local moves. For saturating_cooperative_contact under cooperativity='global' only m_total enters and contact classification is irrelevant; for hs and the contact-quadratic models the classified counts enter through lambda_intra and lambda_inter.",
-    "bending_cancels": "The fixed reduced bending penalty is temperature-independent and identical within each state, so kappa_bend*(n_i + n_j - n_j - n_i) = 0: it cancels exactly and never enters the swap criterion. There is a single swap rule for all three potential families.",
+    "swap_rule_note": "The swap evaluates the same state-aware potential as local moves. For saturating_cooperative_contact under cooperativity='global' only m_total enters; local_coordination_saturation uses the complete degree state; for hs and the contact-quadratic models the classified counts enter through lambda_intra and lambda_inter.",
+    "bending_cancels": "The fixed reduced bending penalty is temperature-independent and identical within each state, so kappa_bend*(n_i + n_j - n_j - n_i) = 0: it cancels exactly and never enters the swap criterion. There is a single swap rule for all four potential families.",
     "temperatures": "Temperatures are fixed to lanes; complete MultiChainState objects are exchanged between adjacent lanes with even/odd alternation."
   },
   "sweep_conventions": {
@@ -527,6 +546,8 @@
     "bending_enabled",
     "bend_definition",
     "potential_kind",
+    "configuration_dependent",
+    "state_observable",
     "potential_definition",
     "potential_normalization",
     "m_ref",
@@ -536,24 +557,27 @@
     "interchain_contact_model",
     "quadratic_normalization",
     "runtime_chain_length",
-    "fit_chain_length"
+    "fit_chain_length",
+    "cooperativity"
   ],
   "potential_metadata_contract": {
     "purpose": "A run's outputs must state the Hamiltonian that was actually sampled, so a reader never has to reconstruct it from the model name.",
-    "potential_kind": "one of linear, contact_quadratic, saturating_cooperative",
-    "potential_definition": "the exact single-chain u_contact(m,T;N) that was sampled, verbatim from the model registry",
-    "multichain_potential_definition": "the exact assembled multi-chain potential: the linear intra/inter split, the label-blind saturating form (global or local cooperativity), or the retained contact-quadratic split rule",
-    "potential_normalization": "what the chain length was used for: empty for linear models, 'm^2/(2N)' for contact_quadratic, 'q = m/N' for saturating_cooperative",
-    "quadratic_normalization": "'m_chain^2/(2*N)' for contact_quadratic ONLY; empty/null for linear AND for saturating_cooperative, which has no m^2/(2N) term",
+    "potential_kind": "one of linear, contact_quadratic, saturating_cooperative, local_coordination_saturation",
+    "potential_definition": "the exact single-chain contact potential that was sampled, verbatim from the model registry; local_coordination_saturation is a function of complete state X rather than m alone",
+    "multichain_potential_definition": "the exact assembled multi-chain potential: the linear intra/inter split, historical saturation (global or optional local), required local coordination saturation, or the retained contact-quadratic split rule",
+    "potential_normalization": "what the state normalization uses: empty for linear models, 'm^2/(2N)' for contact_quadratic, 'q = m/N' for saturating_cooperative, and 'q_i = k_i/2' for local_coordination_saturation",
+    "quadratic_normalization": "'m_chain^2/(2*N)' for contact_quadratic ONLY; empty/null for linear and both saturation families, which have no m^2/(2N) term",
     "m_ref": "contact-number reference used to center q; 0 for every model, recorded explicitly rather than left implicit",
-    "nonlinear_contact_scope": "'linear_intra_inter_split' for hs; 'all_contacts_global' or 'all_contacts_local_degree' for saturating_cooperative_contact according to the cooperativity rule; 'intra_per_chain' for contact-quadratic models",
-    "interchain_contact_model": "'same_linear_coefficient_independent_lambda' for hs; 'same_single_chain_potential' for saturating_cooperative_contact; 'linear_coefficient_only' for the retained split models",
-    "runtime_chain_length": "the physical beads per chain N; the label-blind multichain definition states the M*N normalization explicitly",
+    "configuration_dependent": "true only when the Hamiltonian needs more than contact_count; local_coordination_saturation records true and all legacy models record false",
+    "state_observable": "nonbonded_contact_degree_histogram_0_6 for local_coordination_saturation; contact_count for every legacy model",
+    "nonlinear_contact_scope": "'linear_intra_inter_split' for hs; 'all_contacts_global' or 'all_contacts_local_degree' for saturating_cooperative_contact according to its rule; 'all_contacts_local_degree' for local_coordination_saturation; 'intra_per_chain' for contact-quadratic models",
+    "interchain_contact_model": "'same_linear_coefficient_independent_lambda' for hs; 'same_single_chain_potential' for both saturation models; 'linear_coefficient_only' for the retained split models",
+    "runtime_chain_length": "the physical beads per chain N; historical global saturation uses M*N explicitly, while local_coordination_saturation uses the fixed q_i=k_i/2 definition and records N as runtime provenance",
     "fit_chain_length": "the N the model was FIT at (provenance only; -1/null when not recorded)",
-    "model_specific_parameters": "Models with named domain parameters record them alongside the packed model_params vector: saturating_cooperative_contact writes A0 and q_sat.",
+    "model_specific_parameters": "Models with named domain parameters record them alongside the packed model_params vector: both saturation models write A0 and q_sat.",
     "additivity_rule": "New contract fields are ADDITIVE. Existing field names, types and values are never repurposed, so readers written against an earlier revision keep working.",
     "quadratic_contact_scope": "mirror of nonlinear_contact_scope, retained for readers written against earlier revisions",
-    "cooperativity": "'global' or 'local'; recorded on every run and always 'global' for models other than saturating_cooperative_contact"
+    "cooperativity": "'global' or 'local'; historical saturating_cooperative_contact defaults to global, local_coordination_saturation requires local, and all other models record global"
   },
   "scope_notes": [
     "This is the minimum scientifically valid multi-chain simulator to test whether the single-chain contact free energy predicts aggregation.",

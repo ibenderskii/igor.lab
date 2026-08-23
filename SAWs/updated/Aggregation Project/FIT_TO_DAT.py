@@ -769,7 +769,9 @@ def _rg_loss_sum(
 #
 #     P_model(m|T) ∝ P0(m) * exp[-u_contact(m, T; N)]
 #
-# Three potential families are supported, selected by potential_kind:
+# Three scalar-contact potential families are supported here. The shared
+# registry also advertises local_coordination_saturation, but this scalar DAT
+# workflow rejects it because a contact count alone is not sufficient state.
 #
 #   "linear"                 u = b(T) * m
 #   "contact_quadratic"      u = b(T) * m + kappa(T) * m^2/(2N)
@@ -788,13 +790,14 @@ def _rg_loss_sum(
 # raw_b_fn(params, T, Tref, Tscale) -> float
 # raw_q_fn(params, T, Tref, Tscale) -> float   (0.0 unless contact_quadratic)
 # derived_Tc(params) -> float | None  (or None if not meaningful for that model)
-# potential_kind: "linear" | "contact_quadratic" | "saturating_cooperative"
+# scalar potential_kind: "linear" | "contact_quadratic" |
+#                        "saturating_cooperative"
 # quadratic_normalization: QUADRATIC_NORMALIZATION for the contact_quadratic
 #     models, None for every other kind (it names the m^2/(2N) convention
 #     specifically, not "whatever this model divides by")
-# potential_normalization: the generic label for what the chain length is used
-#     for -- None when N is not needed, else QUADRATIC_NORMALIZATION or
-#     Q_NORMALIZATION.  This is what user-facing messages should quote.
+# potential_normalization: the generic state normalization label -- None for
+#     linear models, QUADRATIC_NORMALIZATION or Q_NORMALIZATION for scalar
+#     nonlinear models, and q_i=k_i/2 for local coordination.
 # potential_definition: the exact potential, as a string, recorded in the model
 #     contract and in every fit output so a fitted parameter can never be
 #     reinterpreted against a different convention
@@ -817,6 +820,13 @@ SATURATING_COOPERATIVE_DEFINITION = (
     "u(m,T;N) = N*[b(T)*q - A0*q^2/(1 + (q/q_sat)^2)],  b(T) = h_b/T - s_b,  "
     "q = m/N,  m_ref = 0,  A0 >= 0 and q_sat > 0 (both temperature-independent)"
 )
+
+LOCAL_COORDINATION_DEFINITION = (
+    "u(X,T) = (h_b/T - s_b)*m(X) - A0*sum_i["
+    "q_i^2/(1 + (q_i/q_sat)^2)],  q_i = k_i/2,  "
+    "k_i = nonbonded nearest-neighbour degree of bead i,  A0 >= 0, q_sat > 0"
+)
+LOCAL_COORDINATION_OBSERVABLE = "nonbonded_contact_degree_histogram_0_6"
 
 
 def _q_zero(params: np.ndarray, T: float, Tref: float, Tscale: float) -> float:
@@ -999,6 +1009,27 @@ MODEL_REGISTRY: Dict[str, Dict] = {
             "(saturating cooperative attraction; A0 >= 0, q_sat > 0)"
         ),
     },
+    "local_coordination_saturation": {
+        "param_names": ["h_b", "s_b", "A0", "q_sat"],
+        "x0": [750.0, 2.8, 0.0, 0.35],
+        "bounds": [
+            (-2000.0, 2000.0), (-10.0, 10.0), (0.0, 20.0), (0.02, 2.0),
+        ],
+        "raw_b_fn": _b_hs,
+        "derived_Tc": None,
+        "potential_kind": "local_coordination_saturation",
+        "quadratic_normalization": None,
+        "potential_normalization": "q_i = k_i/2",
+        "potential_definition": LOCAL_COORDINATION_DEFINITION,
+        "m_ref": M_REF_DEFAULT,
+        "requires_chain_length": False,
+        "configuration_dependent": True,
+        "state_observable": LOCAL_COORDINATION_OBSERVABLE,
+        "description": (
+            "u(X,T) = (h_b/T - s_b)*m(X) - A0*sum_i "
+            "q_i^2/(1+(q_i/q_sat)^2), q_i=k_i/2"
+        ),
+    },
 }
 
 # Linear models carry no curvature in m and need no chain length.  Filling the
@@ -1014,6 +1045,8 @@ for _spec in MODEL_REGISTRY.values():
     # definition, and m^2/(2N) is the only normalization that ever needed N.
     _spec.setdefault("potential_definition", _spec["description"])
     _spec.setdefault("potential_normalization", _spec["quadratic_normalization"])
+    _spec.setdefault("configuration_dependent", False)
+    _spec.setdefault("state_observable", "contact_count")
 del _spec
 
 
@@ -1032,7 +1065,10 @@ del _spec
 #       v2 model keeps its parameters, its potential, and its numerical output
 #       bit for bit; the four pre-existing contract keys are unchanged, so a
 #       v2-era comparator that reads only those keys still works.
-MODEL_API_VERSION = 3
+#   v4: adds local_coordination_saturation and the complete-state contract
+#       fields. This scalar DAT workflow advertises that shared contract but
+#       rejects the new model rather than discarding its degree histogram.
+MODEL_API_VERSION = 4
 
 
 def get_model_contract() -> dict:
@@ -1045,7 +1081,7 @@ def get_model_contract() -> dict:
     ``potential_definition`` is the authoritative statement of the potential;
     ``quadratic_normalization`` names the m^2/(2N) convention specifically and is
     None for every model that does not use it, while ``potential_normalization``
-    is the generic label for whatever the chain length is used for.
+    names the model's generic state normalization (which need not involve N).
     """
     return {
         "model_api_version": MODEL_API_VERSION,
@@ -1058,6 +1094,8 @@ def get_model_contract() -> dict:
                 "potential_definition": str(spec["potential_definition"]),
                 "potential_normalization": spec["potential_normalization"],
                 "m_ref": int(spec["m_ref"]),
+                "configuration_dependent": bool(spec["configuration_dependent"]),
+                "state_observable": str(spec["state_observable"]),
             }
             for name, spec in MODEL_REGISTRY.items()
         },
@@ -1232,6 +1270,13 @@ def make_contact_u_fn(
     reweighting path -- contacts, joint Rg, Rg prediction -- uses one potential.
     """
     spec = MODEL_REGISTRY[model_name]
+    if bool(spec.get("configuration_dependent")):
+        raise ValueError(
+            f"model {model_name!r} requires {spec['state_observable']} and cannot "
+            "be fitted by FIT_TO_DAT's scalar contact/Rg workflow. Use "
+            "fit_lattice_contact_model_2.py with a coordination-enabled "
+            "Wang-Landau baseline."
+        )
     kind = str(spec["potential_kind"])
     try:
         build = POTENTIAL_BUILDERS[kind]
