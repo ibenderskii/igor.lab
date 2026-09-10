@@ -9,9 +9,18 @@ non-bonded contact count ``m``::
 
 The default ``k=0.30`` and center spacing ``3`` were selected from the existing
 N=30, 44, and 60 athermal contact distributions to give roughly 25 percent
-adjacent replica-exchange acceptance.  Centers continue until the last center
-is at or above the geometric contact maximum; a center just beyond the maximum
-is intentional because it pulls probability toward the compact endpoint.
+adjacent replica-exchange acceptance.  Exchange acceptance alone does not size
+a ladder, though: a harmonic window's mode sits ``|s|/k`` *below* its center,
+where ``s = d log P0/dm`` is the athermal log-density slope, so a ladder that
+stops at the first center past the geometric maximum falls short of that
+maximum by several contacts and starves the compact tail it exists to reach.
+Centers therefore run to ``m_max + |s(m_max)|/k``, with ``|s(m_max)|`` supplied
+as ``--tail_slope``; see :func:`center_extension`.  ``--tail_slope 0``
+reproduces the old ladder and is kept only as an explicit escape hatch.
+
+``--checkpoint`` is mandatory.  A run that fails a production diagnostic raises
+before any baseline is written, so without a checkpoint every sample collected
+is discarded; the checkpoint is what makes that failure recoverable.
 
 Each umbrella samples ``exp[-B_j(m)]`` times the athermal density.  Adjacent
 umbrellas exchange configurations, and the production histograms are combined
@@ -93,13 +102,62 @@ def logsumexp(values: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
     return np.squeeze(result, axis=axis)
 
 
-def make_window_centers(m_min: int, m_max: int, spacing: int) -> np.ndarray:
-    """Return integer centers from m_min through the first center >= m_max."""
+def center_extension(tail_slope: float, umbrella_k: float) -> int:
+    """Contacts by which the harmonic centers must run past ``m_max``.
+
+    Window ``j`` samples ``p_j(m) ~ P0(m) exp[-k/2 (m-m0_j)^2]``, so with
+    ``s(m) = d log P0/dm`` the biased log-density has derivative
+
+        L'(m) = s(m) - k (m - m0_j).
+
+    In the compact tail ``s < 0``, so an interior mode sits at
+    ``m0_j + s/k``, that is ``|s|/k`` *below* the center.  A ladder that stops
+    at the first center at or above ``m_max`` therefore never reaches
+    ``m_max``: with ``k=0.30`` a slope of only ``-1.5`` displaces the endpoint
+    window by five contacts.
+
+    Requiring ``k (m0 - m_max) >= |s(m_max)|`` makes ``L'(m_max) >= 0``.
+    Because ``log P0`` is concave in the compact tail, ``L'' = s' - k < 0``, so
+    ``L'`` is decreasing and stays positive over the whole range: the endpoint
+    window is pinned at ``m_max`` rather than merely peaked near it.  At
+    equality ``p(m_max)/p(m_max-1) = exp(k/2) > 1``, so ``m_max`` is at least
+    as well populated as the level below it.
+
+    The condition is ``m0 >= m_max + |s(m_max)|/k``; this returns that
+    allowance rounded up to a whole contact.  Over-extending is cheap - the
+    surplus windows pin at ``m_max``, contribute samples there, and WHAM
+    absorbs them - whereas under-extending loses the tail entirely, so the
+    rounding is deliberately upward.
+    """
+    if not math.isfinite(tail_slope) or tail_slope < 0.0:
+        raise ValueError("tail_slope must be finite and nonnegative")
+    if not math.isfinite(umbrella_k) or umbrella_k <= 0.0:
+        raise ValueError("umbrella_k must be finite and positive")
+    # The 1e-9 guard keeps an exact ratio such as 3.0/0.30 from rounding up to
+    # a spurious extra contact through binary floating point.
+    return int(math.ceil(tail_slope / umbrella_k - 1e-9))
+
+
+def make_window_centers(
+    m_min: int, m_max: int, spacing: int, extension: int = 0
+) -> np.ndarray:
+    """Return integer centers from m_min through the first center at or above
+    ``m_max + extension``.
+
+    ``extension`` is the compact-tail allowance from :func:`center_extension`.
+    With ``extension=0`` this reproduces the original ladder exactly; the
+    arithmetic is now integer so that a large ``m_max`` cannot pick up a
+    floating-point off-by-one window.
+    """
     if m_max < m_min:
         raise ValueError("m_max must be at least m_min")
     if spacing < 1:
         raise ValueError("window spacing must be positive")
-    count = int(math.ceil((m_max - m_min) / spacing)) + 1
+    extension = int(extension)
+    if extension < 0:
+        raise ValueError("center extension must be nonnegative")
+    ceiling = m_max + extension
+    count = (ceiling - m_min + spacing - 1) // spacing + 1
     return m_min + spacing * np.arange(count, dtype=np.int64)
 
 
@@ -521,6 +579,15 @@ def save_checkpoint(
         "m_max": np.array(args.m_max, dtype=np.int64),
         "umbrella_k": np.array(args.umbrella_k, dtype=np.float64),
         "window_spacing": np.array(args.window_spacing, dtype=np.int64),
+        # Provenance only. load_checkpoint deliberately does not gate on these:
+        # the ladder is fully determined by window_centers, which is already
+        # compared exactly, and two tail slopes that round to the same ladder
+        # describe the same run. Recording them keeps CHECKPOINT_VERSION at 1
+        # so existing checkpoints still load.
+        "tail_slope": np.array(args.tail_slope, dtype=np.float64),
+        "center_extension": np.array(
+            center_extension(args.tail_slope, args.umbrella_k), dtype=np.int64
+        ),
         "window_centers": np.asarray(centers, dtype=np.int64),
         "base_seed": np.array(args.base_seed, dtype=np.int64),
         "sample_every": np.array(args.sample_every, dtype=np.int64),
@@ -1230,9 +1297,12 @@ def analyse_samples(
         )
     if failures and enforce_checks:
         joined = "\n  - ".join(failures)
+        checkpoint_hint = args.checkpoint or args.resume_checkpoint
         raise RuntimeError(
             "umbrella production diagnostics failed; the athermal output was not "
-            f"written:\n  - {joined}\nThe complete samples remain in the checkpoint."
+            f"written:\n  - {joined}\nThe complete samples remain in "
+            f"{checkpoint_hint}; extend or re-analyse the run from there rather "
+            "than restarting."
         )
 
     with warnings.catch_warnings():
@@ -1393,6 +1463,10 @@ def write_output(
         bend_definition=np.array(BEND_DEFINITION),
         umbrella_k=np.array(args.umbrella_k, dtype=np.float64),
         umbrella_window_spacing=np.array(args.window_spacing, dtype=np.int64),
+        umbrella_tail_slope=np.array(args.tail_slope, dtype=np.float64),
+        umbrella_center_extension=np.array(
+            center_extension(args.tail_slope, args.umbrella_k), dtype=np.int64
+        ),
         umbrella_window_centers=np.asarray(centers, dtype=np.int64),
         umbrella_bias_matrix=analysis["bias_matrix"],
         umbrella_initialization=np.asarray(simulation["initialization"], dtype="U16"),
@@ -1529,6 +1603,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="integer spacing between harmonic centers",
     )
     parser.add_argument(
+        "--tail_slope", type=float, default=None,
+        help="magnitude of d log P0/dm at m_max, in units of 1/contact. Centers "
+             "run to m_max + tail_slope/umbrella_k so the endpoint window is "
+             "pinned at m_max instead of sitting |s|/k below its center. There "
+             "is no default because this is a property of the chain, not of the "
+             "sampler; over-estimating only adds windows, under-estimating "
+             "loses the compact tail. Pass 0 to reproduce the old ladder.",
+    )
+    parser.add_argument(
         "--steps_per_window", type=int, default=20_000_000,
         help="attempted local moves for every logical umbrella walker",
     )
@@ -1568,7 +1651,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint", type=str, default=None,
-        help="restartable umbrella checkpoint NPZ written atomically",
+        help="REQUIRED restartable umbrella checkpoint NPZ written atomically; "
+             "a failed diagnostic gate aborts before the baseline is written, "
+             "and this is what preserves the samples. --resume_checkpoint "
+             "satisfies the requirement on its own",
     )
     parser.add_argument(
         "--resume_checkpoint", type=str, default=None,
@@ -1663,6 +1749,27 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--umbrella_k must be finite and positive")
     if args.window_spacing < 1:
         raise ValueError("--window_spacing must be positive")
+    if args.tail_slope is None:
+        raise ValueError(
+            "--tail_slope is required: it is |d log P0/dm| at m_max and sets "
+            "how far the harmonic centers must run past m_max, because a "
+            "window's mode sits |s|/k below its center. There is no safe "
+            "default. Pass --tail_slope 0 only to reproduce the ladder that "
+            "stops at the first center at or above m_max, which starves the "
+            "compact tail unless log P0 is flat there."
+        )
+    if not math.isfinite(args.tail_slope) or args.tail_slope < 0.0:
+        raise ValueError("--tail_slope must be finite and nonnegative")
+    extension = center_extension(args.tail_slope, args.umbrella_k)
+    if extension > args.m_max - args.m_min:
+        raise ValueError(
+            f"--tail_slope={args.tail_slope:g} with --umbrella_k="
+            f"{args.umbrella_k:g} needs the centers to run {extension} contacts "
+            f"past m_max, more than the physical range "
+            f"{args.m_max - args.m_min}. Harmonic windows this soft cannot hold "
+            "a tail that steep; raise --umbrella_k, which shrinks the required "
+            "extension as 1/k."
+        )
     if args.steps_per_window < 1:
         raise ValueError("--steps_per_window must be positive")
     if not 0.0 <= args.burnin < 1.0:
@@ -1678,6 +1785,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--n_processes must be positive")
     if args.rg_bins < 1:
         raise ValueError("--rg_bins must be positive")
+    if not (args.checkpoint or args.resume_checkpoint):
+        raise ValueError(
+            "--checkpoint is required. A run that fails a production "
+            "diagnostic raises before the baseline is written, so without a "
+            "checkpoint every sample collected is lost. Pass --checkpoint PATH, "
+            "or --resume_checkpoint PATH to continue and rewrite an existing one."
+        )
     if args.checkpoint_every_seconds <= 0.0:
         raise ValueError("--checkpoint_every_seconds must be positive")
     if args.max_wall_seconds <= 0.0:
@@ -1715,7 +1829,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(args.resume_checkpoint)
 
 
-def print_window_design(args: argparse.Namespace, centers: np.ndarray) -> None:
+def print_window_design(
+    args: argparse.Namespace, centers: np.ndarray, extension: int = 0
+) -> None:
     sigma = 1.0 / math.sqrt(args.umbrella_k)
     adjacent_penalty = 0.5 * args.umbrella_k * args.window_spacing ** 2
     print("=== umbrella design ===", flush=True)
@@ -1728,6 +1844,31 @@ def print_window_design(args: argparse.Namespace, centers: np.ndarray) -> None:
     print(
         f"bias at one center spacing     : {adjacent_penalty:.4f}", flush=True
     )
+    print(
+        f"assumed |dlogP0/dm| at m_max   : {args.tail_slope:g}", flush=True
+    )
+    print(
+        f"required center extension      : {extension} contacts "
+        f"(= ceil(|s|/k)); top center must reach "
+        f"{args.m_max + extension}",
+        flush=True,
+    )
+    if extension == 0:
+        print(
+            "WARNING: --tail_slope 0 reproduces the ladder that stops at the "
+            "first center at or above m_max. Unless log P0 is flat at m_max, "
+            "the endpoint window will sit below m_max and the compact tail "
+            "will be starved.",
+            flush=True,
+        )
+    else:
+        print(
+            f"top center {int(centers[-1])} clears "
+            f"{args.m_max + extension} = m_max + ceil(|s|/k), so the endpoint "
+            f"window is pinned at m={args.m_max} rather than peaking "
+            f"{args.tail_slope / args.umbrella_k:.1f} contacts below its center.",
+            flush=True,
+        )
     if centers[-1] > args.m_max:
         print(
             f"upper center {int(centers[-1])} lies beyond m_max intentionally; "
@@ -1764,6 +1905,83 @@ def run_self_test() -> int:
         abs(float(full_swap - simple_swap)) < 1e-14 and simple_swap < 0.0
     )
 
+    # Zero extension must reproduce the ladders this script shipped with, so
+    # the tail fix cannot silently perturb the geometry it is not meant to
+    # touch.  m_max = 2, 11, 30, 50 and 74 are N = 6, 15, 30, 44 and 60.
+    historical_ladders = {
+        (0, 2, 3): [0, 3],
+        (0, 11, 3): [0, 3, 6, 9, 12],
+        (0, 30, 3): list(range(0, 31, 3)),
+        (0, 50, 3): list(range(0, 52, 3)),
+        (0, 74, 3): list(range(0, 76, 3)),
+    }
+    checks["zero extension reproduces the original ladders"] = all(
+        make_window_centers(low, high, step, 0).tolist() == expected
+        for (low, high, step), expected in historical_ladders.items()
+    )
+    checks["center extension is ceil(|s|/k)"] = bool(
+        center_extension(0.0, 0.30) == 0
+        and center_extension(3.0, 0.30) == 10
+        and center_extension(4.0, 0.30) == 14
+        and center_extension(1.5, 0.50) == 3
+    )
+
+    # Exact statement of the defect and its repair, with no sampling: a
+    # synthetic concave log-density whose slope reaches -4 at m_max = 40.
+    tail_levels = np.arange(41, dtype=np.float64)
+    tail_log_p0 = -0.05 * tail_levels ** 2  # s(m) = -0.1 m, so s(40) = -4
+    tail_slope = 4.0
+
+    def top_window_distribution(extension_value: int) -> np.ndarray:
+        ladder = make_window_centers(
+            0, 40, DEFAULT_WINDOW_SPACING, extension_value
+        )
+        biased = tail_log_p0 - 0.5 * DEFAULT_UMBRELLA_K * (
+            tail_levels - float(ladder[-1])
+        ) ** 2
+        return np.exp(biased - float(logsumexp(biased)))
+
+    starved = top_window_distribution(0)
+    repaired = top_window_distribution(
+        center_extension(tail_slope, DEFAULT_UMBRELLA_K)
+    )
+    checks["the unextended ladder starves the compact endpoint"] = bool(
+        int(np.argmax(starved)) < 40 and starved[40] < 1e-4
+    )
+    checks["the extended ladder pins the top window at m_max"] = bool(
+        int(np.argmax(repaired)) == 40
+    )
+
+    def refuses(mutate) -> bool:
+        probe = parse_args([])
+        probe.N = 6
+        probe.m_max = 2
+        probe.tail_slope = 0.0
+        probe.checkpoint = "/tmp/umbrella_probe.npz"
+        mutate(probe)
+        try:
+            validate_args(probe)
+        except ValueError:
+            return True
+        return False
+
+    def _drop_tail_slope(probe: argparse.Namespace) -> None:
+        probe.tail_slope = None
+
+    def _drop_checkpoint(probe: argparse.Namespace) -> None:
+        probe.checkpoint = None
+        probe.resume_checkpoint = None
+
+    def _impossible_slope(probe: argparse.Namespace) -> None:
+        probe.tail_slope = 50.0
+
+    checks["a missing --tail_slope is refused"] = refuses(_drop_tail_slope)
+    checks["a missing --checkpoint is refused"] = refuses(_drop_checkpoint)
+    checks["an unreachable extension is refused"] = refuses(_impossible_slope)
+    checks["a supplied --tail_slope and --checkpoint validate"] = not refuses(
+        lambda probe: None
+    )
+
     exact_values, exact_contact_probability, exact_radii = enumerate_rooted_saws(6)
     test_args = parse_args([])
     test_args.N = 6
@@ -1781,22 +1999,39 @@ def run_self_test() -> int:
     test_args.base_seed = 8128
     test_args.rg_bins = 24
     test_args.no_joint = False
-    test_args.checkpoint = None
-    test_args.resume_checkpoint = None
     test_args.max_wall_seconds = math.inf
     test_args.n_blocks = 8
     test_args.min_samples_per_level = 0
     test_args.min_adjacent_overlap = 0.0
     test_args.min_swap_acceptance = 0.0
     test_args.min_round_trips = 0
-    validate_args(test_args)
-    test_centers = make_window_centers(
-        test_args.m_min, test_args.m_max, test_args.window_spacing
-    )
-    simulation = run_replica_exchange(test_args, test_centers, progress=False)
-    analysis = analyse_samples(
-        test_args, test_centers, simulation, enforce_checks=False
-    )
+    # Zero here on purpose: it keeps this end-to-end case on the two-window
+    # ladder it has always used, so its thresholds still mean what they meant.
+    # The extension itself is covered exactly by the checks above.
+    test_args.tail_slope = 0.0
+    scratch = tempfile.TemporaryDirectory()
+    try:
+        test_args.checkpoint = str(Path(scratch.name) / "self_test_checkpoint.npz")
+        test_args.resume_checkpoint = None
+        validate_args(test_args)
+        test_centers = make_window_centers(
+            test_args.m_min,
+            test_args.m_max,
+            test_args.window_spacing,
+            center_extension(test_args.tail_slope, test_args.umbrella_k),
+        )
+        simulation = run_replica_exchange(test_args, test_centers, progress=False)
+        analysis = analyse_samples(
+            test_args, test_centers, simulation, enforce_checks=False
+        )
+        checks["the mandatory checkpoint is written and reloads"] = bool(
+            Path(test_args.checkpoint).exists()
+            and load_checkpoint(
+                Path(test_args.checkpoint), test_args, test_centers
+            )["states"]
+        )
+    finally:
+        scratch.cleanup()
     estimated = analysis["built"]["c_prob"]
     exact_full = np.zeros(test_args.m_max + 1, dtype=np.float64)
     exact_full[exact_values] = exact_contact_probability
@@ -1837,8 +2072,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.self_test:
         return run_self_test()
     validate_args(args)
-    centers = make_window_centers(args.m_min, args.m_max, args.window_spacing)
-    print_window_design(args, centers)
+    extension = center_extension(args.tail_slope, args.umbrella_k)
+    centers = make_window_centers(
+        args.m_min, args.m_max, args.window_spacing, extension
+    )
+    print_window_design(args, centers, extension)
     if args.show_window_design:
         return 0
 
