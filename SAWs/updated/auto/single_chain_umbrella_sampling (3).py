@@ -80,6 +80,10 @@ from single_chain_wang_landau import (
 Vec = Tuple[int, int, int]
 DEFAULT_UMBRELLA_K = 0.30
 DEFAULT_WINDOW_SPACING = 3
+# Coordination histogram bins count beads, so a bin never exceeds N and int16
+# is four times smaller than int64 with no realistic risk of overflow.  The
+# bound is enforced explicitly in validate_args rather than assumed.
+COORDINATION_DTYPE = np.int16
 CHECKPOINT_VERSION = 1
 RAW_SAMPLES_WARNING = (
     "These arrays are systematic importance resamples with duplicates; do not "
@@ -293,8 +297,10 @@ def solve_wham(
 
 def empirical_adjacent_overlap(window_histograms: np.ndarray) -> np.ndarray:
     histogram = np.asarray(window_histograms, dtype=np.float64)
+    if histogram.ndim != 2:
+        raise ValueError("window_histograms must be two-dimensional")
     totals = histogram.sum(axis=1)
-    if histogram.ndim != 2 or np.any(totals <= 0.0):
+    if np.any(totals <= 0.0):
         raise ValueError("every histogram row must contain samples")
     probabilities = histogram / totals[:, None]
     return np.minimum(probabilities[:-1], probabilities[1:]).sum(axis=1)
@@ -440,7 +446,7 @@ def advance_walker(
         "rg_samples": np.asarray(radii, dtype=np.float64),
         "bend_samples": np.asarray(bends, dtype=np.int64),
         "coordination_histogram_samples": np.asarray(
-            coordination, dtype=np.int64
+            coordination, dtype=COORDINATION_DTYPE
         ).reshape((-1, 7)),
         "sample_steps": np.asarray(sample_steps, dtype=np.int64),
         "sample_windows": np.full(len(contacts), window_index, dtype=np.int64),
@@ -466,12 +472,32 @@ def empty_sample_store() -> Dict[str, List[np.ndarray]]:
 def append_samples(
     store: Dict[str, List[np.ndarray]], result: Dict[str, Any]
 ) -> None:
+    """Append one block's samples, all keys together or none of them.
+
+    Row ``i`` of ``contact_samples`` is only meaningful alongside row ``i`` of
+    ``sample_windows``, ``sample_walkers`` and ``sample_steps``: the window
+    label is what WHAM uses to assign the sample its bias, so a one-row slip
+    between these arrays would silently reweight samples under the wrong
+    umbrella.  Appending per key under a per-key emptiness test made that
+    slip representable; appending the block as a unit does not.
+    """
+    block: Dict[str, np.ndarray] = {}
     for key in SAMPLE_KEYS:
         values = np.asarray(result[key])
         if key == "coordination_histogram_samples":
-            values = values.reshape((-1, 7))
-        if values.shape[0] > 0:
-            store[key].append(values)
+            values = values.astype(COORDINATION_DTYPE, copy=False).reshape((-1, 7))
+        block[key] = values
+    rows = {key: values.shape[0] for key, values in block.items()}
+    if len(set(rows.values())) != 1:
+        raise RuntimeError(
+            f"sample arrays from one block disagree on length: {rows}. "
+            "Storing them would misalign every sample from its window, "
+            "walker and step labels."
+        )
+    if next(iter(rows.values())) == 0:
+        return
+    for key in SAMPLE_KEYS:
+        store[key].append(block[key])
 
 
 def concatenate_samples(store: Dict[str, List[np.ndarray]]) -> Dict[str, np.ndarray]:
@@ -485,7 +511,7 @@ def concatenate_samples(store: Dict[str, List[np.ndarray]]) -> Dict[str, np.ndar
         if chunks:
             out[key] = np.concatenate(chunks, axis=0)
         elif key == "coordination_histogram_samples":
-            out[key] = np.empty((0, 7), dtype=np.int64)
+            out[key] = np.empty((0, 7), dtype=COORDINATION_DTYPE)
         elif key in integer_keys:
             out[key] = np.array([], dtype=np.int64)
         else:
@@ -494,6 +520,28 @@ def concatenate_samples(store: Dict[str, List[np.ndarray]]) -> Dict[str, np.ndar
     if len(set(sizes.values())) != 1:
         raise RuntimeError(f"sample arrays have inconsistent lengths: {sizes}")
     return out
+
+
+def compact_sample_store(
+    store: Dict[str, List[np.ndarray]]
+) -> Dict[str, np.ndarray]:
+    """Collapse each key's chunk list into one array in place, and return it.
+
+    At the default settings a block contributes ``exchange_every //
+    sample_every`` rows per walker - two - so a 20-million-step run ends
+    holding several hundred thousand tiny arrays per key, whose per-object
+    overhead measures several times the sample data itself.  Compacting at
+    every checkpoint bounds that.
+
+    Row order is preserved and every key is rebuilt from the same
+    :func:`concatenate_samples` result, which has already checked that all
+    seven arrays have equal length, so compaction cannot move a sample away
+    from its own window, walker and step labels.
+    """
+    packed = concatenate_samples(store)
+    for key in SAMPLE_KEYS:
+        store[key] = [packed[key]] if packed[key].shape[0] else []
+    return packed
 
 
 def _rng_states_to_arrays(
@@ -572,7 +620,9 @@ def save_checkpoint(
     initialization: np.ndarray,
     elapsed_seconds: float,
 ) -> None:
-    samples = concatenate_samples(sample_store)
+    # Compacts ``sample_store`` in place as a side effect; see
+    # compact_sample_store for why that happens here rather than per block.
+    samples = compact_sample_store(sample_store)
     rng_versions, rng_keys, rng_gaussian = _rng_states_to_arrays(
         [state["rng_state"] for state in states]
     )
@@ -732,7 +782,7 @@ def load_checkpoint(
         for key in SAMPLE_KEYS:
             values = np.asarray(saved[key]).copy()
             if key == "coordination_histogram_samples":
-                values = values.astype(np.int64).reshape((-1, 7))
+                values = values.astype(COORDINATION_DTYPE).reshape((-1, 7))
             elif key == "rg_samples":
                 values = values.astype(np.float64)
             else:
@@ -914,8 +964,13 @@ def run_replica_exchange(
                 flush=True,
             )
         if args.steps_per_window != loaded["saved_target_steps"]:
+            verb = (
+                "extending"
+                if args.steps_per_window > loaded["saved_target_steps"]
+                else "reducing"
+            )
             print(
-                "Resume note: extending target from "
+                f"Resume note: {verb} target from "
                 f"{loaded['saved_target_steps']} to {args.steps_per_window} "
                 "steps per window.",
                 flush=True,
@@ -957,7 +1012,8 @@ def run_replica_exchange(
         if starting_step:
             print(
                 f"Resuming {n_windows} walkers at step {starting_step}; "
-                f"samples retained={concatenate_samples(sample_store)['contact_samples'].size}.",
+                "samples retained="
+                f"{sum(int(c.shape[0]) for c in sample_store['contact_samples'])}.",
                 flush=True,
             )
 
@@ -1093,28 +1149,62 @@ def run_replica_exchange(
                 stopped_for_time = True
                 break
     finally:
+        # The final checkpoint is written here, not after the try block, so it
+        # is also written when the loop exits by raising: a worker consistency
+        # error, a KeyboardInterrupt, or a SIGTERM turned into an exception.
+        # Those are precisely the failures the mandatory checkpoint exists to
+        # make recoverable, and writing only on the success path left every
+        # sample since the last periodic checkpoint - up to
+        # --checkpoint_every_seconds of sampling, or all of it if the failure
+        # came first - with nowhere to land.
+        #
+        # The state saved here is always consistent: a block's results are
+        # committed to `states` only after every walker in it has returned, so
+        # a walker that raises aborts the whole block before anything is
+        # updated, and the walkers stay synchronized at the previous exchange
+        # boundary, which is the only thing load_checkpoint accepts.
+        elapsed = previous_elapsed + time.time() - invocation_start
+        if checkpoint_path is not None:
+            try:
+                save_checkpoint(
+                    checkpoint_path,
+                    args=args,
+                    centers=centers,
+                    burn_steps=burn_steps,
+                    states=states,
+                    window_by_walker=window_by_walker,
+                    sample_store=sample_store,
+                    exchange_rng=exchange_rng,
+                    exchange_round=exchange_round,
+                    swap_attempts=swap_attempts,
+                    swap_accepts=swap_accepts,
+                    round_trip_phase=round_trip_phase,
+                    round_trips=round_trips,
+                    initialization=initialization,
+                    elapsed_seconds=elapsed,
+                )
+            except Exception as checkpoint_error:
+                # Never let a checkpoint failure replace the exception that is
+                # already propagating; report it and let the original surface.
+                print(
+                    f"WARNING: final checkpoint to {checkpoint_path} failed: "
+                    f"{checkpoint_error!r}",
+                    flush=True,
+                )
+        # Shut the pool down only after the checkpoint is safely on disk.  The
+        # walker states live in this process, not in the workers, so nothing
+        # the checkpoint needs is still pending, and an error raised in
+        # shutdown must not be what costs the run its samples.
         if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-
-    elapsed = previous_elapsed + time.time() - invocation_start
-    if checkpoint_path is not None:
-        save_checkpoint(
-            checkpoint_path,
-            args=args,
-            centers=centers,
-            burn_steps=burn_steps,
-            states=states,
-            window_by_walker=window_by_walker,
-            sample_store=sample_store,
-            exchange_rng=exchange_rng,
-            exchange_round=exchange_round,
-            swap_attempts=swap_attempts,
-            swap_accepts=swap_accepts,
-            round_trip_phase=round_trip_phase,
-            round_trips=round_trips,
-            initialization=initialization,
-            elapsed_seconds=elapsed,
-        )
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                # cancel_futures is Python 3.9+.  On 3.8 - which is what RCC
+                # Midway2's python/anaconda-2021.05 module provides - the
+                # keyword raises TypeError before the pool is touched, so
+                # retrying without it is both safe and equivalent apart from
+                # waiting on any already-queued block.
+                executor.shutdown(wait=True)
 
     samples = concatenate_samples(sample_store)
     complete = all(
@@ -1257,7 +1347,85 @@ def analyse_samples(
         required[
             np.asarray(args.excluded_contact_levels, dtype=np.int64) - args.m_min
         ] = False
+
+    # Solved before the gate rather than after it, because the per-level
+    # relative error below is a production diagnostic and not merely an output
+    # column.  Nothing else about this call changed.
+    blocked_stderr, blocked_count, block_estimates = blocked_wham_contact_stderr(
+        contacts,
+        windows,
+        sample_steps,
+        centers.size,
+        args.m_min,
+        args.m_max,
+        bias,
+        args.n_blocks,
+        args.wham_tolerance,
+        args.wham_max_iterations,
+        wham["free_energies"],
+    )
+    probability = wham["probability"]
+    blocked_rel_stderr = np.full(probability.shape, np.nan, dtype=np.float64)
+    resolvable = probability > 0.0
+    blocked_rel_stderr[resolvable] = (
+        blocked_stderr[resolvable] / probability[resolvable]
+    )
+
+    # The ladder is adequate only if the endpoint umbrella is genuinely pinned
+    # at m_max, that is k*(top_center - m_max) >= |d log P0/dm| at m_max.  That
+    # is the inequality center_extension is built from, but it was only ever
+    # checked against the *assumed* --tail_slope, which is the one input to a
+    # run that nothing verifies.  WHAM has now recovered the real slope, so
+    # check the same inequality against that.  Getting --tail_slope too small
+    # starves precisely the compact tail these umbrellas exist to reach, and it
+    # does so quietly: the surviving samples at m_max still pass a pooled count
+    # threshold.
+    pinning_headroom = args.umbrella_k * (float(centers[-1]) - float(args.m_max))
+    log_probability = np.asarray(wham["log_probability"], dtype=np.float64)
+    top_window_mode = int(np.argmax(window_histograms[-1])) + args.m_min
+    recovered_tail_slope = float("nan")
     failures: List[str] = []
+    if args.m_max > args.m_min:
+        if not np.isfinite(log_probability[-1]):
+            failures.append(
+                f"m={args.m_max} carries no weight at all, so the endpoint "
+                "umbrella never reached the compact limit and the tail slope "
+                "cannot be recovered to size the ladder. Rerun with a "
+                "substantially larger --tail_slope "
+                f"(it was {args.tail_slope:g}, giving a top center of "
+                f"{int(centers[-1])})"
+            )
+        elif np.isfinite(log_probability[-2]):
+            recovered_tail_slope = float(
+                log_probability[-2] - log_probability[-1]
+            )
+            # The slack is k/2, derived rather than chosen.  If the headroom
+            # falls short by d, the endpoint window still has
+            # p(m_max)/p(m_max-1) = exp(k/2 - d), so while d < k/2 the compact
+            # limit stays at least as populated as the level below it and the
+            # tail is not starved.  Past that it is.  Without this the gate
+            # would hard-fail a run sitting at the boundary, where the docstring
+            # itself argues the endpoint is adequately populated, on nothing
+            # more than which side of it the statistical slope estimate landed.
+            if recovered_tail_slope > pinning_headroom + 0.5 * args.umbrella_k:
+                needed = center_extension(
+                    max(recovered_tail_slope, 0.0), args.umbrella_k
+                )
+                failures.append(
+                    "the endpoint umbrella is not pinned at m_max: WHAM "
+                    f"recovers |d log P0/dm|={recovered_tail_slope:.3f} at "
+                    f"m={args.m_max}, more than k/2 above the "
+                    f"k*(top_center - m_max)={pinning_headroom:.3f} this ladder "
+                    f"provides, so its mode "
+                    f"sits at m={top_window_mode}. The assumed "
+                    f"--tail_slope={args.tail_slope:g} was too small; "
+                    f"{recovered_tail_slope:.3f} or more is required, putting "
+                    f"the top center at {args.m_max + needed} or above against "
+                    f"this run's {int(centers[-1])}. The ladder is fixed when "
+                    "the run starts, so unlike the other failures here this "
+                    "one cannot be repaired by extending the checkpoint"
+                )
+
     if args.min_samples_per_level > 0:
         deficient = contact_values[
             required & (pooled_counts < args.min_samples_per_level)
@@ -1296,11 +1464,36 @@ def analyse_samples(
             "adjacent exchange acceptance below --min_swap_acceptance="
             f"{args.min_swap_acceptance:g}: {pairs}"
         )
-    total_round_trips = int(np.asarray(simulation["round_trips"]).sum())
-    if total_round_trips < args.min_round_trips:
+    if args.max_level_rel_stderr > 0.0:
+        gated = required & resolvable
+        noisy = np.flatnonzero(
+            gated & (blocked_rel_stderr > args.max_level_rel_stderr)
+        )
+        if noisy.size:
+            worst = [
+                (int(contact_values[i]), float(blocked_rel_stderr[i]))
+                for i in noisy
+            ]
+            failures.append(
+                "contact levels whose blocked-WHAM standard error, relative to "
+                "P(m) itself, exceeds --max_level_rel_stderr="
+                f"{args.max_level_rel_stderr:g}: {worst}. "
+                "--min_samples_per_level cannot see this: a pooled count of "
+                "biased samples says nothing about how far a level's unbiased "
+                "estimate moves between time blocks"
+            )
+    round_trips = np.asarray(simulation["round_trips"], dtype=np.int64)
+    total_round_trips = int(round_trips.sum())
+    min_walker_round_trips = int(round_trips.min()) if round_trips.size else 0
+    # Per walker, not summed.  A sum over the whole ladder is satisfied by one
+    # walker traversing once while every other walker sits in its starting
+    # window, which is the opposite of the mixing this is meant to certify.
+    if min_walker_round_trips < args.min_round_trips:
+        starved = np.flatnonzero(round_trips < args.min_round_trips).tolist()
         failures.append(
-            f"only {total_round_trips} walker round trips; "
-            f"--min_round_trips={args.min_round_trips}"
+            f"--min_round_trips={args.min_round_trips} is a floor per walker; "
+            f"walkers {starved} are below it (fewest {min_walker_round_trips}, "
+            f"{total_round_trips} summed over all {round_trips.size} walkers)"
         )
     if failures and enforce_checks:
         joined = "\n  - ".join(failures)
@@ -1336,19 +1529,6 @@ def analyse_samples(
             f"probability: max error {wham_histogram_error:.3e}"
         )
 
-    blocked_stderr, blocked_count, block_estimates = blocked_wham_contact_stderr(
-        contacts,
-        windows,
-        sample_steps,
-        centers.size,
-        args.m_min,
-        args.m_max,
-        bias,
-        args.n_blocks,
-        args.wham_tolerance,
-        args.wham_max_iterations,
-        wham["free_energies"],
-    )
     weights = np.asarray(built["weights"], dtype=np.float64)
     ess = effective_sample_size(weights)
     window_samples = window_histograms.sum(axis=1)
@@ -1379,6 +1559,7 @@ def analyse_samples(
         "predicted_swap_acceptance": predicted_swap,
         "swap_rate": swap_rate,
         "c_blocked_stderr": blocked_stderr,
+        "c_blocked_rel_stderr": blocked_rel_stderr,
         "c_block_estimates": block_estimates,
         "blocked_count": blocked_count,
         "importance_ess": ess,
@@ -1389,6 +1570,10 @@ def analyse_samples(
         "wham_histogram_error": wham_histogram_error,
         "diagnostic_failures": failures,
         "total_round_trips": total_round_trips,
+        "min_walker_round_trips": min_walker_round_trips,
+        "recovered_tail_slope": recovered_tail_slope,
+        "pinning_headroom": pinning_headroom,
+        "top_window_mode": top_window_mode,
     }
 
 
@@ -1503,6 +1688,18 @@ def write_output(
         umbrella_total_round_trips=np.array(
             analysis["total_round_trips"], dtype=np.int64
         ),
+        umbrella_min_walker_round_trips=np.array(
+            analysis["min_walker_round_trips"], dtype=np.int64
+        ),
+        umbrella_recovered_tail_slope=np.array(
+            analysis["recovered_tail_slope"], dtype=np.float64
+        ),
+        umbrella_pinning_headroom=np.array(
+            analysis["pinning_headroom"], dtype=np.float64
+        ),
+        umbrella_top_window_mode=np.array(
+            analysis["top_window_mode"], dtype=np.int64
+        ),
         umbrella_pull_move_weight=np.array(
             args.pull_move_weight, dtype=np.float64
         ),
@@ -1532,6 +1729,7 @@ def write_output(
             analysis["importance_ess"], dtype=np.float64
         ),
         c_blocked_stderr=analysis["c_blocked_stderr"],
+        c_blocked_rel_stderr=analysis["c_blocked_rel_stderr"],
         c_block_estimates=analysis["c_block_estimates"],
         c_blocked_batch_count=np.array(
             analysis["blocked_count"], dtype=np.int64
@@ -1545,6 +1743,9 @@ def write_output(
         ),
         min_swap_acceptance=np.array(
             args.min_swap_acceptance, dtype=np.float64
+        ),
+        max_level_rel_stderr=np.array(
+            args.max_level_rel_stderr, dtype=np.float64
         ),
         min_round_trips=np.array(args.min_round_trips, dtype=np.int64),
         excluded_contact_levels=np.asarray(
@@ -1691,6 +1892,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="minimum pooled biased samples at each required contact level; zero disables",
     )
     parser.add_argument(
+        "--max_level_rel_stderr", type=float, default=0.25,
+        help="maximum blocked-WHAM standard error, relative to P(m) itself, at "
+             "every required contact level that carries weight. This is the "
+             "coverage test --min_samples_per_level cannot perform: a pooled "
+             "count of biased samples says nothing about how far a level's "
+             "unbiased estimate moves between time blocks. Nonpositive disables",
+    )
+    parser.add_argument(
         "--min_adjacent_overlap", type=float, default=0.10,
         help="minimum empirical overlap coefficient for every adjacent window pair",
     )
@@ -1700,7 +1909,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--min_round_trips", type=int, default=1,
-        help="minimum total low-window to high-window to low-window walker trips",
+        help="minimum low-window to high-window to low-window trips required of "
+             "EVERY walker. This is a per-walker floor, not a total: summed "
+             "over the ladder it would be satisfied by a single walker "
+             "traversing while all the others stayed put",
     )
     parser.add_argument(
         "--excluded_contact_levels", type=int, nargs="*", default=[],
@@ -1731,6 +1943,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.N < 3:
         raise ValueError("--N must be at least 3")
+    coordination_limit = int(np.iinfo(COORDINATION_DTYPE).max)
+    if args.N > coordination_limit:
+        # Coordination histogram bins count beads, so a bin can reach N.
+        raise ValueError(
+            f"--N must not exceed {coordination_limit}: coordination histogram "
+            f"samples are stored as {np.dtype(COORDINATION_DTYPE).name}"
+        )
     if args.m_min != 0:
         raise ValueError("--m_min must be zero for a full athermal baseline")
     verified = geometric_contact_maximum(args.N)
@@ -1818,6 +2037,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--n_blocks must be at least 2")
     if args.min_samples_per_level < 0:
         raise ValueError("--min_samples_per_level must be nonnegative")
+    if not math.isfinite(args.max_level_rel_stderr):
+        raise ValueError("--max_level_rel_stderr must be finite")
     if not 0.0 <= args.min_adjacent_overlap <= 1.0:
         raise ValueError("--min_adjacent_overlap must lie in [0,1]")
     if not 0.0 <= args.min_swap_acceptance <= 1.0:
@@ -1884,8 +2105,104 @@ def print_window_design(
         )
 
 
+def _self_test_case(
+    *,
+    exact_values: np.ndarray,
+    exact_contact_probability: np.ndarray,
+    exact_radii: np.ndarray,
+    tail_slope: float,
+    pull_move_weight: float,
+    steps_per_window: int,
+    base_seed: int,
+) -> Dict[str, Any]:
+    """Run one short N=6 umbrella simulation and score it against enumeration.
+
+    Factored out so the end-to-end path can be exercised under more than one
+    move mixture.  The pull move is the only move in the kernel whose Hastings
+    ratio is not identically zero, and it additionally rejects proposals whose
+    inverse is absent from the reverse catalog; both are corrections that bias
+    P(m) silently if their sign or scope is wrong, and neither is reachable
+    while --pull_move_weight is zero.
+    """
+    test_args = parse_args([])
+    test_args.N = 6
+    test_args.m_min = 0
+    test_args.m_max = int(exact_values.max())
+    test_args.umbrella_k = DEFAULT_UMBRELLA_K
+    test_args.window_spacing = DEFAULT_WINDOW_SPACING
+    test_args.steps_per_window = steps_per_window
+    test_args.burnin = 0.20
+    test_args.sample_every = 10
+    test_args.exchange_every = 50
+    test_args.pull_move_weight = pull_move_weight
+    test_args.init = "rod"
+    test_args.n_processes = 1
+    test_args.base_seed = base_seed
+    test_args.rg_bins = 24
+    test_args.no_joint = False
+    test_args.max_wall_seconds = math.inf
+    test_args.n_blocks = 8
+    test_args.min_samples_per_level = 0
+    test_args.min_adjacent_overlap = 0.0
+    test_args.min_swap_acceptance = 0.0
+    test_args.min_round_trips = 0
+    test_args.max_level_rel_stderr = 0.0
+    test_args.tail_slope = tail_slope
+
+    scratch = tempfile.TemporaryDirectory()
+    try:
+        test_args.checkpoint = str(Path(scratch.name) / "self_test_checkpoint.npz")
+        test_args.resume_checkpoint = None
+        validate_args(test_args)
+        centers = make_window_centers(
+            test_args.m_min,
+            test_args.m_max,
+            test_args.window_spacing,
+            center_extension(test_args.tail_slope, test_args.umbrella_k),
+        )
+        simulation = run_replica_exchange(test_args, centers, progress=False)
+        analysis = analyse_samples(
+            test_args, centers, simulation, enforce_checks=False
+        )
+        checkpoint_reloads = bool(
+            Path(test_args.checkpoint).exists()
+            and load_checkpoint(Path(test_args.checkpoint), test_args, centers)[
+                "states"
+            ]
+        )
+    finally:
+        scratch.cleanup()
+
+    estimated = analysis["built"]["c_prob"]
+    exact_full = np.zeros(test_args.m_max + 1, dtype=np.float64)
+    exact_full[exact_values] = exact_contact_probability
+    estimated_mean_rg = float(
+        np.dot(analysis["weights"], simulation["samples"]["rg_samples"])
+    )
+    exact_mean_rg = float(exact_radii.mean())
+    pinning_failed = any(
+        "not pinned at m_max" in failure or "carries no weight at all" in failure
+        for failure in analysis["diagnostic_failures"]
+    )
+    return {
+        "args": test_args,
+        "centers": centers,
+        "simulation": simulation,
+        "analysis": analysis,
+        "estimated": estimated,
+        "exact_full": exact_full,
+        "total_variation": 0.5 * float(np.abs(estimated - exact_full).sum()),
+        "relative_rg_error": abs(estimated_mean_rg - exact_mean_rg) / exact_mean_rg,
+        "checkpoint_reloads": checkpoint_reloads,
+        "pinning_failed": pinning_failed,
+    }
+
+
 def run_self_test() -> int:
-    print("Self-test: WHAM algebra and a short exact N=6 umbrella simulation")
+    print(
+        "Self-test: WHAM algebra and two short exact N=6 umbrella simulations, "
+        "one of them with pull moves and an extended ladder"
+    )
     checks: Dict[str, bool] = {}
 
     contact_values = np.arange(3, dtype=np.int64)
@@ -1998,74 +2315,51 @@ def run_self_test() -> int:
     )
     checks["an extension far past m_max is allowed"] = not refuses(_steep_tail)
     checks["--show_window_design needs no checkpoint"] = not refuses(_design_only)
+    # Compared in decimal, and only here in the test - center_extension itself
+    # stays plain binary ceil.  The property under test is the exact statement
+    # k*ext >= |s|, and evaluating that in binary tests the rounding of the
+    # comparison rather than the extension: fl(0.3)*3 lands one ulp below
+    # fl(0.9), so the pair (0.9, 0.30), at the default k, reads as a violation
+    # while ext=3 is in fact exactly right.  The three pairs that expose this
+    # are included on purpose, so the list can be extended without the check
+    # failing for reasons that have nothing to do with the extension.
+    from decimal import Decimal as _Decimal
+
     checks["the extension never falls below |s|/k"] = all(
-        umbrella_k * center_extension(slope, umbrella_k) >= slope
+        _Decimal(str(umbrella_k)) * center_extension(slope, umbrella_k)
+        >= _Decimal(str(slope))
         for slope, umbrella_k in (
             (3.0, 0.30), (3.0000000001, 0.30), (1.0000000005, 1.0),
             (4.0, 0.30), (2.5, 0.30), (0.7, 0.25), (10.0, 1.0), (0.0, 0.30),
             (9.5, 0.30), (2.0, 0.20), (6.0, 0.60), (0.1, 0.30),
+            (0.9, 0.30), (0.9, 0.09), (1.8, 0.09),
         )
     )
 
     exact_values, exact_contact_probability, exact_radii = enumerate_rooted_saws(6)
-    test_args = parse_args([])
-    test_args.N = 6
-    test_args.m_min = 0
-    test_args.m_max = int(exact_values.max())
-    test_args.umbrella_k = DEFAULT_UMBRELLA_K
-    test_args.window_spacing = DEFAULT_WINDOW_SPACING
-    test_args.steps_per_window = 160_000
-    test_args.burnin = 0.20
-    test_args.sample_every = 10
-    test_args.exchange_every = 50
-    test_args.pull_move_weight = 0.0
-    test_args.init = "rod"
-    test_args.n_processes = 1
-    test_args.base_seed = 8128
-    test_args.rg_bins = 24
-    test_args.no_joint = False
-    test_args.max_wall_seconds = math.inf
-    test_args.n_blocks = 8
-    test_args.min_samples_per_level = 0
-    test_args.min_adjacent_overlap = 0.0
-    test_args.min_swap_acceptance = 0.0
-    test_args.min_round_trips = 0
-    # Zero here on purpose: it keeps this end-to-end case on the two-window
-    # ladder it has always used, so its thresholds still mean what they meant.
-    # The extension itself is covered exactly by the checks above.
-    test_args.tail_slope = 0.0
-    scratch = tempfile.TemporaryDirectory()
-    try:
-        test_args.checkpoint = str(Path(scratch.name) / "self_test_checkpoint.npz")
-        test_args.resume_checkpoint = None
-        validate_args(test_args)
-        test_centers = make_window_centers(
-            test_args.m_min,
-            test_args.m_max,
-            test_args.window_spacing,
-            center_extension(test_args.tail_slope, test_args.umbrella_k),
-        )
-        simulation = run_replica_exchange(test_args, test_centers, progress=False)
-        analysis = analyse_samples(
-            test_args, test_centers, simulation, enforce_checks=False
-        )
-        checks["the mandatory checkpoint is written and reloads"] = bool(
-            Path(test_args.checkpoint).exists()
-            and load_checkpoint(
-                Path(test_args.checkpoint), test_args, test_centers
-            )["states"]
-        )
-    finally:
-        scratch.cleanup()
-    estimated = analysis["built"]["c_prob"]
-    exact_full = np.zeros(test_args.m_max + 1, dtype=np.float64)
-    exact_full[exact_values] = exact_contact_probability
-    total_variation = 0.5 * float(np.abs(estimated - exact_full).sum())
-    estimated_mean_rg = float(
-        np.dot(analysis["weights"], simulation["samples"]["rg_samples"])
+    exact_kwargs = {
+        "exact_values": exact_values,
+        "exact_contact_probability": exact_contact_probability,
+        "exact_radii": exact_radii,
+    }
+
+    # Case 1 keeps the ladder and move mixture this end-to-end check has always
+    # used - two windows, no pull moves - so its thresholds still mean what they
+    # meant.  tail_slope 0 is deliberate here.
+    legacy = _self_test_case(
+        tail_slope=0.0, pull_move_weight=0.0,
+        steps_per_window=160_000, base_seed=8128, **exact_kwargs
     )
-    exact_mean_rg = float(exact_radii.mean())
-    relative_rg_error = abs(estimated_mean_rg - exact_mean_rg) / exact_mean_rg
+    analysis = legacy["analysis"]
+    test_args = legacy["args"]
+    estimated = legacy["estimated"]
+    exact_full = legacy["exact_full"]
+    total_variation = legacy["total_variation"]
+    relative_rg_error = legacy["relative_rg_error"]
+
+    checks["the mandatory checkpoint is written and reloads"] = legacy[
+        "checkpoint_reloads"
+    ]
     checks["short REUS/WHAM run recovers exact P(m)"] = total_variation < 0.035
     checks["short REUS/WHAM run recovers exact mean Rg"] = relative_rg_error < 0.035
     checks["joint distribution preserves both marginals"] = bool(
@@ -2076,6 +2370,49 @@ def run_self_test() -> int:
         len(set(analysis["wham"]["samples_per_window"].tolist())) == 1
     )
 
+    # Case 2 is the same chain under the production move mixture and a real
+    # extension, so the Hastings-corrected pull move and the extended ladder are
+    # both scored against exact enumeration rather than only against each other.
+    # |d log P0/dm| at m_max = 2 is about 1.28 for N=6, so tail_slope 1.3 is the
+    # smallest honest value; it puts the top center at 9.
+    pulled = _self_test_case(
+        tail_slope=1.3, pull_move_weight=0.25,
+        steps_per_window=160_000, base_seed=2718, **exact_kwargs
+    )
+    checks["REUS/WHAM with Hastings-corrected pull moves recovers exact P(m)"] = (
+        pulled["total_variation"] < 0.035
+    )
+    checks["REUS/WHAM with pull moves recovers exact mean Rg"] = (
+        pulled["relative_rg_error"] < 0.035
+    )
+
+    # The posterior pinning diagnostic must fire on the ladder that is starved
+    # and stay quiet on the one that is not; a check that only ever passes would
+    # not distinguish the two.
+    checks["the pinning diagnostic accepts an adequately extended ladder"] = (
+        not pulled["pinning_failed"]
+    )
+    checks["the pinning diagnostic rejects the unextended ladder"] = legacy[
+        "pinning_failed"
+    ]
+    # A floor on the SUM accepts a ladder where one walker did all of the
+    # traversing and the rest never left home; a floor per walker must not.
+    # Re-score the finished legacy samples against a round-trip vector with
+    # exactly that shape - the total is enormous, the weakest walker is zero.
+    probe_simulation = dict(legacy["simulation"])
+    probe_simulation["round_trips"] = np.array(
+        [0] + [10_000] * (len(legacy["centers"]) - 1), dtype=np.int64
+    )
+    probe_args = legacy["args"]
+    probe_args.min_round_trips = 1
+    probe_failures = analyse_samples(
+        probe_args, legacy["centers"], probe_simulation, enforce_checks=False
+    )["diagnostic_failures"]
+    probe_args.min_round_trips = 0
+    checks["a round-trip floor per walker rejects one walker doing it all"] = any(
+        "floor per walker" in failure for failure in probe_failures
+    )
+
     print(f"  synthetic WHAM max error : {synthetic_error:.3e}")
     print(f"  exact P(m)               : {exact_full.tolist()}")
     print(f"  estimated P(m)           : {estimated.tolist()}")
@@ -2083,6 +2420,17 @@ def run_self_test() -> int:
     print(f"  mean Rg relative error   : {relative_rg_error:.6g}")
     print(f"  empirical overlaps       : {analysis['empirical_overlap'].tolist()}")
     print(f"  exchange acceptance      : {analysis['swap_rate'].tolist()}")
+    print(
+        "  with pull moves + extension: centers "
+        f"{pulled['centers'].tolist()}, TVD {pulled['total_variation']:.6g}, "
+        f"mean Rg rel err {pulled['relative_rg_error']:.6g}"
+    )
+    print(
+        "  recovered |dlogP0/dm| at m_max: "
+        f"{pulled['analysis']['recovered_tail_slope']:.4f} against "
+        f"{pulled['analysis']['pinning_headroom']:.4f} headroom (extended) / "
+        f"{analysis['pinning_headroom']:.4f} (unextended)"
+    )
     for description, passed in checks.items():
         print(f"  {'PASS' if passed else 'FAIL'}: {description}")
     if all(checks.values()):
@@ -2163,7 +2511,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         flush=True,
     )
     print(
-        f"walker low-high-low round trips  : {analysis['total_round_trips']}",
+        f"walker low-high-low round trips  : {analysis['total_round_trips']} "
+        f"total, fewest {analysis['min_walker_round_trips']} for any walker",
+        flush=True,
+    )
+    print(
+        f"worst relative blocked stderr    : "
+        f"{float(np.nanmax(analysis['c_blocked_rel_stderr'])):.3f}",
+        flush=True,
+    )
+    print(
+        f"recovered |dlogP0/dm| at m_max   : "
+        f"{analysis['recovered_tail_slope']:.3f} against "
+        f"{analysis['pinning_headroom']:.3f} of pinning headroom "
+        f"(--tail_slope was {args.tail_slope:g})",
         flush=True,
     )
     print(f"total wall time                  : {simulation['elapsed_seconds']:.1f}s", flush=True)
