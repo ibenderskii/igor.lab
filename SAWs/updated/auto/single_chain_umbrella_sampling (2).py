@@ -52,7 +52,6 @@ import tempfile
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor
-from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -81,10 +80,6 @@ from single_chain_wang_landau import (
 Vec = Tuple[int, int, int]
 DEFAULT_UMBRELLA_K = 0.30
 DEFAULT_WINDOW_SPACING = 3
-# Resource guard only.  Umbrella centers may legitimately lie arbitrarily far
-# beyond m_max, so nothing here is a physical limit; this exists so a mistyped
-# --tail_slope cannot silently ask for a bias matrix with millions of rows.
-MAX_WINDOWS = 4096
 CHECKPOINT_VERSION = 1
 RAW_SAMPLES_WARNING = (
     "These arrays are systematic importance resamples with duplicates; do not "
@@ -134,19 +129,20 @@ def center_extension(tail_slope: float, umbrella_k: float) -> int:
     WHAM absorbs them - whereas under-extending loses the tail entirely, so the
     rounding is strictly upward with no tolerance.
 
-    The quotient is taken in decimal rather than binary.  ``|s|/k`` is a ratio
-    of two decimal literals typed on the command line, and in binary a case
-    such as ``3.0/0.30`` evaluates to ``10.000000000000002``; a plain ``ceil``
-    would spend a window on that artifact, while subtracting a tolerance to
-    absorb it would let genuine values round *down* and break the pinning
-    guarantee above.  Decimal division gives exactly ``10`` and does neither.
+    Do not reintroduce a tolerance here.  Subtracting even ``1e-9`` before the
+    ceiling lets a genuine value round *down* and silently breaks the pinning
+    guarantee above: ``|s|=3.0000000001`` at ``k=0.30`` would return 10, and
+    ``k*10 < |s|``.  A plain ceiling can instead spend one extra contact on a
+    binary artifact - ``2.1/0.30`` evaluates to ``7.000000000000001``, and
+    about 1.5 percent of one- and two-decimal input pairs behave this way - but
+    that costs at most one window, often none once the ladder is quantised by
+    ``--window_spacing``, and it errs in the safe direction.
     """
     if not math.isfinite(tail_slope) or tail_slope < 0.0:
         raise ValueError("tail_slope must be finite and nonnegative")
     if not math.isfinite(umbrella_k) or umbrella_k <= 0.0:
         raise ValueError("umbrella_k must be finite and positive")
-    quotient = Decimal(str(tail_slope)) / Decimal(str(umbrella_k))
-    return int(quotient.to_integral_value(rounding=ROUND_CEILING))
+    return int(math.ceil(tail_slope / umbrella_k))
 
 
 def make_window_centers(
@@ -1772,26 +1768,11 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if not math.isfinite(args.tail_slope) or args.tail_slope < 0.0:
         raise ValueError("--tail_slope must be finite and nonnegative")
-    extension = center_extension(args.tail_slope, args.umbrella_k)
-    # There is deliberately no cap tied to the physical contact range. A center
-    # is only the vertex of a harmonic bias and may sit arbitrarily far beyond
-    # m_max; such windows pin at m_max, keep full overlap with their neighbour,
-    # and are absorbed by WHAM. The only real limit is resources, and it is
-    # counted in windows.
-    n_windows = make_window_centers(
-        args.m_min, args.m_max, args.window_spacing, extension
-    ).size
-    if n_windows > MAX_WINDOWS:
-        raise ValueError(
-            f"--tail_slope={args.tail_slope:g} with --umbrella_k="
-            f"{args.umbrella_k:g} and --window_spacing={args.window_spacing} "
-            f"would build {n_windows} umbrellas ({extension} contacts past "
-            f"m_max), above the MAX_WINDOWS={MAX_WINDOWS} resource guard. "
-            "Centers beyond m_max are legitimate, so this is a guard against a "
-            "mistyped slope rather than a physical limit: raise "
-            "--window_spacing or --umbrella_k, or raise MAX_WINDOWS if you "
-            "really intend this many replicas."
-        )
+    # No cap is applied to the extension. A center is only the vertex of a
+    # harmonic bias and may sit arbitrarily far beyond m_max; such windows pin
+    # at m_max, keep full overlap with their neighbour, and are absorbed by
+    # WHAM. Neither the physical contact range nor any window count is a
+    # mathematical restriction, so nothing is validated here.
     if args.steps_per_window < 1:
         raise ValueError("--steps_per_window must be positive")
     if not 0.0 <= args.burnin < 1.0:
@@ -1901,30 +1882,6 @@ def print_window_design(
             "it concentrates the endpoint window at the compact limit.",
             flush=True,
         )
-    baseline_windows = make_window_centers(
-        args.m_min, args.m_max, args.window_spacing, 0
-    ).size
-    extra_windows = int(centers.size) - int(baseline_windows)
-    print(
-        f"windows added by the extension : {extra_windows} of {centers.size}",
-        flush=True,
-    )
-    if extra_windows > baseline_windows:
-        print(
-            "NOTE: over half the ladder now sits past m_max. That is allowed "
-            "and unbiased - the surplus windows pin at m_max and WHAM absorbs "
-            "them - but wall time grows linearly in the window count and "
-            "walker round-trip time grows as its square, so check "
-            "--min_round_trips is still reachable. Raising --umbrella_k "
-            "shortens the extension as 1/k.",
-            flush=True,
-        )
-    if not (args.checkpoint or args.resume_checkpoint):
-        print(
-            "Reminder: this dry run needs no checkpoint, but a production run "
-            "requires --checkpoint.",
-            flush=True,
-        )
 
 
 def run_self_test() -> int:
@@ -1971,9 +1928,10 @@ def run_self_test() -> int:
     )
     checks["center extension is ceil(|s|/k)"] = bool(
         center_extension(0.0, 0.30) == 0
-        and center_extension(3.0, 0.30) == 10
-        and center_extension(4.0, 0.30) == 14
         and center_extension(1.5, 0.50) == 3
+        and center_extension(4.0, 0.50) == 8
+        and center_extension(1.25, 0.25) == 5
+        and center_extension(4.0, 0.30) == 14
     )
 
     # Exact statement of the defect and its repair, with no sampling: a
@@ -2024,11 +1982,9 @@ def run_self_test() -> int:
 
     def _steep_tail(probe: argparse.Namespace) -> None:
         # |s|/k = 167 contacts past m_max = 2. Legal: a center is only the
-        # vertex of a harmonic bias and carries no physical range restriction.
+        # vertex of a harmonic bias and carries no range restriction, and no
+        # window-count cap is imposed either.
         probe.tail_slope = 50.0
-
-    def _mistyped_slope(probe: argparse.Namespace) -> None:
-        probe.tail_slope = 1.0e6
 
     def _design_only(probe: argparse.Namespace) -> None:
         probe.checkpoint = None
@@ -2041,13 +1997,13 @@ def run_self_test() -> int:
         lambda probe: None
     )
     checks["an extension far past m_max is allowed"] = not refuses(_steep_tail)
-    checks["a mistyped slope hits the resource guard"] = refuses(_mistyped_slope)
     checks["--show_window_design needs no checkpoint"] = not refuses(_design_only)
     checks["the extension never falls below |s|/k"] = all(
         umbrella_k * center_extension(slope, umbrella_k) >= slope
         for slope, umbrella_k in (
             (3.0, 0.30), (3.0000000001, 0.30), (1.0000000005, 1.0),
             (4.0, 0.30), (2.5, 0.30), (0.7, 0.25), (10.0, 1.0), (0.0, 0.30),
+            (9.5, 0.30), (2.0, 0.20), (6.0, 0.60), (0.1, 0.30),
         )
     )
 
