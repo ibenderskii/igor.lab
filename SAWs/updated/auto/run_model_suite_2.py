@@ -3565,6 +3565,10 @@ def make_seed_averaged_distribution_plots(suite_state, comparison_dir: Path,
                 tol,
             )
 
+            # Plot contacts on the original (unshifted) axis.
+            c_plot = (np.asarray(agg["c_vals"], dtype=float)
+                      + float(baseline["contact_offset"]))
+
             plots_dir.mkdir(parents=True, exist_ok=True)
             fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
             temps = np.asarray(agg["temps"], dtype=float)
@@ -3580,9 +3584,9 @@ def make_seed_averaged_distribution_plots(suite_state, comparison_dir: Path,
                 color = cmap(norm(float(temp)))
                 pc_mean = agg["Pc_mean"][i]
                 pc_sd = agg["Pc_sd"][i]
-                axes[0].plot(agg["c_vals"], pc_mean, color=color, linewidth=1.5)
-                axes[0].fill_between(
-                    agg["c_vals"],
+                axes[1].plot(c_plot, pc_mean, color=color, linewidth=1.5)
+                axes[1].fill_between(
+                    c_plot,
                     np.clip(pc_mean - pc_sd, 0.0, 1.0),
                     np.clip(pc_mean + pc_sd, 0.0, 1.0),
                     color=color,
@@ -3592,10 +3596,10 @@ def make_seed_averaged_distribution_plots(suite_state, comparison_dir: Path,
 
                 prg_mean = agg["Prg_mean"][i]
                 prg_sd = agg["Prg_sd"][i]
-                axes[1].plot(
+                axes[0].plot(
                     agg["rg_centers"], prg_mean, color=color, linewidth=1.5
                 )
-                axes[1].fill_between(
+                axes[0].fill_between(
                     agg["rg_centers"],
                     np.clip(prg_mean - prg_sd, 0.0, 1.0),
                     np.clip(prg_mean + prg_sd, 0.0, 1.0),
@@ -3605,14 +3609,14 @@ def make_seed_averaged_distribution_plots(suite_state, comparison_dir: Path,
                 )
 
             axes[0].set(
-                xlabel="Contacts, m",
-                ylabel="Probability mass",
-                title=r"$P(m\mid T)$",
-            )
-            axes[1].set(
                 xlabel=r"$R_g$",
                 ylabel="Probability mass",
                 title=r"$P(R_g\mid T)$",
+            )
+            axes[1].set(
+                xlabel="Contacts, m",
+                ylabel="Probability mass",
+                title=r"$P(m\mid T)$",
             )
             for ax in axes:
                 ax.set_ylim(bottom=0.0)
