@@ -3128,6 +3128,243 @@ def _predicted_means(
 # bootstrap; does not introduce a second pathway)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Parallel, warm-started bootstrap execution
+#
+# Replicates are independent, so they are distributed over worker processes.
+# Every replicate's resample is drawn up front from the bootstrap RNG in replicate
+# order -- the exact sequence the serial loop drew -- and each replicate is then
+# computed by the same function whether it runs in-process or in a worker, so the
+# outputs do not depend on the worker count. Workers are forked: the objective
+# closures and baseline arrays are inherited (copy-on-write) rather than pickled;
+# only replicate indices go out and plain dicts/arrays come back.
+#
+# Warm start: each replicate's optimizer starts first from the full-data best fit,
+# then from all the usual restart points. The best result over this superset of
+# starts can never be worse than the best over the original starts alone.
+# ---------------------------------------------------------------------------
+
+_BOOT_STATE: Optional[Dict[str, Any]] = None
+
+
+def resolve_bootstrap_workers(requested: Optional[int], n_replicates: int) -> Tuple[int, str]:
+    """Choose the bootstrap worker count.
+
+    Precedence: --bootstrap-workers (>0), then $FIT_BOOTSTRAP_WORKERS, then
+    $SLURM_CPUS_PER_TASK, else 1 (serial). The result is capped at the number of
+    CPUs this process may run on and at the number of replicates.
+    """
+    import os
+    n: int = 1
+    source = "default (serial)"
+    if requested is not None and int(requested) > 0:
+        n, source = int(requested), "--bootstrap-workers"
+    else:
+        for var in ("FIT_BOOTSTRAP_WORKERS", "SLURM_CPUS_PER_TASK"):
+            raw = os.environ.get(var, "").strip()
+            if raw:
+                try:
+                    val = int(raw.split("(")[0])
+                except ValueError:
+                    continue
+                if val > 0:
+                    n, source = val, f"${var}"
+                    break
+    try:
+        avail = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        avail = os.cpu_count() or 1
+    capped = max(1, min(n, max(1, int(avail)), max(1, int(n_replicates))))
+    if capped != n:
+        source += f" (capped from {n}: {avail} CPUs available, {n_replicates} replicates)"
+    return capped, source
+
+
+def _bootstrap_replicate(bi: int) -> Dict[str, Any]:
+    """Fit and evaluate bootstrap replicate ``bi`` from the module-level state.
+
+    Returns {"bi", "ok", ...}. An optimizer failure (no successful restart) is
+    reported as ok=False, exactly as the serial loop counted it; any other error
+    propagates, as it did in the serial loop.
+    """
+    st = _BOOT_STATE
+    if st is None:
+        raise RuntimeError("bootstrap state not initialised")
+    local_idx = st["local_idx"][bi]
+    fit_rg, can_fit_rg = st["fit_rg"], st["can_fit_rg"]
+    local_baseline, state_u_fn = st["local_baseline"], st["state_u_fn"]
+    u_fn, loss_fn = st["u_fn"], st["loss_fn"]
+    m_centers, p0_mass = st["m_centers"], st["p0_mass"]
+    temps, rg_weight = st["temps"], st["rg_weight"]
+    train_idx, val_idx, has_val = st["train_idx"], st["val_idx"], st["has_val"]
+
+    # Resampled training temperatures; contacts and Rg stay paired.
+    boot_temps_b = st["train_temps"][local_idx]
+    boot_ct_b = st["p_obs_ct_train"][local_idx]
+    boot_rg_b = st["p_obs_rg_train"][local_idx] if (fit_rg and can_fit_rg) else None
+
+    obj_fn_b, obj_args_b = build_objective(
+        fit_rg, boot_temps_b, m_centers, boot_ct_b, p0_mass, u_fn, loss_fn,
+        crg_prob=st["crg_prob"], c_edges_joint=st["c_edges_joint"],
+        p_obs_rg_train=boot_rg_b, rg_weight=rg_weight,
+        local_baseline=local_baseline, state_u_fn=state_u_fn,
+    )
+    try:
+        best_b, best_b_val, restart_recs = fit_restarts(
+            obj_fn_b, obj_args_b, st["x0s_boot"], st["bounds"]
+        )
+    except (RuntimeError, Exception) as exc:  # noqa: B014 - count all failures
+        return {"bi": bi, "ok": False, "error": str(exc)}
+
+    params_b = best_b.x
+    warm = st["warm_start"]
+    best_start = next(
+        (r["restart_index"] for r in restart_recs
+         if r["success"] and r["objective"] is not None and r["objective"] == float(best_b_val)),
+        None,
+    )
+    rand_recs = restart_recs[1:] if warm else restart_recs
+    rand_ok = [r["objective"] for r in rand_recs if r["success"] and r["objective"] is not None]
+    diag = {
+        "bootstrap_index": bi,
+        "objective": float(best_b_val),
+        "best_start": (None if best_start is None else
+                       ("warm" if (warm and best_start == 0)
+                        else f"random_{best_start - 1 if warm else best_start}")),
+        "warm_objective": (restart_recs[0]["objective"]
+                           if (warm and restart_recs[0]["success"]) else None),
+        "best_random_objective": (min(rand_ok) if rand_ok else None),
+        "n_starts": len(restart_recs),
+        "n_starts_success": sum(1 for r in restart_recs if r["success"]),
+    }
+
+    # Contact losses on ORIGINAL (non-resampled) temperature sets.
+    ct_pt = per_temp_contact_losses(
+        temps, m_centers, st["p_obs_mass"], p0_mass, params_b, u_fn, loss_fn,
+        local_baseline=local_baseline, state_u_fn=state_u_fn,
+    )
+    train_loss_b = float(ct_pt[train_idx].sum())
+    val_loss_b = float(ct_pt[val_idx].sum()) if has_val else float("nan")
+    all_loss_b = float(ct_pt.sum())
+
+    mean_rg_b = None
+    rg_train_b = rg_val_b = rg_all_b = float("nan")
+    if can_fit_rg:
+        _, rg_mod_b = predict_rg_mass(
+            st["crg_prob"], st["c_edges_joint"], st["rg_edges_model_lattice"], temps,
+            params_b, u_fn, local_baseline=local_baseline, state_u_fn=state_u_fn,
+        )
+        rg_pt = per_temp_rg_losses(rg_mod_b, st["p_obs_rg_model_grid"], loss_fn)
+        rg_train_b = float(rg_pt[train_idx].sum())
+        rg_val_b = float(rg_pt[val_idx].sum()) if has_val else float("nan")
+        rg_all_b = float(rg_pt.sum())
+        # mean Rg prediction band
+        mean_rg_b = st["rg_scale"] * (st["rg_centers_model_lattice"][None, :] * rg_mod_b).sum(axis=1)
+
+    # Combined losses use the configured rg_weight (objective_combined form).
+    def _combined(ct, rg):
+        return ct + rg_weight * rg if (can_fit_rg and np.isfinite(rg)) else ct
+    comb_train_b = _combined(train_loss_b, rg_train_b)
+    comb_val_b = _combined(val_loss_b, rg_val_b)
+    comb_all_b = _combined(all_loss_b, rg_all_b)
+
+    Tc_b: Optional[float] = None
+    if st["derived_Tc_fn"] is not None:
+        Tc_b = st["derived_Tc_fn"](params_b)
+
+    record: Dict[str, Any] = {"bootstrap_index": bi}
+    for pname, pval in zip(st["param_names"], params_b):
+        record[pname] = float(pval)
+    if Tc_b is not None and np.isfinite(Tc_b):
+        record["Tc"] = float(Tc_b)
+    record["train_loss"] = train_loss_b
+    if has_val:
+        record["validation_loss"] = val_loss_b
+    record["all_loss"] = all_loss_b
+    if can_fit_rg:
+        record["rg_train_loss"] = rg_train_b
+        if has_val:
+            record["rg_validation_loss"] = rg_val_b
+        record["rg_all_loss"] = rg_all_b
+        record["combined_train_loss"] = comb_train_b
+        if has_val:
+            record["combined_validation_loss"] = comb_val_b
+        record["combined_all_loss"] = comb_all_b
+    record["objective"] = float(best_b_val)
+
+    # Prediction bands on the full temperature ladder.
+    b_fn = st["b_fn"]
+    b_T = np.array([b_fn(params_b, float(T)) for T in temps])
+    mean_c = _predicted_means(
+        temps, m_centers, p0_mass, params_b, u_fn,
+        local_baseline=local_baseline, state_u_fn=state_u_fn,
+    )
+    return {"bi": bi, "ok": True, "record": record, "b_T": b_T, "mean_c": mean_c,
+            "mean_rg": mean_rg_b, "diag": diag}
+
+
+def _run_bootstrap_replicates(n_rep: int, n_workers: int) -> Tuple[List[Dict[str, Any]], str]:
+    """Run replicates 0..n_rep-1 (serially or on forked workers); results in index order."""
+    import sys
+    interval = max(1, n_rep // 5)
+    results: List[Optional[Dict[str, Any]]] = [None] * n_rep
+    mode = "serial"
+    if n_workers > 1:
+        import multiprocessing as _mp
+        # Workers receive the replicate function by reference, so it must be
+        # reachable as <its module>._bootstrap_replicate (true when this file runs
+        # as a script or is imported normally).
+        _mod = sys.modules.get(getattr(_bootstrap_replicate, "__module__", ""), None)
+        if "fork" not in _mp.get_all_start_methods():
+            print("  WARNING: 'fork' start method unavailable; running the bootstrap serially.")
+        elif getattr(_mod, "_bootstrap_replicate", None) is not _bootstrap_replicate:
+            print("  WARNING: fitter module is not importable by name in this process; "
+                  "running the bootstrap serially.")
+        else:
+            mode = "fork"
+    if mode == "serial":
+        for bi in range(n_rep):
+            results[bi] = _bootstrap_replicate(bi)
+            if (bi + 1) % interval == 0 or bi == n_rep - 1:
+                print(f"  {bi + 1}/{n_rep} done", flush=True)
+        return results, mode  # type: ignore[return-value]
+
+    import multiprocessing as _mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
+    # Flush before forking so buffered parent output is not duplicated by children.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    done = 0
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=_mp.get_context("fork")) as pool:
+        futures = {pool.submit(_bootstrap_replicate, bi): bi for bi in range(n_rep)}
+        try:
+            for fut in as_completed(futures):
+                bi = futures[fut]
+                try:
+                    results[bi] = fut.result()
+                except BrokenProcessPool as exc:
+                    raise RuntimeError(
+                        "a bootstrap worker process died abruptly (for example, killed "
+                        "for exceeding the job's memory limit); no bootstrap outputs "
+                        "were written. Rerun with fewer workers (--bootstrap-workers or "
+                        "$FIT_BOOTSTRAP_WORKERS) or more memory."
+                    ) from exc
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"bootstrap replicate {bi} raised in a worker process: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                done += 1
+                if done % interval == 0 or done == n_rep:
+                    print(f"  {done}/{n_rep} done", flush=True)
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
+    return results, mode  # type: ignore[return-value]
+
+
 def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> None:
     temps = ctx["temps"]
     m_centers = ctx["m_centers"]
@@ -3185,102 +3422,98 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     b_T_list: List[np.ndarray] = []
     meanC_list: List[np.ndarray] = []
     meanRg_list: List[np.ndarray] = []
+    diag_rows: List[Dict[str, Any]] = []
+
+    warm_start = bool(getattr(args, "bootstrap_warm_start", True))
+    n_workers, worker_source = resolve_bootstrap_workers(
+        getattr(args, "bootstrap_workers", None), args.bootstrap
+    )
+    if warm_start:
+        lo_b = np.array([b[0] for b in bounds], dtype=float)
+        hi_b = np.array([b[1] for b in bounds], dtype=float)
+        x0s_boot = [np.clip(np.array(params_fit, dtype=float), lo_b, hi_b)] + list(x0s)
+    else:
+        x0s_boot = list(x0s)
 
     print(f"\nBootstrap ({args.bootstrap} replicates, method={args.bootstrap_method}, "
           f"seed={bseed}, confidence={confidence}):")
     print("  (empirical temperature-resampling uncertainty; contacts and Rg are "
           "resampled as paired observations)")
+    print(f"  starts per replicate: {len(x0s_boot)} "
+          + ("(full-data best fit + the restart points)" if warm_start
+             else "(the restart points; warm start disabled)"))
+    print(f"  workers: {n_workers}  [{worker_source}]", flush=True)
 
-    for bi in range(args.bootstrap):
-        # Resample training indices with replacement; contacts and Rg stay paired.
-        local_idx = bstrap_rng.integers(0, n_train, size=n_train)
-        boot_temps_b = train_temps[local_idx]
-        boot_ct_b = p_obs_ct_train[local_idx]
-        boot_rg_b = p_obs_rg_train[local_idx] if (fit_rg and can_fit_rg) else None
+    # Draw every replicate's resample up front, in replicate order: this is the
+    # exact sequence the serial loop drew, so results are worker-count invariant.
+    local_idx_all = [bstrap_rng.integers(0, n_train, size=n_train)
+                     for _ in range(args.bootstrap)]
 
-        obj_fn_b, obj_args_b = build_objective(
-            fit_rg, boot_temps_b, m_centers, boot_ct_b, p0_mass, u_fn, loss_fn,
-            crg_prob=crg_prob, c_edges_joint=c_edges_joint,
-            p_obs_rg_train=boot_rg_b, rg_weight=rg_weight,
-            local_baseline=local_baseline, state_u_fn=state_u_fn,
-        )
+    global _BOOT_STATE
+    _BOOT_STATE = {
+        "local_idx": local_idx_all, "x0s_boot": x0s_boot, "warm_start": warm_start,
+        "bounds": bounds, "fit_rg": fit_rg, "can_fit_rg": can_fit_rg,
+        "local_baseline": local_baseline, "state_u_fn": state_u_fn,
+        "u_fn": u_fn, "loss_fn": loss_fn, "b_fn": b_fn,
+        "m_centers": m_centers, "p0_mass": p0_mass, "p_obs_mass": p_obs_mass,
+        "temps": temps, "rg_weight": rg_weight, "rg_scale": rg_scale,
+        "train_idx": train_idx, "val_idx": val_idx, "has_val": has_val,
+        "train_temps": train_temps, "p_obs_ct_train": p_obs_ct_train,
+        "p_obs_rg_train": p_obs_rg_train, "crg_prob": crg_prob,
+        "c_edges_joint": c_edges_joint, "rg_edges_model_lattice": rg_edges_model_lattice,
+        "rg_centers_model_lattice": rg_centers_model_lattice,
+        "p_obs_rg_model_grid": p_obs_rg_model_grid,
+        "param_names": param_names, "derived_Tc_fn": derived_Tc_fn,
+    }
+    try:
+        rep_results, exec_mode = _run_bootstrap_replicates(args.bootstrap, n_workers)
+    finally:
+        _BOOT_STATE = None
 
-        try:
-            best_b, best_b_val = fit_one_split(obj_fn_b, obj_args_b, x0s, bounds)
-        except (RuntimeError, Exception) as exc:  # noqa: B014 - count all failures
-            print(f"  replicate {bi:4d}: FAILED ({exc})")
+    for res in rep_results:  # replicate order, independent of completion order
+        bi = res["bi"]
+        if not res["ok"]:
+            print(f"  replicate {bi:4d}: FAILED ({res['error']})")
             n_boot_failed += 1
+            diag_rows.append({"bootstrap_index": bi, "status": "failed"})
             continue
+        boot_records.append(res["record"])
+        b_T_list.append(res["b_T"])
+        meanC_list.append(res["mean_c"])
+        if res["mean_rg"] is not None:
+            meanRg_list.append(res["mean_rg"])
+        diag_rows.append(dict(res["diag"], status="ok"))
 
-        params_b = best_b.x
-
-        # Contact losses on ORIGINAL (non-resampled) temperature sets.
-        ct_pt = per_temp_contact_losses(
-            temps, m_centers, p_obs_mass, p0_mass, params_b, u_fn, loss_fn,
-            local_baseline=local_baseline, state_u_fn=state_u_fn,
-        )
-        train_loss_b = float(ct_pt[train_idx].sum())
-        val_loss_b = float(ct_pt[val_idx].sum()) if has_val else float("nan")
-        all_loss_b = float(ct_pt.sum())
-
-        rg_train_b = rg_val_b = rg_all_b = float("nan")
-        if can_fit_rg:
-            _, rg_mod_b = predict_rg_mass(
-                crg_prob, c_edges_joint, rg_edges_model_lattice, temps, params_b, u_fn,
-                local_baseline=local_baseline, state_u_fn=state_u_fn,
-            )
-            rg_pt = per_temp_rg_losses(rg_mod_b, p_obs_rg_model_grid, loss_fn)
-            rg_train_b = float(rg_pt[train_idx].sum())
-            rg_val_b = float(rg_pt[val_idx].sum()) if has_val else float("nan")
-            rg_all_b = float(rg_pt.sum())
-            # mean Rg prediction band
-            meanRg_list.append(
-                rg_scale * (rg_centers_model_lattice[None, :] * rg_mod_b).sum(axis=1)
-            )
-
-        # Combined losses use the configured rg_weight (objective_combined form).
-        def _combined(ct, rg):
-            return ct + rg_weight * rg if (can_fit_rg and np.isfinite(rg)) else ct
-        comb_train_b = _combined(train_loss_b, rg_train_b)
-        comb_val_b = _combined(val_loss_b, rg_val_b)
-        comb_all_b = _combined(all_loss_b, rg_all_b)
-
-        Tc_b: Optional[float] = None
-        if derived_Tc_fn is not None:
-            Tc_b = derived_Tc_fn(params_b)
-
-        record: Dict[str, Any] = {"bootstrap_index": bi}
-        for pname, pval in zip(param_names, params_b):
-            record[pname] = float(pval)
-        if Tc_b is not None and np.isfinite(Tc_b):
-            record["Tc"] = float(Tc_b)
-        record["train_loss"] = train_loss_b
-        if has_val:
-            record["validation_loss"] = val_loss_b
-        record["all_loss"] = all_loss_b
-        if can_fit_rg:
-            record["rg_train_loss"] = rg_train_b
-            if has_val:
-                record["rg_validation_loss"] = rg_val_b
-            record["rg_all_loss"] = rg_all_b
-            record["combined_train_loss"] = comb_train_b
-            if has_val:
-                record["combined_validation_loss"] = comb_val_b
-            record["combined_all_loss"] = comb_all_b
-        record["objective"] = float(best_b_val)
-        boot_records.append(record)
-
-        # Prediction bands on the full temperature ladder.
-        b_T_list.append(np.array([b_fn(params_b, float(T)) for T in temps]))
-        meanC_list.append(_predicted_means(
-            temps, m_centers, p0_mass, params_b, u_fn,
-            local_baseline=local_baseline, state_u_fn=state_u_fn,
-        ))
-
-        interval = max(1, args.bootstrap // 5)
-        if (bi + 1) % interval == 0 or bi == args.bootstrap - 1:
-            print(f"  {bi + 1}/{args.bootstrap} done")
-
+    # Per-replicate start diagnostics (supplementary file; not read by the suite).
+    diag_csv_path = outdir / "bootstrap_restart_diagnostics.csv"
+    diag_cols = ["bootstrap_index", "status", "objective", "best_start", "warm_objective",
+                 "best_random_objective", "n_starts", "n_starts_success"]
+    with open(diag_csv_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(diag_cols)
+        for row in diag_rows:
+            w.writerow(["" if row.get(c) is None else
+                        ("%.12g" % row[c] if isinstance(row.get(c), float) else row[c])
+                        for c in diag_cols])
+    ok_diag = [r for r in diag_rows if r.get("status") == "ok"]
+    warm_diag: Optional[Dict[str, Any]] = None
+    if warm_start and ok_diag:
+        n_warm_best = sum(1 for r in ok_diag if r["best_start"] == "warm")
+        gaps = [r["best_random_objective"] - r["objective"] for r in ok_diag
+                if r["best_random_objective"] is not None]
+        warm_diag = {
+            "n_replicates_best_from_warm_start": int(n_warm_best),
+            "n_replicates_best_from_random_start": int(len(ok_diag) - n_warm_best),
+            "n_replicates_random_starts_missed_best": int(sum(1 for g in gaps if g > 1e-9)),
+            "max_best_random_minus_best": (float(max(gaps)) if gaps else None),
+            "note": ("Counts replicates whose best objective came from the warm start, and "
+                     "how many would have ended at a worse objective with the random "
+                     "restart points alone."),
+        }
+        print(f"  warm start: best in {n_warm_best}/{len(ok_diag)} replicates; random "
+              f"starts alone missed the best objective in "
+              f"{warm_diag['n_replicates_random_starts_missed_best']}/{len(ok_diag)}")
+    print(f"Saved: {diag_csv_path}")
     n_boot_success = len(boot_records)
     if n_boot_success == 0:
         print(
@@ -3467,6 +3700,14 @@ def run_bootstrap_uncertainty(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
         "bootstrap_method": str(args.bootstrap_method),
         "confidence": confidence,
         "fraction_successful": frac_success,
+        "execution": {
+            "workers": int(n_workers),
+            "worker_source": worker_source,
+            "mode": exec_mode,
+            "warm_start": bool(warm_start),
+            "starts_per_replicate": int(len(x0s_boot)),
+        },
+        "warm_start_diagnostics": warm_diag,
         "param_bound_fractions": bound_fracs,
         "covariance": {
             "order": list(param_names),
@@ -4358,6 +4599,17 @@ def main() -> None:
              "bootstrap_prediction_bands.npz.",
     )
     ap.add_argument(
+        "--bootstrap-workers", type=int, default=None, dest="bootstrap_workers",
+        metavar="N",
+        help="Worker processes for bootstrap replicates (default: $FIT_BOOTSTRAP_WORKERS, "
+             "else $SLURM_CPUS_PER_TASK, else 1). Results do not depend on N.",
+    )
+    ap.add_argument(
+        "--no-bootstrap-warm-start", action="store_false", dest="bootstrap_warm_start",
+        help="Start bootstrap replicates only from the restart points (the pre-patch "
+             "behaviour) instead of the full-data best fit plus the restart points.",
+    )
+    ap.add_argument(
         "--uncertainty-diagnostics", action="store_true", dest="uncertainty_diagnostics",
         help="Compute local objective-curvature (numerical Hessian) and optimizer "
              "restart-stability diagnostics (NOT statistical standard errors).",
@@ -4437,6 +4689,8 @@ def main() -> None:
         raise ValueError("--n_restarts must be >= 1")
     if args.bootstrap < 0:
         raise ValueError("--bootstrap must be >= 0")
+    if getattr(args, "bootstrap_workers", None) is not None and args.bootstrap_workers < 0:
+        raise ValueError("--bootstrap-workers must be >= 0")
     if not np.isfinite(args.rg_weight) or args.rg_weight < 0:
         raise ValueError("--rg-weight must be finite and >= 0")
     if not (0.0 < args.bootstrap_confidence < 1.0):
