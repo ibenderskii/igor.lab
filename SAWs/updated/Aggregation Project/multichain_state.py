@@ -179,6 +179,16 @@ class MultiChainState:
         exactly like ``counts``.  When constructed as ``None`` it is recomputed
         from a full per-chain recount in :meth:`__post_init__`, so every
         construction path is consistent.
+    degrees : np.ndarray or None
+        Optional per-bead split nonbonded contact degree, shape ``(M*N, 2)``
+        int64 indexed by global bead ID: column 0 counts intrachain neighbours
+        (k_intra), column 1 interchain neighbours (k_inter).  Populated only when
+        the run's Hamiltonian needs it (a label-blind model under
+        ``cooperativity="local"``; see ``make_state(track_degrees=True)``) and
+        ``None`` otherwise.  Maintained incrementally by accepted moves.
+    degree_joint : np.ndarray or None
+        Bead counts by ``(k_intra, k_inter)``, shape ``(7, 7)`` int64; present
+        exactly when ``degrees`` is.  Derived from ``degrees`` when omitted.
     """
     coords_unwrapped: np.ndarray
     site_owner: dict
@@ -186,6 +196,8 @@ class MultiChainState:
     box_size: int
     n_bend: int = 0
     intra_contacts_by_chain: np.ndarray = None
+    degrees: np.ndarray = None
+    degree_joint: np.ndarray = None
 
     def __post_init__(self) -> None:
         # Keep the per-chain intrachain cache authoritative for every constructor.
@@ -199,6 +211,12 @@ class MultiChainState:
         else:
             self.intra_contacts_by_chain = np.asarray(
                 self.intra_contacts_by_chain, dtype=np.int64)
+        if self.degrees is not None:
+            self.degrees = np.asarray(self.degrees, dtype=np.int64)
+            self.degree_joint = (
+                degree_joint_from_degrees(self.degrees)
+                if self.degree_joint is None
+                else np.asarray(self.degree_joint, dtype=np.int64))
 
     # -- shape helpers ------------------------------------------------------
     @property
@@ -237,29 +255,47 @@ class MultiChainState:
             box_size=int(self.box_size),
             n_bend=int(self.n_bend),
             intra_contacts_by_chain=self.intra_contacts_by_chain.copy(),
+            degrees=None if self.degrees is None else self.degrees.copy(),
+            degree_joint=(None if self.degree_joint is None
+                          else self.degree_joint.copy()),
         )
 
 
-def make_state(coords_unwrapped: np.ndarray, box_size: int) -> MultiChainState:
+def degree_joint_from_degrees(degrees: np.ndarray) -> np.ndarray:
+    """Bead counts by ``(k_intra, k_inter)``, shape ``(7, 7)`` int64.
+
+    ``degrees`` is an ``(n_beads, 2)`` integer array of split degrees.  Integer
+    counting only, so the result is independent of bead order.
+    """
+    d = np.asarray(degrees, dtype=np.int64)
+    return np.bincount(d[:, 0] * 7 + d[:, 1], minlength=49).reshape(7, 7)
+
+
+def make_state(coords_unwrapped: np.ndarray, box_size: int,
+               track_degrees: bool = False) -> MultiChainState:
     """Construct a fully consistent state from unwrapped coordinates.
 
     Builds the occupancy map (raising on double occupancy) and computes the
     authoritative contact counts via the full oracle.  This is the canonical
-    constructor used by tests and initializers.
+    constructor used by tests and initializers.  ``track_degrees`` also
+    populates the per-bead split-degree cache from the full oracle.
     """
     coords = _validate_coords_array(coords_unwrapped)
     L = int(box_size)
     _check_box_size(L)
     site_owner = build_site_owner(coords, L)
     # Local import breaks the module-load cycle (contacts imports this module).
-    from multichain_contacts import full_contacts_split
+    from multichain_contacts import attach_degree_cache, full_contacts_split
     intra_by_chain, inter = full_contacts_split(coords, site_owner, L)
     counts = ContactCounts(int(intra_by_chain.sum()), int(inter))
-    return MultiChainState(
+    state = MultiChainState(
         coords_unwrapped=coords, site_owner=site_owner, counts=counts,
         box_size=L, n_bend=total_bend_count(coords),
         intra_contacts_by_chain=intra_by_chain,
     )
+    if track_degrees:
+        attach_degree_cache(state)
+    return state
 
 
 def total_bend_count(coords_unwrapped: np.ndarray) -> int:
@@ -435,6 +471,14 @@ def validate_state(state: MultiChainState, *, check_contacts: bool = True) -> No
             raise MultiChainStateError(
                 f"cached bend count n_bend={state.n_bend} disagrees with full "
                 f"recount {recount_bends}")
+        if state.degrees is not None:
+            from multichain_contacts import contact_degrees_split
+            split = contact_degrees_split(state)
+            if (not np.array_equal(state.degrees, split)
+                    or not np.array_equal(state.degree_joint,
+                                          degree_joint_from_degrees(split))):
+                raise MultiChainStateError(
+                    "cached per-bead degree cache disagrees with a full recount")
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +588,7 @@ def initialize_dispersed_state(
     box_size: int,
     seed: int,
     max_placement_attempts: int = 2000,
+    track_degrees: bool = False,
 ) -> MultiChainState:
     """Deterministically build a dispersed multi-chain state from a seed.
 
@@ -602,4 +647,4 @@ def initialize_dispersed_state(
                 f"attempts; lower the volume fraction or raise "
                 f"max_placement_attempts")
 
-    return make_state(coords, L)
+    return make_state(coords, L, track_degrees=track_degrees)

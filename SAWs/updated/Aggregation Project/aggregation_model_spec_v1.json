@@ -1,8 +1,8 @@
 {
   "model_name": "multichain_lattice_aggregation",
-  "spec_revision": 5,
+  "spec_revision": 6,
   "schema_version": 4,
-  "multichain_output_schema_version": 4,
+  "multichain_output_schema_version": 5,
   "model_api_version": 4,
   "description": "Minimal scientifically valid multi-chain lattice-polymer aggregation model. Extends the validated single-chain ISAW replica-exchange architecture (remd_uniform_chain_2_new.py) to M identical self-avoiding chains in a periodic cubic box, reusing the single-chain fitted contact free energy without refitting. This document is the model/software CONTRACT; it deliberately does NOT hard-code one set of runtime parameters (M, N, L, temperatures, lambda values). Those are chosen per run and recorded in each run's output metadata.",
   "spec_revision_history": [
@@ -30,6 +30,11 @@
       "spec_revision": 5,
       "model_api_version": 4,
       "change": "Adds local_coordination_saturation as a distinct fitted model. Its complete state is the nonbonded degree histogram h_0 through h_6 and its Hamiltonian is b(T)*m_total - A0*sum_i g(k_i), with q_i=k_i/2. It always uses local cooperativity, counts intra- and interchain neighbours identically, and requires one common contact scale. The historical saturating_cooperative_contact global default and every pre-existing Hamiltonian are unchanged."
+    },
+    {
+      "spec_revision": 6,
+      "model_api_version": 4,
+      "change": "Per-bead (k_intra, k_inter) degree cache for the local cooperative rule, optional degree weights, and additive coordination observables. Under cooperativity='local' each monomer's nonbonded degree is tracked split into intrachain and interchain neighbours, and g is evaluated at k_eff_i = w_intra*k_intra_i + w_inter*k_inter_i (linear term unweighted). The default weights (1, 1) are the revision-5 Hamiltonian bit for bit, and every historical output key, column and dataset is unchanged; multichain output schema 4 -> 5 and snapshot schema 1 -> 2 are additive only."
     }
   ],
   "system": {
@@ -186,13 +191,14 @@
       ],
       "equation": "lambda_contact * [b(T)*m_total - A0*sum_i q_i^2/(1 + (q_i/q_sat)^2)], with q_i = k_i/2",
       "state_observable": "nonbonded_contact_degree_histogram_0_6",
-      "degree_definition": "k_i counts nonbonded wrapped nearest-neighbour beads at monomer i. Covalent neighbours are excluded; intrachain and interchain neighbours enter identically; sum_i k_i = 2*m_total.",
+      "degree_definition": "k_i counts nonbonded wrapped nearest-neighbour beads at monomer i. Covalent neighbours are excluded; intrachain and interchain neighbours enter identically at the default degree weights (see degree_weights); sum_i k_i = 2*m_total.",
       "fit_transfer": "h_b, s_b, A0 and q_sat are loaded unchanged from the single-chain fit summary. No multichain refit or parameter rescaling is performed.",
       "cooperativity_rule": "local is the only valid rule and is the omitted-argument default for this model. An explicit global rule is rejected because it would replace the fitted Hamiltonian with a different m_total/(M*N) model.",
-      "move_delta_rule": "lambda_contact * [b(T)*d_total - A0*delta(sum_i g(k_i))], evaluated from the beads whose local neighbourhood changed.",
+      "move_delta_rule": "lambda_contact * [b(T)*d_total - A0*delta(sum_i g(k_eff_i))], evaluated from the cached split degrees of the beads whose local neighbourhood changed; d_intra and d_inter follow exactly from sum_i k_intra_i = 2*m_intra and sum_i k_inter_i = 2*m_inter.",
       "additivity": "The state potential is a sum of local monomer terms and is exactly additive over non-interacting chains.",
       "nesting": "At A0 = 0 the cooperative term is skipped and the potential is exactly lambda_contact*b(T)*m_total.",
-      "contact_scale": "lambda_contact = lambda_intra = lambda_inter; unequal values are rejected because the fitted Hamiltonian is label blind."
+      "contact_scale": "lambda_contact = lambda_intra = lambda_inter; unequal values are rejected because the fitted Hamiltonian is label blind.",
+      "degree_weights": "k_eff_i = w_intra*k_intra_i + w_inter*k_inter_i replaces k_i inside g(k) = (k/2)^2/(1 + (k/(2*q_sat))^2) only; the linear b(T)*m_total term is unweighted. Defaults w_intra = w_inter = 1 reproduce the label-blind Hamiltonian bit for bit. Set by --degree-weight-intra / --degree-weight-inter (finite, >= 0); non-default weights are rejected for every rule other than cooperativity='local'. The same weights apply to saturating_cooperative_contact under cooperativity='local'."
     },
     "contact_quadratic_legacy_rule": {
       "models": [
@@ -329,7 +335,8 @@
     "debug_path": "Recompute full_contact_counts for every geometrically valid trial state (exact oracle).",
     "production_path": "Local delta-contact algorithm: enumerate incident canonical contact pairs before the move, build/update a temporary occupancy for the trial, enumerate incident pairs after, canonicalize IDs, determine removed/added intra/inter contacts (deduplicated when multiple moved beads share a contact), and update cached counts.",
     "translation_optimization": "Whole-chain translation cannot change intrachain contacts; only interchain contacts involving the translated chain are recomputed.",
-    "debug_assertion": "An environment-controlled assertion (MULTICHAIN_DEBUG_CONTACTS, analogous to ISAW_DEBUG_CONTACTS) compares cached counts against full_contact_counts after every accepted move."
+    "debug_assertion": "An environment-controlled assertion (MULTICHAIN_DEBUG_CONTACTS, analogous to ISAW_DEBUG_CONTACTS) compares cached counts against full_contact_counts after every accepted move.",
+    "local_degree_cache": "Label-blind models under cooperativity='local' carry a per-bead cache degrees (M*N, 2) int64 = (k_intra, k_inter) by global bead ID and degree_joint (7, 7) int64 bead counts; every other Hamiltonian leaves both None. A trial reads old degrees from the cache and new degrees through an occupancy overlay (vacated old sites empty, new sites -> moved IDs, else site_owner) over the moved beads and the occupants neighbouring their old and new sites; the changes are committed only on acceptance. Sums contract integer per-(k_intra, k_inter) counts with g in fixed order (collapsed onto k = 0..6 ascending when the weights are equal), so serial and multiprocessing runs stay bit-identical; the worker receives and returns the degree array. The debug assertion also checks the cache element-wise against the full oracle."
   },
   "observables": {
     "per_chain_geometry": {
@@ -368,6 +375,24 @@
         "largest cluster fraction f_max = s_max / M"
       ],
       "note": "This is an explicit chain-level graph built from interchain contact pairs; it is NOT the single-chain bead-level contact-graph S_max."
+    },
+    "coordination": {
+      "per_cycle": [
+        "total-degree histogram h_0..h_6 per lane (every model; from the cache or one O(M*N) oracle pass)",
+        "local rule only: S = sum_i g(k_eff_i), u_linear = lambda*b(T)*m_total, u_coop = -lambda*A0*S (u_linear + u_coop = u - kappa_bend*n_bend)"
+      ],
+      "post_burnin_accumulators": [
+        "(k_intra, k_inter) joint bead counts, 7 x 7 per lane",
+        "per sequence position i: sums over chains of k_intra and k_inter (mean degree <k>(i) and its intra/inter parts)"
+      ],
+      "burnin_rule": "first accumulated cycle = floor(n_cycles * burnin_frac), the compute_statistics index; run_remd_multichain default burnin_frac 0.5, the CLI --burnin-frac value is passed through",
+      "invariants": [
+        "sum_k h_k = M*N and sum_k k*h_k = 2*m_total every cycle",
+        "sum k_intra*n = 2*m_intra and sum k_inter*n = 2*m_inter over the joint",
+        "h_6 = 0; interior beads k <= 4, end beads k <= 5",
+        "M * sum_i <k>(i) = 2*<m_total> over the post-burn-in window"
+      ],
+      "schema_version": 1
     }
   },
   "outputs": {
@@ -406,7 +431,18 @@
       "std_chain_rg_mean_lattice",
       "n_clusters_mean",
       "local_acceptance_rate",
-      "translation_acceptance_rate"
+      "translation_acceptance_rate",
+      "degree_mean",
+      "frac_k0",
+      "frac_k1",
+      "frac_k2",
+      "frac_k3",
+      "frac_k4",
+      "frac_k5",
+      "frac_k6",
+      "S_mean (local rule; blank otherwise)",
+      "u_linear_mean (local rule; blank otherwise)",
+      "u_coop_mean (local rule; blank otherwise)"
     ],
     "npz_keys": [
       "Ts",
@@ -425,7 +461,23 @@
       "P_fmax",
       "model metadata",
       "multi-chain run metadata",
-      "schema_version"
+      "schema_version",
+      "coord_degree_values",
+      "coord_degree_hist",
+      "coord_post_burnin_start_cycle",
+      "coord_n_post_cycles",
+      "coord_P_degree",
+      "coord_joint_counts",
+      "coord_P_joint",
+      "coord_mean_degree_by_position",
+      "coord_mean_degree_intra_by_position",
+      "coord_mean_degree_inter_by_position",
+      "coord_S_mean (local rule)",
+      "coord_S_std (local rule)",
+      "degree_cache_enabled",
+      "degree_weight_intra",
+      "degree_weight_inter",
+      "coordination_observables_schema_version"
     ],
     "distribution_semantics": {
       "P_mean_chain_rg": "cycle-level distribution of the MEAN per-chain Rg across chains.",
@@ -454,7 +506,9 @@
         "largest_cluster_size",
         "largest_cluster_fraction",
         "m_intra_per_chain",
-        "m_inter_pairs_per_chain"
+        "m_inter_pairs_per_chain",
+        "mean_degree",
+        "cooperative_sum"
       ],
       "central_observables": [
         "m_intra (single-chain collapse)",
@@ -495,9 +549,13 @@
       "lambda_intra",
       "lambda_inter",
       "snapshot_stride",
-      "completion_marker"
+      "completion_marker",
+      "degree_histogram",
+      "cooperative_sum (local rule)"
     ],
-    "note": "The single-chain HDF5 schema (T, bead, xyz) is NOT reused for multi-chain coordinates; chain identity is explicit."
+    "note": "The single-chain HDF5 schema (T, bead, xyz) is NOT reused for multi-chain coordinates; chain identity is explicit.",
+    "snapshot_schema_version": 2,
+    "coordination_note": "Schema v2 adds degree_histogram (snapshot, temperature_lane, 7) int64 for every run and cooperative_sum (snapshot, temperature_lane) float64 for local-rule runs. Per-bead degrees are not stored; multichain_observables.snapshot_degrees rebuilds them from the coordinates and L, which also reads v1 files."
   },
   "initialization": {
     "independent_walkers": "Each REMD temperature lane begins from its OWN independently generated dispersed state, using deterministic per-lane seeds init_seed = seed + INITIALIZATION_SEED_STRIDE * lane (stride 1000003, distinct from the per-cycle sweep-seed strides). Initialization occurs in the main process so serial and multiprocessing runs share identical starting states.",

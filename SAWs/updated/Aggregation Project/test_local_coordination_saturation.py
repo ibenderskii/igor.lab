@@ -7,10 +7,12 @@ import numpy as np
 import pytest
 
 import FIT_TO_DAT as dat
-import fit_lattice_contact_model_2 as fit
+from _fitter_import import load_fitter
 import multichain_state as mcs
 import remd_multichain as multi
 import remd_uniform_chain_2_new as remd
+
+fit = load_fitter()
 
 
 MODEL = "local_coordination_saturation"
@@ -49,13 +51,14 @@ def test_aggregation_spec_records_the_new_model_without_rewriting_legacy() -> No
     path = Path(__file__).with_name("aggregation_model_spec_v1.json")
     spec = json.loads(path.read_text(encoding="utf-8"))
     assert spec["model_api_version"] == 4
-    assert spec["spec_revision"] == 5
+    assert spec["spec_revision"] == 6
     local = spec["reduced_potential"]["local_coordination_contact_term"]
     assert local["models"] == [MODEL]
     assert "q_i = k_i/2" in local["equation"]
     assert "intrachain and interchain" in local["degree_definition"]
+    assert "w_intra*k_intra_i + w_inter*k_inter_i" in local["degree_weights"]
     history = spec["spec_revision_history"]
-    assert history[-2]["spec_revision"] == 4
+    assert history[-2]["spec_revision"] == 5
     assert "historical" in history[-1]["change"].lower()
 
 
