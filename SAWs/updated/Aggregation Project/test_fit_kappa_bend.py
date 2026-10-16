@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pytest suite for the kappa_bend metadata path in fit_lattice_contact_model_2.
+"""pytest suite for the kappa_bend metadata path in fit_lattice_contact_model_parallel.
 
 The bending penalty is baked into the BASELINE distribution; the fitter only
 reads it, validates it against the CLI, and propagates it into its outputs. It
@@ -17,10 +17,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import fit_lattice_contact_model_2 as fit
+from _fitter_import import FITTER, load_fitter
 
-FITTER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      "fit_lattice_contact_model_2.py")
+fit = load_fitter()
 
 
 # ---------------------------------------------------------------------------

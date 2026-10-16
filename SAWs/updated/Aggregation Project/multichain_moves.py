@@ -387,7 +387,8 @@ def proposal_delta_bends(state: MultiChainState, proposal: MoveProposal) -> int:
 
 
 def apply_proposal(state: MultiChainState, proposal: MoveProposal,
-                   delta: Tuple[int, int], delta_bends: int = None) -> None:
+                   delta: Tuple[int, int], delta_bends: int = None,
+                   degree_changes: Dict[int, Tuple[int, int]] = None) -> None:
     """Apply an ACCEPTED proposal's new positions and update caches in place.
 
     After committing the moved beads, the proposal's chain is re-based into the
@@ -402,9 +403,11 @@ def apply_proposal(state: MultiChainState, proposal: MoveProposal,
     sampler passes the value it already computed for the Metropolis decision; when
     omitted (direct callers / tests) it is recomputed from the pre-move state, so
     ``state.n_bend`` stays in sync however the proposal is applied.
+    ``degree_changes`` plays the same role for the optional per-bead degree
+    cache (see :func:`multichain_contacts.apply_moved_beads`).
     """
     if delta_bends is None:
         delta_bends = proposal_delta_bends(state, proposal)
-    apply_moved_beads(state, proposal.moved, delta)
+    apply_moved_beads(state, proposal.moved, delta, degree_changes)
     canonicalize_chain_coordinates(state, proposal.chain)
     state.n_bend = int(state.n_bend) + int(delta_bends)

@@ -22,6 +22,7 @@ aggregation reduced potential.
 """
 from __future__ import annotations
 
+import functools
 import os
 from typing import Dict, Iterable, Tuple
 
@@ -31,6 +32,7 @@ from multichain_state import (
     NN6,
     ContactCounts,
     MultiChainState,
+    degree_joint_from_degrees,
 )
 
 Site = Tuple[int, int, int]
@@ -247,6 +249,7 @@ def apply_moved_beads(
     state: MultiChainState,
     moved: Dict[int, Tuple[int, int, int]],
     delta: Tuple[int, int],
+    degree_changes: Dict[int, Tuple[int, int]] = None,
 ) -> None:
     """Apply new UNWRAPPED positions for moved beads and update caches in place.
 
@@ -259,9 +262,17 @@ def apply_moved_beads(
     ``delta[0]`` is attributed to that chain (inferred from the moved beads'
     global IDs).  The invariant ``intra_contacts_by_chain.sum() == counts.intra``
     is therefore preserved by construction.
+
+    When the state carries the per-bead degree cache it is updated too, from
+    ``degree_changes`` (as returned by :func:`trial_degree_changes` for this
+    move) or, when omitted, recomputed for this move before it is applied.
     """
     N = state.chain_length
     L = int(state.box_size)
+    if state.degrees is not None and degree_changes is None:
+        degree_changes = trial_degree_changes(state, moved, {
+            int(g): (int(p[0]) % L, int(p[1]) % L, int(p[2]) % L)
+            for g, p in moved.items()})
     # Remove old wrapped sites first (so a bead moving onto another moved bead's
     # vacated site does not clobber it).
     for g in moved:
@@ -282,6 +293,8 @@ def apply_moved_beads(
     if moved_chain is not None:
         state.intra_contacts_by_chain[moved_chain] = (
             int(state.intra_contacts_by_chain[moved_chain]) + int(delta[0]))
+    if state.degrees is not None:
+        apply_degree_changes(state, degree_changes)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +471,228 @@ def delta_cooperative_sum(
 
 
 # ---------------------------------------------------------------------------
+# Split (intrachain, interchain) degree, weighted local sum, per-bead cache
+# ---------------------------------------------------------------------------
+# k_i = k_intra,i + k_inter,i.  The local cooperative term is evaluated at the
+# weighted degree  k_eff,i = w_intra*k_intra,i + w_inter*k_inter,i , so
+#
+#     S(X; q_sat, w) = sum_i g(k_eff,i).
+#
+# The default weights (1, 1) make k_eff,i = k_i: intra- and interchain
+# neighbours are indistinguishable and S is exactly cooperative_sum, bit for bit.
+# Sums are formed from INTEGER bead counts per (k_intra, k_inter) contracted
+# with g in a fixed order (see _contract), so they never depend on iteration
+# order (serial vs multiprocessing).
+
+DEFAULT_DEGREE_WEIGHTS = (1.0, 1.0)
+
+_VACANT = -1  # overlay marker: a site emptied by a trial move
+
+
+def _split_degree_at(occ: Dict[Site, int], overlay: Dict[Site, int], gid: int,
+                     site: Site, N: int, L: int) -> Tuple[int, int]:
+    """(k_intra, k_inter) of bead ``gid`` at ``site``; ``overlay`` overrides ``occ``."""
+    ci = gid // N
+    mi = gid % N
+    sx, sy, sz = site
+    ka = 0
+    ke = 0
+    for dx, dy, dz in NN6:
+        s2 = ((sx + dx) % L, (sy + dy) % L, (sz + dz) % L)
+        g2 = overlay.get(s2)
+        if g2 is None:
+            g2 = occ.get(s2)
+            if g2 is None:
+                continue
+        elif g2 == _VACANT:
+            continue
+        g2 = int(g2)
+        if g2 == gid:
+            continue
+        if g2 // N == ci:
+            if abs(mi - (g2 % N)) == 1:
+                continue  # covalently bonded: never a contact
+            ka += 1
+        else:
+            ke += 1
+    return ka, ke
+
+
+def contact_degrees_split(state: MultiChainState) -> np.ndarray:
+    """(k_intra, k_inter) of every bead, shape ``(M*N, 2)`` int64 (oracle; O(M*N)).
+
+    Row sums equal :func:`contact_degrees`; column sums are ``2*m_intra`` and
+    ``2*m_inter``.
+    """
+    N = state.chain_length
+    L = int(state.box_size)
+    deg = np.zeros((int(state.n_chains) * int(N), 2), dtype=np.int64)
+    empty: Dict[Site, int] = {}
+    for site, gid in state.site_owner.items():
+        gid = int(gid)
+        deg[gid] = _split_degree_at(state.site_owner, empty, gid, site, N, L)
+    return deg
+
+
+def attach_degree_cache(state: MultiChainState) -> None:
+    """Populate ``state.degrees`` / ``state.degree_joint`` from the full oracle."""
+    state.degrees = contact_degrees_split(state)
+    state.degree_joint = degree_joint_from_degrees(state.degrees)
+
+
+@functools.lru_cache(maxsize=None)
+def _g_total_table(q_sat: float, w: float) -> Tuple[float, ...]:
+    """``g(w*k)`` for k = 0..6 (equal weights; w = 1 is ``_g_table``)."""
+    return tuple(cooperative_g(w * k, q_sat) for k in range(7))
+
+
+@functools.lru_cache(maxsize=None)
+def _g_split_table(q_sat: float, w_intra: float, w_inter: float
+                   ) -> Tuple[float, ...]:
+    """``g(w_intra*a + w_inter*e)`` flattened at index ``a*7 + e``."""
+    return tuple(cooperative_g(w_intra * a + w_inter * e, q_sat)
+                 for a in range(7) for e in range(7))
+
+
+def _contract(counts, q_sat: float, weights) -> float:
+    """``sum_{a,e} g(w_intra*a + w_inter*e) * counts[a*7 + e]`` in fixed order.
+
+    ``counts`` holds integers indexed ``k_intra*7 + k_inter``.  With equal
+    weights g depends on the total degree only, so the counts are collapsed onto
+    k = a + e first and contracted over k = 0..6 ascending: the arithmetic of
+    :func:`cooperative_sum` / :func:`delta_cooperative_sum`, bit for bit at the
+    default weights.
+    """
+    w_intra, w_inter = float(weights[0]), float(weights[1])
+    total = 0.0
+    if w_intra == w_inter:
+        n = [0] * 7
+        for a in range(7):
+            for e in range(7 - a):  # a + e <= 6: a bead has six neighbour sites
+                n[a + e] += counts[a * 7 + e]
+        g = _g_total_table(float(q_sat), w_intra)
+        for k in range(7):
+            if n[k]:
+                total += g[k] * n[k]
+    else:
+        g = _g_split_table(float(q_sat), w_intra, w_inter)
+        for i in range(49):
+            if counts[i]:
+                total += g[i] * counts[i]
+    return float(total)
+
+
+def cooperative_sum_from_joint(joint: np.ndarray, q_sat: float,
+                               weights=DEFAULT_DEGREE_WEIGHTS) -> float:
+    """``S`` from a ``(7, 7)`` (k_intra, k_inter) bead-count table."""
+    return _contract(np.asarray(joint, dtype=np.int64).ravel().tolist(),
+                     q_sat, weights)
+
+
+def cooperative_sum_state(state: MultiChainState, q_sat: float,
+                          weights=DEFAULT_DEGREE_WEIGHTS) -> float:
+    """``S`` from the cached joint when present, else from the full oracle."""
+    joint = state.degree_joint
+    if joint is None:
+        joint = degree_joint_from_degrees(contact_degrees_split(state))
+    return cooperative_sum_from_joint(joint, q_sat, weights)
+
+
+def trial_degree_changes(
+    state: MultiChainState, moved_ids: Iterable[int], new_sites: Dict[int, Site],
+) -> Dict[int, Tuple[int, int]]:
+    """New ``(k_intra, k_inter)`` of every bead whose split degree the move changes.
+
+    Requires the degree cache (old degrees are read from ``state.degrees``).
+    Only the moved beads and the occupants neighbouring their OLD and NEW sites
+    can change.  New degrees are read through an overlay of the trial occupancy
+    (vacated old sites empty, new sites -> moved IDs, otherwise ``site_owner``),
+    so ``site_owner`` is never copied.  Reptation, which moves all N beads and
+    shifts monomer identity along the chain, goes through the same path.  The
+    move is assumed geometrically valid, as for :func:`delta_contacts`.
+    """
+    N = state.chain_length
+    L = int(state.box_size)
+    occ = state.site_owner
+    moved_ids = [int(g) for g in moved_ids]
+    old_sites = [_wrapped_site(state, g) for g in moved_ids]
+    overlay: Dict[Site, int] = dict.fromkeys(old_sites, _VACANT)
+    for g in moved_ids:
+        overlay[new_sites[g]] = g
+
+    affected = set(moved_ids)
+    for sx, sy, sz in old_sites:
+        for dx, dy, dz in NN6:
+            g2 = occ.get(((sx + dx) % L, (sy + dy) % L, (sz + dz) % L))
+            if g2 is not None:
+                affected.add(int(g2))
+    for g in moved_ids:
+        sx, sy, sz = new_sites[g]
+        for dx, dy, dz in NN6:
+            s2 = ((sx + dx) % L, (sy + dy) % L, (sz + dz) % L)
+            g2 = overlay.get(s2)
+            if g2 is None:
+                g2 = occ.get(s2)
+            if g2 is not None and g2 != _VACANT:
+                affected.add(int(g2))
+
+    deg = state.degrees
+    out: Dict[int, Tuple[int, int]] = {}
+    for g in affected:
+        site = new_sites[g] if g in new_sites else _wrapped_site(state, g)
+        new = _split_degree_at(occ, overlay, g, site, N, L)
+        if new[0] != deg[g, 0] or new[1] != deg[g, 1]:
+            out[g] = new
+    return out
+
+
+def contact_delta_from_degree_changes(
+    state: MultiChainState, changes: Dict[int, Tuple[int, int]],
+) -> Tuple[int, int]:
+    """(delta_intra, delta_inter) implied by a split-degree change set.
+
+    Exact: every contact adds one incidence to each endpoint, so
+    ``sum_i k_intra,i = 2*m_intra`` and ``sum_i k_inter,i = 2*m_inter``.
+    """
+    deg = state.degrees
+    da = 0
+    de = 0
+    for g, (a, e) in changes.items():
+        da += a - int(deg[g, 0])
+        de += e - int(deg[g, 1])
+    return da // 2, de // 2
+
+
+def delta_cooperative_sum_cached(
+    state: MultiChainState, changes: Dict[int, Tuple[int, int]], q_sat: float,
+    weights=DEFAULT_DEGREE_WEIGHTS,
+) -> float:
+    """Change in ``S`` for a split-degree change set (old degrees from the cache).
+
+    Integer per-(k_intra, k_inter) count changes contracted by :func:`_contract`;
+    at the default weights this equals :func:`delta_cooperative_sum` bit for bit.
+    """
+    deg = state.degrees
+    dn = [0] * 49
+    for g, (a, e) in changes.items():
+        dn[int(deg[g, 0]) * 7 + int(deg[g, 1])] -= 1
+        dn[a * 7 + e] += 1
+    return _contract(dn, q_sat, weights)
+
+
+def apply_degree_changes(state: MultiChainState,
+                         changes: Dict[int, Tuple[int, int]]) -> None:
+    """Commit a split-degree change set to ``state.degrees`` / ``degree_joint``."""
+    deg = state.degrees
+    joint = state.degree_joint
+    for g, (a, e) in changes.items():
+        joint[int(deg[g, 0]), int(deg[g, 1])] -= 1
+        joint[a, e] += 1
+        deg[g, 0] = a
+        deg[g, 1] = e
+
+
+# ---------------------------------------------------------------------------
 # Interchain pair aggregation (for the chain-cluster graph)
 # ---------------------------------------------------------------------------
 
@@ -517,9 +752,24 @@ def assert_counts_match(state: MultiChainState, context: str = "") -> None:
             f"recount {intra_by_chain.tolist()}{' ' + context if context else ''}")
     # Degree/pair-count identity: every contact contributes one incidence to each
     # of its two endpoints, so sum_i k_i == 2 * m_total for ANY valid state.
-    deg_sum = int(contact_degrees(state).sum())
+    degrees = contact_degrees(state)
+    deg_sum = int(degrees.sum())
     if deg_sum != 2 * (recount_intra + int(inter)):
         raise AssertionError(
             f"sum of contact degrees {deg_sum} != 2*m_total "
             f"{2 * (recount_intra + int(inter))}"
             f"{' ' + context if context else ''}")
+    # Per-bead degree cache (when tracked): element-wise against the oracles.
+    if state.degrees is not None:
+        split = contact_degrees_split(state)
+        if (not np.array_equal(state.degrees, split)
+                or not np.array_equal(split.sum(axis=1), degrees)):
+            bad = np.nonzero(np.any(state.degrees != split, axis=1))[0]
+            raise AssertionError(
+                f"cached per-bead degrees differ from the oracle at beads "
+                f"{bad.tolist()[:10]}{' ' + context if context else ''}")
+        if not np.array_equal(state.degree_joint,
+                              degree_joint_from_degrees(split)):
+            raise AssertionError(
+                f"cached degree_joint != bincount of the oracle degrees"
+                f"{' ' + context if context else ''}")

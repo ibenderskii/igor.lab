@@ -22,12 +22,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import fit_lattice_contact_model_2 as fit
+from _fitter_import import FITTER, load_fitter
 import FIT_TO_DAT as dat
 import remd_uniform_chain_2_new as remd
 
+fit = load_fitter()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-FITTER = os.path.join(HERE, "fit_lattice_contact_model_2.py")
 DAT = os.path.join(HERE, "FIT_TO_DAT.py")
 
 LEGACY_MODELS = ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3", "heat_capacity")
