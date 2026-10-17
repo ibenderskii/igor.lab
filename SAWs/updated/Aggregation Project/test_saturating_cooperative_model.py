@@ -16,8 +16,6 @@ pre-existing models moved a single bit while this one was added.
 
 Run:  python -m pytest "test_saturating_cooperative_model.py" -q
 """
-import hashlib
-import importlib.util
 import json
 import os
 import subprocess
@@ -28,12 +26,13 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import fit_lattice_contact_model_2 as fit
 import FIT_TO_DAT as dat
+import remd_uniform_chain_2_new as remd
+from _fitter_import import FITTER, load_fitter
+
+fit = load_fitter()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-UPDATED = os.path.dirname(HERE)
-FITTER = os.path.join(HERE, "fit_lattice_contact_model_2.py")
 
 MODEL = "saturating_cooperative_contact"
 LEGACY_MODELS = ("hs", "tc_scale", "hs_quadratic", "poly2", "poly3", "heat_capacity")
@@ -41,14 +40,6 @@ QUADRATIC_MODELS = ("hs_m2_const", "hs_m2_hs")
 TREF, TSCALE = 320.0, 80.0
 TEMPS = np.linspace(280.0, 360.0, 9)
 N_BEADS = 30
-
-# The two project copies in scope must declare an identical model contract.
-FITTER_COPIES = {
-    "aggregation": os.path.join(
-        UPDATED, "Aggregation Project", "fit_lattice_contact_model_2.py"
-    ),
-    "auto": os.path.join(UPDATED, "auto", "fit_lattice_contact_model_2.py"),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -452,37 +443,34 @@ def test_a_saturating_target_is_not_reproducible_by_the_linear_model():
 
 
 # ---------------------------------------------------------------------------
-# 8. Model contracts are identical across every fitter copy
+# 8. The fitter, FIT_TO_DAT and the sampler declare one model contract
 # ---------------------------------------------------------------------------
+# A single fitter remains (../auto/fit_lattice_contact_model_parallel.py), so
+# byte identity between copies no longer applies; the contract it shares with
+# FIT_TO_DAT and remd_uniform_chain_2_new is what must not drift.
 
-def _load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+def _semantic_contract(contract):
+    """The contract without free-text prose.
+
+    ``description`` is prose, and so is ``potential_definition`` wherever it
+    merely repeats the description (the linear and quadratic models); every
+    other field, including the saturating models' definitions, is compared.
+    """
+    models = {}
+    for name, entry in contract["models"].items():
+        entry = dict(entry)
+        if entry.get("potential_definition") == entry.get("description"):
+            entry.pop("potential_definition")
+        entry.pop("description", None)
+        models[name] = entry
+    return dict(contract, models=models)
 
 
-def test_the_project_fitter_copies_are_byte_identical():
-    digests = {}
-    for name, path in FITTER_COPIES.items():
-        assert os.path.exists(path), path
-        with open(path, "rb") as fh:
-            digests[name] = hashlib.md5(fh.read()).hexdigest()
-    assert len(set(digests.values())) == 1, digests
-
-
-def test_model_contract_is_identical_across_every_fitter_copy():
-    contracts = {
-        name: _load_module(f"_satcoop_fitter_{name}", path).get_model_contract()
-        for name, path in FITTER_COPIES.items()
-    }
-    contracts["fit_to_dat"] = dat.get_model_contract()
-
-    reference = contracts["aggregation"]
-    for name, contract in contracts.items():
-        assert contract == reference, name
-
+def test_model_contract_is_identical_across_fitter_fit_to_dat_and_sampler():
+    reference = fit.get_model_contract()
+    assert dat.get_model_contract() == reference
+    assert (_semantic_contract(remd.get_model_contract())
+            == _semantic_contract(reference))
     assert reference["model_api_version"] == 4
     assert MODEL in reference["models"]
 

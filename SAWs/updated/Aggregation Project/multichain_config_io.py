@@ -36,14 +36,24 @@ except Exception:  # pragma: no cover - import guard
     h5py = None
     _HAVE_H5PY = False
 
-MULTICHAIN_SNAPSHOT_SCHEMA_VERSION = 1
+# v2: optional per-snapshot ``degree_histogram`` (n, nT, 7) and, for local-rule
+# runs, ``cooperative_sum`` (n, nT) datasets.  v1 files (no such datasets) read
+# unchanged; per-bead degrees are rebuilt from coordinates by
+# ``multichain_observables.snapshot_degrees``.
+MULTICHAIN_SNAPSHOT_SCHEMA_VERSION = 2
 # v2: added reptation/rotation move types (extra move-acceptance CSV rows) and the
 # reptation_acceptance_rate / rotation_acceptance_rate results-CSV columns.
 # v3: added the degree-of-cohesion results-CSV columns (Dc and Dc/L, mean/std).
 # v4: renamed the degree_of_cohesion_* results-CSV columns to Dc_* (BREAKING: a v3
 # CSV header will not match), and added standard-error-of-the-mean columns (*_sem,
 # std/sqrt(ESS)) plus the Rg/Dc autocorrelation diagnostics (Rg_tau_int, *_ess).
-MULTICHAIN_OUTPUT_SCHEMA_VERSION = 4
+# v5: additive coordination observables -- coord_* distributions-NPZ keys and
+# results-CSV columns appended at the end (degree_mean, frac_k0..frac_k6, S_mean,
+# u_linear_mean, u_coop_mean); no existing key or column changed.
+MULTICHAIN_OUTPUT_SCHEMA_VERSION = 5
+# Version of the coordination-observable definitions (degree histogram, split
+# (k_intra, k_inter) joint, per-position mean degree, S = sum_i g(k_eff_i)).
+COORDINATION_OBSERVABLES_SCHEMA_VERSION = 1
 
 _INT16_MIN, _INT16_MAX = -32768, 32767
 _INT16_SAFE = 30000
@@ -181,10 +191,19 @@ class MultiChainSnapshotWriter:
             else:
                 meta.attrs[key] = str(value)
 
-    def _create_datasets(self, coord_dtype: str) -> None:
+    def _create_datasets(self, coord_dtype: str, optional=()) -> None:
         nT, M, N = self.nT, self.M, self.N
         g = self._snap
         chunk_rows = min(self.flush_interval, 64)
+        # Optional coordination datasets (schema v2), fixed by the first append.
+        if "degree_histogram" in optional:
+            g.create_dataset("degree_histogram", shape=(0, nT, 7),
+                             maxshape=(None, nT, 7), dtype="int64",
+                             chunks=(chunk_rows, nT, 7))
+        if "cooperative_sum" in optional:
+            g.create_dataset("cooperative_sum", shape=(0, nT), maxshape=(None, nT),
+                             dtype="float64", chunks=(chunk_rows, nT))
+        self._optional = tuple(optional)
         g.create_dataset("cycle", shape=(0,), maxshape=(None,), dtype="int64",
                          chunks=(chunk_rows,))
         g.create_dataset(
@@ -203,7 +222,14 @@ class MultiChainSnapshotWriter:
         self, *, cycle: int, coordinates: np.ndarray, walker_id: np.ndarray,
         m_intra: np.ndarray, m_inter: np.ndarray, mean_chain_rg2: np.ndarray,
         largest_cluster_size: np.ndarray,
+        degree_histogram: np.ndarray = None, cooperative_sum: np.ndarray = None,
     ) -> None:
+        """Append one snapshot row.
+
+        ``degree_histogram`` (nT, 7) and ``cooperative_sum`` (nT,) are optional;
+        whichever are given on the first append get a dataset and are then
+        required on every later append.
+        """
         nT, M, N = self.nT, self.M, self.N
         coords = np.asarray(coordinates)
         if coords.shape != (nT, M, N, 3):
@@ -233,10 +259,24 @@ class MultiChainSnapshotWriter:
             raise SnapshotWriterError("contact/cluster counts must be nonnegative")
         if not np.all(np.isfinite(rg2)) or np.any(rg2 < 0):
             raise SnapshotWriterError("mean_chain_rg2 must be finite and nonnegative")
+        optional = {}
+        if degree_histogram is not None:
+            hist = np.asarray(degree_histogram).astype(np.int64)
+            if hist.shape != (nT, 7) or np.any(hist < 0):
+                raise SnapshotWriterError(
+                    f"degree_histogram must be a nonnegative {(nT, 7)} array")
+            optional["degree_histogram"] = hist
+        if cooperative_sum is not None:
+            optional["cooperative_sum"] = _vec(
+                cooperative_sum, "cooperative_sum").astype(np.float64)
 
         if not self._datasets_created:
             dtype = self._coord_dtype or _choose_coord_dtype(coords)
-            self._create_datasets(dtype)
+            self._create_datasets(dtype, tuple(optional))
+        if tuple(optional) != self._optional:
+            raise SnapshotWriterError(
+                f"optional snapshot datasets {tuple(optional)} differ from the "
+                f"first snapshot's {self._optional}")
         dtype = self._snap.attrs["coordinate_dtype"]
         lo, hi = (_INT16_MIN, _INT16_MAX) if dtype == "int16" else (
             int(np.iinfo(np.int32).min), int(np.iinfo(np.int32).max))
@@ -254,7 +294,8 @@ class MultiChainSnapshotWriter:
             ("m_inter", me, (new, nT)),
             ("largest_cluster_size", lcs, (new, nT)),
             ("mean_chain_rg2", rg2, (new, nT)),
-        ):
+        ) + tuple((name, value, (new,) + value.shape)
+                  for name, value in optional.items()):
             ds = self._snap[name]
             ds.resize(shape)
             ds[row] = value
@@ -340,6 +381,12 @@ RESULTS_CSV_COLUMNS = [
     "std_chain_rg_mean", "std_chain_rg_mean_lattice", "n_clusters_mean",
     "local_acceptance_rate", "translation_acceptance_rate",
     "reptation_acceptance_rate", "rotation_acceptance_rate",
+    # Coordination observables (schema v5, appended): mean nonbonded degree per
+    # bead and bead fractions at k = 0..6 (every model); for local-rule runs the
+    # mean of S = sum_i g(k_eff_i) and of the split u_linear + u_coop = u -
+    # kappa_bend*n_bend (blank cells for other models).
+    "degree_mean", "frac_k0", "frac_k1", "frac_k2", "frac_k3", "frac_k4",
+    "frac_k5", "frac_k6", "S_mean", "u_linear_mean", "u_coop_mean",
 ]
 
 
@@ -350,7 +397,8 @@ def save_results_csv(results: list, out_prefix: str) -> str:
         w = csv.writer(f)
         w.writerow(RESULTS_CSV_COLUMNS)
         for r in results:
-            w.writerow([r.get(k, math.nan) for k in RESULTS_CSV_COLUMNS])
+            row = [r.get(k, math.nan) for k in RESULTS_CSV_COLUMNS]
+            w.writerow(["" if v is None else v for v in row])
     print(f"Saved {path}")
     return path
 

@@ -25,8 +25,13 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 import remd_uniform_chain_2_new as remd  # integrated_autocorr_time (ESS for SEMs)
-from multichain_state import MultiChainState, per_chain_rg2
-from multichain_contacts import ContactCounts, interchain_pair_counts
+from multichain_state import (MultiChainState, degree_joint_from_degrees,
+                              make_state, per_chain_rg2)
+from multichain_contacts import (ContactCounts, contact_degrees_split,
+                                 interchain_pair_counts)
+
+# Nonbonded contact degree values k = 0..6 (six cubic-lattice neighbour sites).
+DEGREE_VALUES = np.arange(7, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,53 @@ def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
     return out
 
 
+def split_degree_summary(degrees: np.ndarray, n_chains: int, chain_length: int
+                         ) -> dict:
+    """Integer coordination summary of one configuration.
+
+    ``degrees`` is the ``(M*N, 2)`` per-bead (k_intra, k_inter) array (global
+    bead-ID order).  Returns the total-degree histogram ``degree_hist`` (7,),
+    the ``(7, 7)`` (k_intra, k_inter) bead-count table ``joint``, and per
+    sequence position the sums over chains of k_intra and k_inter, shape (N,).
+    """
+    d = np.asarray(degrees, dtype=np.int64)
+    by_pos = d.reshape(int(n_chains), int(chain_length), 2).sum(axis=0)
+    return {
+        "degree_hist": np.bincount(d[:, 0] + d[:, 1], minlength=7),
+        "joint": degree_joint_from_degrees(d),
+        "k_intra_by_position": by_pos[:, 0],
+        "k_inter_by_position": by_pos[:, 1],
+    }
+
+
+def degrees_from_coordinates(coords_unwrapped: np.ndarray, box_size: int
+                             ) -> np.ndarray:
+    """Per-bead (k_intra, k_inter), shape ``(M*N, 2)``, rebuilt from coordinates."""
+    return contact_degrees_split(make_state(coords_unwrapped, int(box_size)))
+
+
+def snapshot_degrees(path: str) -> np.ndarray:
+    """Per-bead (k_intra, k_inter) ``(n_snapshots, nT, M*N, 2)`` from a snapshot file.
+
+    Rebuilt from the stored coordinates and the box size ``L`` in the metadata
+    only, so schema v1 files (which store no coordination data) read exactly
+    like v2 files.  Only committed rows are read.
+    """
+    import h5py
+    from multichain_config_io import committed_rows
+
+    with h5py.File(path, "r") as f:
+        L = int(f["metadata"].attrs["L"])
+        snap = f["snapshots"]
+        coords = snap["coordinates"][:committed_rows(snap)]
+    n, nT, M, N, _ = coords.shape
+    out = np.zeros((n, nT, M * N, 2), dtype=np.int64)
+    for i in range(n):
+        for k in range(nT):
+            out[i, k] = degrees_from_coordinates(coords[i, k].astype(np.int64), L)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Post-run statistics (per lane) and distributions
 # ---------------------------------------------------------------------------
@@ -369,8 +421,33 @@ def compute_statistics(
                       "m_inter_incidences_per_chain_std",
                       "m_total_pairs_per_chain_mean"):
                 r[k] = float("nan")
+        r.update(_coordination_statistics(lane, sl))
         results.append(r)
     return results
+
+
+def _coordination_statistics(lane: dict, sl: slice) -> dict:
+    """Post-burn-in coordination means (optional lane keys).
+
+    ``degree_hist`` (per-cycle (7,) histograms) gives the mean nonbonded degree
+    per bead and the bead fractions at k = 0..6.  ``coop_sum`` / ``u_linear`` /
+    ``u_coop`` exist only for local-rule runs; elsewhere they are ``None``
+    (written as blank CSV cells).
+    """
+    out = {}
+    hist = lane.get("degree_hist")
+    if hist is not None and len(hist):
+        H = np.asarray(hist, dtype=float).reshape(-1, 7)[sl]
+        n_beads = H.sum(axis=1)
+        out["degree_mean"] = _mean(H @ DEGREE_VALUES / n_beads)
+        for k in range(7):
+            out[f"frac_k{k}"] = _mean(H[:, k] / n_beads)
+    for key, name in (("coop_sum", "S_mean"), ("u_linear", "u_linear_mean"),
+                      ("u_coop", "u_coop_mean")):
+        seq = lane.get(key)
+        out[name] = (_mean(np.asarray(seq, dtype=float)[sl])
+                     if seq is not None and len(seq) else None)
+    return out
 
 
 def _int_hist_matrix(seqs: List[np.ndarray]):

@@ -138,6 +138,20 @@ LOCAL_MULTICHAIN_POTENTIAL_DEFINITION = (
     "BOTH intra- and interchain neighbours;  sum_i k_i = 2*m_total;  "
     "lambda_contact = lambda_intra = lambda_inter")
 
+# Same Hamiltonian with non-default per-bead degree weights.  The default
+# weights (1, 1) are exactly LOCAL_MULTICHAIN_POTENTIAL_DEFINITION.
+LOCAL_WEIGHTED_MULTICHAIN_POTENTIAL_DEFINITION = (
+    "u(X,T) = lambda_contact * [b(T)*m_total - A0*sum_i g(k_eff_i)] "
+    "+ kappa_bend * n_bend_total;  g(k) = kappa^2/(1 + (kappa/q_sat)^2) with "
+    "kappa = k/2;  k_eff_i = w_intra*k_intra_i + w_inter*k_inter_i, the "
+    "nonbonded contact degree of monomer i split into intra- and interchain "
+    "neighbours;  the linear term is unweighted;  "
+    "lambda_contact = lambda_intra = lambda_inter")
+
+# Per-bead degree weights (w_intra, w_inter) of the local cooperative term.  The
+# default (1, 1) counts intra- and interchain neighbours identically.
+DEFAULT_DEGREE_WEIGHTS = mcc.DEFAULT_DEGREE_WEIGHTS
+
 # Only the SATURATING model is label blind: it is nonlinear in the contact
 # count, so the intra/inter split cannot be carried through it and one common
 # contact scale is required.  hs is LINEAR, so u = b(T)*(l_i*m_intra +
@@ -184,6 +198,30 @@ def _validate_cooperativity(mode, model_name: str) -> str:
             f"model, not {model_name!r}")
     return m
 
+def _tracks_degrees(model_name: str, cooperativity) -> bool:
+    """True when the Hamiltonian needs the per-bead degree cache (local rule)."""
+    return (_uses_label_blind_contacts(model_name)
+            and _validate_cooperativity(cooperativity, model_name) == "local")
+
+
+def _validate_degree_weights(weights, model_name: str, cooperativity
+                             ) -> Tuple[float, float]:
+    """Return ``(w_intra, w_inter)`` as floats, rejecting invalid combinations.
+
+    Weights must be finite and >= 0.  They act only on the local cooperative
+    term, so non-default weights are rejected for every other Hamiltonian.
+    """
+    w = (float(weights[0]), float(weights[1]))
+    if not all(math.isfinite(x) and x >= 0.0 for x in w):
+        raise ValueError(f"degree weights must be finite and >= 0, got {w!r}")
+    if w != DEFAULT_DEGREE_WEIGHTS and not _tracks_degrees(model_name,
+                                                           cooperativity):
+        raise ValueError(
+            "degree weights apply only to the local cooperative term "
+            "(a saturation model with cooperativity='local')")
+    return w
+
+
 # Scope retained by the contact-quadratic models.  The saturation model reports
 # ``all_contacts_global`` through :func:`_contact_scope` instead.
 NONLINEAR_CONTACT_SCOPE = "intra_per_chain"
@@ -206,10 +244,13 @@ def _label_blind_contact_scale(lambda_intra: float, lambda_inter: float) -> floa
 
 def _multichain_potential_definition(
     model_name: str, cooperativity=DEFAULT_COOPERATIVITY,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> str:
     cooperativity = _validate_cooperativity(cooperativity, model_name)
     if _uses_label_blind_contacts(model_name):
         if str(cooperativity) == "local":
+            if tuple(degree_weights) != DEFAULT_DEGREE_WEIGHTS:
+                return LOCAL_WEIGHTED_MULTICHAIN_POTENTIAL_DEFINITION
             return LOCAL_MULTICHAIN_POTENTIAL_DEFINITION
         return MULTICHAIN_POTENTIAL_DEFINITION
     if str(remd.MODEL_REGISTRY[model_name]["potential_kind"]) == "linear":
@@ -290,7 +331,7 @@ def reduced_potential_counts(
 
 def local_cooperative_potential_state(
     state: MultiChainState, temperature: float, model_name: str, params,
-    Tref: float, Tscale: float,
+    Tref: float, Tscale: float, degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> float:
     """Contacts-only saturating potential with LOCAL (per-monomer) cooperativity.
 
@@ -306,19 +347,26 @@ def local_cooperative_potential_state(
     a sum of strictly local terms, so it is exactly additive over
     non-interacting chains and it does distinguish states that concentrate their
     contacts on a few monomers from states that spread them out.
+
+    ``degree_weights = (w_intra, w_inter)`` evaluates g at the weighted degree
+    ``w_intra*k_intra_i + w_inter*k_inter_i``; the default (1, 1) is the
+    label-blind degree.  The sum is read from the per-bead degree cache when the
+    state carries one and from the full oracle otherwise (same float).
     """
     A0, q_sat = remd.validated_saturating_params(params)
     b = remd.reduced_bias(model_name, params, float(temperature), Tref, Tscale)
     m_total = int(state.counts.intra) + int(state.counts.inter)
     if A0 == 0.0:
         return float(b) * m_total  # exact hs nesting; q_sat cannot matter
-    return float(b) * m_total - A0 * mcc.cooperative_sum(state, q_sat)
+    return float(b) * m_total - A0 * mcc.cooperative_sum_state(
+        state, q_sat, degree_weights)
 
 
 def reduced_contact_potential_state(
     state: MultiChainState, temperature: float, model_name: str, params,
     Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
     cooperativity: str = DEFAULT_COOPERATIVITY,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> float:
     """State-aware contacts-only reduced potential.
 
@@ -335,13 +383,18 @@ def reduced_contact_potential_state(
 
         lambda_intra * sum_alpha u_contact(m_intra_alpha, T; N)
         + lambda_inter * b(T) * m_inter
+
+    ``degree_weights`` applies only to the local rule (see
+    :func:`local_cooperative_potential_state`); other rules ignore it, and the
+    sampler entry points reject non-default weights for them.
     """
     spec = remd.MODEL_REGISTRY[model_name]
     if _uses_label_blind_contacts(model_name):
         scale = _label_blind_contact_scale(lambda_intra, lambda_inter)
         if _validate_cooperativity(cooperativity, model_name) == "local":
             return scale * local_cooperative_potential_state(
-                state, temperature, model_name, params, Tref, Tscale)
+                state, temperature, model_name, params, Tref, Tscale,
+                degree_weights)
         m_total = int(state.counts.intra) + int(state.counts.inter)
         total_beads = int(state.n_chains) * int(state.chain_length)
         return scale * remd.reduced_contact_potential(
@@ -367,6 +420,7 @@ def reduced_potential_state(
     state: MultiChainState, temperature: float, model_name: str, params,
     Tref: float, Tscale: float, lambda_intra: float, lambda_inter: float,
     kappa_bend: float = 0.0, cooperativity: str = DEFAULT_COOPERATIVITY,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> float:
     """Full state-aware reduced potential: contacts + kappa_bend * n_bend_total.
 
@@ -379,8 +433,8 @@ def reduced_potential_state(
     """
     return reduced_contact_potential_state(
         state, temperature, model_name, params, Tref, Tscale,
-        lambda_intra, lambda_inter,
-        cooperativity=cooperativity) + float(kappa_bend) * int(state.n_bend)
+        lambda_intra, lambda_inter, cooperativity=cooperativity,
+        degree_weights=degree_weights) + float(kappa_bend) * int(state.n_bend)
 
 
 def reduced_potential_bending_counts(
@@ -435,6 +489,7 @@ def swap_log_accept_state(
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float,
     cooperativity: str = DEFAULT_COOPERATIVITY,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> float:
     """Generalized full-state swap log-acceptance.
 
@@ -453,7 +508,8 @@ def swap_log_accept_state(
     def u(state, T):
         return reduced_contact_potential_state(
             state, T, model_name, params, Tref, Tscale, lambda_intra,
-            lambda_inter, cooperativity=cooperativity)
+            lambda_inter, cooperativity=cooperativity,
+            degree_weights=degree_weights)
     return (u(state_i, T_i) + u(state_j, T_j)
             - u(state_j, T_i) - u(state_i, T_j))
 
@@ -488,6 +544,7 @@ def attempt_swap(
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float, rng: random.Random,
     cooperativity: str = DEFAULT_COOPERATIVITY,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> bool:
     """Attempt a generalized REMD state exchange between two lanes.
 
@@ -509,7 +566,7 @@ def attempt_swap(
     log_accept = swap_log_accept_state(
         replica_a.state, replica_b.state, replica_a.T, replica_b.T,
         model_name, params, Tref, Tscale, lambda_intra, lambda_inter,
-        cooperativity=cooperativity)
+        cooperativity=cooperativity, degree_weights=degree_weights)
     if log_accept >= 0.0 or rng.random() < math.exp(log_accept):
         replica_a.state, replica_b.state = replica_b.state, replica_a.state
         return True
@@ -528,6 +585,7 @@ def mc_sweep(
     n_reptation: int = 1, n_rotation: int = 1,
     debug_contacts: bool = False, kappa_bend: float = 0.0,
     cooperativity: str = DEFAULT_COOPERATIVITY,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS,
 ) -> None:
     """Run one lane's local + translation + reptation + rotation proposals in place.
 
@@ -549,6 +607,12 @@ def mc_sweep(
     sampler.  Move counters are the shared (n_moves, 4) block: proposed /
     geometrically_valid / state_changing / metropolis_accepted (null proposals
     never count as state-changing).
+
+    Under the local rule the per-bead degree cache drives the move: it is
+    attached to ``state`` if absent, the contact and ``delta_S`` changes come
+    from the changed beads' cached vs trial split degrees, and the cache is
+    committed only on acceptance.  ``degree_weights`` weights k_intra/k_inter
+    inside g (local rule only; the default (1, 1) is label blind).
     """
     # Environment-controlled contact debugging works even without the CLI flag.
     debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
@@ -563,8 +627,11 @@ def mc_sweep(
     # A0 and q_sat are read once per sweep (they are temperature independent and
     # invariant under every move).  A0 == 0 nests hs exactly, so the cooperative
     # sum is never evaluated in that case.
+    weights = _validate_degree_weights(degree_weights, model_name, coop)
     if local_coop:
         A0_coop, q_sat_coop = remd.validated_saturating_params(params)
+        if state.degrees is None:
+            mcc.attach_degree_cache(state)  # the local Hamiltonian needs it
     else:
         A0_coop, q_sat_coop = 0.0, 1.0
     # Runtime chain length for per-chain m^2/(2N), global q=m/(M*N), and local
@@ -584,19 +651,27 @@ def mc_sweep(
         counters[idx, 1] += 1  # geometrically valid
         if prop.state_changing:
             counters[idx, 2] += 1  # state changing
-        d_intra, d_inter = mvs.proposal_delta(state, prop)
+        if local_coop:
+            # Only beads that moved, or whose neighbourhood gained/lost an
+            # occupant, can change degree; their cached vs trial split degrees
+            # give the exact contact deltas (sum_i k_i = 2*m) and delta_S.
+            changes = mcc.trial_degree_changes(state, prop.moved, prop.new_sites)
+            d_intra, d_inter = mcc.contact_delta_from_degree_changes(
+                state, changes)
+        else:
+            changes = None
+            d_intra, d_inter = mvs.proposal_delta(state, prop)
         d_bends = mvs.proposal_delta_bends(state, prop)
         if local_coop:
             # Local cooperativity: the linear term is exact in the contact
             # delta, and the cooperative term uses the O(moved) change in
-            # sum_i g(k_i).  Only beads that moved, or whose neighbourhood
-            # gained/lost an occupant, can change degree.
+            # sum_i g(k_eff_i).
             d_total = int(d_intra) + int(d_inter)
             if A0_coop == 0.0:
                 d_contact = b * d_total
             else:
-                d_S = mcc.delta_cooperative_sum(
-                    state, prop.moved.keys(), prop.new_sites, q_sat_coop)
+                d_S = mcc.delta_cooperative_sum_cached(
+                    state, changes, q_sat_coop, weights)
                 d_contact = b * d_total - A0_coop * d_S
             du = contact_scale * d_contact + kb * int(d_bends)
             accept = (du <= 0.0) or (rng.random() < math.exp(-du))
@@ -636,7 +711,8 @@ def mc_sweep(
             accept = (du <= 0.0) or metropolis_accept_delta(
                 d_intra, d_inter, b, li, lin, rng.random(), kb, d_bends)
         if accept:
-            mvs.apply_proposal(state, prop, (d_intra, d_inter), delta_bends=d_bends)
+            mvs.apply_proposal(state, prop, (d_intra, d_inter), delta_bends=d_bends,
+                               degree_changes=changes)
             if prop.state_changing:
                 counters[idx, 3] += 1  # accepted (state-changing)
             if debug_contacts:
@@ -678,6 +754,20 @@ class MultiReplica:
     dc_lattice_traj: list = field(default_factory=list)  # degree of cohesion Dc (lattice)
     dc_over_L_traj: list = field(default_factory=list)   # dimensionless Dc / L
     n_bend_traj: list = field(default_factory=list)      # cached total 90-degree turns/cycle
+    # Coordination observables (additive).  Per cycle: the total-degree
+    # histogram h_0..h_6 (every model) and, for local-rule runs, S =
+    # sum_i g(k_eff_i) with the split u_linear + u_coop = u - kappa_bend*n_bend.
+    degree_hist_traj: list = field(default_factory=list)  # (7,) int64 per cycle
+    coop_sum_traj: list = field(default_factory=list)
+    u_linear_traj: list = field(default_factory=list)
+    u_coop_traj: list = field(default_factory=list)
+    # Post-burn-in accumulators (integer sums; never stored per cycle).
+    coord_start_cycle: int = 0        # first accumulated cycle (_post_burnin)
+    coord_n_post: int = 0             # number of accumulated cycles
+    coord_joint: np.ndarray = field(  # bead counts by (k_intra, k_inter)
+        default_factory=lambda: np.zeros((7, 7), dtype=np.int64))
+    coord_k_intra_by_position: np.ndarray = None  # (N,) sums over chains+cycles
+    coord_k_inter_by_position: np.ndarray = None
     # Independent-initialization provenance (recorded per lane; Change 2).
     init_seed: int = 0
     init_m_intra: int = 0
@@ -725,15 +815,16 @@ def evolve_lane_worker(
     model_name: str, params, Tref: float, Tscale: float,
     lambda_intra: float, lambda_inter: float, kappa_bend: float, seed: int,
     debug_contacts: bool, cooperativity: str = DEFAULT_COOPERATIVITY,
-) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int, np.ndarray]:
+    degrees: np.ndarray = None, degree_weights=DEFAULT_DEGREE_WEIGHTS,
+) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int, np.ndarray, np.ndarray]:
     """Evolve one lane for a cycle without transferring trajectories.
 
     The occupancy map is rebuilt from coordinates inside the worker, so only the
     bounded coordinate array, the two cached counts, the cached bend count, the
-    per-chain intrachain cache, and the small move-counter block cross the process
-    boundary (no growing trajectory lists, no shared mutable occupancy).  The bend
-    count and the per-chain contact cache are carried exactly like the aggregate
-    counts so serial and multiprocessing runs stay bit-identical.
+    per-chain intrachain cache, the optional per-bead degree cache, and the small
+    move-counter block cross the process boundary (no growing trajectory lists,
+    no shared mutable occupancy).  These caches are carried exactly like the
+    aggregate counts so serial and multiprocessing runs stay bit-identical.
     """
     coords = np.asarray(coords_unwrapped, dtype=np.int64).copy()
     site_owner = mcs.build_site_owner(coords, box_size)
@@ -741,16 +832,17 @@ def evolve_lane_worker(
         coords_unwrapped=coords, site_owner=site_owner,
         counts=ContactCounts.from_tuple(counts_tuple), box_size=int(box_size),
         n_bend=int(n_bend),
-        intra_contacts_by_chain=np.asarray(intra_by_chain, dtype=np.int64).copy())
+        intra_contacts_by_chain=np.asarray(intra_by_chain, dtype=np.int64).copy(),
+        degrees=None if degrees is None else np.array(degrees, dtype=np.int64))
     counters = np.asarray(move_counters, dtype=np.int64).copy()
     rng = random.Random(int(seed))
     mc_sweep(state, counters, temperature, model_name, params, Tref, Tscale,
              lambda_intra, lambda_inter, n_local, n_translation, rng,
              n_reptation=n_reptation, n_rotation=n_rotation,
              debug_contacts=debug_contacts, kappa_bend=kappa_bend,
-             cooperativity=cooperativity)
+             cooperativity=cooperativity, degree_weights=degree_weights)
     return (state.coords_unwrapped, state.counts.as_tuple(), counters,
-            int(state.n_bend), state.intra_contacts_by_chain)
+            int(state.n_bend), state.intra_contacts_by_chain, state.degrees)
 
 
 def _lane_seed(base_seed: int, cycle: int, lane: int) -> int:
@@ -773,7 +865,7 @@ def _init_lane_seed(base_seed: int, lane: int) -> int:
 
 def _build_independent_replicas(
     Ts: np.ndarray, M: int, N: int, L: int, base_seed: int,
-    cluster_contact_threshold: int,
+    cluster_contact_threshold: int, track_degrees: bool = False,
 ) -> List[MultiReplica]:
     """One independently initialized :class:`MultiReplica` per temperature lane.
 
@@ -785,9 +877,12 @@ def _build_independent_replicas(
     replicas: List[MultiReplica] = []
     for lane, T in enumerate(Ts):
         init_seed = _init_lane_seed(base_seed, lane)
-        state = mcs.initialize_dispersed_state(M, N, L, seed=init_seed)
+        state = mcs.initialize_dispersed_state(M, N, L, seed=init_seed,
+                                               track_degrees=track_degrees)
         clu = obs.cluster_summary(state, cluster_contact_threshold)
         rep = MultiReplica(T=float(T), state=state)
+        rep.coord_k_intra_by_position = np.zeros(N, dtype=np.int64)
+        rep.coord_k_inter_by_position = np.zeros(N, dtype=np.int64)
         rep.init_seed = int(init_seed)
         rep.init_m_intra = int(state.counts.intra)
         rep.init_m_inter = int(state.counts.inter)
@@ -812,6 +907,7 @@ def run_remd_multichain(
     seed: int | None = None, n_workers: int = 1, verbose: bool = True,
     debug_contacts: bool = False,
     snapshot_writer=None, snapshot_stride: int = 1, snapshot_start_cycle: int = 0,
+    degree_weights=DEFAULT_DEGREE_WEIGHTS, burnin_frac: float = 0.5,
 ) -> Tuple[List[MultiReplica], np.ndarray, np.ndarray, np.ndarray]:
     """Run multi-chain REMD.
 
@@ -820,6 +916,12 @@ def run_remd_multichain(
     sampler exactly).  Returns ``(replicas, swap_props, swap_accs,
     walker_lane_history)`` where the last is ``(n_cycles, nT)`` giving each
     walker's lane index per cycle (for round-trip diagnostics).
+
+    ``degree_weights`` weights k_intra/k_inter in the local cooperative term
+    (local rule only).  ``burnin_frac`` sets the post-burn-in window of the
+    coordination accumulators, with the same index rule as
+    :func:`multichain_observables.compute_statistics` (default 0.5, the CLI
+    default); it never affects sampling.
     """
     if seed is None:
         seed = random.SystemRandom().randrange(1, 2 ** 31)
@@ -830,6 +932,13 @@ def run_remd_multichain(
     if _uses_label_blind_contacts(model_name):
         _label_blind_contact_scale(lambda_intra, lambda_inter)
     cooperativity = _validate_cooperativity(cooperativity, model_name)
+    degree_weights = _validate_degree_weights(degree_weights, model_name,
+                                              cooperativity)
+    # The per-bead degree cache is populated only when the Hamiltonian needs it.
+    track_degrees = _tracks_degrees(model_name, cooperativity)
+    if track_degrees:
+        coop_A0, coop_q_sat = remd.validated_saturating_params(params)
+        coop_scale = _label_blind_contact_scale(lambda_intra, lambda_inter)
     # Environment-controlled contact debugging works even without the CLI flag.
     debug_contacts = bool(debug_contacts or mcc.DEBUG_CONTACTS)
 
@@ -845,7 +954,12 @@ def run_remd_multichain(
     # Each REMD lane begins from its OWN independently generated dispersed state
     # (deterministic per-lane seeds); no shared starting configuration.
     replicas = _build_independent_replicas(
-        Ts, M, N, L, base_seed, cluster_contact_threshold)
+        Ts, M, N, L, base_seed, cluster_contact_threshold,
+        track_degrees=track_degrees)
+    # Coordination accumulators use exactly compute_statistics' burn-in index.
+    coord_start = obs._post_burnin(n_cycles, burnin_frac)
+    for rep in replicas:
+        rep.coord_start_cycle = int(coord_start)
 
     swap_props = np.zeros(max(nT - 1, 0), dtype=np.int64)
     swap_accs = np.zeros(max(nT - 1, 0), dtype=np.int64)
@@ -876,11 +990,11 @@ def run_remd_multichain(
                         model_name, params, Tref, Tscale,
                         lambda_intra, lambda_inter, kappa_bend,
                         _lane_seed(base_seed, cycle, k), debug_contacts,
-                        cooperativity)
+                        cooperativity, replicas[k].state.degrees, degree_weights)
                     for k in range(nT)]
                 for k, fut in enumerate(futures):
-                    coords, counts_tuple, counters, n_bend, intra_by_chain = \
-                        fut.result()
+                    (coords, counts_tuple, counters, n_bend, intra_by_chain,
+                     degrees) = fut.result()
                     rep = replicas[k]
                     rep.state = MultiChainState(
                         coords_unwrapped=np.asarray(coords, dtype=np.int64),
@@ -888,7 +1002,8 @@ def run_remd_multichain(
                         counts=ContactCounts.from_tuple(counts_tuple), box_size=L,
                         n_bend=int(n_bend),
                         intra_contacts_by_chain=np.asarray(
-                            intra_by_chain, dtype=np.int64))
+                            intra_by_chain, dtype=np.int64),
+                        degrees=degrees)
                     rep.move_counters = counters
             else:
                 for k, rep in enumerate(replicas):
@@ -898,7 +1013,8 @@ def run_remd_multichain(
                              n_local, n_translation, rng,
                              n_reptation=n_reptation, n_rotation=n_rotation,
                              debug_contacts=debug_contacts, kappa_bend=kappa_bend,
-                             cooperativity=cooperativity)
+                             cooperativity=cooperativity,
+                             degree_weights=degree_weights)
 
             # Even/odd adjacent swaps (temperatures fixed to lanes).  The actual
             # production swap operation is attempt_swap; the deterministic
@@ -910,7 +1026,8 @@ def run_remd_multichain(
                 swap_rng = random.Random(_lane_seed(base_seed, cycle, 1000 + k))
                 if attempt_swap(replicas[k], replicas[k + 1], model_name, params,
                                 Tref, Tscale, lambda_intra, lambda_inter,
-                                swap_rng, cooperativity=cooperativity):
+                                swap_rng, cooperativity=cooperativity,
+                                degree_weights=degree_weights):
                     swap_accs[k] += 1
                     wa, wb = lane_walker[k], lane_walker[k + 1]
                     lane_walker[k], lane_walker[k + 1] = wb, wa
@@ -927,13 +1044,15 @@ def run_remd_multichain(
                 snap_me = np.empty(nT, dtype=np.int64)
                 snap_rg2 = np.empty(nT, dtype=np.float64)
                 snap_lcs = np.empty(nT, dtype=np.int64)
+                snap_hist = np.empty((nT, 7), dtype=np.int64)
+                snap_S = np.empty(nT, dtype=np.float64)
 
             for k, rep in enumerate(replicas):
                 cyc = obs.cycle_observables(rep.state, cluster_contact_threshold)
                 u = reduced_potential_state(
                     rep.state, rep.T, model_name, params, Tref, Tscale,
                     lambda_intra, lambda_inter, kappa_bend,
-                    cooperativity=cooperativity)
+                    cooperativity=cooperativity, degree_weights=degree_weights)
                 rep.u_traj.append(u)
                 rep.eeff_traj.append(rep.T * u)
                 rep.m_intra_traj.append(cyc["m_intra"])
@@ -952,19 +1071,44 @@ def run_remd_multichain(
                 # Cached total bend count (O(1) read); additive supplementary
                 # observable, never alters sampling.
                 rep.n_bend_traj.append(int(rep.state.n_bend))
+                # Coordination observables (additive; never alter sampling).
+                # Per-bead split degrees come from the cache when the run tracks
+                # them, otherwise from one O(M*N) oracle pass.
+                degrees = (rep.state.degrees if rep.state.degrees is not None
+                           else mcc.contact_degrees_split(rep.state))
+                coord = obs.split_degree_summary(degrees, M, N)
+                rep.degree_hist_traj.append(coord["degree_hist"])
+                if cycle >= coord_start:
+                    rep.coord_joint += coord["joint"]
+                    rep.coord_k_intra_by_position += coord["k_intra_by_position"]
+                    rep.coord_k_inter_by_position += coord["k_inter_by_position"]
+                    rep.coord_n_post += 1
+                if track_degrees:
+                    S = mcc.cooperative_sum_from_joint(
+                        coord["joint"], coop_q_sat, degree_weights)
+                    b_T = remd.reduced_bias(model_name, params, rep.T, Tref, Tscale)
+                    rep.coop_sum_traj.append(S)
+                    rep.u_linear_traj.append(
+                        coop_scale * float(b_T) * cyc["m_total"])
+                    rep.u_coop_traj.append(-coop_scale * coop_A0 * S)
                 if do_snapshot:
                     snap_coords[k] = rep.state.coords_unwrapped
                     snap_mi[k] = cyc["m_intra"]
                     snap_me[k] = cyc["m_inter"]
                     snap_rg2[k] = cyc["mean_chain_rg2_lattice"]
                     snap_lcs[k] = cyc["largest_cluster_size"]
+                    snap_hist[k] = coord["degree_hist"]
+                    if track_degrees:
+                        snap_S[k] = rep.coop_sum_traj[-1]
 
             if do_snapshot:
                 snapshot_writer.append(
                     cycle=cycle, coordinates=snap_coords,
                     walker_id=lane_walker.astype(np.int64),
                     m_intra=snap_mi, m_inter=snap_me,
-                    mean_chain_rg2=snap_rg2, largest_cluster_size=snap_lcs)
+                    mean_chain_rg2=snap_rg2, largest_cluster_size=snap_lcs,
+                    degree_histogram=snap_hist,
+                    cooperative_sum=snap_S if track_degrees else None)
 
             if verbose and (cycle + 1) % report_every == 0:
                 rates = " ".join(
@@ -999,7 +1143,61 @@ def _traj_dicts(replicas: List[MultiReplica]) -> List[dict]:
         # M carried per lane so contact normalization uses an explicit chain
         # count (never inferred from cluster sizes).
         "n_chains": rep.state.n_chains,
+        # Coordination observables (the local-rule series are empty otherwise).
+        "degree_hist": rep.degree_hist_traj,
+        "coop_sum": rep.coop_sum_traj,
+        "u_linear": rep.u_linear_traj,
+        "u_coop": rep.u_coop_traj,
     } for rep in replicas]
+
+
+def _coordination_distributions(replicas, M: int, N: int) -> dict:
+    """``coord_*`` distribution keys from the per-lane coordination observables.
+
+    Everything except the per-cycle histogram trajectory uses the run's
+    post-burn-in accumulators (window start ``coord_post_burnin_start_cycle``).
+    Probabilities are bead fractions; lanes without post-burn-in samples are NaN.
+    """
+    nT = len(replicas)
+    n_post = np.array([int(r.coord_n_post) for r in replicas], dtype=np.int64)
+    joint = np.array([r.coord_joint for r in replicas], dtype=np.int64).reshape(
+        nT, 7, 7)
+    k_intra = np.array([r.coord_k_intra_by_position for r in replicas],
+                       dtype=np.int64).reshape(nT, N)
+    k_inter = np.array([r.coord_k_inter_by_position for r in replicas],
+                       dtype=np.int64).reshape(nT, N)
+    degree_counts = np.zeros((nT, 7), dtype=np.int64)  # by total k = a + e
+    for a in range(7):
+        for e in range(7 - a):
+            degree_counts[:, a + e] += joint[:, a, e]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        bead_samples = (n_post * M * N).astype(float)[:, None]
+        chain_samples = (n_post * M).astype(float)[:, None]
+        P_degree = degree_counts / bead_samples
+        out = {
+            "coord_degree_values": obs.DEGREE_VALUES.copy(),
+            "coord_degree_hist": np.array(
+                [np.asarray(r.degree_hist_traj, dtype=np.int64).reshape(-1, 7)
+                 for r in replicas], dtype=np.int64),
+            "coord_post_burnin_start_cycle": np.array(
+                [int(r.coord_start_cycle) for r in replicas], dtype=np.int64),
+            "coord_n_post_cycles": n_post,
+            "coord_P_degree": P_degree,
+            "coord_joint_counts": joint,
+            "coord_P_joint": joint / bead_samples[:, :, None],
+            "coord_mean_degree_by_position": (k_intra + k_inter) / chain_samples,
+            "coord_mean_degree_intra_by_position": k_intra / chain_samples,
+            "coord_mean_degree_inter_by_position": k_inter / chain_samples,
+        }
+    if replicas and replicas[0].coop_sum_traj:
+        S_mean, S_std = [], []
+        for r in replicas:
+            post = np.asarray(r.coop_sum_traj, dtype=float)[r.coord_start_cycle:]
+            S_mean.append(float(post.mean()) if post.size else float("nan"))
+            S_std.append(float(post.std(ddof=0)) if post.size else float("nan"))
+        out["coord_S_mean"] = np.array(S_mean, dtype=float)
+        out["coord_S_std"] = np.array(S_std, dtype=float)
+    return out
 
 
 def _bend_fraction_by_temp(replicas, M: int, N: int, burnin_frac: float
@@ -1052,7 +1250,20 @@ def build_run_distributions(replicas, Ts, *, burnin_frac, rg_bins, rg_scale):
         [np.asarray(r.n_bend_traj, dtype=np.int64) for r in replicas],
         dtype=np.int64) if replicas else np.zeros((0, 0), dtype=np.int64)
     dist["bend_fraction"] = _bend_fraction_by_temp(replicas, M, N, burnin_frac)
+    if replicas:
+        dist.update(_coordination_distributions(replicas, M, N))
     return dist
+
+
+def _coordination_metadata(model_name, cooperativity, degree_weights) -> dict:
+    """Shared NPZ / run-summary / snapshot provenance of the coordination layer."""
+    return {
+        "degree_cache_enabled": bool(_tracks_degrees(model_name, cooperativity)),
+        "degree_weight_intra": float(degree_weights[0]),
+        "degree_weight_inter": float(degree_weights[1]),
+        "coordination_observables_schema_version":
+            int(mcio.COORDINATION_OBSERVABLES_SCHEMA_VERSION),
+    }
 
 
 def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
@@ -1062,9 +1273,12 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
                     fit_summary_json, reptation_sweeps_per_swap=1,
                     rotation_sweeps_per_swap=1, kappa_bend=0.0,
                     fit_chain_length=None,
-                    cooperativity=DEFAULT_COOPERATIVITY) -> dict:
+                    cooperativity=DEFAULT_COOPERATIVITY,
+                    degree_weights=DEFAULT_DEGREE_WEIGHTS) -> dict:
     """Inject full model + run provenance into a distributions/summary dict."""
     cooperativity = _validate_cooperativity(cooperativity, model_name)
+    degree_weights = _validate_degree_weights(degree_weights, model_name,
+                                              cooperativity)
     dist["schema_version"] = int(SCHEMA_VERSION)
     dist["model_api_version"] = int(MODEL_API_VERSION)
     dist["model_name"] = str(model_name)
@@ -1095,7 +1309,8 @@ def attach_metadata(dist: dict, *, M, N, L, Ts, seed, model_name, param_names,
     dist["configuration_dependent"] = bool(spec["configuration_dependent"])
     dist["state_observable"] = str(spec["state_observable"])
     dist["multichain_potential_definition"] = \
-        _multichain_potential_definition(model_name, cooperativity)
+        _multichain_potential_definition(model_name, cooperativity, degree_weights)
+    dist.update(_coordination_metadata(model_name, cooperativity, degree_weights))
     if str(spec["potential_kind"]) in {
         "saturating_cooperative", "local_coordination_saturation"
     }:
@@ -1247,6 +1462,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "monomer's own nonbonded contact degree (intra AND "
                          "inter), giving a short-ranged, exactly additive "
                          "cooperativity with the same fitted A0 and q_sat.")
+    ap.add_argument("--degree-weight-intra", type=float, default=1.0,
+                    dest="degree_weight_intra",
+                    help="local cooperativity only: weight of intrachain "
+                         "neighbours in each monomer's degree, k_eff = "
+                         "w_intra*k_intra + w_inter*k_inter, inside g(k_eff). "
+                         "The linear b(T)*m_total term is unweighted. The "
+                         "default (1, 1) treats intra- and interchain "
+                         "neighbours identically.")
+    ap.add_argument("--degree-weight-inter", type=float, default=1.0,
+                    dest="degree_weight_inter",
+                    help="local cooperativity only: weight of interchain "
+                         "neighbours in k_eff (see --degree-weight-intra).")
     ap.add_argument("--cluster-contact-threshold", type=int, default=1,
                     dest="cluster_contact_threshold")
     ap.add_argument("--seed", type=int, default=42)
@@ -1368,6 +1595,9 @@ def main(argv=None) -> None:
     # Store the resolved rule so snapshot/run-summary helpers do not serialize
     # the argparse sentinel None.
     args.cooperativity = cooperativity
+    degree_weights = _validate_degree_weights(
+        (args.degree_weight_intra, args.degree_weight_inter), model_name,
+        cooperativity)
 
     # Validate the fitted single-chain normalization.  The label-blind saturation
     # Hamiltonian uses M*N total beads at evaluation time, while N remains the
@@ -1413,9 +1643,12 @@ def main(argv=None) -> None:
     print(f"Model: {model_name} — {_spec['description']}")
     print(f"Single-chain contact potential: {_spec['potential_definition']}")
     print(f"Multichain potential: "
-          f"{_multichain_potential_definition(model_name, cooperativity)}")
+          f"{_multichain_potential_definition(model_name, cooperativity, degree_weights)}")
     if _uses_label_blind_contacts(model_name):
         print(f"Cooperativity rule: {cooperativity}")
+    if _tracks_degrees(model_name, cooperativity):
+        print(f"Local degree weights: w_intra={degree_weights[0]:g} "
+              f"w_inter={degree_weights[1]:g} (per-bead degree cache enabled)")
     print(f"m_ref = {int(_spec['m_ref'])}")
     print(f"Parameter source: {parameter_source}"
           + (f" ({fit_summary_json})" if fit_summary_json else ""))
@@ -1457,7 +1690,8 @@ def main(argv=None) -> None:
             cluster_contact_threshold=args.cluster_contact_threshold,
             seed=args.seed, n_workers=args.n_workers, verbose=True,
             debug_contacts=args.debug_contacts,
-            snapshot_writer=snapshot_writer, snapshot_stride=args.snapshot_stride)
+            snapshot_writer=snapshot_writer, snapshot_stride=args.snapshot_stride,
+            degree_weights=degree_weights, burnin_frac=args.burnin_frac)
         if snapshot_writer is not None:
             snapshot_writer.update_metadata({
                 "end_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())})
@@ -1483,7 +1717,7 @@ def main(argv=None) -> None:
         cluster_contact_threshold=args.cluster_contact_threshold,
         parameter_source=parameter_source, fit_summary_json=fit_summary_json,
         kappa_bend=kappa_bend, fit_chain_length=fit_chain_length,
-        cooperativity=cooperativity)
+        cooperativity=cooperativity, degree_weights=degree_weights)
 
     out_files = {
         "results_csv": mcio.save_results_csv(results, args.out_prefix),
@@ -1528,6 +1762,12 @@ def main(argv=None) -> None:
     mcio.save_run_summary(run_summary, summary_path)
 
 
+def _args_degree_weights(args) -> Tuple[float, float]:
+    """(w_intra, w_inter) from parsed CLI args (default 1, 1)."""
+    return (float(getattr(args, "degree_weight_intra", 1.0)),
+            float(getattr(args, "degree_weight_inter", 1.0)))
+
+
 def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
                        Tscale, temp_source, phi, fit_summary_json,
                        kappa_bend=0.0, bending_enabled=False,
@@ -1563,7 +1803,8 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         "configuration_dependent": bool(spec["configuration_dependent"]),
         "state_observable": str(spec["state_observable"]),
         "multichain_potential_definition":
-            _multichain_potential_definition(model_name, args.cooperativity),
+            _multichain_potential_definition(model_name, args.cooperativity,
+                                             _args_degree_weights(args)),
         "cooperativity": str(args.cooperativity),
         "runtime_chain_length": int(args.N),
         "fit_chain_length": (int(fit_chain_length)
@@ -1585,6 +1826,8 @@ def _snapshot_metadata(args, Ts, model_name, param_names, model_params, Tref,
         "start_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
         "end_time": "unknown",
     }
+    meta.update(_coordination_metadata(model_name, args.cooperativity,
+                                       _args_degree_weights(args)))
     if str(spec["potential_kind"]) in {
         "saturating_cooperative", "local_coordination_saturation"
     }:
@@ -1672,7 +1915,8 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "configuration_dependent": bool(spec["configuration_dependent"]),
         "state_observable": str(spec["state_observable"]),
         "multichain_potential_definition":
-            _multichain_potential_definition(model_name, cooperativity),
+            _multichain_potential_definition(model_name, cooperativity,
+                                             _args_degree_weights(args)),
         "runtime_chain_length": int(N),
         "fit_chain_length": (int(fit_chain_length)
                              if fit_chain_length is not None else None),
@@ -1714,6 +1958,8 @@ def _run_summary(args, Ts, temp_source, model_name, param_names, model_params,
         "git_commit": remd._git_commit(),
         "output_files": out_files,
     }
+    summary.update(_coordination_metadata(model_name, cooperativity,
+                                          _args_degree_weights(args)))
     if str(spec["potential_kind"]) in {
         "saturating_cooperative", "local_coordination_saturation"
     }:
@@ -2020,6 +2266,49 @@ def _qt_saturating_cooperative() -> None:
 
     print("  quick-test saturating-cooperative all-contact Hamiltonian "
           "(formula/label-blind/move-delta/swap/M=1/A0=0/determinism): PASSED")
+
+
+def _qt_local_coordination() -> None:
+    """Per-bead degree cache + coordination observables of the local rule."""
+    model = "local_coordination_saturation"
+    p = [700.0, 2.3, 1.2, 0.4]
+    # (1) Cache == oracle after every accepted move of all six types, in a dense
+    # box with wraparound neighbours, at default and non-default degree weights.
+    for weights in (DEFAULT_DEGREE_WEIGHTS, (1.0, 0.25)):
+        st = mcs.initialize_dispersed_state(4, 6, 4, seed=2, track_degrees=True)
+        counters = mvs.new_move_counters()
+        for s in range(20):
+            mc_sweep(st, counters, 340.0, model, p, 320.0, 80.0, 1.0, 1.0, 24, 4,
+                     random.Random(50 + s), n_reptation=4, n_rotation=4,
+                     debug_contacts=True, degree_weights=weights)
+        assert np.all(counters[:, 3] > 0)
+        mcs.validate_state(st)
+    # (2) A0 = 0 reproduces hs bit for bit; hs never builds the degree cache.
+    kw = dict(n_chains=3, chain_length=8, box_size=8, Ts=np.linspace(305, 350, 4),
+              local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=8,
+              Tref=320.0, Tscale=80.0, seed=31, verbose=False)
+    reps0, _, sa0, _ = run_remd_multichain(model_name=model,
+                                           params=[700.0, 2.3, 0.0, 0.4], **kw)
+    repsh, _, sah, _ = run_remd_multichain(model_name="hs", params=[700.0, 2.3],
+                                           **kw)
+    assert np.array_equal(sa0, sah)
+    for a, b in zip(reps0, repsh):
+        assert a.u_traj == b.u_traj and a.m_intra_traj == b.m_intra_traj
+        assert b.state.degrees is None
+    # (3) Invariants and serial vs 2-worker identity of the new observables.
+    r1, *_ = run_remd_multichain(model_name=model, params=p, n_workers=1, **kw)
+    r2, *_ = run_remd_multichain(model_name=model, params=p, n_workers=2, **kw)
+    for a, b in zip(r1, r2):
+        H = np.array(a.degree_hist_traj)
+        m_total = np.array(a.m_intra_traj) + np.array(a.m_inter_traj)
+        assert np.all(H.sum(axis=1) == 24) and np.array_equal(H @ np.arange(7),
+                                                               2 * m_total)
+        assert np.array_equal(H, np.array(b.degree_hist_traj))
+        assert a.coop_sum_traj == b.coop_sum_traj and a.u_traj == b.u_traj
+        assert np.array_equal(a.coord_joint, b.coord_joint)
+        assert np.array_equal(a.state.degrees, b.state.degrees)
+    print("  quick-test local coordination (degree cache vs oracle, weights, "
+          "A0=0 == hs, invariants, serial == 2-worker): PASSED")
 
 
 def _qt_short_run(n_workers, tmp, tag, lambda_intra=1.0, lambda_inter=1.0,
@@ -2402,6 +2691,7 @@ def run_quick_test() -> None:
     _qt_lambda_modes()
     _qt_generalized_swap()
     _qt_saturating_cooperative()
+    _qt_local_coordination()
     _qt_bending()
     _qt_independent_init()
     _qt_canonicalization()

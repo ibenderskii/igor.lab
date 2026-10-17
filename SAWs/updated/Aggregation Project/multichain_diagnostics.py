@@ -56,6 +56,10 @@ DIAGNOSED_OBSERVABLES = (
     # Diagnosed for ESS/drift like the others but deliberately kept OUT of
     # CENTRAL_OBSERVABLES, so it never drives a convergence warning.
     "n_bend",
+    # Coordination observables, likewise supplementary (no warnings): the mean
+    # nonbonded contact degree per bead, and S = sum_i g(k_eff_i) for local-rule
+    # runs (an empty series, method="insufficient_samples", for other models).
+    "mean_degree", "cooperative_sum",
 )
 # Observables whose ESS / drift trigger convergence WARNINGS.  Kept to the raw
 # extensive counts so normalized series (deterministic transforms at fixed M) do
@@ -76,6 +80,7 @@ def _lane_series(rep, rg_scale: float) -> Dict[str, np.ndarray]:
     m_intra = np.asarray(rep.m_intra_traj, dtype=float)
     m_inter = np.asarray(rep.m_inter_traj, dtype=float)
     M = float(rep.state.n_chains) if rep.state.n_chains else float("nan")
+    hist = np.asarray(getattr(rep, "degree_hist_traj", []), dtype=float).reshape(-1, 7)
     return {
         "u": np.asarray(rep.u_traj, dtype=float),
         "m_intra": m_intra,
@@ -88,6 +93,9 @@ def _lane_series(rep, rg_scale: float) -> Dict[str, np.ndarray]:
         "m_intra_per_chain": m_intra / M,
         "m_inter_pairs_per_chain": m_inter / M,
         "n_bend": np.asarray(getattr(rep, "n_bend_traj", []), dtype=float),
+        "mean_degree": hist @ np.arange(7) / hist.sum(axis=1),
+        "cooperative_sum": np.asarray(getattr(rep, "coop_sum_traj", []),
+                                      dtype=float),
     }
 
 
