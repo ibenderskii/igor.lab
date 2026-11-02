@@ -137,9 +137,9 @@ def _randbelow(mt, st, n):
         k += 1
         t >>= 1
     shift = np.uint64(32 - k)
-    r = int(_genrand_uint32(mt, st) >> shift)
+    r = np.int64(_genrand_uint32(mt, st) >> shift)
     while r >= n:
-        r = int(_genrand_uint32(mt, st) >> shift)
+        r = np.int64(_genrand_uint32(mt, st) >> shift)
     return r
 
 

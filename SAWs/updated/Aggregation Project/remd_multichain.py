@@ -574,6 +574,73 @@ def attempt_swap(
 
 
 # ---------------------------------------------------------------------------
+# Sweep kernels.  "python" is mc_sweep below (the reference); "numba" runs the
+# same lane sweep in multichain_kernels, bit for bit (same state, counters and
+# RNG stream); "auto" uses numba when it imports and a start-up lockstep
+# self-check on this machine shows the two agree, otherwise python.
+# ---------------------------------------------------------------------------
+
+SAMPLER_KERNELS = ("auto", "numba", "python")
+_MCK_MODULE: list = []
+LAST_SAMPLER_INFO: dict = {}
+
+
+def _kernel_module():
+    """multichain_kernels, or None when it (or numba) cannot be imported."""
+    if not _MCK_MODULE:
+        try:
+            import multichain_kernels as _m
+            if not _m.NUMBA_AVAILABLE:
+                _m = None
+            else:
+                _m.check_move_tables(mvs, remd)
+        except Exception:  # pragma: no cover - environment dependent
+            _m = None
+        _MCK_MODULE.append(_m)
+    return _MCK_MODULE[0]
+
+
+def resolve_sampler_kernel(requested, *, model_name, params, Tref, Tscale, M, N, L, Ts,
+                           lambda_intra, lambda_inter, kappa_bend, cooperativity,
+                           degree_weights, local_sweeps_per_swap=1,
+                           translation_sweeps_per_swap=1, reptation_sweeps_per_swap=1,
+                           rotation_sweeps_per_swap=1, verbose=False):
+    """Return (kernel, info); ``info`` records the choice and the self-check."""
+    requested = str(requested)
+    if requested not in SAMPLER_KERNELS:
+        raise ValueError(f"--kernel must be one of {SAMPLER_KERNELS}, got {requested!r}")
+    if requested == "python":
+        return "python", {"requested": requested, "kernel": "python", "reason": "requested"}
+    mck = _kernel_module()
+    info = {"requested": requested,
+            "numba_version": getattr(mck, "NUMBA_VERSION", None) if mck else None}
+    if mck is None:
+        if requested == "numba":
+            raise RuntimeError("--kernel numba requested but numba (or multichain_kernels) "
+                               "is unavailable")
+        info.update(kernel="python", reason="numba unavailable")
+        return "python", info
+    check = mck.selfcheck(
+        sys.modules[__name__], model_name, params, Tref, Tscale, int(M), int(N), int(L),
+        list(np.asarray(Ts, dtype=float)), lambda_intra, lambda_inter, kappa_bend,
+        cooperativity, degree_weights, local_sweeps_per_swap, translation_sweeps_per_swap,
+        reptation_sweeps_per_swap, rotation_sweeps_per_swap)
+    info["selfcheck"] = check
+    if not check.get("ok"):
+        if requested == "numba":
+            raise RuntimeError(f"numba kernel failed its self-check: {check.get('reason')}")
+        info.update(kernel="python", reason=f"self-check failed: {check.get('reason')}")
+        if verbose:
+            print(f"  [kernel] numba self-check FAILED ({check.get('reason')}); using python")
+        return "python", info
+    info.update(kernel="numba", reason="self-check passed")
+    if verbose:
+        print(f"  [kernel] numba {info['numba_version']} (self-check: identical to python "
+              f"at {len(check['temperatures'])} temperatures x {check['sweeps']} sweeps)")
+    return "numba", info
+
+
+# ---------------------------------------------------------------------------
 # Local MC sweep (one lane)
 # ---------------------------------------------------------------------------
 
@@ -586,6 +653,7 @@ def mc_sweep(
     debug_contacts: bool = False, kappa_bend: float = 0.0,
     cooperativity: str = DEFAULT_COOPERATIVITY,
     degree_weights=DEFAULT_DEGREE_WEIGHTS,
+    kernel: str = "python",
 ) -> None:
     """Run one lane's local + translation + reptation + rotation proposals in place.
 
@@ -642,6 +710,45 @@ def mc_sweep(
     N = state.chain_length
     total_beads = int(state.n_chains) * int(N)
     nonlinear = remd.MODEL_REGISTRY[model_name]["potential_kind"] != "linear"
+
+    if kernel == "numba" and not debug_contacts:
+        # Same coefficients as the Python branches below, resolved here once.
+        mck = _kernel_module()
+        kind = mck._ik.KIND_CODES[str(remd.MODEL_REGISTRY[model_name]["potential_kind"])]
+        kappa = 0.0
+        A0 = 0.0
+        q_sat = 1.0
+        n_f = float(N)
+        gtab = None
+        equal_w = True
+        if local_coop:
+            path = mck.PATH_LOCAL
+            A0, q_sat = A0_coop, q_sat_coop
+            w_intra, w_inter = float(weights[0]), float(weights[1])
+            equal_w = w_intra == w_inter
+            gtab = (mcc._g_total_table(float(q_sat), w_intra) if equal_w
+                    else mcc._g_split_table(float(q_sat), w_intra, w_inter))
+        elif label_blind:
+            path = mck.PATH_GLOBAL
+            if kind == 2:
+                A0, q_sat = remd.validated_saturating_params(params)
+            n_f = float(remd.validate_chain_length(model_name, total_beads))
+        elif nonlinear:
+            path = mck.PATH_QUADRATIC
+            if kind != 1:
+                raise ValueError(f"unsupported nonlinear potential kind for {model_name!r}")
+            kappa = remd.quadratic_bias(model_name, params, float(temperature), Tref, Tscale)
+            n_f = float(remd.validate_chain_length(model_name, N))
+        else:
+            path = mck.PATH_LINEAR
+        mck.mc_sweep_numba(
+            state, counters, rng, n_local=int(n_local), n_translation=int(n_translation),
+            n_reptation=int(n_reptation), n_rotation=int(n_rotation), path=path, kind=kind,
+            b=float(b), kappa=float(kappa), A0=float(A0), q_sat=float(q_sat), n_f=n_f,
+            li=li, lin=lin, cs=float(contact_scale), kb=kb, gtab=gtab, equal_w=equal_w)
+        return
+    if kernel not in ("python", "numba"):
+        raise ValueError(f"unresolved sampler kernel {kernel!r}")
 
     def _attempt(prop):
         idx = mvs.MOVE_INDEX[prop.move_type]
@@ -816,6 +923,7 @@ def evolve_lane_worker(
     lambda_intra: float, lambda_inter: float, kappa_bend: float, seed: int,
     debug_contacts: bool, cooperativity: str = DEFAULT_COOPERATIVITY,
     degrees: np.ndarray = None, degree_weights=DEFAULT_DEGREE_WEIGHTS,
+    kernel: str = "python",
 ) -> Tuple[np.ndarray, Tuple[int, int], np.ndarray, int, np.ndarray, np.ndarray]:
     """Evolve one lane for a cycle without transferring trajectories.
 
@@ -840,7 +948,8 @@ def evolve_lane_worker(
              lambda_intra, lambda_inter, n_local, n_translation, rng,
              n_reptation=n_reptation, n_rotation=n_rotation,
              debug_contacts=debug_contacts, kappa_bend=kappa_bend,
-             cooperativity=cooperativity, degree_weights=degree_weights)
+             cooperativity=cooperativity, degree_weights=degree_weights,
+             kernel=kernel)
     return (state.coords_unwrapped, state.counts.as_tuple(), counters,
             int(state.n_bend), state.intra_contacts_by_chain, state.degrees)
 
@@ -908,6 +1017,7 @@ def run_remd_multichain(
     debug_contacts: bool = False,
     snapshot_writer=None, snapshot_stride: int = 1, snapshot_start_cycle: int = 0,
     degree_weights=DEFAULT_DEGREE_WEIGHTS, burnin_frac: float = 0.5,
+    kernel: str = "python",
 ) -> Tuple[List[MultiReplica], np.ndarray, np.ndarray, np.ndarray]:
     """Run multi-chain REMD.
 
@@ -946,6 +1056,19 @@ def run_remd_multichain(
     N = int(chain_length)
     L = int(box_size)
     nT = len(Ts)
+    # Resolve the sweep kernel ("auto" runs a lockstep self-check; it uses its own
+    # RNGs and states, so the run below is unaffected).  The sampled trajectory
+    # does not depend on the kernel.
+    kernel, kernel_info = resolve_sampler_kernel(
+        kernel, model_name=model_name, params=params, Tref=Tref, Tscale=Tscale,
+        M=M, N=N, L=L, Ts=Ts, lambda_intra=lambda_intra, lambda_inter=lambda_inter,
+        kappa_bend=kappa_bend, cooperativity=cooperativity, degree_weights=degree_weights,
+        local_sweeps_per_swap=local_sweeps_per_swap,
+        translation_sweeps_per_swap=translation_sweeps_per_swap,
+        reptation_sweeps_per_swap=reptation_sweeps_per_swap,
+        rotation_sweeps_per_swap=rotation_sweeps_per_swap, verbose=verbose)
+    LAST_SAMPLER_INFO.clear()
+    LAST_SAMPLER_INFO.update(kernel_info)
     n_local = int(local_sweeps_per_swap) * M * N
     n_translation = int(translation_sweeps_per_swap) * M
     n_reptation = int(reptation_sweeps_per_swap) * M
@@ -990,7 +1113,7 @@ def run_remd_multichain(
                         model_name, params, Tref, Tscale,
                         lambda_intra, lambda_inter, kappa_bend,
                         _lane_seed(base_seed, cycle, k), debug_contacts,
-                        cooperativity, replicas[k].state.degrees, degree_weights)
+                        cooperativity, replicas[k].state.degrees, degree_weights, kernel)
                     for k in range(nT)]
                 for k, fut in enumerate(futures):
                     (coords, counts_tuple, counters, n_bend, intra_by_chain,
@@ -1014,7 +1137,7 @@ def run_remd_multichain(
                              n_reptation=n_reptation, n_rotation=n_rotation,
                              debug_contacts=debug_contacts, kappa_bend=kappa_bend,
                              cooperativity=cooperativity,
-                             degree_weights=degree_weights)
+                             degree_weights=degree_weights, kernel=kernel)
 
             # Even/odd adjacent swaps (temperatures fixed to lanes).  The actual
             # production swap operation is attempt_swap; the deterministic
@@ -1048,7 +1171,10 @@ def run_remd_multichain(
                 snap_S = np.empty(nT, dtype=np.float64)
 
             for k, rep in enumerate(replicas):
-                cyc = obs.cycle_observables(rep.state, cluster_contact_threshold)
+                cyc = obs.cycle_observables(
+                    rep.state, cluster_contact_threshold,
+                    pair_counts=(_kernel_module().interchain_pair_counts(rep.state)
+                                 if kernel == "numba" else None))
                 u = reduced_potential_state(
                     rep.state, rep.T, model_name, params, Tref, Tscale,
                     lambda_intra, lambda_inter, kappa_bend,
@@ -1075,7 +1201,9 @@ def run_remd_multichain(
                 # Per-bead split degrees come from the cache when the run tracks
                 # them, otherwise from one O(M*N) oracle pass.
                 degrees = (rep.state.degrees if rep.state.degrees is not None
-                           else mcc.contact_degrees_split(rep.state))
+                           else (_kernel_module().contact_degrees_split(rep.state)
+                                 if kernel == "numba"
+                                 else mcc.contact_degrees_split(rep.state)))
                 coord = obs.split_degree_summary(degrees, M, N)
                 rep.degree_hist_traj.append(coord["degree_hist"])
                 if cycle >= coord_start:
@@ -1478,6 +1606,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     dest="cluster_contact_threshold")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-workers", type=int, default=1, dest="n_workers")
+    ap.add_argument(
+        "--kernel", choices=list(SAMPLER_KERNELS), default="auto",
+        help=("lane-sweep implementation: 'numba' (compiled, bit-identical to "
+              "'python'), 'python' (reference), or 'auto' = numba when it imports "
+              "and passes a start-up lockstep self-check against python, else "
+              "python.  The sampled trajectory does not depend on this choice."))
     ap.add_argument("--out-prefix", type=str, default="remd_multichain_out",
                     dest="out_prefix")
     ap.add_argument("--rg-scale", type=float, default=1.0, dest="rg_scale")
@@ -1691,7 +1825,8 @@ def main(argv=None) -> None:
             seed=args.seed, n_workers=args.n_workers, verbose=True,
             debug_contacts=args.debug_contacts,
             snapshot_writer=snapshot_writer, snapshot_stride=args.snapshot_stride,
-            degree_weights=degree_weights, burnin_frac=args.burnin_frac)
+            degree_weights=degree_weights, burnin_frac=args.burnin_frac,
+            kernel=args.kernel)
         if snapshot_writer is not None:
             snapshot_writer.update_metadata({
                 "end_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())})
@@ -1757,6 +1892,8 @@ def main(argv=None) -> None:
         results, wall, out_files, replicas, diagnostics,
         configuration_path is not None, kappa_bend, bending_enabled,
         fit_chain_length, cooperativity)
+    # Implementation provenance (kernel, self-check); the data do not depend on it.
+    run_summary["sampler_implementation"] = dict(LAST_SAMPLER_INFO)
     summary_path = f"{args.out_prefix}_run_summary.json"
     out_files["run_summary_json"] = summary_path
     mcio.save_run_summary(run_summary, summary_path)
