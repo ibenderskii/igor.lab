@@ -35,7 +35,8 @@ A field is excluded only by **name**, and every excluded difference is still lis
 - wall times and timestamps;
 - host / Python / platform fields;
 - `git_commit` and other `git_*` fields;
-- anything matching `*_seconds`.
+- anything matching `*_seconds`;
+- `sampler_implementation` (which kernel ran, its start-up self-check and the RNG scheme). This is implementation provenance; the sampled data do not depend on it.
 
 The output roots and code roots are normalized to placeholder tokens, because outputs record their own paths.
 
@@ -47,8 +48,11 @@ The cross-worker check also excludes the worker-count fields themselves: `execut
 fit_hs  fit_sat  fit_hc_kl      real 44-mer data (RnBaseline44 + remd_distributions_44mer)
 fit_lcs fit_lcs_kl fit_hsq10    exact 10-bead SAW baseline (local-coordination + quadratic models)
 remd_hs remd_hs_bend remd_hsq remd_sat remd_lcs      single-chain REMD, 5 lanes x 40 cycles
+remdpl_hs remdpl_sat remdpl_lcs                      the same on 1 worker with --rng-scheme per-lane
 mc_hs mc_hs_bend mc_sat mc_lcs                       multichain REMD, M=3 N=12 L=8, 4 lanes x 12 cycles
 ```
+
+`remdpl_*` cases are skipped for code trees whose sampler has no `--rng-scheme` (e.g. `main`). They are checked against the candidate's own `remd_*_w2` instead: `scheme remdpl_X_w1 == remd_X_w2` in the report.
 
 The fitter cases switch on:
 
@@ -66,6 +70,7 @@ The sampler cases switch on diagnostics, diagnostic trajectories, configuration 
 | fitter | 1, 2 | 1 vs 2 |
 | multichain | 1, 2 | 1 vs 2 |
 | single-chain REMD | 1, 2, 3 | 2 vs 3 |
+| single-chain, per-lane | 1 | equals `remd_*` at 2 workers |
 
 ## A finding the harness surfaced
 
@@ -76,4 +81,4 @@ On current `main`, **single-chain REMD with `--n-workers 1` doesn't produce the 
 
 Both are valid, but they are different streams. Results are identical for any W ≥ 2 (checked 2 vs 3 for hs, hs+κ, hs_quadratic, sat and lcs).
 
-Production ran with 32 workers, so the parallel stream is the one to preserve. **Stage 3 must therefore give its 1-core Numba runs the worker-mode seeding.** Then a 1-core run reproduces the Oct 16–17 `--n-workers 32` outputs exactly. The fitter and the multichain sampler are invariant for 1 vs 2.
+Production ran with 32 workers, so the parallel stream is the one to preserve. Stage 3 adds `--rng-scheme per-lane`, which reseeds each lane exactly the way the workers do but inside one process. A 1-core run with that flag reproduces the `--n-workers ≥ 2` outputs exactly (the `scheme` lines in the report). The fitter and the multichain sampler are invariant for 1 vs 2.

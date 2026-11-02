@@ -141,6 +141,21 @@ def remd_lcs(ctx):
                  ["--Tref", "320", "--Tscale", "80"])
 
 
+# One-core runs with worker-mode seeding (--rng-scheme per-lane, Stage 3):
+# each must reproduce the corresponding --n-workers 2 case exactly.  Skipped
+# for code trees whose sampler has no --rng-scheme option (e.g. main).
+def remdpl_hs(ctx):
+    return remd_hs(ctx) + ["--rng-scheme", "per-lane"]
+
+
+def remdpl_sat(ctx):
+    return remd_sat(ctx) + ["--rng-scheme", "per-lane"]
+
+
+def remdpl_lcs(ctx):
+    return remd_lcs(ctx) + ["--rng-scheme", "per-lane"]
+
+
 def _mc(ctx, model, params, extra=()) -> List[str]:
     return [str(ctx["code"] / "Aggregation Project" / "remd_multichain.py"),
             "--n-chains", "3", "--N", "12", "--box-size", "8",
@@ -177,6 +192,7 @@ CASES: Dict[str, Callable] = {
     "fit_lcs": fit_lcs, "fit_lcs_kl": fit_lcs_kl, "fit_hsq10": fit_hsq10,
     "remd_hs": remd_hs, "remd_hs_bend": remd_hs_bend, "remd_hsq": remd_hsq,
     "remd_sat": remd_sat, "remd_lcs": remd_lcs,
+    "remdpl_hs": remdpl_hs, "remdpl_sat": remdpl_sat, "remdpl_lcs": remdpl_lcs,
     "mc_hs": mc_hs, "mc_hs_bend": mc_hs_bend, "mc_sat": mc_sat, "mc_lcs": mc_lcs,
 }
 
@@ -185,8 +201,13 @@ CASES: Dict[str, Callable] = {
 # cycle and lane), so n_workers=1 and n_workers>=2 legitimately differ there;
 # worker invariance is checked within the parallel family (2 vs 3).  The fitter
 # and the multichain sampler are invariant across 1 vs 2.
-FAMILY_WORKERS = {"fit": "1,2", "remd": "1,2,3", "mc": "1,2"}
+FAMILY_WORKERS = {"fit": "1,2", "remd": "1,2,3", "remdpl": "1", "mc": "1,2"}
 CROSS_WORKER_PAIRS = {"fit": (1, 2), "remd": (2, 3), "mc": (1, 2)}
+# Case families that need a feature: (script relative to the code root, marker
+# string that must appear in it).  Cases are skipped when the marker is absent.
+FAMILY_REQUIRES = {"remdpl": ("auto/remd_uniform_chain_2_new.py", "--rng-scheme")}
+# Cross-scheme equivalences: <family>_<x>_w<a> must equal <target>_<x>_w<b>.
+CROSS_SCHEME_PAIRS = {"remdpl": ("remd", 1, 2)}
 
 
 def family(name: str) -> str:
@@ -256,6 +277,12 @@ def main(argv=None) -> int:
 
     failures = []
     for name in names:
+        req = FAMILY_REQUIRES.get(family(name))
+        if req is not None:
+            script = code / req[0]
+            if not script.is_file() or req[1] not in script.read_text(encoding="utf-8", errors="replace"):
+                print(f"{name:22s}   skipped (code tree has no {req[1]})", flush=True)
+                continue
         wspec = FAMILY_WORKERS[family(name)] if args.workers == "auto" else args.workers
         for w in [int(x) for x in wspec.split(",") if x]:
             case_id = f"{name}_w{w}"

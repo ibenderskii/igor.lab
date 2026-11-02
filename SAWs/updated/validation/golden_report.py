@@ -87,6 +87,22 @@ def main(argv=None) -> int:
         lines.append(f"{'ok  ' if ok else 'FAIL'} workers {name} (w{wa} vs w{wb})")
         if not ok:
             lines += ["      " + l for l in txt.splitlines()]
+    for name in names:
+        fam = rc.family(name)
+        if fam not in rc.CROSS_SCHEME_PAIRS or not wanted(name + "_w0"):
+            continue
+        target, wa, wb = rc.CROSS_SCHEME_PAIRS[fam]
+        other = target + name[len(fam):]
+        da, db = C / f"{name}_w{wa}", C / f"{other}_w{wb}"
+        if not (da.is_dir() and db.is_dir()):
+            lines.append(f"FAIL scheme  {name}: missing {da.name} or {db.name}")
+            ok_all = False
+            continue
+        ok, txt = _cmp(da, db, norm + [(str(da), "<CASE>"), (str(db), "<CASE>")], CROSS_WORKER_IGNORES)
+        ok_all &= ok
+        lines.append(f"{'ok  ' if ok else 'FAIL'} scheme  {name}_w{wa} == {other}_w{wb}")
+        if not ok:
+            lines += ["      " + l for l in txt.splitlines()]
     lines.append("RESULT: " + ("ALL IDENTICAL" if ok_all else "DIFFERENCES FOUND"))
     text = "\n".join(lines) + "\n"
     print(text, end="")

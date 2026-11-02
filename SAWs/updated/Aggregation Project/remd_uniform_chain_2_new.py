@@ -204,6 +204,22 @@ from isaw_config_io import SnapshotWriter  # noqa: E402,F401  (run_remd annotati
 from lattice_bending import (  # noqa: E402
     BEND_DEFINITION, count_bends, delta_bends,
 )
+# The compiled local-move kernel (isaw_kernels, bit-identical to mc_sweep) is
+# imported lazily by _kernel_module(), so importing this module -- e.g. from the
+# multichain sampler, which only uses the model registry and potentials -- does
+# not import numba.
+_IK_MODULE: list = []
+
+
+def _kernel_module():
+    """isaw_kernels, or None when it (or numba) cannot be imported."""
+    if not _IK_MODULE:
+        try:
+            import isaw_kernels as _ik_mod
+        except Exception:  # pragma: no cover - environment dependent
+            _ik_mod = None
+        _IK_MODULE.append(_ik_mod)
+    return _IK_MODULE[0]
 
 # Matplotlib is imported LAZILY inside the plotting functions only.  Importing
 # it at module import time would initialize a GUI/Agg backend in every spawned
@@ -1449,6 +1465,77 @@ def attempt_swap(
 
 
 # ---------------------------------------------------------------------------
+# Local-sweep kernels.  "python" is mc_sweep above (the reference).  "numba"
+# is isaw_kernels.mc_sweep_numba, which reproduces it bit for bit (same state,
+# counters and random-number stream).  "auto" uses numba when it imports AND a
+# start-up lockstep self-check on this machine shows the two kernels agree,
+# otherwise python.
+# ---------------------------------------------------------------------------
+
+SAMPLER_KERNELS = ("auto", "numba", "python")
+RNG_SCHEMES = ("auto", "per-lane")
+
+
+def sweep_replica(kernel: str, replica: Replica, steps: int, model_name: str, params,
+                  Tref: float, Tscale: float, kappa_bend: float = 0.0, n_beads=None) -> None:
+    """Run ``steps`` local moves on ``replica`` with the resolved kernel."""
+    if kernel == "numba":
+        _kernel_module().mc_sweep_numba(_sys.modules[__name__], replica, steps, model_name,
+                                        params, Tref, Tscale, kappa_bend, n_beads)
+        if _DEBUG_CONTACTS:
+            st = replica.state
+            if configuration_dependent_model(model_name):
+                m_chk, h_chk = contact_count_and_coordination_histogram(st.chain, st.occ)
+                assert tuple(h_chk) == tuple(st.coordination_hist), "numba kernel: hist out of sync"
+            else:
+                m_chk = int(round(contact_count(st.chain, st.occ)))
+            assert st.m == m_chk, "numba kernel: state.m out of sync with contact_count"
+            assert st.n_bend == count_bends(st.chain), "numba kernel: n_bend out of sync"
+        return
+    if kernel != "python":
+        raise ValueError(f"unresolved sampler kernel {kernel!r}")
+    mc_sweep(replica, steps, model_name, params, Tref, Tscale, kappa_bend, n_beads)
+
+
+def configuration_dependent_model(model_name: str) -> bool:
+    return bool(MODEL_REGISTRY[model_name]["configuration_dependent"])
+
+
+def resolve_sampler_kernel(requested: str, model_name: str, params, Tref: float,
+                           Tscale: float, kappa_bend: float, N: int, Ts,
+                           verbose: bool = False) -> tuple[str, dict]:
+    """Return (kernel, info).  ``info`` records the choice and the self-check."""
+    requested = str(requested)
+    if requested not in SAMPLER_KERNELS:
+        raise ValueError(f"--kernel must be one of {SAMPLER_KERNELS}, got {requested!r}")
+    if requested == "python":
+        return "python", {"requested": requested, "kernel": "python", "reason": "requested"}
+    _ik = _kernel_module()
+    info: dict = {"requested": requested,
+                  "numba_version": getattr(_ik, "NUMBA_VERSION", None) if _ik else None}
+    if _ik is None or not _ik.NUMBA_AVAILABLE:
+        if requested == "numba":
+            raise RuntimeError("--kernel numba requested but numba (or isaw_kernels) is unavailable")
+        info.update(kernel="python", reason="numba unavailable")
+        return "python", info
+    check = _ik.selfcheck(_sys.modules[__name__], model_name, params, Tref, Tscale,
+                          float(kappa_bend), int(N), list(np.asarray(Ts, dtype=float)))
+    info["selfcheck"] = check
+    if not check.get("ok"):
+        if requested == "numba":
+            raise RuntimeError(f"numba kernel failed its self-check: {check.get('reason')}")
+        info.update(kernel="python", reason=f"self-check failed: {check.get('reason')}")
+        if verbose:
+            print(f"  [kernel] numba self-check FAILED ({check.get('reason')}); using python")
+        return "python", info
+    info.update(kernel="numba", reason="self-check passed")
+    if verbose:
+        print(f"  [kernel] numba {info['numba_version']} (self-check: identical to python "
+              f"at {len(check['temperatures'])} temperatures x {check['steps']} steps)")
+    return "numba", info
+
+
+# ---------------------------------------------------------------------------
 # Parallel worker (top-level for pickling on Windows spawn)
 # ---------------------------------------------------------------------------
 
@@ -1466,6 +1553,7 @@ def evolve_replica_worker(
     seed: int,
     kappa_bend: float = 0.0,
     n_beads=None,
+    kernel: str = "python",
 ) -> tuple["ChainState", int, int, np.ndarray]:
     """Deterministically sweep one lane without transferring trajectories.
 
@@ -1482,7 +1570,8 @@ def evolve_replica_worker(
         local_acc=int(local_acc), local_prop=int(local_prop),
         move_counters=np.asarray(move_counters, dtype=np.int64).copy(),
     )
-    mc_sweep(replica, steps, model_name, params, Tref, Tscale, kappa_bend, n_beads)
+    sweep_replica(kernel, replica, steps, model_name, params, Tref, Tscale,
+                  kappa_bend, n_beads)
     return (replica.state, replica.local_acc, replica.local_prop,
             replica.move_counters)
 
@@ -1578,6 +1667,8 @@ def run_remd(
     snapshot_stride: int = 1,
     snapshot_start_cycle: int = 0,
     kappa_bend: float = 0.0,
+    kernel: str = "python",
+    rng_scheme: str = "auto",
 ) -> tuple[list[Replica], np.ndarray, np.ndarray]:
     """
     Run REMD.
@@ -1593,6 +1684,14 @@ def run_remd(
       5. When a ``snapshot_writer`` is supplied, coordinates and per-lane scalars
          are streamed to disk every ``snapshot_stride`` cycles, starting at
          ``snapshot_start_cycle``.
+
+    ``kernel`` selects the local-sweep implementation ("python", "numba" or
+    "auto"; see :func:`resolve_sampler_kernel`) -- the sampled trajectory is the
+    same either way.  ``rng_scheme`` selects the random-number stream of the
+    local sweeps: "auto" keeps the historical behaviour (one global stream when
+    n_workers == 1, a fresh seed per cycle and lane in worker mode);
+    "per-lane" uses the worker-mode seeding even when n_workers == 1, so a
+    one-process run reproduces an n_workers >= 2 run exactly.
 
     ``kappa_bend`` adds the fixed reduced bending penalty kappa_bend*n_bend to the
     LOCAL Metropolis rule only.  Being temperature-independent it cancels exactly
@@ -1614,6 +1713,16 @@ def run_remd(
     # well-defined; previously seed=None left the global RNG unseeded.
     if seed is None:
         seed = random.SystemRandom().randrange(1, 2 ** 31)
+    if str(rng_scheme) not in RNG_SCHEMES:
+        raise ValueError(f"rng_scheme must be one of {RNG_SCHEMES}, got {rng_scheme!r}")
+    # Resolve the kernel before seeding: the self-check restores the global
+    # random state it uses, and is followed by the run's own seeding below.
+    kernel, kernel_info = resolve_sampler_kernel(
+        kernel, model_name, params, Tref, Tscale, kappa_bend, N, Ts, verbose=verbose)
+    per_lane = (n_workers > 1) or (str(rng_scheme) == "per-lane")
+    kernel_info["rng_scheme"] = "per-lane" if per_lane else "serial"
+    if diag_store is not None:
+        diag_store["sampler_implementation"] = kernel_info
     _seed_all(seed)
 
     structural_stride = _validate_stride("structural_stride", structural_stride)
@@ -1714,7 +1823,7 @@ def run_remd(
                         replicas[k].local_acc, replicas[k].local_prop,
                         replicas[k].move_counters,
                         steps_per_swap, model_name, params, Tref, Tscale,
-                        worker_seeds[k], kappa_bend, n_beads,
+                        worker_seeds[k], kappa_bend, n_beads, kernel,
                     )
                     for k in range(nT)
                 ]
@@ -1724,10 +1833,23 @@ def run_remd(
                     replicas[k].local_acc = local_acc
                     replicas[k].local_prop = local_prop
                     replicas[k].move_counters = move_counters
+            elif per_lane:
+                # Worker-mode seeding in this process: each lane's sweep draws
+                # from a fresh stream seeded exactly as evolve_replica_worker
+                # seeds it, and the main process's stream (swaps) is untouched,
+                # as it is when the sweeps run in worker processes.
+                for k, rep in enumerate(replicas):
+                    saved_state = random.getstate()
+                    try:
+                        random.seed(int(base_seed + 100_000 * cycle + k))
+                        sweep_replica(kernel, rep, steps_per_swap, model_name, params,
+                                      Tref, Tscale, kappa_bend, n_beads)
+                    finally:
+                        random.setstate(saved_state)
             else:
                 for rep in replicas:
-                    mc_sweep(rep, steps_per_swap, model_name, params, Tref, Tscale,
-                             kappa_bend, n_beads)
+                    sweep_replica(kernel, rep, steps_per_swap, model_name, params,
+                                  Tref, Tscale, kappa_bend, n_beads)
 
             t1 = time.perf_counter()
             t_sweep_total += t1 - t0
@@ -5525,6 +5647,21 @@ def main() -> None:
     ap.add_argument("--burnin-frac",    type=float, default=0.7,     help="fraction of trajectory to discard as burnin")
     ap.add_argument("--n-workers",      type=int,   default=6,       help="parallel workers for local sweeps (1 = serial)")
     ap.add_argument(
+        "--kernel", choices=list(SAMPLER_KERNELS), default="auto",
+        help=("local-sweep implementation: 'numba' (compiled, bit-identical to "
+              "'python'), 'python' (reference), or 'auto' = numba when it imports "
+              "and passes a start-up lockstep self-check against python, else python. "
+              "The sampled trajectory does not depend on this choice."),
+    )
+    ap.add_argument(
+        "--rng-scheme", dest="rng_scheme", choices=list(RNG_SCHEMES), default="auto",
+        help=("random-number stream of the local sweeps: 'auto' = historical "
+              "behaviour (one global stream with --n-workers 1; per-cycle, per-lane "
+              "seeds with more workers); 'per-lane' = the worker-mode seeding even "
+              "with --n-workers 1, so a 1-core run reproduces an --n-workers >= 2 "
+              "run exactly (use this to move multi-core runs onto one core)."),
+    )
+    ap.add_argument(
         "--rg-scale", type=float, default=1.0,
         help=(
             "Scale factor for reporting/outputting Rg. "
@@ -6084,6 +6221,8 @@ def main() -> None:
             snapshot_stride=int(args.snapshot_stride),
             snapshot_start_cycle=int(args.snapshot_start_cycle),
             kappa_bend=float(kappa_bend),
+            kernel=str(args.kernel),
+            rng_scheme=str(args.rng_scheme),
         )
         # Mark the snapshot file complete ONLY after run_remd returns normally.
         if snapshot_writer is not None:
@@ -6287,6 +6426,9 @@ def main() -> None:
         "total_steps_per_replica": int(total_steps),
         "seed": int(args.seed),
         "n_workers": int(args.n_workers),
+        # Implementation provenance (kernel, its self-check, RNG scheme); the
+        # sampled trajectory is determined by seed + rng_scheme, not by kernel.
+        "sampler_implementation": diag_store.get("sampler_implementation"),
         "burnin_frac": float(args.burnin_frac),
         "rg_bins": int(args.rg_bins),
         "rg_scale": float(args.rg_scale),

@@ -723,6 +723,14 @@ def validate_config(cfg: dict) -> dict:
                     f"Baseline {name!r}: remd.{field} must be >= {lower}"
                 )
             remd[field] = value
+        if remd.get("kernel") is not None and remd["kernel"] not in ("auto", "numba", "python"):
+            raise ValueError(
+                f"Baseline {name!r}: remd.kernel must be auto, numba or python"
+            )
+        if remd.get("rng_scheme") is not None and remd["rng_scheme"] not in ("auto", "per-lane"):
+            raise ValueError(
+                f"Baseline {name!r}: remd.rng_scheme must be auto or per-lane"
+            )
         burnin = float(remd.get("burnin_frac", 0.7))
         if not np.isfinite(burnin) or not (0.0 <= burnin < 1.0):
             raise ValueError(
@@ -1478,6 +1486,12 @@ def build_remd_command(cfg, baseline, fit_dir: Path, seed: int,
         cmd += ["--timing"]
     if not remd.get("plots", False):
         cmd += ["--no-plots"]
+    # Optional sampler-implementation keys, forwarded only when present so that
+    # existing configs keep their exact commands and job signatures.
+    if remd.get("kernel") is not None:
+        cmd += ["--kernel", str(remd["kernel"])]
+    if remd.get("rng_scheme") is not None:
+        cmd += ["--rng-scheme", str(remd["rng_scheme"])]
     diag = remd.get("diagnostics") or {}
     if diag.get("enabled", False):
         cmd += [

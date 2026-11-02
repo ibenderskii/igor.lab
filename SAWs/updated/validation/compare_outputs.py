@@ -49,6 +49,9 @@ DEFAULT_IGNORE_KEYS = [
     r"host(name)?", r"node(name)?", r"pid", r"cwd", r"user(name)?",
     r"python(_executable|_version)?", r"executable", r"sys_version", r"platform",
     r"slurm_.*", r"git(_.*)?",
+    # Implementation provenance added by the Numba stage (which kernel ran, its
+    # start-up self-check, the RNG scheme); the sampled data do not depend on it.
+    r"sampler_implementation",
 ]
 SKIP_SUFFIXES = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".log", ".out", ".err", ".pyc"}
 SKIP_NAME_RE = re.compile(r"(^|_)(stdout|stderr)(\.|_|$)|^\.|^_", re.IGNORECASE)
