@@ -129,8 +129,11 @@ m with Boltzmann weights.  Use --fit-rg to include Rg in the objective
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -842,6 +845,51 @@ def js_div(p_obs: np.ndarray, p_mod: np.ndarray, eps: float = 1e-12) -> float:
     return 0.5 * (kl1 + kl2)
 
 
+def _prepare_target_rows(p_obs_rows, eps: float = 1e-12) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Clip, normalize and log every observed row ONCE.
+
+    These are exactly the observed-side operations of :func:`js_div` and
+    :func:`kl_div` (same ufuncs, same order), so a prepared loss returns the
+    identical float.  The observed distributions never change during an
+    optimization, but the unprepared losses redo this work on every objective
+    evaluation for every temperature.
+    """
+    rows = []
+    for row in p_obs_rows:
+        p = np.asarray(row, dtype=float)
+        p = np.clip(p, eps, 1.0)
+        p = p / p.sum()
+        rows.append((p, np.log(p)))
+    return rows
+
+
+def _js_prepared(p_obs_n: np.ndarray, log_p_obs_n: np.ndarray, p_mod: np.ndarray,
+                 eps: float = 1e-12) -> float:
+    """:func:`js_div` with the observed side precomputed (bit-identical)."""
+    p_mod = np.asarray(p_mod, dtype=float)
+    p_mod = np.clip(p_mod, eps, 1.0)
+    p_mod = p_mod / p_mod.sum()
+    m = np.clip(0.5 * (p_obs_n + p_mod), eps, 1.0)
+    log_m = np.log(m)
+    kl1 = float(np.sum(p_obs_n * (log_p_obs_n - log_m)))
+    kl2 = float(np.sum(p_mod * (np.log(p_mod) - log_m)))
+    return 0.5 * (kl1 + kl2)
+
+
+def _kl_prepared(p_obs_n: np.ndarray, log_p_obs_n: np.ndarray, p_mod: np.ndarray,
+                 eps: float = 1e-12) -> float:
+    """:func:`kl_div` with the observed side precomputed (bit-identical)."""
+    p_mod = np.asarray(p_mod, dtype=float)
+    p_mod = np.clip(p_mod, eps, 1.0)
+    p_mod = p_mod / p_mod.sum()
+    return float(np.sum(p_obs_n * (log_p_obs_n - np.log(p_mod))))
+
+
+# Losses with a prepared counterpart.  build_objective() uses the prepared form
+# for these and falls back to the plain loss_fn for anything else.
+_PREPARED_LOSSES: Dict[Callable, Callable] = {js_div: _js_prepared, kl_div: _kl_prepared}
+
+
 def _get_loss_fn(name: str) -> Callable[[np.ndarray, np.ndarray], float]:
     if name == "kl":
         return kl_div
@@ -1422,6 +1470,35 @@ def make_contact_state_u_fn(
         g = (q * q) / (1.0 + (q / q_sat) ** 2)
         return u_lin - A0 * (hist @ g)
 
+    def prepare_local_state_u(params, contacts, histograms):
+        """Return u_at(T) for fixed params and states (same validation, same floats).
+
+        The cooperative term A0 * (hist @ g) does not depend on T, so it is
+        evaluated once here instead of once per temperature and marginal; u_at
+        then performs exactly the remaining operations of ``local_state_u``.
+        """
+        A0, q_sat = validated_saturating_params(params)
+        contacts_arr = np.asarray(contacts, dtype=float)
+        hist = np.asarray(histograms, dtype=float)
+        if hist.ndim != 2 or hist.shape[1] != 7:
+            raise ValueError(
+                "local coordination state potential requires histograms of shape (S, 7)"
+            )
+        if hist.shape[0] != contacts_arr.size:
+            raise ValueError("coordination histogram/contact state counts differ")
+        if A0 == 0.0:
+            def u_at(T):
+                return raw_b(params, T, Tref, Tscale) * contacts_arr
+            return u_at
+        q = 0.5 * np.arange(7, dtype=float)
+        g = (q * q) / (1.0 + (q / q_sat) ** 2)
+        coop = A0 * (hist @ g)
+
+        def u_at(T):
+            return raw_b(params, T, Tref, Tscale) * contacts_arr - coop
+        return u_at
+
+    local_state_u.prepare = prepare_local_state_u
     return local_state_u
 
 
@@ -1691,6 +1768,161 @@ def objective_local_coordination_combined(
 
 
 # ---------------------------------------------------------------------------
+# Prepared objectives.  build_objective() returns these when the loss has a
+# prepared form (JS, KL).  Each performs exactly the floating-point operations
+# of its counterpart above, in the same order, with the loop-invariant work
+# hoisted out: the observed-side clip/normalize/log of every target row, the
+# joint-baseline support and centers, and -- for the local-coordination model --
+# the T-independent cooperative term and one exp(u) shared by the contact and
+# Rg marginals at each temperature.  The originals are kept unchanged for
+# callers (and tests) that use them directly.
+# ---------------------------------------------------------------------------
+
+def _local_u_at(state_u_fn: Callable, params: np.ndarray, local_baseline: Dict[str, Any]):
+    prepare = getattr(state_u_fn, "prepare", None)
+    if prepare is None:
+        def u_at(T):
+            return state_u_fn(params, T, local_baseline["contacts"], local_baseline["histograms"])
+        return u_at
+    return prepare(params, local_baseline["contacts"], local_baseline["histograms"])
+
+
+def objective_prepared(
+    params: np.ndarray,
+    temps: np.ndarray,
+    m_centers: np.ndarray,
+    prep_ct: List[Tuple[np.ndarray, np.ndarray]],
+    p0_mass: np.ndarray,
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
+    prepared_loss: Callable,
+) -> float:
+    """Prepared :func:`objective` (identical value)."""
+    total = 0.0
+    for i, T in enumerate(temps):
+        p_mod = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
+        total += prepared_loss(prep_ct[i][0], prep_ct[i][1], p_mod)
+    return total
+
+
+def objective_combined_prepared(
+    params: np.ndarray,
+    train_temps: np.ndarray,
+    m_centers: np.ndarray,
+    prep_ct: List[Tuple[np.ndarray, np.ndarray]],
+    p0_mass: np.ndarray,
+    crg_prob: np.ndarray,
+    m_joint: np.ndarray,
+    joint_support: np.ndarray,
+    prep_rg: List[Tuple[np.ndarray, np.ndarray]],
+    u_fn: Callable[[np.ndarray, float, np.ndarray], np.ndarray],
+    prepared_loss: Callable,
+    rg_weight: float,
+) -> float:
+    """Prepared :func:`objective_combined` (identical value)."""
+    total = 0.0
+    for i, T in enumerate(train_temps):
+        p_mod_ct = model_contact_mass(p0_mass, m_centers, float(T), params, u_fn)
+        total += prepared_loss(prep_ct[i][0], prep_ct[i][1], p_mod_ct)
+        x = _stabilized_exponent(
+            -np.asarray(u_fn(params, float(T), m_joint), dtype=float), joint_support
+        )
+        w_m = np.exp(x)
+        rg_mass = (crg_prob.T * w_m).T.sum(axis=0)
+        Z = rg_mass.sum()
+        if Z > 0:
+            rg_mass /= Z
+        total += rg_weight * prepared_loss(prep_rg[i][0], prep_rg[i][1], rg_mass)
+    return total
+
+
+def _local_contact_mass_from_factor(local_baseline, p0, factor, n_contact_bins):
+    """local_coordination_contact_mass() given the per-state exp(x) factor."""
+    weights = p0 * factor
+    Z = float(weights.sum())
+    if not np.isfinite(Z) or Z <= 0.0:
+        raise FloatingPointError(
+            "local coordination reweighting produced a nonpositive partition sum"
+        )
+    return np.bincount(
+        local_baseline["contact_bin_index"], weights=weights, minlength=n_contact_bins
+    ) / Z
+
+
+def _local_rg_mass_from_factor(local_baseline, factor):
+    """local_coordination_rg_mass() given the per-state exp(x) factor."""
+    if not local_baseline.get("has_rg_joint"):
+        raise ValueError(
+            "local coordination baseline has no sparse state/Rg joint statistics"
+        )
+    record_weights = local_baseline["rg_joint_mass"] * factor[
+        local_baseline["rg_state_index"]
+    ]
+    rg_mass = np.bincount(
+        local_baseline["rg_bin_index"],
+        weights=record_weights,
+        minlength=int(local_baseline["n_rg_bins"]),
+    )
+    Z = float(rg_mass.sum())
+    if not np.isfinite(Z) or Z <= 0.0:
+        raise FloatingPointError(
+            "local coordination Rg reweighting produced a nonpositive partition sum"
+        )
+    return rg_mass / Z
+
+
+def objective_local_coordination_prepared(
+    params: np.ndarray,
+    temps: np.ndarray,
+    n_contact_bins: int,
+    prep_ct: List[Tuple[np.ndarray, np.ndarray]],
+    local_baseline: Dict[str, Any],
+    state_u_fn: Callable,
+    prepared_loss: Callable,
+) -> float:
+    """Prepared :func:`objective_local_coordination` (identical value)."""
+    u_at = _local_u_at(state_u_fn, params, local_baseline)
+    p0 = np.asarray(local_baseline["state_mass"], dtype=float)
+    support = p0 > 0.0
+    total = 0.0
+    for i, T in enumerate(temps):
+        u = np.asarray(u_at(float(T)), dtype=float)
+        factor = np.exp(_stabilized_exponent(-u, support))
+        p_mod = _local_contact_mass_from_factor(local_baseline, p0, factor, n_contact_bins)
+        total += prepared_loss(prep_ct[i][0], prep_ct[i][1], p_mod)
+    return total
+
+
+def objective_local_coordination_combined_prepared(
+    params: np.ndarray,
+    temps: np.ndarray,
+    n_contact_bins: int,
+    prep_ct: List[Tuple[np.ndarray, np.ndarray]],
+    prep_rg: List[Tuple[np.ndarray, np.ndarray]],
+    local_baseline: Dict[str, Any],
+    state_u_fn: Callable,
+    prepared_loss: Callable,
+    rg_weight: float,
+) -> float:
+    """Prepared :func:`objective_local_coordination_combined` (identical value).
+
+    One u(T) and one exp(x) per temperature serve both marginals; the original
+    evaluated the full state potential and its exponential once per marginal.
+    """
+    u_at = _local_u_at(state_u_fn, params, local_baseline)
+    p0 = np.asarray(local_baseline["state_mass"], dtype=float)
+    support = p0 > 0.0
+    total = 0.0
+    for i, T in enumerate(temps):
+        u = np.asarray(u_at(float(T)), dtype=float)
+        factor = np.exp(_stabilized_exponent(-u, support))
+        p_ct = _local_contact_mass_from_factor(local_baseline, p0, factor, n_contact_bins)
+        p_rg = _local_rg_mass_from_factor(local_baseline, factor)
+        total += prepared_loss(prep_ct[i][0], prep_ct[i][1], p_ct)
+        total += float(rg_weight) * prepared_loss(prep_rg[i][0], prep_rg[i][1], p_rg)
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Rg prediction
 # ---------------------------------------------------------------------------
 
@@ -1882,6 +2114,34 @@ def build_objective(
     Mirrors the selection used by the primary fit: combined contact+Rg objective
     when fit_rg is True, contact-only objective otherwise.
     """
+    prepared_loss = _PREPARED_LOSSES.get(loss_fn)
+    if prepared_loss is not None:
+        prep_ct = _prepare_target_rows(p_obs_ct_train)
+        if local_baseline is not None:
+            if state_u_fn is None:
+                raise ValueError("state_u_fn is required for local coordination fitting")
+            if fit_rg:
+                return objective_local_coordination_combined_prepared, (
+                    train_temps, len(m_centers), prep_ct,
+                    _prepare_target_rows(p_obs_rg_train), local_baseline, state_u_fn,
+                    prepared_loss, float(rg_weight),
+                )
+            return objective_local_coordination_prepared, (
+                train_temps, len(m_centers), prep_ct, local_baseline, state_u_fn,
+                prepared_loss,
+            )
+        if fit_rg:
+            c_edges_arr = np.asarray(c_edges_joint)
+            m_joint = 0.5 * (c_edges_arr[:-1] + c_edges_arr[1:])
+            joint_support = np.asarray(crg_prob, dtype=float).sum(axis=1) > 0.0
+            return objective_combined_prepared, (
+                train_temps, m_centers, prep_ct, p0_mass, crg_prob, m_joint,
+                joint_support, _prepare_target_rows(p_obs_rg_train), u_fn,
+                prepared_loss, float(rg_weight),
+            )
+        return objective_prepared, (
+            train_temps, m_centers, prep_ct, p0_mass, u_fn, prepared_loss,
+        )
     if local_baseline is not None:
         if state_u_fn is None:
             raise ValueError("state_u_fn is required for local coordination fitting")
@@ -1905,35 +2165,100 @@ def build_objective(
     return objective, (train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn)
 
 
-def fit_restarts(
-    obj_fn: Callable,
-    obj_args: Tuple,
-    x0s: List[np.ndarray],
-    bounds: List[Tuple[float, float]],
-    *,
-    maxiter: int = 800,
-):
-    """Run L-BFGS-B from every restart.
+# ---------------------------------------------------------------------------
+# Fit memo + parallel prefetch of independent fits
+#
+# Every fit is a deterministic function of (objective, arguments, start points,
+# bounds, maxiter): L-BFGS-B, single-threaded BLAS, no RNG.  So
+#   * a fit requested twice with identical inputs (the uncertainty-diagnostics
+#     restart rerun, the rg-weight scan point at the production weight) can
+#     return the first result, and
+#   * independent fits (primary restarts, split refits, rg-weight refits) can be
+#     computed early, in parallel worker processes, and picked up later by the
+#     unchanged serial call sites,
+# without changing any output.  Results are assembled in restart order and
+# selected by the original rule, and a restart that raised re-raises at the
+# point where the serial code would have raised.  Workers come from the same
+# setting as the bootstrap (--bootstrap-workers, $FIT_BOOTSTRAP_WORKERS,
+# $SLURM_CPUS_PER_TASK; serial by default).
+# ---------------------------------------------------------------------------
 
-    Returns (best_result, best_objective, restart_records) where restart_records
-    is a per-restart list of dicts (success, objective, params, n_iter, message).
-    Raises RuntimeError if no restart succeeds with a finite objective.
-    Selection logic is identical to the primary fit.
+_FIT_MEMO: Dict[str, Tuple[str, Any]] = {}
+_FIT_MEMO_REFS: List[Any] = []        # keeps identity-keyed objects alive (ids stay unique)
+_FIT_POOL_PROBLEMS: Optional[List[Tuple]] = None
+_IN_FIT_WORKER = False
+DEFAULT_MAXITER = 800
+
+
+def clear_fit_memo() -> None:
+    """Forget memoized fits (tests; long-lived interactive sessions)."""
+    _FIT_MEMO.clear()
+    del _FIT_MEMO_REFS[:]
+
+
+def _fp_update(h, obj, refs: List[Any]) -> None:
+    """Feed a canonical byte description of ``obj`` into hash ``h``.
+
+    Arrays and scalars hash by value (dtype, shape, raw bytes / exact float
+    hex); containers recurse; anything else (functions, the baseline dict)
+    hashes by identity and is kept alive in ``refs`` so its id cannot be reused.
     """
-    if minimize is None:
-        raise RuntimeError("scipy is required for fitting. Install scipy.")
+    if isinstance(obj, np.ndarray):
+        h.update(b"A" + str(obj.dtype).encode() + repr(obj.shape).encode())
+        if obj.dtype.kind == "O":
+            for x in obj.reshape(-1):
+                _fp_update(h, x, refs)
+        else:
+            h.update(np.ascontiguousarray(obj).tobytes())
+    elif isinstance(obj, (list, tuple)):
+        h.update((b"L" if isinstance(obj, list) else b"T") + str(len(obj)).encode())
+        for x in obj:
+            _fp_update(h, x, refs)
+    elif isinstance(obj, bool) or obj is None:
+        h.update(b"B" + repr(obj).encode())
+    elif isinstance(obj, float):
+        h.update(b"F" + float(obj).hex().encode())
+    elif isinstance(obj, int):
+        h.update(b"I" + repr(int(obj)).encode())
+    elif isinstance(obj, str):
+        h.update(b"S" + obj.encode("utf-8"))
+    elif isinstance(obj, np.generic):
+        h.update(b"G" + str(obj.dtype).encode() + obj.tobytes())
+    else:
+        refs.append(obj)
+        h.update(b"O" + type(obj).__qualname__.encode() + b":" + str(id(obj)).encode())
+    h.update(b";")
+
+
+def _fit_key(obj_fn, obj_args, x0s, bounds, maxiter) -> Tuple[str, List[Any]]:
+    h = hashlib.sha256()
+    refs: List[Any] = []
+    _fp_update(h, (minimize, obj_fn, tuple(obj_args), list(x0s), list(bounds), int(maxiter)), refs)
+    return h.hexdigest(), refs
+
+
+def _memo_store(key: str, refs: List[Any], entry: Tuple[str, Any]) -> None:
+    _FIT_MEMO[key] = entry
+    _FIT_MEMO_REFS.extend(refs)
+
+
+def _run_restart(obj_fn, obj_args, x0, bounds, maxiter):
+    return minimize(
+        obj_fn, x0,
+        args=obj_args,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": maxiter},
+    )
+
+
+def _select_restarts(results) -> Tuple[Any, float, List[Dict[str, Any]]]:
+    """The original restart loop's bookkeeping and selection, over finished restarts."""
     best = None
     best_val_obj = float("inf")
     failed_messages: List[str] = []
     restart_records: List[Dict[str, Any]] = []
-    for ri, x0 in enumerate(x0s):
-        res = minimize(
-            obj_fn, x0,
-            args=obj_args,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": maxiter},
-        )
+    for ri, res in enumerate(results):
         restart_records.append({
             "restart_index": ri,
             "success": bool(res.success),
@@ -1954,13 +2279,147 @@ def fit_restarts(
     return best, best_val_obj, restart_records
 
 
+def fit_restarts(
+    obj_fn: Callable,
+    obj_args: Tuple,
+    x0s: List[np.ndarray],
+    bounds: List[Tuple[float, float]],
+    *,
+    maxiter: int = DEFAULT_MAXITER,
+):
+    """Run L-BFGS-B from every restart.
+
+    Returns (best_result, best_objective, restart_records) where restart_records
+    is a per-restart list of dicts (success, objective, params, n_iter, message).
+    Raises RuntimeError if no restart succeeds with a finite objective.
+    Selection logic is identical to the primary fit.
+
+    Identical requests are answered from the fit memo (filled here or by
+    :func:`prefetch_fits`); a memoized failure re-raises the same exception.
+    """
+    if minimize is None:
+        raise RuntimeError("scipy is required for fitting. Install scipy.")
+    key, refs = _fit_key(obj_fn, obj_args, x0s, bounds, maxiter)
+    hit = _FIT_MEMO.get(key)
+    if hit is not None:
+        kind, payload = hit
+        if kind == "err":
+            raise payload
+        return copy.deepcopy(payload)
+    try:
+        # Serial order: a restart that raises stops the loop, as before.
+        out = _select_restarts(
+            [_run_restart(obj_fn, obj_args, x0, bounds, maxiter) for x0 in x0s]
+        )
+    except Exception as exc:
+        _memo_store(key, refs, ("err", exc))
+        raise
+    _memo_store(key, refs, ("ok", out))
+    return copy.deepcopy(out)
+
+
+def _restart_task(pi: int, ri: int):
+    """Worker: one restart of one prefetched problem (inherited by fork)."""
+    global _IN_FIT_WORKER
+    _IN_FIT_WORKER = True
+    obj_fn, obj_args, x0s, bounds, maxiter = _FIT_POOL_PROBLEMS[pi]
+    try:
+        return ("ok", _run_restart(obj_fn, obj_args, x0s[ri], bounds, maxiter))
+    except Exception as exc:  # returned, re-raised later where serial code raised
+        return ("err", exc)
+
+
+def _assemble_restarts(seq) -> Optional[Tuple[str, Any]]:
+    """Serial semantics over per-restart outcomes in restart order."""
+    results = []
+    for kind, payload in seq:
+        if kind == "lost":
+            return None          # cannot reproduce serial semantics; recompute later
+        if kind == "err":
+            return ("err", payload)
+        results.append(payload)
+    try:
+        return ("ok", _select_restarts(results))
+    except Exception as exc:
+        return ("err", exc)
+
+
+def prefetch_fits(problems: List[Tuple], n_workers: int, label: str = "") -> int:
+    """Compute independent fits in parallel and memoize them for their call sites.
+
+    ``problems`` holds (obj_fn, obj_args, x0s, bounds, maxiter) tuples, exactly as
+    the call sites will later pass them to fit_restarts / fit_one_split.  Each
+    restart of each problem is one task on a fork pool.  With one worker, without
+    the fork start method, or inside a worker this is a no-op and the call sites
+    compute serially as before.  Returns the number of problems memoized.
+    """
+    global _FIT_POOL_PROBLEMS
+    if minimize is None or int(n_workers) <= 1 or _IN_FIT_WORKER:
+        return 0
+    import multiprocessing as _mp
+    if "fork" not in _mp.get_all_start_methods():
+        return 0
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
+
+    pending: List[Tuple[str, List[Any], Tuple]] = []
+    seen = set()
+    for obj_fn, obj_args, x0s, bounds, maxiter in problems:
+        key, refs = _fit_key(obj_fn, obj_args, x0s, bounds, maxiter)
+        if key in _FIT_MEMO or key in seen:
+            continue
+        seen.add(key)
+        pending.append((key, refs, (obj_fn, obj_args, list(x0s), bounds, maxiter)))
+    tasks = [(pi, ri) for pi, (_, _, pr) in enumerate(pending) for ri in range(len(pr[2]))]
+    if not tasks:
+        return 0
+    workers = min(int(n_workers), len(tasks))
+    print(f"  [{label or 'fits'}] {len(tasks)} restarts of {len(pending)} fit(s) "
+          f"on {workers} workers", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    outcomes: Dict[Tuple[int, int], Tuple[str, Any]] = {}
+    _FIT_POOL_PROBLEMS = [pr for _, _, pr in pending]
+    try:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=_mp.get_context("fork")) as pool:
+            futures = {pool.submit(_restart_task, pi, ri): (pi, ri) for pi, ri in tasks}
+            for fut in as_completed(futures):
+                try:
+                    outcomes[futures[fut]] = fut.result()
+                except BrokenProcessPool:
+                    raise
+                except Exception:  # e.g. an unpicklable result: recompute at the call site
+                    outcomes[futures[fut]] = ("lost", None)
+    except BrokenProcessPool as exc:
+        print(f"  WARNING: [{label}] a fit worker died ({exc}); these fits will run "
+              "serially at their call sites.", flush=True)
+        return 0
+    finally:
+        _FIT_POOL_PROBLEMS = None
+    n_memo = 0
+    for pi, (key, refs, pr) in enumerate(pending):
+        entry = _assemble_restarts(
+            [outcomes.get((pi, ri), ("lost", None)) for ri in range(len(pr[2]))]
+        )
+        if entry is not None:
+            _memo_store(key, refs, entry)
+            n_memo += 1
+    return n_memo
+
+
+def _fit_workers(args: argparse.Namespace, n_tasks: int) -> int:
+    """Worker count for prefetched fits (same precedence as the bootstrap)."""
+    return resolve_bootstrap_workers(getattr(args, "bootstrap_workers", None),
+                                     max(1, int(n_tasks)))[0]
+
+
 def fit_one_split(
     obj_fn: Callable,
     obj_args: Tuple,
     x0s: List[np.ndarray],
     bounds: List[Tuple[float, float]],
     *,
-    maxiter: int = 800,
+    maxiter: int = DEFAULT_MAXITER,
 ):
     """Run all restarts and return (best_result, best_objective).
 
@@ -2244,6 +2703,23 @@ def run_split_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> None
     # Aggregate per-temperature held-out contact error across splits.
     held_ct_sum = np.zeros(n, dtype=float)
     held_ct_cnt = np.zeros(n, dtype=int)
+
+    # Every split refit is independent: compute them in parallel up front (the
+    # loop below then reads them from the fit memo, in split order).
+    try:
+        problems = []
+        for sp in splits:
+            tr = sp["train_idx"]
+            ofn, oargs = build_objective(
+                fit_rg, temps[tr], m_centers, p_obs_mass[tr], p0_mass, u_fn, loss_fn,
+                crg_prob=crg_prob, c_edges_joint=c_edges_joint,
+                p_obs_rg_train=(p_obs_rg_model_grid[tr] if (fit_rg and can_fit_rg) else None),
+                rg_weight=rg_weight, local_baseline=local_baseline, state_u_fn=state_u_fn,
+            )
+            problems.append((ofn, oargs, x0s, bounds, DEFAULT_MAXITER))
+    except Exception:
+        problems = []  # the loop raises at the same point as before
+    prefetch_fits(problems, _fit_workers(args, len(problems) * len(x0s)), "split sensitivity")
 
     for sp in splits:
         train_idx = sp["train_idx"]
@@ -4081,6 +4557,23 @@ def run_rg_weight_sensitivity(args: argparse.Namespace, ctx: Dict[str, Any]) -> 
     p_obs_ct_train = p_obs_mass[train_idx]
     p_obs_rg_train = p_obs_rg_model_grid[train_idx]
 
+    # Every weight's refit is independent: compute them in parallel up front.
+    # The production weight reuses the primary fit from the memo when the
+    # objective is the same.
+    try:
+        problems = []
+        for w in weights:
+            ofn, oargs = build_objective(
+                w > 0.0, train_temps, m_centers, p_obs_ct_train, p0_mass, u_fn, loss_fn,
+                crg_prob=crg_prob, c_edges_joint=c_edges_joint,
+                p_obs_rg_train=p_obs_rg_train, rg_weight=w,
+                local_baseline=local_baseline, state_u_fn=state_u_fn,
+            )
+            problems.append((ofn, oargs, x0s, bounds, DEFAULT_MAXITER))
+    except Exception:
+        problems = []
+    prefetch_fits(problems, _fit_workers(args, len(problems) * len(x0s)), "rg-weight scan")
+
     for w in weights:
         use_rg = w > 0.0
         obj_fn, obj_args = build_objective(
@@ -4601,8 +5094,10 @@ def main() -> None:
     ap.add_argument(
         "--bootstrap-workers", type=int, default=None, dest="bootstrap_workers",
         metavar="N",
-        help="Worker processes for bootstrap replicates (default: $FIT_BOOTSTRAP_WORKERS, "
-             "else $SLURM_CPUS_PER_TASK, else 1). Results do not depend on N.",
+        help="Worker processes for the bootstrap replicates and for the independent "
+             "refits of the primary fit, split sensitivity and rg-weight scan "
+             "(default: $FIT_BOOTSTRAP_WORKERS, else $SLURM_CPUS_PER_TASK, else 1). "
+             "Results do not depend on N.",
     )
     ap.add_argument(
         "--no-bootstrap-warm-start", action="store_false", dest="bootstrap_warm_start",
@@ -5201,6 +5696,8 @@ def main() -> None:
         local_baseline=local_baseline, state_u_fn=state_u_fn,
     )
 
+    prefetch_fits([(obj_fn, obj_args, x0s, bounds, DEFAULT_MAXITER)],
+                  _fit_workers(args, len(x0s)), "primary fit")
     best, best_val_obj = fit_one_split(obj_fn, obj_args, x0s, bounds)
 
     params_fit = best.x
