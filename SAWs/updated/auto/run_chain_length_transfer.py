@@ -283,6 +283,10 @@ def _build_command(
         command.append("--diagnostics")
     if args.timing:
         command.append("--timing")
+    if getattr(args, "kernel", None) is not None:
+        command += ["--kernel", str(args.kernel)]
+    if getattr(args, "rng_scheme", None) is not None:
+        command += ["--rng-scheme", str(args.rng_scheme)]
     return command
 
 
@@ -949,6 +953,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--diagnostics", action="store_true", help="enable sampler diagnostics"
     )
     parser.add_argument("--timing", action="store_true")
+    parser.add_argument(
+        "--kernel", choices=["auto", "numba", "python"], default=None,
+        help="forwarded to the REMD script as --kernel (omitted when not given, "
+             "so existing run fingerprints are unchanged)",
+    )
+    parser.add_argument(
+        "--rng-scheme", dest="rng_scheme", choices=["auto", "per-lane"], default=None,
+        help="forwarded to the REMD script as --rng-scheme; 'per-lane' with "
+             "--n-workers 1 reproduces an --n-workers >= 2 run on one core",
+    )
     parser.add_argument(
         "--analyze-only",
         action="store_true",
