@@ -6,6 +6,7 @@ lane RNG state (multichain_kernels.snapshot + rng.getstate()).
 """
 from __future__ import annotations
 
+import json
 import random
 
 import numpy as np
@@ -128,3 +129,100 @@ def test_resolution_and_fallback():
                 kappa_bend=0.0, cooperativity=None, degree_weights=(1.0, 1.0))
     finally:
         rm._MCK_MODULE[:] = saved
+
+
+# --- --kernel auto must fall back to Python when Numba fails to compile ------
+
+if mk.NUMBA_AVAILABLE:
+    from numba import njit as _njit
+    from numba.core.errors import TypingError
+
+    @_njit
+    def _uncompilable(*args):
+        # A genuine Numba compilation failure (array + str): raises TypingError
+        # on the first call, the way an unsupported numba/numpy combination would.
+        return args[0] + "x"
+
+
+def _resolve(requested, **over):
+    kw = dict(model_name="hs", params=CONFIGS["hs"][1], Tref=320.0, Tscale=80.0, M=3, N=10,
+              L=7, Ts=[290.0, 350.0], lambda_intra=1.0, lambda_inter=1.0, kappa_bend=0.0,
+              cooperativity=None, degree_weights=(1.0, 1.0))
+    kw.update(over)
+    return rm.resolve_sampler_kernel(requested, **kw)
+
+
+@pytest.mark.parametrize("target,where", [("_sweep", "lane sweep"),
+                                          ("_pair_matrix", "observables"),
+                                          ("_degrees_split", "observables")])
+def test_auto_falls_back_on_compilation_error(monkeypatch, target, where):
+    monkeypatch.setattr(mk, target, _uncompilable)
+    with pytest.warns(RuntimeWarning, match="numba self-check failed"):
+        kind, info = _resolve("auto")
+    assert kind == "python"
+    check = info["selfcheck"]
+    assert not check["ok"] and check["error_type"] == "TypingError"
+    assert where in check["reason"] and "TypingError" in info["reason"]
+    assert "_exception" not in check and "\x1b" not in check["error"]
+    json.dumps(info)  # stored in run_summary.json
+
+
+@pytest.mark.parametrize("target", ["_sweep", "_pair_matrix", "_degrees_split"])
+def test_explicit_numba_raises_with_cause(monkeypatch, target):
+    monkeypatch.setattr(mk, target, _uncompilable)
+    with pytest.raises(RuntimeError, match="TypingError") as ei:
+        _resolve("numba")
+    assert "--kernel python" in str(ei.value)
+    assert isinstance(ei.value.__cause__, TypingError)
+
+
+def test_auto_falls_back_when_observables_differ(monkeypatch):
+    monkeypatch.setattr(mk, "contact_degrees_split",
+                        lambda st: mcc.contact_degrees_split(st) + 1)
+    with pytest.warns(RuntimeWarning):
+        kind, info = _resolve("auto")
+    assert kind == "python" and "observables differ" in info["reason"]
+    assert info["selfcheck"]["temperatures"][-1]["observables_identical"] is False
+
+
+def test_selfcheck_records_observable_check():
+    kind, info = _resolve("auto", model_name="local_coordination_saturation", params=LCS,
+                          kappa_bend=0.3)
+    assert kind == "numba"
+    temps = info["selfcheck"]["temperatures"]
+    assert temps and all(t["identical"] and t["observables_identical"] for t in temps)
+
+
+def test_python_reference_errors_propagate(monkeypatch):
+    real = rm.mc_sweep
+
+    def sweep(*a, kernel="python", **k):
+        if kernel == "python":
+            raise ValueError("python reference failure")
+        return real(*a, kernel=kernel, **k)
+
+    monkeypatch.setattr(rm, "mc_sweep", sweep)
+    with pytest.raises(ValueError, match="python reference failure"):
+        _resolve("auto")
+
+
+@pytest.mark.parametrize("target", ["_sweep", "_pair_matrix"])
+def test_run_remd_multichain_auto_with_broken_numba_matches_python(monkeypatch, target):
+    common = dict(n_chains=3, chain_length=10, box_size=7, Ts=np.array([290.0, 350.0]),
+                  local_sweeps_per_swap=1, translation_sweeps_per_swap=1, n_cycles=4,
+                  model_name="hs", params=CONFIGS["hs"][1], Tref=320.0, Tscale=80.0,
+                  kappa_bend=0.2, seed=2, verbose=False)
+
+    def run(**extra):
+        reps, sp, sa, wh = rm.run_remd_multichain(**common, **extra)
+        return ([(r.u_traj, r.m_intra_traj, r.m_inter_traj, r.rg_traj, r.lcs_traj,
+                  r.state.coords_unwrapped.tolist(), r.move_counters.tolist()) for r in reps],
+                sp.tolist(), sa.tolist(), wh.tolist())
+
+    ref = run(kernel="python")
+    monkeypatch.setattr(mk, target, _uncompilable)
+    with pytest.warns(RuntimeWarning):
+        got = run(kernel="auto")
+    assert got == ref
+    assert rm.LAST_SAMPLER_INFO["kernel"] == "python"
+    assert rm.LAST_SAMPLER_INFO["selfcheck"]["error_type"] == "TypingError"

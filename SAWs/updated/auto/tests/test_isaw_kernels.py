@@ -7,10 +7,12 @@ counters) AND the Python ``random`` state after the sweep.
 from __future__ import annotations
 
 import copy
+import json
 import random
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -146,6 +148,70 @@ class FallbackTests(unittest.TestCase):
                 R.resolve_sampler_kernel("numba", "hs", MODELS["hs"], 320.0, 80.0, 0.0, 20, [300.0])
         finally:
             K.NUMBA_AVAILABLE = saved
+
+
+if K.NUMBA_AVAILABLE:
+    from numba import njit as _njit
+    from numba.core.errors import TypingError
+
+    @_njit
+    def _uncompilable(*args):
+        # A genuine Numba compilation failure (array + str): raises TypingError
+        # on the first call, the way an unsupported numba/numpy combination would.
+        return args[0] + "x"
+
+
+@unittest.skipUnless(K.NUMBA_AVAILABLE, "numba not installed")
+class CompileFailureFallbackTests(unittest.TestCase):
+    """--kernel auto must fall back to Python when the Numba sweep fails to compile."""
+
+    ARGS = ("hs", MODELS["hs"], 320.0, 80.0, 0.0, 20, [280.0, 360.0])
+
+    def test_auto_falls_back_on_compilation_error(self):
+        random.seed(11)
+        before = random.getstate()
+        with mock.patch.object(K, "_sweep", _uncompilable):
+            with self.assertWarns(RuntimeWarning):
+                kernel, info = R.resolve_sampler_kernel("auto", *self.ARGS)
+        self.assertEqual(kernel, "python")
+        self.assertIn("TypingError", info["reason"])
+        check = info["selfcheck"]
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["error_type"], "TypingError")
+        self.assertNotIn("_exception", check)
+        self.assertNotIn("\x1b", check["error"])
+        json.dumps(info)  # stored in run_summary.json
+        self.assertEqual(random.getstate(), before, "self-check must restore the global RNG")
+
+    def test_explicit_numba_raises_with_cause(self):
+        with mock.patch.object(K, "_sweep", _uncompilable):
+            with self.assertRaises(RuntimeError) as cm:
+                R.resolve_sampler_kernel("numba", *self.ARGS)
+        self.assertIn("TypingError", str(cm.exception))
+        self.assertIn("--kernel python", str(cm.exception))
+        self.assertIsInstance(cm.exception.__cause__, TypingError)
+
+    def test_python_reference_errors_propagate(self):
+        def broken(*a, **k):
+            raise ValueError("python reference failure")
+        with mock.patch.object(R, "mc_sweep", broken):
+            with self.assertRaisesRegex(ValueError, "python reference failure"):
+                R.resolve_sampler_kernel("auto", *self.ARGS)
+
+    def test_run_remd_auto_with_broken_numba_matches_python(self):
+        kw = dict(N=16, Ts=np.array([290.0, 330.0]), steps_per_swap=100, n_cycles=4,
+                  model_name="hs", params=MODELS["hs"], Tref=320.0, Tscale=80.0,
+                  seed=4, verbose=False, kappa_bend=0.2)
+
+        def run(**extra):
+            reps, sp, sa = R.run_remd(**kw, **extra)
+            return [r.E_traj + r.C_traj + r.Rg_traj for r in reps], sp.tolist(), sa.tolist()
+
+        ref = run(kernel="python")
+        with mock.patch.object(K, "_sweep", _uncompilable):
+            with self.assertWarns(RuntimeWarning):
+                got = run(kernel="auto")
+        self.assertEqual(got, ref)
 
 
 if __name__ == "__main__":

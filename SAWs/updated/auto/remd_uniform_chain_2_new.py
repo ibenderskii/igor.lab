@@ -1518,13 +1518,23 @@ def resolve_sampler_kernel(requested: str, model_name: str, params, Tref: float,
             raise RuntimeError("--kernel numba requested but numba (or isaw_kernels) is unavailable")
         info.update(kernel="python", reason="numba unavailable")
         return "python", info
+    # A Numba compilation/runtime error inside the self-check comes back as a
+    # failed check (check["_exception"] holds it); errors from the Python
+    # reference sweep propagate.  The check runs once, before any sampling.
     check = _ik.selfcheck(_sys.modules[__name__], model_name, params, Tref, Tscale,
                           float(kappa_bend), int(N), list(np.asarray(Ts, dtype=float)))
+    exc = check.pop("_exception", None)
     info["selfcheck"] = check
     if not check.get("ok"):
         if requested == "numba":
-            raise RuntimeError(f"numba kernel failed its self-check: {check.get('reason')}")
+            raise RuntimeError(
+                f"--kernel numba: the numba kernel failed its start-up self-check "
+                f"({check.get('reason')}); use --kernel python, or --kernel auto to "
+                f"fall back automatically") from exc
         info.update(kernel="python", reason=f"self-check failed: {check.get('reason')}")
+        import warnings as _warnings
+        _warnings.warn(f"--kernel auto: numba self-check failed ({check.get('reason')}); "
+                       f"using the python kernel", RuntimeWarning, stacklevel=2)
         if verbose:
             print(f"  [kernel] numba self-check FAILED ({check.get('reason')}); using python")
         return "python", info

@@ -593,7 +593,16 @@ def selfcheck(rm, model_name: str, params, Tref: float, Tscale: float, M: int, N
     For the lowest, middle and highest temperature: build an independent lane
     state, advance it with ``sweeps`` Python sweeps, then run ``sweeps`` more
     sweeps with each kernel from copies of the same state and RNG state, and
-    require identical state, counters and RNG state.
+    require identical state, counters and RNG state.  Then run the compiled
+    per-cycle observables (contact_degrees_split, interchain_pair_counts) on the
+    resulting state and require the exact Python results, so every function the
+    numba kernel uses in production is compiled and checked here, at start-up.
+
+    An exception from the Numba path -- a compilation error such as Numba's
+    TypingError, or a runtime error -- fails the check (``ok`` False, with the
+    exception recorded), so ``--kernel auto`` can fall back to Python.  Errors
+    from the Python reference sweep propagate: the Python kernel would hit them
+    too.
     """
     import copy
     info: Dict[str, Any] = {"ok": False, "sweeps": int(sweeps), "temperatures": []}
@@ -621,11 +630,34 @@ def selfcheck(rm, model_name: str, params, Tref: float, Tscale: float, M: int, N
         for k in range(int(sweeps)):
             ra, rb = random.Random(seed + 100 + k), random.Random(seed + 100 + k)
             rm.mc_sweep(sa, ca, T, rng=ra, kernel="python", **kw)
-            rm.mc_sweep(sb, cb, T, rng=rb, kernel="numba", **kw)
+            try:
+                rm.mc_sweep(sb, cb, T, rng=rb, kernel="numba", **kw)
+            except Exception as exc:  # compilation (e.g. TypingError) or runtime failure
+                info["temperatures"].append({"T": T, "identical": False})
+                _ik.record_selfcheck_exception(info, exc, f"numba lane sweep raised at T={T}")
+                return info
             same = same and (snapshot(sa, ca) == snapshot(sb, cb)) and ra.getstate() == rb.getstate()
-        info["temperatures"].append({"T": T, "identical": bool(same)})
         if not same:
+            info["temperatures"].append({"T": T, "identical": False})
             info["reason"] = f"python and numba lane sweeps differ at T={T}"
+            return info
+        # The compiled observables the production loop calls when kernel == "numba".
+        try:
+            deg_c = contact_degrees_split(sa)
+            pairs_c = interchain_pair_counts(sa)
+        except Exception as exc:  # compilation (e.g. TypingError) or runtime failure
+            info["temperatures"].append({"T": T, "identical": True,
+                                         "observables_identical": False})
+            _ik.record_selfcheck_exception(info, exc, f"compiled observables raised at T={T}")
+            return info
+        deg_p = rm.mcc.contact_degrees_split(sa)
+        pairs_p = rm.mcc.interchain_pair_counts(sa)
+        obs_same = (deg_c.dtype == deg_p.dtype and deg_c.shape == deg_p.shape
+                    and np.array_equal(deg_c, deg_p) and pairs_c == pairs_p)
+        info["temperatures"].append({"T": T, "identical": True,
+                                     "observables_identical": bool(obs_same)})
+        if not obs_same:
+            info["reason"] = f"compiled and python observables differ at T={T}"
             return info
     info["ok"] = True
     return info

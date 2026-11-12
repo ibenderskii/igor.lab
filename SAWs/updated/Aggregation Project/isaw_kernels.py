@@ -621,6 +621,34 @@ def mc_sweep_numba(R, replica, steps: int, model_name: str, params, Tref: float,
 # Start-up self-check: Python vs Numba in lockstep on this machine
 # ---------------------------------------------------------------------------
 
+def describe_exception(exc: BaseException, limit: int = 2000) -> Tuple[str, str]:
+    """(one-line summary, full message) of ``exc``, ANSI colour codes removed.
+
+    Numba colours its TypingError text; the self-check records these strings in
+    run_summary.json, so they are plain text and bounded in length.
+    """
+    import re
+    text = re.sub(r"\x1b\[[0-9;]*m", "", str(exc)).strip()
+    first = text.splitlines()[0].strip() if text else ""
+    summary = f"{type(exc).__name__}: {first}" if first else type(exc).__name__
+    return summary, text[:limit]
+
+
+def record_selfcheck_exception(info: Dict[str, Any], exc: BaseException, where: str) -> None:
+    """Mark a self-check as failed because the Numba path raised ``exc``.
+
+    The exception object itself is kept under ``"_exception"`` so the resolver
+    can chain it (``raise ... from exc``) for ``--kernel numba``; the resolver
+    removes that key before the info dict is stored or serialized.
+    """
+    summary, text = describe_exception(exc)
+    info["ok"] = False
+    info["reason"] = f"{where}: {summary}"
+    info["error_type"] = type(exc).__name__
+    info["error"] = text
+    info["_exception"] = exc
+
+
 def _snapshot(rep) -> tuple:
     s = rep.state
     return (tuple(s.chain), frozenset(s.occ), s.m, s.E, s.n_bend,
@@ -636,6 +664,12 @@ def selfcheck(R, model_name: str, params, Tref: float, Tscale: float, kappa_bend
     sweep (``warm`` steps), then run ``steps`` more steps with each kernel from
     copies of the same state and RNG state, and require identical state,
     counters and RNG state.  The global ``random`` state is restored.
+
+    An exception from the Numba sweep -- a compilation error such as Numba's
+    TypingError, or a runtime error -- fails the check (``ok`` False, with the
+    exception recorded), so ``--kernel auto`` can fall back to Python.  Errors
+    from the Python reference sweep propagate: the Python kernel would hit them
+    too.
     """
     import copy
     info: Dict[str, Any] = {"ok": False, "steps": int(steps), "temperatures": []}
@@ -656,7 +690,13 @@ def selfcheck(R, model_name: str, params, Tref: float, Tscale: float, kappa_bend
             R.mc_sweep(a, int(steps), model_name, params, Tref, Tscale, kappa_bend, int(N))
             sa = random.getstate()
             random.setstate(s0)
-            mc_sweep_numba(R, b, int(steps), model_name, params, Tref, Tscale, kappa_bend, int(N))
+            try:
+                mc_sweep_numba(R, b, int(steps), model_name, params, Tref, Tscale,
+                               kappa_bend, int(N))
+            except Exception as exc:  # compilation (e.g. TypingError) or runtime failure
+                info["temperatures"].append({"T": T, "identical": False})
+                record_selfcheck_exception(info, exc, f"numba sweep raised at T={T}")
+                return info
             sb = random.getstate()
             same = (_snapshot(a) == _snapshot(b)) and (sa == sb)
             info["temperatures"].append({"T": T, "identical": bool(same)})

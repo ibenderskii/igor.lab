@@ -577,7 +577,9 @@ def attempt_swap(
 # Sweep kernels.  "python" is mc_sweep below (the reference); "numba" runs the
 # same lane sweep in multichain_kernels, bit for bit (same state, counters and
 # RNG stream); "auto" uses numba when it imports and a start-up lockstep
-# self-check on this machine shows the two agree, otherwise python.
+# self-check on this machine shows the two agree (sweep and compiled
+# observables), otherwise python -- including when numba raises while
+# compiling or running during that check.
 # ---------------------------------------------------------------------------
 
 SAMPLER_KERNELS = ("auto", "numba", "python")
@@ -620,16 +622,27 @@ def resolve_sampler_kernel(requested, *, model_name, params, Tref, Tscale, M, N,
                                "is unavailable")
         info.update(kernel="python", reason="numba unavailable")
         return "python", info
+    # A Numba compilation/runtime error inside the self-check (lane sweep or
+    # compiled observables) comes back as a failed check (check["_exception"]
+    # holds it); errors from the Python reference sweep propagate.  The check
+    # runs once, before any sampling.
     check = mck.selfcheck(
         sys.modules[__name__], model_name, params, Tref, Tscale, int(M), int(N), int(L),
         list(np.asarray(Ts, dtype=float)), lambda_intra, lambda_inter, kappa_bend,
         cooperativity, degree_weights, local_sweeps_per_swap, translation_sweeps_per_swap,
         reptation_sweeps_per_swap, rotation_sweeps_per_swap)
+    exc = check.pop("_exception", None)
     info["selfcheck"] = check
     if not check.get("ok"):
         if requested == "numba":
-            raise RuntimeError(f"numba kernel failed its self-check: {check.get('reason')}")
+            raise RuntimeError(
+                f"--kernel numba: the numba kernel failed its start-up self-check "
+                f"({check.get('reason')}); use --kernel python, or --kernel auto to "
+                f"fall back automatically") from exc
         info.update(kernel="python", reason=f"self-check failed: {check.get('reason')}")
+        import warnings as _warnings
+        _warnings.warn(f"--kernel auto: numba self-check failed ({check.get('reason')}); "
+                       f"using the python kernel", RuntimeWarning, stacklevel=2)
         if verbose:
             print(f"  [kernel] numba self-check FAILED ({check.get('reason')}); using python")
         return "python", info
