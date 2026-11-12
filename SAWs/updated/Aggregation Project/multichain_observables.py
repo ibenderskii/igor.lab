@@ -117,8 +117,8 @@ def _cluster_components(n_chains: int, edges: Sequence[tuple]) -> List[int]:
     return list(sizes.values())
 
 
-def cluster_summary(state: MultiChainState, cluster_contact_threshold: int = 1
-                    ) -> dict:
+def cluster_summary(state: MultiChainState, cluster_contact_threshold: int = 1,
+                    pair_counts=None) -> dict:
     """Chain-level aggregation cluster statistics.
 
     Two chains are connected when they share at least
@@ -129,7 +129,8 @@ def cluster_summary(state: MultiChainState, cluster_contact_threshold: int = 1
     thr = int(cluster_contact_threshold)
     if thr < 1:
         raise ValueError("cluster_contact_threshold must be >= 1")
-    pair_counts = interchain_pair_counts(state)
+    if pair_counts is None:  # callers may pass an exact precomputed mapping
+        pair_counts = interchain_pair_counts(state)
     edges = [pair for pair, cnt in pair_counts.items() if cnt >= thr]
     sizes = _cluster_components(M, edges)
     largest = max(sizes) if sizes else 0
@@ -172,8 +173,8 @@ def per_chain_contacts(m_intra, m_inter, n_chains: int) -> dict:
     }
 
 
-def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
-                      ) -> dict:
+def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1,
+                      pair_counts=None) -> dict:
     """All per-cycle structural observables for one lane (lattice units).
 
     Raw contact counts (``m_intra, m_inter, m_total``) are the extensive
@@ -185,7 +186,7 @@ def cycle_observables(state: MultiChainState, cluster_contact_threshold: int = 1
     the interchain normalization).
     """
     geo = chain_geometry_summary(state)
-    clu = cluster_summary(state, cluster_contact_threshold)
+    clu = cluster_summary(state, cluster_contact_threshold, pair_counts=pair_counts)
     dc_over_L = mean_pair_com_distance_over_L(state)
     counts = state.counts
     out = {
